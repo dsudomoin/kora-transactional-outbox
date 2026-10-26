@@ -555,6 +555,76 @@ class XidPartitionsIT {
     }
 
     @Test
+    void quiesceWaitsForARelayStepAndTimesOutWithoutALock() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+        TestDb.burnXids(2500);
+
+        try (var step = TestDb.connect(); var c = TestDb.connect()) {
+            long lower = tail(c, names);
+            long offset = currentXid(c) % 1000;
+            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
+                TestDb.burnXids((int) (1000 - offset) + 10);
+            }
+            step.setAutoCommit(false); // a relay step in flight, past the quiesce timeout
+            try (var ps = step.prepareStatement("select pg_advisory_xact_lock_shared(?, ?)")) {
+                ps.setInt(1, names.internalNamespace());
+                ps.setInt(2, TableNames.LOCK_SWAP);
+                ps.execute();
+            }
+
+            long start = System.nanoTime();
+            assertThatThrownBy(() -> partitions.ensurePremade(c, Duration.ofMillis(300), Duration.ofMillis(300)))
+                    .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("55P03"));
+
+            assertThat(Duration.ofNanos(System.nanoTime() - start)).isGreaterThanOrEqualTo(Duration.ofMillis(300));
+            assertThat(queryLong(c, "select count(*) from pg_locks where locktype = 'advisory' and pid ="
+                            + " pg_backend_pid()"))
+                    .as("this session holds no swap lock").isZero();
+            assertThat(swapLocks(c, names)).as("only the step's shared one").isOne();
+            assertThat(tail(c, names)).isEqualTo(lower);
+            step.commit();
+            partitions.ensurePremade(c, Duration.ofMillis(300), Duration.ofMillis(300));
+
+            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
+            assertTailAboveLastRange(c, names);
+        }
+    }
+
+    @Test
+    void errorMidSwapRollsBackAndReleasesTheSwapLock() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+        TestDb.burnXids(2500);
+
+        try (var c = TestDb.connect()) {
+            long offset = currentXid(c) % 1000;
+            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
+                TestDb.burnXids((int) (1000 - offset) + 10);
+            }
+            var before = PartitionDdl.listRanges(c, names.base());
+            partitions.inSwap = () -> { // an OutOfMemoryError, say: neither an SQLException nor a RuntimeException
+                throw new Error("mid-swap");
+            };
+
+            assertThatThrownBy(() -> partitions.ensurePremade(c)).isExactlyInstanceOf(Error.class);
+
+            assertThat(c.getAutoCommit()).isTrue();
+            assertThat(swapLocks(c, names)).as("the quiesce lock released, not left to the pool").isZero();
+            assertThat(PartitionDdl.listRanges(c, names.base())).as("the detach rolled back, nothing committed")
+                    .containsExactlyInAnyOrderElementsOf(before);
+            assertThat(detachPending(c, names.tail())).as("still attached").isEqualTo("false");
+            partitions.inSwap = null;
+            partitions.ensurePremade(c);
+
+            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
+            assertTailAboveLastRange(c, names);
+        }
+    }
+
+    @Test
     void tailRowCommittedWhileTheSwapWaitsIsNotDropped() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(Duration.ofSeconds(5));
         var names = bootstrap(config);

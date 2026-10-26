@@ -102,6 +102,9 @@ public final class XidPartitions {
     private final boolean resample;
     private final AtomicLong deferLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private volatile boolean overflow;
+    /** For tests: runs inside the swap transaction right after the tail's detach, to fail the swap there. */
+    @Nullable
+    Runnable inSwap;
 
     public XidPartitions(TableNames names, OutboxConfig.PartitionsConfig cfg) {
         this(names, cfg, LONG_TRANSACTION, true);
@@ -132,7 +135,11 @@ public final class XidPartitions {
         this.premake = cfg.premake();
         this.swapLockTimeout = cfg.swapLockTimeout();
         this.quiesce = "select pg_advisory_lock(" + names.internalNamespace() + ", " + TableNames.LOCK_SWAP + ")";
-        this.unquiesce = "select pg_advisory_unlock(" + names.internalNamespace() + ", " + TableNames.LOCK_SWAP + ")";
+        // only when held, so a quiesce that timed out costs no "you don't own a lock" WARNING in the server log
+        this.unquiesce = "select pg_advisory_unlock(" + names.internalNamespace() + ", " + TableNames.LOCK_SWAP + ")"
+                + " from pg_locks where locktype = 'advisory' and pid = pg_backend_pid() and mode = 'ExclusiveLock'"
+                + " and classid::bigint = " + Integer.toUnsignedLong(names.internalNamespace()) + " and objid = "
+                + TableNames.LOCK_SWAP + " and objsubid = 2";
         this.longTransaction = longTransaction;
         this.resample = resample;
     }
@@ -222,19 +229,26 @@ public final class XidPartitions {
                     names.base(), s.ahead, blocker);
             return;
         }
-        PartitionDdl.execute(c, quiesceTimeout, quiesce); // under the session's own timeouts again afterwards
         boolean swapped;
+        Throwable failure = null;
         try {
+            // inside the try: whatever fails once the lock is granted, even an Error, releases it below; a session
+            // lock left behind would go back to the pool and keep every relay step out
+            PartitionDdl.execute(c, quiesceTimeout, quiesce); // under the session's own timeouts again afterwards
             swapped = swap(c, lower, top);
-        } catch (SQLException | RuntimeException e) {
+        } catch (Throwable t) {
+            failure = t;
+            throw t;
+        } finally {
             try {
                 execute(c, unquiesce);
-            } catch (SQLException cleanup) { // a terminated session, its lock gone with it: keep the cause on top
-                e.addSuppressed(cleanup);
+            } catch (SQLException e) { // a terminated session, its lock gone with it: keep the cause on top
+                if (failure == null) {
+                    throw e;
+                }
+                failure.addSuppressed(e);
             }
-            throw e;
         }
-        execute(c, unquiesce);
         if (swapped) {
             overflow = false;
         } else {
@@ -267,6 +281,9 @@ public final class XidPartitions {
             st.execute("lock table only " + base + " in access exclusive mode");
             locked = System.nanoTime();
             st.execute("alter table " + base + " detach partition " + names.tail());
+            if (inSwap != null) {
+                inSwap.run();
+            }
             try (var rs = st.executeQuery("select 1 from " + names.tail() + " limit 1")) {
                 if (rs.next()) {
                     c.rollback();
@@ -282,8 +299,12 @@ public final class XidPartitions {
             st.execute("alter table " + base + " attach partition " + names.tail() + " "
                     + PartitionDdl.bounds(Long.toString(top), null));
             c.commit();
-        } catch (SQLException | RuntimeException e) {
-            c.rollback();
+        } catch (Throwable e) { // an Error too: setAutoCommit(true) below would commit the DDL run so far
+            try {
+                c.rollback();
+            } catch (SQLException cleanup) { // a terminated session, its transaction gone with it
+                e.addSuppressed(cleanup);
+            }
             throw e;
         } finally {
             c.setAutoCommit(true);
