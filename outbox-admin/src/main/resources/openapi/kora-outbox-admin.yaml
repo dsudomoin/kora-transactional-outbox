@@ -1,0 +1,43 @@
+openapi: 3.0.3
+info:
+  title: kora-outbox admin
+  version: v1
+paths:
+  /kora-outbox/admin/v1/status:
+    get:
+      operationId: getStatus
+      tags: [OutboxAdmin]
+      responses:
+        '200':
+          description: Outbox status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+        '401':
+          description: No credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Credentials not allowed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  schemas:
+    Status:
+      type: object
+      required: [halted]
+      properties:
+        halted:
+          type: boolean
+          description: Delivery stopped by the xid-regression check
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string

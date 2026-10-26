@@ -1,0 +1,54 @@
+// java-library, publishing and shared dependencies are configured by the root build.
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath("ru.tinkoff.kora:openapi-generator:${project.property("koraVersion")}")
+    }
+}
+
+plugins {
+    id("org.openapi.generator") version "7.14.0"
+}
+
+openApiGenerate {
+    generatorName = "kora"
+    inputSpec = "$projectDir/src/main/resources/openapi/kora-outbox-admin.yaml"
+    outputDir = layout.buildDirectory.dir("generated/openapi").get().asFile.path
+    apiPackage = "io.github.dsudomoin.kora.outbox.admin.api"
+    modelPackage = "io.github.dsudomoin.kora.outbox.admin.model"
+    configOptions = mapOf(
+        "mode" to "java-server",
+        "interceptors" to """{"*":[{"type":"io.github.dsudomoin.kora.outbox.admin.OutboxAdminInterceptor"}]}""",
+    )
+}
+
+sourceSets.main {
+    java.srcDir(tasks.openApiGenerate.map { it.outputDir }) // compileJava and sourcesJar depend on the generation
+}
+
+tasks.sourcesJar {
+    exclude(".openapi-generator*", ".openapi-generator/**") // the generator's bookkeeping, not sources
+}
+
+tasks.test {
+    // Kora's generated $AdminTestAppImpl inherits JsonModule's Kafka factories; JUnit's discovery reflects on them and
+    // fails without kafka-clients on the classpath. Generated classes hold no tests.
+    exclude("**/\$*")
+}
+
+dependencies {
+    api(project(":outbox"))
+    api("ru.tinkoff.kora:http-server-common")
+    api("ru.tinkoff.kora:json-common")
+    annotationProcessor("ru.tinkoff.kora:annotation-processors")
+
+    testImplementation(testFixtures(project(":outbox")))
+    testImplementation("ru.tinkoff.kora:http-server-undertow")
+    testImplementation("ru.tinkoff.kora:json-module")
+    testImplementation("ru.tinkoff.kora:openapi-management")
+    testImplementation("ru.tinkoff.kora:config-hocon")
+    testImplementation("ru.tinkoff.kora:test-junit5")
+    testAnnotationProcessor("ru.tinkoff.kora:annotation-processors")
+}

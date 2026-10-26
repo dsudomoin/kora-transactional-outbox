@@ -1,0 +1,15 @@
+openapi: 3.0.3
+info:
+  title: admin wiring test app
+  version: '1'
+paths:
+  /hello:
+    get:
+      operationId: hello
+      responses:
+        '200':
+          description: Greeting
+          content:
+            text/plain:
+              schema:
+                type: string

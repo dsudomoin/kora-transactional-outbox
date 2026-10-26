@@ -1,6 +1,6 @@
 val koraVersion: String by project
 
-configure(listOf(project(":outbox"), project(":outbox-kafka"))) {
+configure(listOf(project(":outbox"), project(":outbox-kafka"), project(":outbox-admin"))) {
     apply(plugin = "java-library")
     apply(plugin = "maven-publish")
 
