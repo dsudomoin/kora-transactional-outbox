@@ -17,17 +17,18 @@ down and interrupts the thread; at 100 % it abandons the call and retries every 
 batchSize × p99(one record) ≤ 0.8 × batchTimeout − per-record timeout
 ```
 
-Target p99 2 s, request timeout 5 s, defaults: (24 − 5) / 2 → `batchSize` ≤ 9. Put the arithmetic in a config
-comment. `batchSize` applies to every handler, Kafka included. If that costs too much throughput:
+Target p99 2 s, request timeout 5 s, defaults: (24 − 5) / 2 → `batchSize` ≤ 9.
+`batchSize` applies to every handler, Kafka included.
 
-- raise `batchTimeout` to fit, keeping it ≥ `delivery.timeout.ms + 5 s + max.block.ms`;
-- or override `handleBatch` to deliver keys concurrently, one (topic, key) in order. `windDownRequested()` is
-  per thread: poll it on the calling thread.
+Throughput: a sequential handler delivers at most min(shards, instances × workers) / mean seconds per record
+(8 / 0.3 s ≈ 26 msg/s). If too low, raise `batchTimeout` (still ≥ `delivery.timeout.ms + 5 s +
+max.block.ms`) or override `handleBatch` to deliver keys concurrently, one (topic, key) in order;
+`windDownRequested()` is per thread, so poll it on the calling thread. Worked numbers: profile 4 in
+[sizing-examples.md](../using-kora-outbox/sizing-examples.md).
 
 | Rationalization | Reality |
 |---|---|
 | "The soft deadline returns NotAttempted for the rest anyway" | A safety net, not flow control. It interrupts a live request (`Retry`: an attempt spent, maybe a duplicate). `byTopic` routes run in turn, so routes behind the slow one, often `kafka.handler()`, wait. |
-| "`batchSize` only limits memory" | It is how many records one call must finish before the deadline. |
 | "The HTTP client has a timeout" | Kora's default read timeout is 2 min. Set a per-request timeout well below `batchTimeout`. |
 
 ## Outcomes
@@ -43,7 +44,7 @@ comment. `batchSize` applies to every handler, Kafka included. If that costs too
 - `relay.retry.maxAttempts` defaults to 0: retry forever. A target failing forever blocks its keys while
   `outbox.shard.lag` grows. Alert on lag, or set `maxAttempts` knowing it applies to Kafka too.
 - A dead-letter path needs an alert on `outbox.dead.size > 0` and a redrive plan (operating-kora-outbox); say so.
-- Idempotency key = `record.messageId()`, stable across attempts and redrive. Not `record.id()`.
+- Idempotency key = `record.messageId()` (stable across attempts and redrive), not `record.id()`.
 
 ## Overriding handleBatch
 
@@ -59,5 +60,5 @@ concurrency, start from [AuditHandler.java](AuditHandler.java). Contract:
 ## Wiring
 
 - One untagged handler: a factory returning exactly `OutboxHandler`, e.g.
-  `OutboxHandler.byTopic(Map.of("audit", new AuditHandler(url)), kafka.handler())` with `KafkaOutboxSender kafka`.
+  `OutboxHandler.byTopic(Map.of("audit", new AuditHandler(url)), kafka.handler())`, injecting `KafkaOutboxSender`.
 - A wrapper around `kafka.handler()` delegates `handleBatch` too, or each record becomes its own acks=all round trip.

@@ -7,9 +7,7 @@ description: Use when adding kora-transactional-outbox (io.github.dsudomoin:kora
 
 ## Overview
 
-`send` writes the message in the caller's transaction; a relay inside the service delivers it after commit. The
-javadocs cover wiring and sending. Services break on what they do not cover: database, Kafka and config
-prerequisites.
+The javadocs cover wiring and sending. Services break on what they omit: database, Kafka and config prerequisites.
 
 ## Quick reference
 
@@ -21,6 +19,7 @@ prerequisites.
 | `null` value in `TypedOutbox` | Kafka tombstone: deletes the key on a compacted topic. |
 | Kotlin | `db.inTx<Unit> { _: Connection -> ... }`; blocking, no `suspend` or dispatcher hops. |
 | Keyed sends for **2+ distinct (topic, key)** in one transaction | One `outbox.sendAll(...)` for all of them. |
+| Choosing shards, workers, pool, partitions | Five worked profiles: [sizing-examples.md](sizing-examples.md). |
 | Existing tests that boot the graph | `outbox.relay.enabled = false` unless they assert delivery (testing-kora-outbox). |
 
 ## Why one sendAll
