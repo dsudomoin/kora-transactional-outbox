@@ -460,6 +460,44 @@ class MaintenanceIT {
     }
 
     @Test
+    void rangesMadeForASwapThatTimedOutAreKeptForTheNextRun() throws Exception {
+        bootstrap();
+        try (var c = TestDb.connect()) {
+            var partitions = new XidPartitions(names, config.partitions());
+            while (partitions.premadeAhead(c) > config.premake() / 2) {
+                TestDb.burnXids(200);
+            }
+        }
+        var maintenance = maintenance();
+        List<String> made;
+        try (var reader = TestDb.connect()) {
+            reader.setAutoCommit(false); // a young reader: no blocker, so the swap waits for it and gives up
+            queryLong(reader, "select count(*) from " + names.base());
+            String log;
+            try (var err = new CapturedStderr()) {
+                assertThat(maintenance.runOnce()).isTrue();
+                log = err.text();
+            }
+            reader.commit();
+            try (var c = TestDb.connect()) {
+                made = PartitionDdl.standalone(c, names.base(), "_x[0-9]+");
+            }
+            assertThat(log).contains("55P03").doesNotContain("detached earlier but never dropped");
+            assertThat(made).as("left standalone by the same run's orphan step").isNotEmpty();
+        }
+
+        String log;
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+            log = err.text();
+        }
+
+        assertThat(log).contains("swapped the partition tail")
+                .doesNotContain("created table " + names.partitionPrefix());
+        assertThat(ranges()).extracting(Bound::name).containsAll(made);
+    }
+
+    @Test
     void pendingRangeDetachDoesNotJamExtension() throws Exception {
         bootstrap();
         var relay = relay(new RecordingHandler(), maintenance());
@@ -676,7 +714,8 @@ class MaintenanceIT {
     @Test
     void emptyLeftoverRangeIsDroppedAndStaleMarkersGo() throws Exception {
         bootstrap();
-        var leftover = names.partitionPrefix() + "999000000"; // a create whose attach never ran
+        // a create whose attach never ran, below the tail: above it, the extension's pre-created ranges wait for a swap
+        var leftover = names.partitionPrefix() + "2";
         try (var c = TestDb.connect()) {
             execute(c, "create table " + leftover + " (like " + names.base() + " including defaults)");
             markDropping(c, names.partitionPrefix() + "1"); // its range was dropped, its marker not deleted

@@ -14,10 +14,11 @@ import org.slf4j.LoggerFactory;
 /**
  * Range-partition DDL shared by the outbox (xid8 bounds) and the inbox (uuid bounds). Every method needs an autocommit
  * connection ({@code DETACH ... CONCURRENTLY} cannot run in a transaction block) and runs each DDL statement under its
- * own {@code lock_timeout} and a {@code statement_timeout} {@link #DDL_MARGIN} longer, so a shorter role or database
- * {@code statement_timeout} cannot end the lock wait first (57014). Both are given back afterwards on every path: the
- * session's own value, or a reset when it had none. Bound values are unquoted text ({@code "1000"}); a {@code null} upper
- * bound is {@code MAXVALUE}. Names are interpolated, so they and the values are checked against a strict charset.
+ * own {@code lock_timeout} and a {@code statement_timeout} {@link #DDL_MARGIN} longer (a validate: its own), so a
+ * shorter role or database {@code statement_timeout} cannot end the lock wait first (57014). Both are given back
+ * afterwards on every path: the session's own value, or a reset when it had none. Bound values are unquoted text
+ * ({@code "1000"}); a {@code null} upper bound is {@code MAXVALUE}. Names are interpolated, so they and the values are
+ * checked against a strict charset.
  */
 public final class PartitionDdl {
 
@@ -25,6 +26,8 @@ public final class PartitionDdl {
     public static final Duration DETACH_LOCK_TIMEOUT = Duration.ofSeconds(30);
     /** A DDL statement's {@code statement_timeout} past its {@code lock_timeout}: room for its own work. */
     static final Duration DDL_MARGIN = Duration.ofSeconds(60);
+    /** A validate's {@code statement_timeout}: it scans the table, under a lock that writers pass. */
+    static final Duration VALIDATE_TIMEOUT = Duration.ofHours(1);
     /** The two timeouts as this session set them, null where it did not (the role, database or server default). */
     private static final String SESSION_TIMEOUTS = "select max(setting) filter (where name = 'lock_timeout'),"
             + " max(setting) filter (where name = 'statement_timeout') from pg_settings"
@@ -77,6 +80,18 @@ public final class PartitionDdl {
         String bounds = bounds(from, to);
         execute(c, lockTimeout, "alter table " + name(parent) + " attach partition " + name(table) + " " + bounds);
         log.info("attached partition {} to {} {}", table, parent, bounds);
+    }
+
+    /**
+     * Validates {@code constraint} of {@code table}, a scan of its rows under SHARE UPDATE EXCLUSIVE on it alone, which
+     * writers pass: {@link #VALIDATE_TIMEOUT} for the statement, {@link #DETACH_LOCK_TIMEOUT} for the lock (autovacuum
+     * gives way, a VACUUM by hand does not). A no-op once validated.
+     */
+    static void validate(Connection c, String table, String constraint) throws SQLException {
+        long start = System.nanoTime();
+        execute(c, DETACH_LOCK_TIMEOUT, VALIDATE_TIMEOUT,
+                "alter table " + name(table) + " validate constraint " + name(constraint));
+        log.info("validated constraint {} of {} in {} ms", constraint, table, (System.nanoTime() - start) / 1_000_000);
     }
 
     public static void detachConcurrentlyAndDrop(Connection c, String parent, String partition, Duration lockTimeout)
@@ -312,6 +327,11 @@ public final class PartitionDdl {
 
     /** Runs {@code sql} under the class's per-statement timeouts, then gives the session's own back. */
     static void execute(Connection c, Duration lockTimeout, String sql) throws SQLException {
+        execute(c, lockTimeout, lockTimeout.plus(DDL_MARGIN), sql);
+    }
+
+    private static void execute(Connection c, Duration lockTimeout, Duration statementTimeout, String sql)
+            throws SQLException {
         String lock;
         String statement;
         try (var st = c.createStatement(); var rs = st.executeQuery(SESSION_TIMEOUTS)) {
@@ -321,7 +341,7 @@ public final class PartitionDdl {
         }
         try (var st = c.createStatement()) {
             st.execute("set lock_timeout = " + lockTimeout.toMillis());
-            st.execute("set statement_timeout = " + lockTimeout.plus(DDL_MARGIN).toMillis());
+            st.execute("set statement_timeout = " + statementTimeout.toMillis());
             st.execute(sql);
         } catch (SQLException | RuntimeException e) {
             try {

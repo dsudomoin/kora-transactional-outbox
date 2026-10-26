@@ -342,7 +342,8 @@ public final class OutboxSchema implements Lifecycle {
      * same extension maintenance runs: the tail swap, the one ACCESS EXCLUSIVE on the parent, under
      * {@code outbox.partitions.swapLockTimeout}, after waiting up to {@code LOCK_TIMEOUT} for relay steps in flight. A
      * lock timeout there (the swap waiting for running transactions in a rolling deploy) is logged and left to
-     * maintenance while inserts at the current xid still find a partition.
+     * maintenance while inserts at the current xid still find a partition. A hot tail is left to maintenance too:
+     * turning it into a range scans it, which would hold the schema lock and every other instance's startup.
      * Partition DDL is serialised by {@code LOCK_MAINTENANCE}, taken here after {@code LOCK_SCHEMA};
      * {@link Maintenance} takes it with {@code pg_try_advisory_lock} and never takes {@code LOCK_SCHEMA}, so the two
      * can never deadlock.

@@ -27,14 +27,14 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * {@code idle_session_timeout = 60s}, so Postgres ends the session of a frozen holder and frees the lock; the setting
  * is reset and the lock released before the connection goes back to the pool. Steps, each on its own (a failure is
  * logged and the next step still runs): finish a pending detach, premade partitions (the extension swaps the tail in
- * one transaction, the library's one ACCESS EXCLUSIVE on the parent: writers stall for its lock wait, at most
- * {@code outbox.partitions.swapLockTimeout}, and the milliseconds it holds the lock; before it, a wait of up to
- * {@code batchTimeout} + 5 s for relay steps in flight blocks no writer), drop of processed partitions, drop of ranges
- * left detached but not dropped: by a crash of this library's maintenance once relayed, by anyone else only when empty
- * ({@code outbox.partitions.orphaned} counts the ones kept, with an ERROR each run, as their rows lie outside the
- * outbox), tick cleanup, cursor cleanup, gauges; when none failed, the run is recorded as the last success. One
- * long-lived instance per outbox table: it registers the gauges {@code outbox.shard.lag}, {@code outbox.retry.size},
- * {@code outbox.dead.size}, {@code outbox.parked.size}, {@code outbox.partitions.premade},
+ * one transaction, a tail with rows becoming a range in it, the library's one ACCESS EXCLUSIVE on the parent: writers
+ * stall for its lock wait, at most {@code outbox.partitions.swapLockTimeout}, and the milliseconds it holds the lock;
+ * before it, a wait of up to {@code batchTimeout} + 5 s for relay steps in flight blocks no writer), drop of processed
+ * partitions, drop of ranges left detached but not dropped: by a crash of this library's maintenance once relayed,
+ * by anyone else only when empty ({@code outbox.partitions.orphaned} counts the ones kept, with an ERROR each run, as
+ * their rows lie outside the outbox), tick cleanup, cursor cleanup, gauges; when none failed, the run is recorded as
+ * the last success. One long-lived instance per outbox table: it registers the gauges {@code outbox.shard.lag},
+ * {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.parked.size}, {@code outbox.partitions.premade},
  * {@code outbox.partitions.overflow}, {@code outbox.partitions.xids_left} (xids before inserts fail while the tail is
  * not attached, with an ERROR each run; NaN while it is), {@code outbox.maintenance.transaction_pooling} and
  * {@code outbox.maintenance.since_success} (NaN until the first run).
