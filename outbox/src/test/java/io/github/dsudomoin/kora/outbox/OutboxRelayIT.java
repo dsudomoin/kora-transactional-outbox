@@ -768,6 +768,31 @@ class OutboxRelayIT {
     }
 
     @Test
+    void aLockedPartitionDoesNotStopTicks() throws Exception {
+        bootstrap(); // 4 shards, 2 workers
+        var handler = new RecordingHandler();
+        var relay = start(handler);
+        var outbox = outbox(relay::wake);
+        awaitParked();
+        try (var err = new CapturedStderr(); var other = TestDb.connect()) {
+            other.setAutoCommit(false);
+            // e.g. an ALTER TABLE by hand on the tail. Shard steps wait for it (a batch read plans over every
+            // partition), but ticks go on without shard sets and say why, so the lag gauge shows the stall
+            execute(other, "lock table " + schema.names().tail() + " in access exclusive mode");
+            long before = ticksMade();
+            var ids = send(outbox, messagesOnShards(40, 0, config.shards() - 1).toArray(OutboxMessage[]::new));
+
+            await(Duration.ofSeconds(2), () -> ticksMade() > before
+                    && err.text().contains("outbox tick made without its shard set"));
+            other.rollback();
+
+            await(Duration.ofSeconds(10), () -> handler.delivered().size() >= ids.size());
+            assertThat(handler.delivered()).extracting(OutboxRecord::messageId)
+                    .containsExactlyInAnyOrderElementsOf(ids);
+        }
+    }
+
+    @Test
     void idleShardsAreSteppedAgainWhenTickIdsGoBackwardsAfterAHaltIsLifted() throws Exception {
         bootstrap(); // 4 shards, 2 workers
         var names = schema.names();

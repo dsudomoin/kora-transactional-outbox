@@ -1029,6 +1029,7 @@ premake / 2 × xidsPerPartition  ≥  пиковое число transaction id �
 | `outbox.shard.lag` растёт | Самый медленный шард отстаёт (цель недоступна, медленный обработчик, мало воркеров). |
 | `outbox.dead.size` > 0 | Есть dead letters, которые нужно разобрать. |
 | ERROR «outbox relay halted» | Регрессия xid («xid regression recovery»). |
+| WARN «outbox tick made without its shard set» | Проба шардов при записи тика не прошла, чаще всего потому, что партицию держит ACCESS EXCLUSIVE (ALTER TABLE, VACUUM FULL, TRUNCATE, LOCK вручную). Тики идут дальше без набора шардов, и relay шагает по всем шардам; пока партиция заблокирована, шаги ждут её, и растёт `outbox.shard.lag`. Не чаще раза в минуту. |
 
 ### Dead letters
 

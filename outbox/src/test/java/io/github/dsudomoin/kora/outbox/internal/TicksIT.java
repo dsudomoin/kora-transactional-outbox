@@ -7,6 +7,7 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.dsudomoin.kora.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
 import jakarta.annotation.Nullable;
@@ -15,6 +16,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Properties;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -357,11 +359,11 @@ class TicksIT {
             // over all 20 000 rows
             c.setAutoCommit(false);
             execute(c, "set local plan_cache_mode = force_generic_plan");
-            execute(c, "prepare tick_insert(int, bigint) as " + ticks.insert(c).replaceFirst("\\?", "\\$1")
+            execute(c, "prepare tick_probe(int, bigint) as " + ticks.probe(c).replaceFirst("\\?", "\\$1")
                     .replaceFirst("\\?", "\\$2"));
             long buffers = 0;
             try (var st = c.createStatement();
-                    var rs = st.executeQuery("explain (analyze, buffers) execute tick_insert(" + SHARDS + ", 0)")) {
+                    var rs = st.executeQuery("explain (analyze, buffers) execute tick_probe(" + SHARDS + ", 0)")) {
                 while (rs.next() && buffers == 0) { // the first Buffers line: the whole statement's
                     var m = Pattern.compile("(hit|read)=(\\d+)").matcher(rs.getString(1));
                     while (m.find()) {
@@ -372,6 +374,73 @@ class TicksIT {
             c.rollback();
 
             assertThat(buffers).as("buffers of a tick over 20 000 new rows on %d shards", SHARDS).isLessThan(200);
+        }
+    }
+
+    @Test
+    void aTickTakesOneTransactionIdItsProbeNone() throws Exception {
+        try (var c = TestDb.connect()) {
+            insertRow(c, 1);
+            long before = queryLong(c, "select pg_current_xact_id()::text::bigint"); // takes one itself
+            for (int i = 0; i < 10; i++) {
+                assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            }
+            long after = queryLong(c, "select pg_current_xact_id()::text::bigint");
+
+            assertThat(after - before).as("xids of 10 ticks and one probe each").isEqualTo(11);
+        }
+    }
+
+    @Test
+    void aLockedPartitionCostsATickItsShardSetNotTheTick() throws Exception {
+        try (var c = TestDb.connect(); var other = TestDb.connect()) {
+            for (int i = 0; i < 6; i++) { // a cached generic plan, as on a pooled connection
+                assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            }
+            var premade = queryString(c, "select inhrelid::regclass::text from pg_inherits i join pg_class k"
+                    + " on k.oid = i.inhrelid where inhparent = '" + names.base() + "'::regclass and k.relname <> '"
+                    + names.unqualified(names.tail()) + "' order by k.oid desc limit 1"); // empty, far above the xid
+            for (var locked : List.of(premade, names.tail())) {
+                other.setAutoCommit(false);
+                execute(other, "lock table " + locked + " in access exclusive mode"); // e.g. an ALTER TABLE by hand
+                long started = System.nanoTime();
+
+                assertThat(ticks.make(c, Duration.ZERO)).as("a tick while %s is locked", locked).isTrue();
+
+                assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofMillis(500));
+                assertThat(shards(c)).as("no shard set: every shard may have rows").isNull();
+                assertSessionRestored(c);
+                other.rollback();
+            }
+
+            insertRow(c, 6);
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            assertThat(shards(c)).as("probed again once the lock is gone").containsExactly(6);
+        }
+    }
+
+    @Test
+    void aProbeThatFailsFallsBackToATickWithoutAShardSetAndWarnsOnce() throws Exception {
+        var role = TestDb.newLoginRole();
+        try (var c = TestDb.connect()) { // the role may make ticks but not read the outbox: its probe fails (42501)
+            execute(c, "grant select, insert on " + names.tick() + " to " + role);
+            execute(c, "grant select on sequence "
+                    + queryString(c, "select pg_get_serial_sequence('" + names.base() + "', 'id')") + " to " + role);
+        }
+        var login = new Properties();
+        login.setProperty("user", role);
+        login.setProperty("password", role);
+        try (var err = new CapturedStderr(); var asRole = TestDb.connect(login); var c = TestDb.connect()) {
+            var roleTicks = new Ticks(names, SHARDS);
+            insertRow(c, 3);
+
+            assertThat(roleTicks.make(asRole, Duration.ZERO)).isTrue();
+            assertThat(shards(c)).isNull();
+            assertThat(roleTicks.make(asRole, Duration.ZERO)).isTrue();
+
+            assertThat(shards(c)).isNull();
+            assertSessionRestored(asRole);
+            assertThat(err.text()).contains("42501").containsOnlyOnce("WARN " + Ticks.class.getName());
         }
     }
 
