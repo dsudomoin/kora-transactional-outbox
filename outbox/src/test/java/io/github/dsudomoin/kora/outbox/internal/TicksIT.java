@@ -381,13 +381,14 @@ class TicksIT {
     void aTickTakesOneTransactionIdItsProbeNone() throws Exception {
         try (var c = TestDb.connect()) {
             insertRow(c, 1);
-            long before = queryLong(c, "select pg_current_xact_id()::text::bigint"); // takes one itself
             for (int i = 0; i < 10; i++) {
                 assertThat(ticks.make(c, Duration.ZERO)).isTrue();
             }
-            long after = queryLong(c, "select pg_current_xact_id()::text::bigint");
+            // gaps between the xids of consecutive tick rows: a stray xid elsewhere (autoanalyze) widens one gap only
+            long gap = queryLong(c, "select min(gap) from (select xmin::text::bigint - lag(xmin::text::bigint)"
+                    + " over (order by id) gap from " + names.tick() + " order by id desc limit 10) t");
 
-            assertThat(after - before).as("xids of 10 ticks and one probe each").isEqualTo(11);
+            assertThat(gap).as("xids per tick, its probe included").isEqualTo(1);
         }
     }
 

@@ -776,10 +776,10 @@ class OutboxRelayIT {
         awaitParked();
         try (var err = new CapturedStderr(); var other = TestDb.connect()) {
             other.setAutoCommit(false);
+            long before = ticksMade(); // before the lock: a fallback tick may come right after it
             // e.g. an ALTER TABLE by hand on the tail. Shard steps wait for it (a batch read plans over every
             // partition), but ticks go on without shard sets and say why, so the lag gauge shows the stall
             execute(other, "lock table " + schema.names().tail() + " in access exclusive mode");
-            long before = ticksMade();
             var ids = send(outbox, messagesOnShards(40, 0, config.shards() - 1).toArray(OutboxMessage[]::new));
 
             await(Duration.ofSeconds(2), () -> ticksMade() > before
