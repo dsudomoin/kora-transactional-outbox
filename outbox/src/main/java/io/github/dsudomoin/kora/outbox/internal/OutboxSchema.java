@@ -26,9 +26,11 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * populated table, fails startup with SQLState 57014 and is left to run by hand. The schema lock is retried for a
  * minute, then startup fails. On existing tables the bootstrap takes no lock that writers wait behind (index creation
  * is skipped when the index exists, partition extension is optional and left to maintenance when it times out). A tick
- * table made before {@code max_id} or {@code shards}, a cursor table made before {@code parked_due_at} and a retry
- * table made before {@code requeues} get the column once; that ALTER waits for running relay transactions and fails
- * startup on timeout. Ticks without {@code shards} (null) count as holding rows of every shard.
+ * table made before {@code max_id} or {@code shards}, a cursor table made before {@code parked_due_at}, a retry table
+ * made before {@code requeues} and a dead table made before the dead-letter hook's columns get each column once; that
+ * ALTER waits for running relay transactions and fails startup on timeout. Ticks without {@code shards} (null) count as
+ * holding rows of every shard; dead letters older than {@code status} are kept, the hook sees new ones only, and adding
+ * its check scans the dead table once under the ALTER's lock.
  */
 public final class OutboxSchema implements Lifecycle {
 
@@ -73,6 +75,7 @@ public final class OutboxSchema implements Lifecycle {
         var retry = relay.retry();
         var requeue = relay.requeue();
         var partitions = config.partitions();
+        var deadLetters = config.deadLetters();
         validateShards(config.shards());
         require(relay.workers() >= 1, "outbox.relay.workers must be at least 1: " + relay.workers());
         require(relay.batchSize() >= 1, "outbox.relay.batchSize must be at least 1: " + relay.batchSize());
@@ -106,6 +109,14 @@ public final class OutboxSchema implements Lifecycle {
         // sent as whole milliseconds, and lock_timeout = 0 is no limit at all
         require(partitions.swapLockTimeout().toMillis() > 0,
                 "outbox.partitions.swapLockTimeout must be positive: " + partitions.swapLockTimeout());
+        require(deadLetters.batchSize() >= 1,
+                "outbox.deadLetters.batchSize must be at least 1: " + deadLetters.batchSize());
+        require(deadLetters.timeout().compareTo(Duration.ZERO) > 0,
+                "outbox.deadLetters.timeout must be positive: " + deadLetters.timeout());
+        require(!deadLetters.retention().isNegative(),
+                "outbox.deadLetters.retention must not be negative: " + deadLetters.retention());
+        require(deadLetters.redriveHistory().compareTo(Duration.ZERO) > 0,
+                "outbox.deadLetters.redriveHistory must be positive: " + deadLetters.redriveHistory());
     }
 
     static void validateShards(int shards) {
@@ -264,6 +275,21 @@ public final class OutboxSchema implements Lifecycle {
                       failed_at  timestamptz not null default now(),
                       error      text
                     )""");
+            // the dead-letter hook's columns, on a fresh table too; letters of a table made before them become kept
+            addColumn(c, n.dead(), "status", "text not null default 'kept' constraint " + n.unqualified(n.dead())
+                    + "_status check (status in ('pending', 'kept', 'scheduled'))");
+            addColumn(c, n.dead(), "due_at", "timestamptz"); // pending: next hook call; scheduled: redrive time
+            addColumn(c, n.dead(), "handler_attempts", "int not null default 0");
+            addColumn(c, n.dead(), "last_handler_error", "text");
+            addColumn(c, n.dead(), "redrives", "int not null default 0");
+            createIndex(c, n.dead() + "_due", n.dead() + " (due_at) where due_at is not null");
+            // how many times a message was redriven, read by its next dead row
+            st.execute("create table if not exists " + n.redriven() + """
+                     (
+                      message_id uuid primary key,
+                      redrives   int not null,
+                      at         timestamptz not null default now()
+                    )""");
             // the xid-regression halt, persisted by Maintenance: one row while halted
             st.execute("create table if not exists " + n.halt() + """
                      (
@@ -353,6 +379,18 @@ public final class OutboxSchema implements Lifecycle {
         }
         try (var st = c.createStatement()) {
             st.execute("create index " + spelled.unqualified(index) + " on " + definition);
+        }
+    }
+
+    /**
+     * Once per table: ACCESS EXCLUSIVE for a metadata-only change (a constant default), plus one scan of the table for
+     * a CHECK constraint on the new column.
+     */
+    private static void addColumn(Connection c, String table, String column, String definition) throws SQLException {
+        if (!columnExists(c, table, column)) {
+            try (var st = c.createStatement()) {
+                st.execute("alter table " + table + " add column if not exists " + column + " " + definition);
+            }
         }
     }
 

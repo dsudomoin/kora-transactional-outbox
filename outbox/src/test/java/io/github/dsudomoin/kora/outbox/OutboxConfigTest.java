@@ -19,7 +19,8 @@ class OutboxConfigTest {
                     new $OutboxConfig_RetryConfig_ConfigValueExtractor(DURATION),
                     new $OutboxConfig_RequeueConfig_ConfigValueExtractor(DURATION)),
             new $OutboxConfig_PartitionsConfig_ConfigValueExtractor(DURATION),
-            new $OutboxConfig_InboxConfig_ConfigValueExtractor(DURATION));
+            new $OutboxConfig_InboxConfig_ConfigValueExtractor(DURATION),
+            new $OutboxConfig_DeadLettersConfig_ConfigValueExtractor(DURATION));
 
     private static OutboxConfig parse(String hocon) {
         var config = HoconConfigFactory.fromHocon(
@@ -57,6 +58,7 @@ class OutboxConfigTest {
                   partitions.restoreOrphans = false
                   inbox.retention = 2h
                   inbox.attachOrphans = false
+                  deadLetters.retention = 90d
                 }
                 """);
 
@@ -68,6 +70,7 @@ class OutboxConfigTest {
         assertThat(config.partitions().restoreOrphans()).isFalse();
         assertThat(config.inbox().retention()).isEqualTo(Duration.ofHours(2));
         assertThat(config.inbox().attachOrphans()).isFalse();
+        assertThat(config.deadLetters().retention()).isEqualTo(Duration.ofDays(90));
     }
 
     @Test
@@ -100,6 +103,25 @@ class OutboxConfigTest {
         assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox.relay.requeue.maxRequeues = -1")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("outbox.relay.requeue.maxRequeues must not be negative: -1");
+    }
+
+    @Test
+    void badDeadLettersValuesAreRejected() {
+        assertRejected("outbox.deadLetters.batchSize = 0", "outbox.deadLetters.batchSize must be at least 1: 0");
+        assertRejected("outbox.deadLetters.timeout = 0ms", "outbox.deadLetters.timeout must be positive: PT0S");
+        assertRejected("outbox.deadLetters.retention = -1ms",
+                "outbox.deadLetters.retention must not be negative: PT-0.001S");
+        assertRejected("outbox.deadLetters.redriveHistory = 0ms",
+                "outbox.deadLetters.redriveHistory must be positive: PT0S");
+    }
+
+    private static void assertRejected(String hocon, String message) {
+        var config = parse(hocon);
+
+        assertThatThrownBy(() -> OutboxSchema.validate(config))
+                .as(hocon)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage(message);
     }
 
     private static void assertDefaults(OutboxConfig config) {
@@ -135,5 +157,11 @@ class OutboxConfigTest {
         assertThat(inbox.premake()).isEqualTo(Duration.ofHours(24));
         assertThat(inbox.retention()).isEqualTo(Duration.ofHours(24));
         assertThat(inbox.attachOrphans()).isTrue();
+
+        var deadLetters = config.deadLetters();
+        assertThat(deadLetters.batchSize()).isEqualTo(100);
+        assertThat(deadLetters.timeout()).isEqualTo(Duration.ofSeconds(30));
+        assertThat(deadLetters.retention()).isZero();
+        assertThat(deadLetters.redriveHistory()).isEqualTo(Duration.ofDays(30));
     }
 }

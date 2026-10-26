@@ -106,6 +106,11 @@ public record TableNames(
         return base + "_dropping";
     }
 
+    /** How many times each message was redriven, kept for {@code outbox.deadLetters.redriveHistory}. */
+    public String redriven() {
+        return base + "_redriven";
+    }
+
     /** The next tail, created beside the current one before the swap that replaces it. */
     public String tailNext() {
         return base + "_tail_next";

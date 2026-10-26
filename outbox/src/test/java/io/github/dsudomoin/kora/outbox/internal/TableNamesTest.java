@@ -17,6 +17,7 @@ class TableNamesTest {
         assertThat(names.cursor()).isEqualTo("outbox_cursor");
         assertThat(names.retry()).isEqualTo("outbox_retry");
         assertThat(names.dead()).isEqualTo("outbox_dead");
+        assertThat(names.redriven()).isEqualTo("outbox_redriven");
         assertThat(names.halt()).isEqualTo("outbox_halt");
         assertThat(names.tail()).isEqualTo("outbox_tail");
         assertThat(names.partitionPrefix()).isEqualTo("outbox_x");

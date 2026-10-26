@@ -48,7 +48,7 @@ class OutboxSchemaIT {
 
         try (var c = TestDb.connect()) {
             for (var table : List.of(n.base(), n.tick(), n.cursor(), n.retry(), n.dead(), n.halt(), n.tail(),
-                    n.maintenance(), n.parked(), n.parked() + "_key", n.parked() + "_due")) {
+                    n.maintenance(), n.parked(), n.parked() + "_key", n.parked() + "_due", n.redriven())) {
                 assertThat(queryString(c, "select to_regclass(?)::text", table)).as(table).isEqualTo(table);
             }
             assertThat(queryString(c, "select pg_get_indexdef(to_regclass(?))", n.parked() + "_key"))
@@ -57,6 +57,8 @@ class OutboxSchemaIT {
                     .endsWith("(shard, due_at)");
             assertThat(OutboxSchema.columnExists(c, n.cursor(), "parked_due_at")).isTrue();
             assertThat(OutboxSchema.columnExists(c, n.retry(), "requeues")).isTrue();
+            assertThat(queryString(c, "select pg_get_indexdef(to_regclass(?))", n.dead() + "_due"))
+                    .endsWith(" (due_at) WHERE (due_at IS NOT NULL)");
             assertThat(queryString(c, "select pg_get_partkeydef(to_regclass(?))", n.base())).isEqualTo("RANGE (xid)");
             assertThat(new XidPartitions(n, config.partitions()).premadeAhead(c))
                     .isGreaterThanOrEqualTo(config.premake());
@@ -208,6 +210,51 @@ class OutboxSchemaIT {
     }
 
     @Test
+    void deadTableIsUpgradedInPlace() throws Exception {
+        var n = TableNames.of(config.table());
+        String letters = "select string_agg(concat_ws(':', id, status, coalesce(due_at::text, 'null'),"
+                + " handler_attempts, coalesce(last_handler_error, 'null'), redrives), ',' order by id)"
+                + " from " + n.dead();
+        try (var c = TestDb.connect()) {
+            execute(c, "create table " + n.dead() + """
+                     (
+                      id         bigint primary key,
+                      shard      smallint not null,
+                      message_id uuid not null,
+                      topic      text not null,
+                      key        bytea,
+                      payload    bytea,
+                      headers    bytea,
+                      created_at timestamptz not null,
+                      attempts   int not null,
+                      failed_at  timestamptz not null default now(),
+                      error      text
+                    )"""); // a dead table of a version before the dead-letter hook
+            execute(c, "insert into " + n.dead() + " (id, shard, message_id, topic, created_at, attempts, error)"
+                    + " values (1, 0, gen_random_uuid(), 't', now(), 3, 'boom'),"
+                    + " (2, 1, gen_random_uuid(), 't', now(), 5, null)");
+
+            new OutboxSchema(db, config).init();
+
+            assertThat(queryString(c, letters)).isEqualTo("1:kept:null:0:null:0,2:kept:null:0:null:0");
+            assertThat(queryString(c, "select (to_regclass(?) is not null)::text", n.dead() + "_due"))
+                    .isEqualTo("true");
+            assertThatThrownBy(() -> execute(c, "update " + n.dead() + " set status = 'gone' where id = 1"))
+                    .isInstanceOf(SQLException.class)
+                    .hasMessageContaining(n.unqualified(n.dead()) + "_status");
+
+            try (var writer = TestDb.connect()) {
+                writer.setAutoCommit(false);
+                execute(writer, "update " + n.dead() + " set error = 'again' where id = 1");
+                // a no-op: no ALTER or CREATE INDEX queues behind the writer's lock on the dead table
+                assertTimeoutPreemptively(Duration.ofSeconds(2), () -> new OutboxSchema(db, config).init());
+                writer.rollback();
+            }
+            assertThat(queryString(c, letters)).isEqualTo("1:kept:null:0:null:0,2:kept:null:0:null:0");
+        }
+    }
+
+    @Test
     void shardMismatchFailsFast() throws Exception {
         new OutboxSchema(db, config.shards(4)).init();
 
@@ -324,7 +371,11 @@ class OutboxSchemaIT {
                 Map.entry("outbox.partitions.xidsPerPartition", c -> c.xidsPerPartition(999)),
                 Map.entry("outbox.partitions.premake", c -> c.premake(1)),
                 Map.entry("outbox.partitions.maintenanceInterval", c -> c.maintenanceInterval(Duration.ZERO)),
-                Map.entry("outbox.partitions.swapLockTimeout", c -> c.swapLockTimeout(Duration.ZERO)));
+                Map.entry("outbox.partitions.swapLockTimeout", c -> c.swapLockTimeout(Duration.ZERO)),
+                Map.entry("outbox.deadLetters.batchSize", c -> c.deadLettersBatchSize(0)),
+                Map.entry("outbox.deadLetters.timeout", c -> c.deadLettersTimeout(Duration.ZERO)),
+                Map.entry("outbox.deadLetters.retention", c -> c.deadLettersRetention(Duration.ofMillis(-1))),
+                Map.entry("outbox.deadLetters.redriveHistory", c -> c.deadLettersRedriveHistory(Duration.ZERO)));
 
         try (var c = TestDb.connect()) {
             for (var e : cases) {

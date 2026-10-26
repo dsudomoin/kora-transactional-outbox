@@ -134,7 +134,8 @@ class TickCostBenchmark {
                 c.rollback(); // after a failed round: their row locks would block the drop
             }
             execute(tick, "drop table if exists " + String.join(", ", names.base(), names.tick(), names.cursor(),
-                    names.retry(), names.dead(), names.halt(), names.maintenance(), names.dropping()) + " cascade");
+                    names.retry(), names.dead(), names.halt(), names.maintenance(), names.dropping(),
+                    names.redriven()) + " cascade");
         }
     }
 

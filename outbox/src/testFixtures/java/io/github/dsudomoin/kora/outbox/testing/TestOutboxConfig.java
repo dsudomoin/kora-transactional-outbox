@@ -5,9 +5,9 @@ import java.time.Duration;
 
 /**
  * Mutable config with fast test defaults and fresh {@link TestDb#uniqueTable()} names for both tables. Relay, retry,
- * requeue and partition settings live on this object itself ({@link #relay()}, {@link #retry()}, {@link #requeue()}
- * and {@link #partitions()} return {@code this}); the inbox block is separate because its {@code table()} and
- * {@code premake()} clash with the outbox ones.
+ * requeue and partition settings live on this object itself ({@link #relay()}, {@link #retry()}, {@link #requeue()} and
+ * {@link #partitions()} return {@code this}); the inbox and dead-letter blocks are separate because their
+ * {@code table()}, {@code premake()} and {@code batchSize()} clash with the outbox ones.
  */
 public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayConfig, OutboxConfig.RetryConfig,
         OutboxConfig.RequeueConfig, OutboxConfig.PartitionsConfig {
@@ -38,6 +38,10 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private Duration inboxPremake = Duration.ofHours(24);
     private Duration inboxRetention = Duration.ofHours(24);
     private boolean inboxAttachOrphans = true;
+    private int deadLettersBatchSize = 100;
+    private Duration deadLettersTimeout = Duration.ofSeconds(5);
+    private Duration deadLettersRetention = Duration.ZERO;
+    private Duration deadLettersRedriveHistory = Duration.ofDays(30);
 
     // OutboxConfig
 
@@ -97,6 +101,31 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
             @Override
             public boolean attachOrphans() {
                 return inboxAttachOrphans;
+            }
+        };
+    }
+
+    @Override
+    public DeadLettersConfig deadLetters() {
+        return new DeadLettersConfig() {
+            @Override
+            public int batchSize() {
+                return deadLettersBatchSize;
+            }
+
+            @Override
+            public Duration timeout() {
+                return deadLettersTimeout;
+            }
+
+            @Override
+            public Duration retention() {
+                return deadLettersRetention;
+            }
+
+            @Override
+            public Duration redriveHistory() {
+                return deadLettersRedriveHistory;
             }
         };
     }
@@ -325,6 +354,28 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
 
     public TestOutboxConfig attachOrphans(boolean attachOrphans) {
         this.inboxAttachOrphans = attachOrphans;
+        return this;
+    }
+
+    // DeadLettersConfig
+
+    public TestOutboxConfig deadLettersBatchSize(int deadLettersBatchSize) {
+        this.deadLettersBatchSize = deadLettersBatchSize;
+        return this;
+    }
+
+    public TestOutboxConfig deadLettersTimeout(Duration deadLettersTimeout) {
+        this.deadLettersTimeout = deadLettersTimeout;
+        return this;
+    }
+
+    public TestOutboxConfig deadLettersRetention(Duration deadLettersRetention) {
+        this.deadLettersRetention = deadLettersRetention;
+        return this;
+    }
+
+    public TestOutboxConfig deadLettersRedriveHistory(Duration deadLettersRedriveHistory) {
+        this.deadLettersRedriveHistory = deadLettersRedriveHistory;
         return this;
     }
 }

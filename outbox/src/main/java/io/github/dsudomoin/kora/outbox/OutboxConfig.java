@@ -27,6 +27,10 @@ public interface OutboxConfig {
         return new InboxConfig() {};
     }
 
+    default DeadLettersConfig deadLetters() {
+        return new DeadLettersConfig() {};
+    }
+
     @ConfigValueExtractor
     interface RelayConfig {
 
@@ -169,6 +173,36 @@ public interface OutboxConfig {
         /** Attach a range detached inside the dedup window back by its name's bounds; false only logs. Default true. */
         default boolean attachOrphans() {
             return true;
+        }
+    }
+
+    @ConfigValueExtractor
+    interface DeadLettersConfig {
+
+        /** Letters per call of the dead-letter hook. Default 100. */
+        default int batchSize() {
+            return 100;
+        }
+
+        /** Bound of one hook call; a call cut at it leaves its letters pending, retried with backoff. Default 30 s. */
+        default Duration timeout() {
+            return Duration.ofSeconds(30);
+        }
+
+        /**
+         * Kept letters older than this, by their {@code failed_at}, are deleted by maintenance; 0 = kept forever, the
+         * default. Letters still pending for the hook are never deleted.
+         */
+        default Duration retention() {
+            return Duration.ZERO;
+        }
+
+        /**
+         * How long the count of a message's redrives is remembered, so a redriven message that dies again carries
+         * it. Default 30 days.
+         */
+        default Duration redriveHistory() {
+            return Duration.ofDays(30);
         }
     }
 }
