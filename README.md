@@ -15,12 +15,32 @@ Transactional outbox для сервисов на [Kora](https://github.com/Tink
   (пока только через `mavenLocal()`).
 - Байткод Java 17; работает из Java и Kotlin. Блокирующий API: `send` выполняется внутри `JdbcConnectionFactory.inTx`.
 
+Общая схема: сообщение записывается одной транзакцией с бизнес-данными, relay на любом инстансе сервиса после коммита
+передаёт его обработчику, а потребитель отбрасывает повторы через inbox.
+
+```mermaid
+flowchart TD
+    tx["db.inTx: бизнес-изменения + outbox.send"]
+    subgraph pg["Postgres"]
+        direction LR
+        biz[("бизнес-таблицы")]
+        outbox[("outbox: партиции по xid8")]
+    end
+    tx -->|"одна транзакция"| pg
+    outbox -->|"закоммиченные строки"| relay["relay на любом инстансе:<br/>тики, шарды, воркеры outbox-relay-N"]
+    relay -->|handleBatch| handler["OutboxHandler: Kafka или свой"]
+    handler -->|"заголовок outbox-message-id"| kafka[["Kafka"]]
+    handler -.->|свой обработчик| other["HTTP API, другая БД, …"]
+    kafka --> consumer["потребитель с Inbox:<br/>повторы по outbox-message-id<br/>отбрасываются в его scope"]
+```
+
 ## Содержание
 
 - [Гарантии](#гарантии)
 - [Требования](#требования)
 - [Установка](#установка)
 - [Быстрый старт](#быстрый-старт): подключение, настройка, отправка, Kafka, свои обработчики, inbox
+- [Как работает relay](#как-работает-relay)
 - [Обработка сбоев](#обработка-сбоев)
 - [Справочник по конфигурации](#справочник-по-конфигурации)
 - [Требования к Kafka](#требования-к-kafka)
@@ -75,6 +95,18 @@ Transactional outbox для сервисов на [Kora](https://github.com/Tink
   (`relay.retry.maxDelay`) или долгих вызовов обработчика верхней границы нет.
 - **Несколько независимых relay для одной таблицы.** У одной таблицы outbox один набор курсоров и один обработчик на
   граф приложения. Маршрутизируйте по топику внутри обработчика ([`byTopic`](#свой-обработчик)).
+
+Куда попадает сообщение: шард зависит только от пары (topic, key) и для ключа не меняется, физическая партиция outbox —
+только от xid транзакции-писателя (то есть от времени записи), а партицию Kafka по ключу выбирает партиционер Kafka.
+Сообщение без ключа попадает в случайный шард.
+
+```mermaid
+flowchart LR
+    send["outbox.send(topic, key, …)<br/>в транзакции с xid X"]
+    send -->|"hash(topic, key)"| shard["шард: hash mod outbox.shards,<br/>у ключа всегда один и тот же"]
+    send -->|"xid X"| part["партиция outbox_x…:<br/>диапазон xid, куда попал X,<br/>то есть по времени записи"]
+    send -->|key| kp["партиция топика Kafka:<br/>партиционер Kafka по key"]
+```
 
 ## Требования
 
@@ -617,7 +649,71 @@ fun process(records: ConsumerRecords<String, ByteArray>) = db.inTx<Unit> { _: Co
   счётчик `outbox.inbox.outside_window`); транзакцию это никогда не валит. Задайте `retention` больше самого большого
   лага потребителя или повторного чтения (replay), которое нужно покрыть.
 
+## Как работает relay
+
+Каждый relay-воркер (`outbox-relay-N`, `relay.workers` на инстанс) делает тик, когда пора, читает курсоры всех шардов
+и выполняет по шагу на каждом шарде, где есть работа. Шаг шарда — одна транзакция (имена таблиц для базового имени
+`outbox`):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as воркер outbox-relay-N
+    participant DB as Postgres
+    participant H as OutboxHandler
+    W->>DB: тик, если пора: pg_current_snapshot() в outbox_tick
+    Note over W,DB: дальше шаг одного шарда, одна транзакция
+    W->>DB: pg_try_advisory_xact_lock(шард)
+    break false: шард сейчас у другого воркера
+        DB-->>W: шаг пропущен
+    end
+    W->>DB: последняя строка курсора шарда
+    DB-->>W: тик P, last_id, цель C (начатого батча или новая)
+    opt в outbox_retry есть головы, срок которых наступил
+        W->>H: handleBatch(головы и следующие за ними строки)
+        H-->>W: outcomes
+        W->>DB: удалить доставленные, перепланировать, перенести в outbox_dead
+    end
+    W->>DB: строки шарда из транзакций, закоммиченных между тиками P и C
+    DB-->>W: чанк после last_id, не больше batchSize строк
+    W->>H: handleBatch(чанк без строк ключей, ждущих в outbox_retry)
+    Note over W,H: 80 % batchTimeout: windDownRequested() и прерывание<br/>100 %: от вызова отказываются, все его записи Retry
+    H-->>W: Delivered / Retry / Permanent / NotAttempted
+    W->>W: BatchClassifier: дальше или пауза
+    alt дальше
+        W->>DB: сбойные ключи в outbox_retry, Permanent в outbox_dead
+    else пауза: ничего не доставлено
+        Note over W,DB: ни одна строка не отводится, курсор встаёт на паузу с backoff
+    end
+    W->>DB: новая строка курсора: прогресс или пауза
+    W->>DB: COMMIT снимает блокировку шарда
+    Note over W,DB: следующий шаг этого шарда может сделать воркер любого инстанса
+```
+
+Почему батч между тиками P и C содержит ровно транзакции, закоммиченные между ними, — в
+[Заметках о дизайне](#заметки-о-дизайне).
+
 ## Обработка сбоев
+
+Путь записи после вызова обработчика (`headFailuresBeforeDivert` по умолчанию 3; `maxAttempts` по умолчанию 0, то
+есть без предела попыток):
+
+```mermaid
+flowchart TD
+    read["записи шага переданы обработчику"] --> pause{{"ничего не доставлено, а сбой на 2+ ключах<br/>или на одном, но неудачных попыток<br/>подряд меньше headFailuresBeforeDivert?"}}
+    pause -->|"да: шард на паузе с backoff,<br/>те же записи читаются снова,<br/>чанком вдвое меньше"| read
+    pause -->|нет| outcome{"outcome записи"}
+    outcome -->|Delivered| ok(["доставлена"])
+    outcome -->|Permanent| dead(["outbox_dead: ERROR в логе,<br/>ключ идёт дальше"])
+    outcome -->|"Retry / NotAttempted"| head["ключ отведён в outbox_retry:<br/>запись — голова с next_attempt_at,<br/>следующие записи ключа — последователи"]
+    head -.-> others(["остальные ключи идут дальше,<br/>новые записи этого ключа<br/>встают в последователи"])
+    head --> due{{"срок головы наступил:<br/>голова и последователи<br/>снова у обработчика"}}
+    due -->|"Retry / NotAttempted:<br/>новый backoff"| due
+    due -->|"Permanent или<br/>исчерпан maxAttempts"| dead
+    due -->|Delivered| next{{"у ключа остались<br/>записи в outbox_retry?"}}
+    next -->|"да: следующая<br/>становится головой"| due
+    next -->|нет| free(["ключ разблокирован"])
+```
 
 Что relay делает с outcome — чтобы вы могли читать логи и метрики:
 
@@ -871,6 +967,25 @@ create table inbox (
   проходят relay как обычно, но его место не освобождается, пока не вмешается оператор («tail overflow»).
 - DDL партиций выполняется с `lock_timeout` (2 с для create и attach, 30 с для detach) и собственным
   `statement_timeout`; после таймаута операция повторяется на следующем запуске.
+
+Жизнь диапазонов при базовом имени `outbox` и настройках по умолчанию: диапазоны `outbox_x<lower>` создаются заранее
+впереди текущего xid, хвост `outbox_tail` принимает перелив, а пройденные диапазоны удаляются целиком, без `DELETE`.
+
+```mermaid
+flowchart TD
+    subgraph axis["outbox: xid растёт сверху вниз"]
+        old["пройденные<br/>outbox_x…"] --> hot["outbox_x…<br/>с текущим xid:<br/>сюда идут вставки"]
+        hot --> ahead["premake = 64<br/>диапазона впереди,<br/>по 16 777 216 xid"]
+        ahead --> tail["outbox_tail<br/>до MAXVALUE:<br/>перелив"]
+    end
+    ahead -.->|"впереди ≤ premake / 2"| ext["расширение: detach и drop<br/>пустого хвоста, новые<br/>диапазоны, новый хвост"]
+    old -->|"верх ≤ xmin тика<br/>самого медленного шарда"| mark["отметка в outbox_dropping"]
+    mark --> detach["DETACH PARTITION … CONCURRENTLY"]
+    detach --> drop["DROP TABLE<br/>и снять отметку, если есть"]
+    detach -.->|"инстанс упал до DROP"| orphan{{"отсоединённый outbox_x…:<br/>с отметкой — нет строк от горизонта шардов,<br/>без отметки — пуст?"}}
+    orphan -->|да| drop
+    orphan -->|нет| keep(["остаётся: ERROR и<br/>outbox.partitions.orphaned"])
+```
 
 **Длинные снапшоты и `premake`.** Хвост отсоединяется, только когда ничто не может оставить этот detach
 незавершённым. Обслуживание откладывает расширение с WARN не чаще раза в минуту, пока любая сессия базы держит
