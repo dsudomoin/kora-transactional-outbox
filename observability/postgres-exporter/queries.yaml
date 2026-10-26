@@ -1,0 +1,15 @@
+# Outbox facts the stock collectors lack. Exported as pg_outbox_<column>. Dead tuples of outbox_cursor / outbox_tick
+# come from the stock collector: pg_stat_user_tables_n_dead_tup{relname=...}.
+pg_outbox:
+  query: |
+    select count(*) as partitions,
+           coalesce(sum(pg_total_relation_size(i.inhrelid)), 0) as total_bytes
+    from pg_inherits i
+    where i.inhparent = to_regclass('public.outbox')
+  metrics:
+    - partitions:
+        usage: GAUGE
+        description: Partitions attached to the outbox table (premade ranges plus the tail)
+    - total_bytes:
+        usage: GAUGE
+        description: Total size of the outbox partition tree, tables plus indexes and TOAST

@@ -1,0 +1,8 @@
+# local planning notes, not part of the repository
+docs/superpowers/
+.superpowers/
+build/
+.gradle/
+.idea/
+*.iml
+.kotlin/

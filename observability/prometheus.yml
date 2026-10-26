@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: bench # the app on the host; 8086 and 8087 are the chaos scenarios' instances 2 and 3 (down otherwise)
+    fallback_scrape_protocol: PrometheusText0.0.4 # Kora's /metrics sends no Content-Type, Prometheus 3 refuses that
+    static_configs:
+      - targets: ["host.docker.internal:8085", "host.docker.internal:8086", "host.docker.internal:8087"]
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
