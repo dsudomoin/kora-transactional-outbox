@@ -159,6 +159,23 @@ final class InboxPartitions {
         return kept;
     }
 
+    /**
+     * Attaches an orphan {@link #dropOrphans} kept back with the bounds its name gives (ATTACH takes SHARE UPDATE
+     * EXCLUSIVE on the inbox, which no writer waits for), but only when its range lies in or next to the span of the
+     * attached ranges (the {@link #window} without its margins): the window takes them as contiguous, so one further
+     * off would put ranges that are missing into it, and inserts of their ids would fail; premake never makes ranges
+     * below the highest. Returns false then. A failed attach (an overlapping range, a row outside the bounds, a lock
+     * timeout) surfaces as {@link SQLException} and, in autocommit, changes nothing.
+     */
+    boolean attachBack(Connection c, Orphan orphan) throws SQLException {
+        var w = window(c); // EMPTY gives no span, and its sums do not overflow
+        if (millis(orphan.from()) > w.to() + interval || millis(orphan.to()) < w.from() - interval) {
+            return false;
+        }
+        PartitionDdl.attach(c, table, orphan.table(), orphan.from(), orphan.to(), PartitionDdl.CREATE_LOCK_TIMEOUT);
+        return true;
+    }
+
     /** The lower bound (ms) a range's name gives: {@code <inbox>_t<yyyyMMddHH[mm]>}, UTC. */
     private static long namedFrom(String partition) {
         var d = partition.substring(partition.lastIndexOf("_t") + 2);
@@ -172,8 +189,9 @@ final class InboxPartitions {
     /**
      * Finalizes a range whose detach was left pending, and drops it when its whole range is past retention, as
      * {@link #dropExpired} would; one inside the dedup window (an operator's detach) is only finalized, and
-     * {@link #dropOrphans} reports it. The pending detach must be finished either way: Postgres allows one per parent and
-     * fails every other {@code DETACH ... CONCURRENTLY} meanwhile (SQLState 55000).
+     * {@link #dropOrphans} reports it ({@link #attachBack} may attach it back). The pending detach must be finished
+     * either way: Postgres allows one per parent and fails every other {@code DETACH ... CONCURRENTLY} meanwhile
+     * (SQLState 55000).
      */
     void finishPendingDetach(Connection c, long now, Duration lockTimeout) throws SQLException {
         var pending = PartitionDdl.pendingDetach(c, table);

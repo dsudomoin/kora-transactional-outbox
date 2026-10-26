@@ -236,7 +236,8 @@ public final class PgInbox implements Inbox, Lifecycle {
      * One run. On the instance that gets {@code pg_try_advisory_lock(internalNs, LOCK_INBOX_MAINTENANCE)} (on one
      * autocommit connection with {@code idle_session_timeout = 60s}, so a frozen holder loses it): finish a pending
      * detach, drop expired ranges, make ranges up to {@code now + premake} (attaching a table of the next range that
-     * exists but is not attached), drop expired ranges a crash left detached but not dropped (the gauge
+     * exists but is not attached), drop expired ranges a crash left detached but not dropped and, with
+     * {@code outbox.inbox.attachOrphans}, attach back the ones still inside the window (the gauge
      * {@code outbox.inbox.partitions.orphaned} counts the ones kept, with an ERROR), each step on its own (a failure is
      * logged and the next step still runs). That part is skipped when the connection does not keep one server session
      * ({@link PartitionDdl#backendChanges}), with an ERROR at most once a minute and the gauge
@@ -295,17 +296,22 @@ public final class PgInbox implements Inbox, Lifecycle {
                 step("partition premake", () -> partitions.ensurePremade(c, now));
                 orphaned = Double.NaN; // unknown unless the step completes
                 step("orphan drop", () -> {
-                    var kept = partitions.dropOrphans(c, now, timeout);
-                    orphaned = kept.size();
-                    for (var orphan : kept) {
+                    int kept = 0;
+                    for (var orphan : partitions.dropOrphans(c, now, timeout)) {
+                        var notAttached = config.inbox().attachOrphans() ? attachBack(c, orphan) : "";
+                        if (notAttached == null) {
+                            continue;
+                        }
+                        kept++;
                         log.error("outbox inbox table {} is a range of {} that is not attached (detached by hand, or"
                                 + " left by an interrupted run) and not yet past outbox.inbox.retention: ids in its"
                                 + " range are not deduplicated, and where the inbox has ranges on both sides of it,"
                                 + " inserts of those ids fail (SQLState 23514). It is kept (gauge"
                                 + " outbox.inbox.partitions.orphaned); attach it back with alter table {} attach"
-                                + " partition {} for values from ('{}') to ('{}')", orphan.table(), names.base(),
-                                names.base(), orphan.table(), orphan.from(), orphan.to());
+                                + " partition {} for values from ('{}') to ('{}'){}", orphan.table(), names.base(),
+                                names.base(), orphan.table(), orphan.from(), orphan.to(), notAttached);
                     }
+                    orphaned = kept;
                 });
             }
         } catch (Throwable t) {
@@ -323,6 +329,22 @@ public final class PgInbox implements Inbox, Lifecycle {
                 }
                 failure.addSuppressed(e);
             }
+        }
+    }
+
+    /** {@link InboxPartitions#attachBack}: null when attached, else why not, to end the orphan's ERROR with. */
+    @Nullable
+    private String attachBack(Connection c, InboxPartitions.Orphan orphan) {
+        try {
+            if (!partitions.attachBack(c, orphan)) {
+                return "; maintenance does not, as no attached range lies next to it: the ranges between would be"
+                        + " missing";
+            }
+            log.info("outbox inbox table {}, a range of {} detached inside the dedup window, is attached back",
+                    orphan.table(), names.base());
+            return null;
+        } catch (SQLException e) { // nothing changed, so the step goes on with the next orphan
+            return "; maintenance could not (SQLState " + e.getSQLState() + "): " + e.getMessage();
         }
     }
 

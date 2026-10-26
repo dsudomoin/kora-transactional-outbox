@@ -570,14 +570,14 @@ class PgInboxIT {
         try (var err = new CapturedStderr()) {
             maintaining.runMaintenance();
 
-            assertThat(err.text()).contains("ERROR").contains(range.name()).contains("23514")
-                    .contains("alter table " + table() + " attach partition " + range.name() + " for values from ('"
-                            + range.from() + "') to ('" + range.to() + "')");
+            assertThat(err.text()).doesNotContain("that is not attached");
         }
         try (var c = TestDb.connect()) {
             assertThat(queryLong(c, "select count(*) from " + range.name())).as("its dedup records").isOne();
         }
-        assertThat(orphanRegistry.get("outbox.inbox.partitions.orphaned").gauge().value()).isEqualTo(1);
+        assertThat(ranges()).as("finished, then attached back").contains(range);
+        assertThat(accept(id)).isFalse();
+        assertThat(orphanRegistry.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
     }
 
     @Test
@@ -599,7 +599,8 @@ class PgInboxIT {
             maintaining.runMaintenance();
 
             assertThat(err.text()).contains("ERROR").contains(empty).contains("WARN").contains(feb30)
-                    .as("not only the first by name").contains(month13);
+                    .as("not only the first by name").contains(month13)
+                    .as("not attached back: the ranges below it are missing").contains("no attached range lies next");
         }
         assertThat(orphanRegistry.get("outbox.inbox.partitions.orphaned").gauge().value())
                 .as("the step completed: the empty one counted, the unparsable ones skipped").isEqualTo(1);
@@ -633,6 +634,89 @@ class PgInboxIT {
         }
         assertThat(ranges()).as("premake attached it back").contains(top);
         assertThat(orphanRegistry.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
+    }
+
+    @Test
+    void orphanInsideTheWindowIsAttachedBack() throws Exception {
+        start();
+        var id = UuidV7.next();
+        assertThat(accept(id)).isTrue();
+        var range = rangeOf(UuidV7.timestampMillis(id));
+        try (var c = TestDb.connect()) { // an operator's detach
+            execute(c, "alter table " + table() + " detach partition " + range.name());
+        }
+        assertThatThrownBy(() -> accept(id)).as("ranges on both sides of it: no partition for the id")
+                .isInstanceOf(RuntimeSqlException.class);
+
+        try (var err = new CapturedStderr()) {
+            inbox.runMaintenance();
+
+            assertThat(err.text()).contains(range.name() + ", a range of").doesNotContain("that is not attached");
+        }
+        assertThat(ranges()).contains(range);
+        assertThat(accept(id)).as("its dedup record counts again").isFalse();
+        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isZero();
+    }
+
+    @Test
+    void orphanAwayFromTheAttachedRangesStaysWithItsError() throws Exception {
+        start();
+        var low = ranges().stream().sorted(Comparator.comparingLong(b -> millis(b.from()))).toList();
+        try (var c = TestDb.connect()) { // the second lowest detached, the ranges on both sides of it dropped
+            execute(c, "alter table " + table() + " detach partition " + low.get(1).name());
+            execute(c, "drop table " + low.get(0).name());
+            execute(c, "drop table " + low.get(2).name());
+        }
+
+        try (var err = new CapturedStderr()) {
+            inbox.runMaintenance();
+
+            assertThat(err.text()).contains("ERROR").contains(low.get(1).name())
+                    .contains("no attached range lies next");
+        }
+        assertThat(ranges()).doesNotContain(low.get(1));
+        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isEqualTo(1);
+    }
+
+    @Test
+    void attachOrphansOffKeepsTheError() throws Exception {
+        config.attachOrphans(false);
+        start();
+        var range = rangeOf(System.currentTimeMillis());
+        try (var c = TestDb.connect()) {
+            execute(c, "alter table " + table() + " detach partition " + range.name());
+        }
+
+        try (var err = new CapturedStderr()) {
+            inbox.runMaintenance();
+
+            assertThat(err.text()).contains("ERROR").contains(range.name()).contains("23514")
+                    .contains("alter table " + table() + " attach partition " + range.name() + " for values from ('"
+                            + range.from() + "') to ('" + range.to() + "')");
+        }
+        assertThat(ranges()).doesNotContain(range);
+        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isEqualTo(1);
+    }
+
+    @Test
+    void overlappingOrphanStaysWithItsError() throws Exception {
+        start();
+        var overlapping = rangeOf(System.currentTimeMillis());
+        var next = rangeOf(millis(overlapping.to()));
+        try (var c = TestDb.connect()) {
+            execute(c, "alter table " + table() + " detach partition " + overlapping.name());
+            execute(c, "alter table " + table() + " detach partition " + next.name());
+            attach(c, table() + "_other", millis(overlapping.from())); // another table took its range meanwhile
+        }
+
+        try (var err = new CapturedStderr()) {
+            inbox.runMaintenance();
+
+            assertThat(err.text()).contains("ERROR").contains(overlapping.name()).contains("42P17")
+                    .contains("would overlap").doesNotContain(next.name() + " is a range");
+        }
+        assertThat(ranges()).doesNotContain(overlapping).as("the failed attach does not stop the next").contains(next);
+        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isEqualTo(1);
     }
 
     @Test
@@ -817,6 +901,13 @@ class PgInboxIT {
         try (var c = TestDb.connect()) {
             return PartitionDdl.listRanges(c, table());
         }
+    }
+
+    private Bound rangeOf(long millis) throws SQLException {
+        return ranges().stream()
+                .filter(b -> millis(b.from()) <= millis && millis < millis(b.to()))
+                .findFirst()
+                .orElseThrow();
     }
 
     private long lowest() throws SQLException {
