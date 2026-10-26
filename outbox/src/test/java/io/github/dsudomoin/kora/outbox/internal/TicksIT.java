@@ -9,9 +9,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
+import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
@@ -24,16 +26,18 @@ import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 
 class TicksIT {
 
+    private static final int SHARDS = 8;
+
     private final JdbcDatabase db = TestDb.newDatabase(2);
     private TableNames names;
     private Ticks ticks;
 
     @BeforeEach
     void bootstrap() throws Exception {
-        var schema = new OutboxSchema(db, new TestOutboxConfig());
+        var schema = new OutboxSchema(db, new TestOutboxConfig().shards(SHARDS));
         schema.init();
         names = schema.names();
-        ticks = new Ticks(names);
+        ticks = new Ticks(names, SHARDS);
     }
 
     @AfterEach
@@ -255,6 +259,108 @@ class TicksIT {
         }
     }
 
+    @Test
+    void aTickRecordsTheShardsThatGainedRowsSinceThePreviousTick() throws Exception {
+        try (var c = TestDb.connect()) {
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            insertRow(c, 3); // autocommit: three transactions
+            insertRow(c, 7);
+            insertRow(c, 3);
+
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            assertThat(shards(c)).containsExactly(3, 7);
+
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            assertThat(shards(c)).as("no row since the previous tick").isEmpty();
+        }
+    }
+
+    @Test
+    void aTransactionRunningAtThePreviousTickCountsInTheTickThatSeesItCommitted() throws Exception {
+        try (var writer = TestDb.connect(); var c = TestDb.connect()) {
+            writer.setAutoCommit(false);
+            insertRow(writer, 5);
+            long xid = queryLong(writer, "select pg_current_xact_id()::text::bigint");
+            queryLong(c, "select pg_current_xact_id()::text::bigint"); // a later xid completes: the writer is below xmax
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            assertThat(ticks.latest(c).snapshot().xip()).as("in flight at P").contains(xid);
+            assertThat(shards(c)).doesNotContain(5);
+
+            writer.commit();
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+
+            assertThat(shards(c)).containsExactly(5); // P.xip minus C.xip
+        }
+    }
+
+    @Test
+    void aTransactionRunningAtATickCountsInTheTickWhereItBecomesVisible() throws Exception {
+        try (var writer = TestDb.connect(); var c = TestDb.connect()) {
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            writer.setAutoCommit(false);
+            insertRow(writer, 6); // xid at or above the next tick's xmax, or in its xip
+            insertRow(c, 1);
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            assertThat(shards(c)).containsExactly(1);
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            assertThat(shards(c)).as("still running").isEmpty();
+
+            writer.commit();
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+
+            assertThat(shards(c)).containsExactly(6);
+        }
+    }
+
+    @Test
+    void aRolledBackTransactionMarksAtMostItsOwnShard() throws Exception {
+        try (var writer = TestDb.connect(); var c = TestDb.connect()) {
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            writer.setAutoCommit(false);
+            insertRow(writer, 2);
+            writer.rollback();
+
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            assertThat(shards(c)).as("a superset is allowed, nothing beyond its shard").isSubsetOf(2);
+
+            insertRow(c, 2);
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            assertThat(shards(c)).containsExactly(2);
+        }
+    }
+
+    @Test
+    void aTickWithoutAPreviousOneStoresNoShardSetMeaningAll() throws Exception {
+        try (var c = TestDb.connect()) {
+            assertThat(shards(c)).as("the bootstrap tick").isNull();
+            insertRow(c, 4);
+            execute(c, "delete from " + names.tick());
+
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+
+            assertThat(shards(c)).isNull();
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            assertThat(shards(c)).isEmpty();
+        }
+    }
+
+    /** One row of {@code shard} in the caller's transaction (its own one in autocommit). */
+    private void insertRow(Connection c, int shard) throws Exception {
+        execute(c, "insert into " + names.base() + " (shard, message_id, topic) values (" + shard
+                + ", gen_random_uuid(), 't')");
+    }
+
+    /** The newest tick's {@code shards}, null when it has none. */
+    @Nullable
+    private List<Integer> shards(Connection c) throws Exception {
+        try (var st = c.createStatement();
+                var rs = st.executeQuery("select shards from " + names.tick() + " order by id desc limit 1")) {
+            rs.next();
+            var array = rs.getArray(1);
+            return array == null ? null : Arrays.stream((Short[]) array.getArray()).map(Short::intValue).toList();
+        }
+    }
+
     private static void awaitLockWait(Connection observer, long pid) throws Exception {
         long deadline = System.nanoTime() + Duration.ofSeconds(1).toNanos();
         while (queryLong(observer, "select count(*) from pg_locks where not granted and pid = " + pid) == 0) {
@@ -267,5 +373,6 @@ class TicksIT {
         assertThat(c.getAutoCommit()).isTrue();
         assertThat(queryString(c, "show lock_timeout")).isEqualTo("0");
         assertThat(queryString(c, "show idle_in_transaction_session_timeout")).isEqualTo("0");
+        assertThat(queryString(c, "show plan_cache_mode")).isEqualTo("auto");
     }
 }

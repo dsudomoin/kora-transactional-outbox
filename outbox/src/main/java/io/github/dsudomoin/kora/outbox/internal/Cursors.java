@@ -10,6 +10,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Per-shard progress as an insert-only log {@code <base>_cursor}: the row with the highest {@code seq} of
@@ -52,13 +53,33 @@ public final class Cursors {
         }
     }
 
+    /**
+     * A shard's latest cursor; {@code behind}: its tick is below the latest tick and a step has to move it up, as a
+     * tick in between has the shard in its {@code shards} or none (null), or its tick is
+     * {@link ShardProcessor#IDLE_APPEND_AFTER} or more older than the latest (or newer: the database clock stepped
+     * back), so an idle step appends, or its tick is gone.
+     */
+    public record Position(Cursor cursor, boolean behind) {}
+
     private static final String COLUMNS =
             "shard, tick_id, target_tick_id, last_id, paused_until, failures, retry_due_at";
 
     private final TableNames names;
+    private final String positions;
 
     public Cursors(TableNames names) {
         this.names = names;
+        // the tick window of a shard is scanned only while its tick is younger than IDLE_APPEND_AFTER: a few seconds
+        // of ticks, however far a paused shard holds tick cleanup back
+        this.positions = "select c.*, c.tick_id < p.latest and case when l.created_at is null or t.created_at is null"
+                + " or l.created_at < t.created_at or l.created_at >= t.created_at + p.idle then true"
+                + " else exists (select 1 from " + names.tick() + " n where n.id > c.tick_id and n.id <= p.latest"
+                + " and (n.shards is null or c.shard = any(n.shards))) end"
+                + " from (select ?::bigint latest, ? * interval '1 microsecond' idle, ?::int shards) p"
+                + " cross join generate_series(0, p.shards - 1) s cross join lateral (select " + COLUMNS + " from "
+                + names.cursor() + " where shard = s order by seq desc limit 1) c"
+                + " left join " + names.tick() + " t on t.id = c.tick_id"
+                + " left join " + names.tick() + " l on l.id = p.latest order by s";
     }
 
     /**
@@ -73,6 +94,25 @@ public final class Cursors {
                 var result = new ArrayList<Cursor>(shards);
                 while (rs.next()) {
                     result.add(cursor(rs));
+                }
+                return result;
+            }
+        }
+    }
+
+    /**
+     * {@link #latestAll} with each shard's {@link Position#behind()} up to the tick {@code latestTickId}: one statement,
+     * per shard an index probe for the cursor and its tick and, while that tick is young, a scan of the ticks after it.
+     */
+    public List<Position> positions(Connection c, int shards, long latestTickId) throws SQLException {
+        try (var ps = c.prepareStatement(positions)) {
+            ps.setLong(1, latestTickId);
+            ps.setLong(2, TimeUnit.MICROSECONDS.convert(ShardProcessor.IDLE_APPEND_AFTER));
+            ps.setInt(3, shards);
+            try (var rs = ps.executeQuery()) {
+                var result = new ArrayList<Position>(shards);
+                while (rs.next()) {
+                    result.add(new Position(cursor(rs), rs.getBoolean(8)));
                 }
                 return result;
             }

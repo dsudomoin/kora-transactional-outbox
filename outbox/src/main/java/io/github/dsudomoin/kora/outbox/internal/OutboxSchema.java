@@ -26,8 +26,8 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * populated table, fails startup with SQLState 57014 and is left to run by hand. The schema lock is retried for a
  * minute, then startup fails. On existing tables the bootstrap takes no lock that writers wait behind (index creation
  * is skipped when the index exists, partition extension is optional and left to maintenance when it times out). A tick
- * table made before {@code max_id} gets the column once; that ALTER waits for running relay transactions and fails
- * startup on timeout.
+ * table made before {@code max_id} or {@code shards} gets the column once; that ALTER waits for running relay
+ * transactions and fails startup on timeout. Ticks without {@code shards} (null) count as holding rows of every shard.
  */
 public final class OutboxSchema implements Lifecycle {
 
@@ -177,10 +177,14 @@ public final class OutboxSchema implements Lifecycle {
                       id         bigint generated always as identity primary key,
                       snapshot   pg_snapshot not null,
                       created_at timestamptz not null default clock_timestamp(),
-                      max_id     bigint
+                      max_id     bigint,
+                      shards     smallint[]
                     )""");
             if (!columnExists(c, n.tick(), "max_id")) { // a tick table made before max_id: a metadata-only change
                 st.execute("alter table " + n.tick() + " add column if not exists max_id bigint");
+            }
+            if (!columnExists(c, n.tick(), "shards")) { // made before shards: likewise; its ticks stay null (all)
+                st.execute("alter table " + n.tick() + " add column if not exists shards smallint[]");
             }
             createIndex(c, n.tick() + "_xmax", n.tick() + " ((pg_snapshot_xmax(snapshot)))"); // Maintenance's xid check
             st.execute("create table if not exists " + n.cursor() + """

@@ -84,7 +84,7 @@ public final class Maintenance {
         this.shards = config.shards();
         this.detachLockTimeout = detachLockTimeout;
         this.partitions = new XidPartitions(names, config.partitions());
-        this.ticks = new Ticks(names);
+        this.ticks = new Ticks(names, config.shards());
         this.cursors = new Cursors(names);
         this.retries = new RetryStore(names);
         // every tick, not just the newest: workers keep ticking after a regression, and their new ticks look fine; the

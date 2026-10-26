@@ -7,8 +7,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
+import java.sql.Connection;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.List;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
@@ -108,6 +110,75 @@ class CursorsIT {
 
             assertThat(nanos[nanos.length / 2] / 1_000_000.0).as("median latestAll ms").isLessThanOrEqualTo(20.0);
         }
+    }
+
+    @Test
+    void aShardIsBehindWhenATickAfterItsCursorMayHoldItsRows() throws Exception {
+        var names = bootstrap(); // 4 shards, every cursor on the bootstrap tick
+        var cursors = new Cursors(names);
+        try (var c = TestDb.connect()) {
+            long first = queryLong(c, "select max(id) from " + names.tick());
+            assertThat(behind(cursors.positions(c, 4, first))).as("on the latest tick")
+                    .containsExactly(false, false, false, false);
+
+            long t1 = tick(c, names, "'{1}'", 10);
+            long t2 = tick(c, names, "'{}'", 20);
+            assertThat(behind(cursors.positions(c, 4, t2))).containsExactly(false, true, false, false);
+            long t3 = tick(c, names, "'{2,3}'", 30);
+            assertThat(behind(cursors.positions(c, 4, t3))).containsExactly(false, true, true, true);
+            assertThat(behind(cursors.positions(c, 4, t1))).as("ticks above the latest passed in do not count")
+                    .containsExactly(false, true, false, false);
+
+            var s1 = cursors.latest(c, 1).withProgress(t2, null, 0);
+            cursors.append(c, s1); // past the tick that held its rows
+            var s2 = cursors.latest(c, 2).withProgress(t1, t3, 7); // a batch in progress: candidate on its own
+            cursors.append(c, s2);
+            var positions = cursors.positions(c, 4, t3);
+            assertThat(behind(positions)).containsExactly(false, false, true, true);
+            assertThat(positions).extracting(Cursors.Position::cursor).isEqualTo(cursors.latestAll(c, 4));
+
+            long t4 = tick(c, names, "null", 40); // an older instance's tick: any shard may have rows
+            assertThat(behind(cursors.positions(c, 4, t4))).containsExactly(true, true, true, true);
+        }
+    }
+
+    @Test
+    void anIdleShardIsBehindOnceItsTickIsFiveSecondsOlderThanTheLatest() throws Exception {
+        var names = bootstrap();
+        var cursors = new Cursors(names);
+        try (var c = TestDb.connect()) {
+            assertThat(behind(cursors.positions(c, 4, tick(c, names, "'{}'", 4_999)))).containsOnly(false);
+            assertThat(behind(cursors.positions(c, 4, tick(c, names, "'{}'", 5_000)))).as("idle append due")
+                    .containsOnly(true);
+            assertThat(behind(cursors.positions(c, 4, tick(c, names, "'{}'", -1)))).as("the clock stepped back")
+                    .containsOnly(true);
+        }
+    }
+
+    @Test
+    void aShardWhoseCursorTickIsGoneIsBehind() throws Exception {
+        var names = bootstrap();
+        var cursors = new Cursors(names);
+        try (var c = TestDb.connect()) {
+            long latest = tick(c, names, "'{}'", 10);
+            execute(c, "delete from " + names.tick() + " where id < " + latest);
+
+            assertThat(behind(cursors.positions(c, 4, latest))).containsOnly(true);
+        }
+    }
+
+    /**
+     * A tick with {@code shards} (SQL), made {@code millis} after the bootstrap tick by the database clock; returns its
+     * id.
+     */
+    private static long tick(Connection c, TableNames names, String shards, long millis) throws Exception {
+        return queryLong(c, "insert into " + names.tick() + " (snapshot, max_id, shards, created_at)"
+                + " select pg_current_snapshot(), 0, " + shards + "::smallint[], min(created_at) + interval '"
+                + millis + " milliseconds' from " + names.tick() + " returning id");
+    }
+
+    private static List<Boolean> behind(List<Cursors.Position> positions) {
+        return positions.stream().map(Cursors.Position::behind).toList();
     }
 
     private TableNames bootstrap() throws Exception {

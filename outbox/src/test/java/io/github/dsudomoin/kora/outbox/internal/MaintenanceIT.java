@@ -213,13 +213,13 @@ class MaintenanceIT {
         String original;
         long forged;
         try (var c = TestDb.connect()) {
-            forged = new Ticks(names).latest(c).id();
+            forged = new Ticks(names, config.shards()).latest(c).id();
             original = queryString(c, "select snapshot::text from " + names.tick() + " where id = " + forged);
             long ahead = currentXid() + 2000;
             execute(c, "update " + names.tick() + " set snapshot = '" + ahead + ":" + ahead + ":'::pg_snapshot"
                     + " where id = " + forged);
             // a tick made after the regression, as running workers would: it is consistent, the forged one is not
-            assertThat(new Ticks(names).make(c, Duration.ZERO)).isTrue();
+            assertThat(new Ticks(names, config.shards()).make(c, Duration.ZERO)).isTrue();
         }
         try (err) {
             try (var otherRunner = TestDb.connect()) {
@@ -396,7 +396,7 @@ class MaintenanceIT {
         long newer;
         List<Bound> between;
         try (var c = TestDb.connect()) {
-            var ticks = new Ticks(names);
+            var ticks = new Ticks(names, config.shards());
             long slowXmin = ticks.get(c, slow).snapshot().xmin();
             long targetXmin = ticks.get(c, target).snapshot().xmin();
             between = ranges().stream()
@@ -815,7 +815,7 @@ class MaintenanceIT {
         send(msg("t", "ok", "1"), msg("t", "poison", "2"), msg("t", "slow", "3"), msg("t", "slow", "4"));
         relay.drain();
         try (var c = TestDb.connect()) {
-            assertThat(new Ticks(names).make(c, Duration.ZERO)).isTrue(); // not processed: 10 s ahead of the cursor
+            assertThat(new Ticks(names, config.shards()).make(c, Duration.ZERO)).isTrue(); // not processed: 10 s ahead of the cursor
             execute(c, "update " + names.tick() + " set created_at = created_at - interval '10 seconds'"
                     + " where id = " + minCursorTickId());
         }
@@ -902,7 +902,7 @@ class MaintenanceIT {
     /** {@code pg_snapshot_xmin} of the tick of the slowest shard. */
     private long minCursorXmin() throws SQLException {
         try (var c = TestDb.connect()) {
-            return new Ticks(names).get(c, minCursorTickId()).snapshot().xmin();
+            return new Ticks(names, config.shards()).get(c, minCursorTickId()).snapshot().xmin();
         }
     }
 

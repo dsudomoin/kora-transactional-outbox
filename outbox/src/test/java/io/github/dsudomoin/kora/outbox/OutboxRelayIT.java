@@ -14,6 +14,7 @@ import io.github.dsudomoin.kora.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.kora.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.kora.outbox.internal.PgOutbox;
 import io.github.dsudomoin.kora.outbox.internal.ShardProcessor;
+import io.github.dsudomoin.kora.outbox.internal.TableNames;
 import io.github.dsudomoin.kora.outbox.internal.Ticks;
 import io.github.dsudomoin.kora.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
@@ -25,6 +26,7 @@ import java.lang.management.ManagementFactory;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -92,7 +94,7 @@ class OutboxRelayIT {
         var outbox = outbox(relay::wake);
         awaitParked();
         try (var c = TestDb.connect()) { // another instance ticks just before the commit
-            assertThat(new Ticks(schema.names()).make(c, Duration.ZERO)).isTrue();
+            assertThat(new Ticks(schema.names(), config.shards()).make(c, Duration.ZERO)).isTrue();
         }
 
         send(outbox, msg("t", "k", "p")); // the wake-up's tick is skipped: that tick is younger than 1 s
@@ -110,16 +112,18 @@ class OutboxRelayIT {
         var lockingWorkers = ConcurrentHashMap.<String>newKeySet();
         var slowTicks = new AtomicBoolean();
         var relay = relay(observed(sql -> {
-            if (sql.contains("generate_series")) { // Cursors.latestAll
+            if (sql.contains("pg_current_snapshot")) { // a tick insert
+                if (slowTicks.get()) { // as if contended
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            } else if (sql.contains("generate_series")) { // Cursors.positions
                 cursorReads.incrementAndGet();
             } else if (sql.contains("pg_try_advisory_xact_lock")) { // a shard step
                 lockingWorkers.add(Thread.currentThread().getName());
-            } else if (sql.contains("pg_current_snapshot") && slowTicks.get()) { // a tick insert, as if contended
-                try {
-                    Thread.sleep(50);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
             }
         }), new OutboxHandler() {
             @Override
@@ -140,15 +144,17 @@ class OutboxRelayIT {
         }
         double readsPerTick = (double) (cursorReads.get() - readsBefore) / (ticksMade() - ticksBefore);
         // another instance's commits: no wake-up; the idle poll's (slow) tick must wake the workers that polled before
-        // it committed
+        // it committed, so they spread the tick's 16 shards with new rows
         var silent = outbox(() -> {});
         slowTicks.set(true);
         int workersPerTick = 0;
-        for (int i = 25; i < 30; i++) {
+        for (int i = 0; i < 5; i++) {
             awaitParked(); // the previous tick's shards are all stepped
             lockingWorkers.clear();
-            send(silent, msg("t", "k" + i, "m" + i));
-            int n = i + 1;
+            int round = i;
+            send(silent, IntStream.range(0, 16).mapToObj(shard -> msg("t", keyOnShard(2 * shard, "r" + round + "-"),
+                    "r" + round)).toArray(OutboxMessage[]::new));
+            int n = 25 + 16 * (i + 1);
             await(Duration.ofSeconds(5), () -> delivered.get() == n);
             workersPerTick += lockingWorkers.size();
         }
@@ -260,10 +266,10 @@ class OutboxRelayIT {
         var attempts = new AtomicInteger();
         var handler = new RecordingHandler();
         var relay = relay(observed(sql -> {
-            if (sql.contains("generate_series")) { // Cursors.latestAll
-                reads.incrementAndGet();
-            } else if (sql.contains("pg_current_snapshot")) { // a tick insert
+            if (sql.contains("pg_current_snapshot")) { // a tick insert
                 attempts.incrementAndGet();
+            } else if (sql.contains("generate_series")) { // Cursors.positions
+                reads.incrementAndGet();
             }
         }), handler);
         relay.init();
@@ -514,7 +520,8 @@ class OutboxRelayIT {
 
             assertThat(handler.delivered()).extracting(OutboxRecord::messageId)
                     .containsExactlyInAnyOrderElementsOf(ids);
-            assertThat(err.text()).contains("outbox shard 0 step failed");
+            // its pass may step shard 0 after the others: the failure may come just after the last delivery
+            await(Duration.ofSeconds(5), () -> err.text().contains("outbox shard 0 step failed"));
         }
     }
 
@@ -541,7 +548,8 @@ class OutboxRelayIT {
 
             assertThat(handler.delivered()).extracting(OutboxRecord::messageId)
                     .containsExactlyInAnyOrderElementsOf(ids);
-            assertThat(err.text()).contains("outbox shard 0 step failed").contains("tracer assertion (test)");
+            await(Duration.ofSeconds(5), () -> err.text().contains("outbox shard 0 step failed")); // see above
+            assertThat(err.text()).contains("tracer assertion (test)");
             assertThat(relayThreads()).hasSize(config.workers());
         }
     }
@@ -690,6 +698,73 @@ class OutboxRelayIT {
         System.out.printf("slowest delivery without a wake-up: %d ms%n", TimeUnit.NANOSECONDS.toMillis(slowest));
         // about one interval: a tick gap of up to 1.75 intervals plus the send and the step; 3 leave room for CI stalls
         assertThat(Duration.ofNanos(slowest)).isLessThan(config.idlePollInterval().multipliedBy(3));
+    }
+
+    @Test
+    void onlyShardsWithNewRowsAreStepped() throws Exception {
+        config.shards(32).workers(4).minTickInterval(Duration.ofMillis(50)).idlePollInterval(Duration.ofMillis(200));
+        bootstrap(); // the defaults
+        var steps = new ConcurrentHashMap<Integer, AtomicInteger>();
+        var handler = new RecordingHandler();
+        var relay = relay(countingSteps(steps), handler);
+        relay.init();
+        var outbox = outbox(relay::wake);
+        var keys = List.of(keyOnShard(5, "a"), keyOnShard(5, "b"), keyOnShard(5, "c"));
+        awaitParked();
+        steps.clear();
+        long ticks = ticksMade();
+        long started = System.nanoTime();
+
+        int sent = 0;
+        while (System.nanoTime() - started < TimeUnit.SECONDS.toNanos(6)) { // rows on shard 5 only
+            send(outbox, msg("t", keys.get(sent % keys.size()), "m" + sent));
+            sent++;
+            Thread.sleep(20);
+        }
+        int total = sent;
+        await(Duration.ofSeconds(5), () -> handler.delivered().size() == total);
+
+        double seconds = (System.nanoTime() - started) / 1e9;
+        long made = ticksMade() - ticks;
+        int others = steps.entrySet().stream().filter(e -> e.getKey() != 5).mapToInt(e -> e.getValue().get())
+                .max().orElse(0);
+        System.out.printf("%d sends to shard 5 in %.1f s, %d ticks: shard 5 stepped %s times, the busiest other"
+                + " shard %d times%n", total, seconds, made, steps.get(5), others);
+        // the other shards step only to move their cursors along every 5 s (idle append), each such step tried by
+        // up to every worker the same tick woke; before, every tick stepped every shard behind it
+        assertThat(others).as("steps of the busiest other shard")
+                .isLessThanOrEqualTo(config.workers() * ((int) (seconds / 5) + 2));
+        assertThat(steps.get(5)).as("steps of shard 5").hasPositiveValue();
+        assertThat(handler.delivered()).extracting(OutboxRecord::messageId).doesNotHaveDuplicates();
+        assertIdOrderPerKey(handler.delivered());
+    }
+
+    @Test
+    void rowsCoveredByAnotherInstancesTicksAreDelivered() throws Exception {
+        // this relay's idle attempts find a younger tick of the other instance and insert none
+        config.shards(32).idlePollInterval(Duration.ofMillis(500));
+        bootstrap();
+        var handler = new RecordingHandler();
+        start(handler);
+        var other = new Ticks(schema.names(), config.shards()); // another instance's tick maker
+        var silent = outbox(() -> {}); // commits on another instance: nothing wakes this relay
+        awaitParked();
+        long before = ticksMade();
+        int otherTicks = 0;
+
+        var ids = new ArrayList<UUID>();
+        for (int i = 0; i < 50; i++) {
+            ids.addAll(send(silent, msg("t", "k" + i % 7, "m" + i), msg("t", null, "u" + i)));
+            try (var c = TestDb.connect()) {
+                otherTicks += other.make(c, Duration.ZERO) ? 1 : 0;
+            }
+            Thread.sleep(20);
+        }
+
+        await(Duration.ofSeconds(5), () -> handler.delivered().size() >= ids.size());
+        assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(ids);
+        assertIdOrderPerKey(handler.delivered());
+        assertThat(ticksMade() - before - otherTicks).as("ticks this relay made").isLessThanOrEqualTo(2);
     }
 
     @Test
@@ -964,6 +1039,56 @@ class OutboxRelayIT {
                 return db.telemetry();
             }
         };
+    }
+
+    /** {@link #db} whose new connections count the shard steps (shard lock attempts) per shard. */
+    private JdbcConnectionFactory countingSteps(Map<Integer, AtomicInteger> steps) {
+        return new JdbcConnectionFactory() {
+            @Override
+            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
+                return db.withConnection(callback);
+            }
+
+            @Override
+            public Connection currentConnection() {
+                return db.currentConnection();
+            }
+
+            @Override
+            public Connection newConnection() {
+                var c = db.newConnection();
+                return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                        new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                            var result = invoke(method, c, args);
+                            if (method.getName().equals("prepareStatement")
+                                    && ((String) args[0]).contains("pg_try_advisory_xact_lock")) {
+                                var ps = (PreparedStatement) result;
+                                return Proxy.newProxyInstance(PreparedStatement.class.getClassLoader(),
+                                        new Class<?>[] {PreparedStatement.class}, (p, m, a) -> {
+                                            if (m.getName().equals("setInt") && (int) a[0] == 2) { // the lock key
+                                                steps.computeIfAbsent((int) a[1] - TableNames.LOCK_SHARD_BASE,
+                                                        shard -> new AtomicInteger()).incrementAndGet();
+                                            }
+                                            return invoke(m, ps, a);
+                                        });
+                            }
+                            return result;
+                        });
+            }
+
+            @Override
+            public DataBaseTelemetry telemetry() {
+                return db.telemetry();
+            }
+        };
+    }
+
+    private static Object invoke(java.lang.reflect.Method method, Object target, Object[] args) throws Throwable {
+        try {
+            return method.invoke(target, args);
+        } catch (InvocationTargetException e) {
+            throw e.getCause();
+        }
     }
 
     private OutboxRelay start(OutboxHandler handler) {

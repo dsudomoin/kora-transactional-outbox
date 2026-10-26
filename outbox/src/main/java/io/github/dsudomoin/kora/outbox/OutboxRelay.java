@@ -2,6 +2,7 @@ package io.github.dsudomoin.kora.outbox;
 
 import io.github.dsudomoin.kora.outbox.internal.Cursors;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
+import io.github.dsudomoin.kora.outbox.internal.Cursors.Position;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
 import io.github.dsudomoin.kora.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.kora.outbox.internal.OutboxSchema;
@@ -40,10 +41,13 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * {@code relay.enabled} is false; {@link #drain()} works either way. Idle workers park until {@link #wake()}, a new tick
  * made by this relay, or the next tick attempt is due, so an idle relay does not spin; an idle attempt makes a tick
  * only when the newest tick of any instance is about {@code idlePollInterval} old, so an idle cluster makes about one
- * tick per {@code idlePollInterval}, and its idle shard steps write nothing (see {@link ShardProcessor#tryProcess}).
- * Every tick this relay makes wakes all its workers, which spread the tick's shards between them. A wake-up that
- * cannot make a tick yet ({@code minTickInterval}) only brings the tick forward, so under a high commit rate the
- * workers read cursors per tick, not per commit. While {@link Maintenance#halted()} the workers take no shards.
+ * tick per {@code idlePollInterval}. A shard is a candidate only when a tick after its cursor holds its rows (each tick
+ * records the shards that gained rows, see {@link Ticks}), its batch is in progress or a retry head is due, so a shard
+ * without new rows costs a step only when its cursor turns 5 s old, and that step's append keeps tick cleanup and
+ * partition drops going. Every tick this relay makes wakes all its workers, which spread the tick's shards with new
+ * rows between them. A wake-up that cannot make a tick yet ({@code minTickInterval}) only brings the tick forward, so
+ * under a high commit rate the workers read cursors per tick, not per commit. While {@link Maintenance#halted()} the
+ * workers take no shards.
  */
 public final class OutboxRelay implements Lifecycle {
 
@@ -77,13 +81,6 @@ public final class OutboxRelay implements Lifecycle {
     private final AtomicLong ticksMade = new AtomicLong();
     /** Per shard, when a worker of this relay last started a step on it ({@code nanoTime}). */
     private final AtomicLongArray stepStarted;
-    /**
-     * Per shard, the latest tick up to which a step of this relay found it {@code IDLE}: its cursor stays behind that
-     * tick without a write, yet nothing up to it is left to read, so it is no candidate while that tick is the latest.
-     * Any other latest tick makes it one again, a lower id too: ids restart below it after a restore (xid-regression
-     * halt lifted).
-     */
-    private final AtomicLongArray idleThrough;
 
     // tick scheduling, shared by the workers: at most one attempt per minTickInterval for wake-ups, per idle period else
     private final Object tickState = new Object();
@@ -106,7 +103,7 @@ public final class OutboxRelay implements Lifecycle {
         this.config = config;
         this.relay = config.relay();
         this.maintenance = maintenance;
-        this.ticks = new Ticks(schema.names());
+        this.ticks = new Ticks(schema.names(), config.shards());
         this.cursors = new Cursors(schema.names());
         this.processor = new ShardProcessor(schema.names(), config, handler, metrics, tracer);
         this.idleNanos = relay.idlePollInterval().toNanos();
@@ -114,7 +111,6 @@ public final class OutboxRelay implements Lifecycle {
         this.idleTickAge = Duration.ofNanos(Math.max(minTickNanos, idleNanos - idleNanos / 4));
         this.lastTickAttempt = System.nanoTime() - idleNanos; // the first pass ticks
         this.stepStarted = new AtomicLongArray(config.shards());
-        this.idleThrough = new AtomicLongArray(config.shards());
         long created = System.nanoTime();
         for (int i = 0; i < config.shards(); i++) {
             stepStarted.set(i, created);
@@ -420,7 +416,7 @@ public final class OutboxRelay implements Lifecycle {
                 var selected = Instant.now().truncatedTo(ChronoUnit.MICROS);
                 long read = System.nanoTime();
                 boolean worked = false;
-                for (var shard : candidates(cursors.latestAll(c, config.shards()), latest, selected)) {
+                for (var shard : candidates(cursors.positions(c, config.shards(), latest), selected)) {
                     if (stopping) {
                         break;
                     }
@@ -436,9 +432,6 @@ public final class OutboxRelay implements Lifecycle {
                     try {
                         var status = processInOwnTransaction(c, shard, latest, now, false).status();
                         worked |= status == ShardStatus.PROGRESS || status == ShardStatus.PAUSED;
-                        if (status == ShardStatus.IDLE) {
-                            idleThrough.set(shard, latest);
-                        }
                     } catch (InterruptedException | VirtualMachineError e) {
                         throw e;
                     } catch (Throwable e) { // rolled back; a stuck shard sorts first and must not starve the rest
@@ -453,16 +446,17 @@ public final class OutboxRelay implements Lifecycle {
         }
 
         /**
-         * Behind the latest tick (and not found idle up to it), mid-batch or with a due retry head, and not paused;
-         * most behind first.
+         * {@link Position#behind() Behind} the latest tick (a tick after its cursor holds its rows, or its cursor is
+         * due an idle append), mid-batch or with a due retry head, and not paused; most behind first. All of it comes
+         * from the database, so every instance sees the same candidates, whichever instance made the ticks.
          */
-        private List<Integer> candidates(List<Cursor> all, long latest, Instant now) {
+        private List<Integer> candidates(List<Position> all, Instant now) {
             int shards = config.shards();
             return all.stream()
+                    .filter(p -> p.behind() || p.cursor().targetTickId() != null
+                            || (p.cursor().retryDueAt() != null && !p.cursor().retryDueAt().isAfter(now)))
+                    .map(Position::cursor)
                     .filter(c -> c.pausedUntil() == null || !c.pausedUntil().isAfter(now))
-                    .filter(c -> (c.tickId() < latest && idleThrough.get(c.shard()) != latest)
-                            || c.targetTickId() != null
-                            || (c.retryDueAt() != null && !c.retryDueAt().isAfter(now)))
                     .sorted(Comparator.comparingLong(Cursor::tickId)
                             .thenComparingInt(c -> Math.floorMod(c.shard() - offset, shards)))
                     .map(Cursor::shard)

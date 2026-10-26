@@ -64,7 +64,7 @@ public final class ShardProcessor implements AutoCloseable {
 
     /**
      * {@code IDLE}: nothing to read up to the latest tick and no retry work; the cursor stays on its older tick
-     * without a write, so the shard is no candidate again before a newer tick.
+     * without a write.
      */
     public enum ShardStatus { NOT_LOCKED, NO_WORK, IDLE, PROGRESS, PAUSED }
 
@@ -77,11 +77,12 @@ public final class ShardProcessor implements AutoCloseable {
     private static final ThreadLocal<HandlerCall> CALL = new ThreadLocal<>();
     private static final long BUG_REPORT_INTERVAL = TimeUnit.SECONDS.toNanos(10);
     /**
-     * How long an idle shard's cursor may stay on its tick without an append (an idle step writes nothing): an idle
-     * relay then burns about {@code shards / 5} transaction ids a second for cursors, plus its idle ticks, and the lag
-     * gauge, tick cleanup and partition drops trail by up to 5 s at idle.
+     * How long an idle shard's cursor may stay on its tick without an append (an idle step writes nothing, and the
+     * relay steps a shard without new rows only once its tick is this old, see {@link Cursors.Position#behind()}): an
+     * idle relay then burns about {@code shards / 5} transaction ids a second for cursors, plus its idle ticks, and the
+     * lag gauge, tick cleanup and partition drops trail by up to 5 s at idle.
      */
-    private static final Duration IDLE_APPEND_AFTER = Duration.ofSeconds(5);
+    static final Duration IDLE_APPEND_AFTER = Duration.ofSeconds(5);
     /**
      * The outcome of each record of a call that found every handler thread still busy (calls that outlived
      * {@code batchTimeout} and ignore interrupts hold them): not attempted, so it costs no attempt, counts as no
@@ -144,7 +145,7 @@ public final class ShardProcessor implements AutoCloseable {
         this.handler = handler;
         this.metrics = metrics;
         this.tracer = tracer;
-        this.ticks = new Ticks(names);
+        this.ticks = new Ticks(names, config.shards());
         this.cursors = new Cursors(names);
         this.reader = new BatchReader(names);
         this.retries = new RetryStore(names);

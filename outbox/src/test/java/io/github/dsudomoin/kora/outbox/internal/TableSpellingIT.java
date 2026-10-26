@@ -84,7 +84,7 @@ class TableSpellingIT {
         bootstrap();
         var outbox = new PgOutbox(db, plain, 1, () -> {}, new OutboxMetrics(null));
         db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "k", bytes("m"))));
-        var ticks = new Ticks(plain.names());
+        var ticks = new Ticks(plain.names(), plainConfig.shards());
         long latest;
         try (var c = TestDb.connect()) {
             assertThat(ticks.make(c, Duration.ZERO)).isTrue();

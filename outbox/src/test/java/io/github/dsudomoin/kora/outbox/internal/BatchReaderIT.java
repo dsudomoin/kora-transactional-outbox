@@ -313,7 +313,7 @@ class BatchReaderIT {
         var schema = new OutboxSchema(db, config);
         schema.init();
         names = schema.names();
-        ticks = new Ticks(names);
+        ticks = new Ticks(names, config.shards());
         outbox = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
         reader = new BatchReader(names);
     }

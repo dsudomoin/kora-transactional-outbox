@@ -499,7 +499,7 @@ class TortureIT {
     private long slowestCursorXmin(Connection c, OutboxSchema schema) throws Exception {
         long tickId = new Cursors(schema.names()).latestAll(c, config.shards()).stream()
                 .mapToLong(Cursor::tickId).min().orElseThrow();
-        return new Ticks(schema.names()).get(c, tickId).snapshot().xmin();
+        return new Ticks(schema.names(), config.shards()).get(c, tickId).snapshot().xmin();
     }
 
     private static void sleep(Duration duration) {

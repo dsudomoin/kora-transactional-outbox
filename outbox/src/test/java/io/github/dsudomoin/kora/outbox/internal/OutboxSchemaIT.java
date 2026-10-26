@@ -165,6 +165,22 @@ class OutboxSchemaIT {
     }
 
     @Test
+    void bootstrapAddsShardsToAnOlderTickTable() throws Exception {
+        new OutboxSchema(db, config).init();
+        var n = TableNames.of(config.table());
+        try (var c = TestDb.connect()) {
+            execute(c, "alter table " + n.tick() + " drop column shards"); // a tick table of an older version
+
+            new OutboxSchema(db, config).init();
+
+            assertThat(queryString(c, "select count(*) || ':' || count(shards) from " + n.tick())).isEqualTo("1:0");
+            assertThat(new Ticks(n, config.shards()).make(c, Duration.ZERO)).isTrue();
+            assertThat(queryString(c, "select shards::text from " + n.tick() + " order by id desc limit 1"))
+                    .isEqualTo("{}");
+        }
+    }
+
+    @Test
     void shardMismatchFailsFast() throws Exception {
         new OutboxSchema(db, config.shards(4)).init();
 
