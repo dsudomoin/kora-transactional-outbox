@@ -6,6 +6,7 @@ import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryString;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.dsudomoin.kora.outbox.OutboxConfig;
 import io.github.dsudomoin.kora.outbox.OutboxRecord;
 import io.github.dsudomoin.kora.outbox.OutboxRelay;
 import io.github.dsudomoin.kora.outbox.internal.PartitionDdl.Attachment;
@@ -351,8 +352,10 @@ class XidPartitionsIT {
     @Test
     void hotTailIsConvertedIntoARange() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
-        var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var names = bootstrap(config); // premake 4: the tail is near
+        int premake = new OutboxConfig.PartitionsConfig() {}.premake(); // the library default, for the conversion
+        var partitions = new XidPartitions(names, new TestOutboxConfig().xidsPerPartition(1000).premake(premake)
+                .swapLockTimeout(SWAP_LOCK_TIMEOUT).partitions());
 
         try (var c = TestDb.connect()) {
             long lower = overflowTail(c, names, 200_000);
@@ -373,10 +376,11 @@ class XidPartitionsIT {
 
             execute(c, "reset client_min_messages");
             var former = formerTail(c, names, lower);
-            assertThat(Long.parseLong(former.to()) - current).as("U, two ranges above").isBetween(1001L, 2000L);
+            assertThat(Long.parseLong(former.to())).as("U, premake / 2 ranges above the current xid's")
+                    .isEqualTo((current / 1000 + premake / 2) * 1000);
             assertThat(queryLong(c, "select count(*) from " + former.name())).isEqualTo(200_000);
             assertThat(queryLong(c, "select count(*) from " + names.tail())).isZero();
-            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
+            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(premake);
             assertThat(partitions.overflow()).isFalse();
             assertTailAboveLastRange(c, names);
             // under ACCESS EXCLUSIVE on the parent: no scan of the rows, no index built on them

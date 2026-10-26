@@ -198,7 +198,7 @@ public final class XidPartitions {
             if (!rows && s.current + size <= s.tailLower) {
                 extend(c, s, target, quiesceTimeout);
             } else if (!bootstrap) { // rows may reach the tail any moment: it becomes a range, holding them
-                convert(c, s, floor + 2 * size, quiesceTimeout);
+                convert(c, s, floor + Math.max(2, premake / 2) * size, quiesceTimeout);
             } // bootstrap leaves that to maintenance: the validate's scan would hold the schema lock and other startups
             return;
         }
@@ -238,9 +238,13 @@ public final class XidPartitions {
      * under its ACCESS EXCLUSIVE, the tail first gets the check {@code <tail>_bounded (xid >= 'H' and xid < 'U')},
      * which Postgres takes as proof that the rows fit the range: added {@code not valid} ({@link #addBound}), then
      * validated, a scan under SHARE UPDATE EXCLUSIVE on the tail, which writers pass. The check applies to new rows at
-     * once, so an insert routed to the tail at or above U fails until the swap: U is {@code bound}, two ranges above
-     * the current xid's lower bound; a check already there is replaced once the current xid comes within half a range
-     * of its U, even while a blocker defers the swap, and kept otherwise, for the next attempt after a failed swap.
+     * once, so an insert routed to the tail at or above U fails until the swap: U is {@code bound}, k = max(2,
+     * premake / 2) ranges above the current xid's lower bound. That margin must outlast the longest lock holder on the
+     * tail: a pg_dump that starts after the check is added holds back both the swap and the check's drop, so it is the
+     * sizing rule premake already follows for long snapshots (README: premake / 2 × xidsPerPartition ≥ peak xid/s ×
+     * longest snapshot). The cost: {@code [H, U)} spans up to premake / 2 ranges and is dropped only once the horizon
+     * passes U. A check already there is replaced once the current xid comes within half a range of its U, even while
+     * a blocker defers the swap, and kept otherwise, for the next attempt after a failed swap.
      * Ranges a failed empty-tail swap pre-created below U are dropped: {@code [H, U)} covers them, and the first would
      * take its name. A swap that finds the current xid at U drops the check, and the next run adds one higher up.
      */
