@@ -184,7 +184,7 @@ public final class RetryStore {
             ps.setLong(1, row.id());
             ps.setInt(2, attempts);
             ps.setString(3, errorText(error));
-            requireOneRow(ps.executeUpdate(), row);
+            requireOneRow(ps.executeUpdate(), "retry", row);
         }
     }
 
@@ -208,14 +208,7 @@ public final class RetryStore {
 
     /** Earliest {@code next_attempt_at} of the heads of {@code shard}; null without heads. */
     public @Nullable Instant minDue(Connection c, int shard) throws SQLException {
-        try (var ps = c.prepareStatement(minDue)) {
-            ps.setShort(1, (short) shard);
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                var min = rs.getObject(1, OffsetDateTime.class);
-                return min == null ? null : min.toInstant();
-            }
-        }
+        return minTimestamp(c, minDue, shard);
     }
 
     public long size(Connection c) throws SQLException {
@@ -226,10 +219,13 @@ public final class RetryStore {
         return count(c, deadSize);
     }
 
-    /** A retry row that is not in the table is a bug: fail so the shard transaction rolls back. */
-    private static void requireOneRow(int rows, OutboxRecord row) {
+    /**
+     * A row that is not in its {@code table} ({@code retry}, {@code parked}) is a bug: fail so the shard transaction
+     * rolls back.
+     */
+    static void requireOneRow(int rows, String table, OutboxRecord row) {
         if (rows != 1) {
-            throw new IllegalStateException("retry row " + row.id() + " not found (" + rows + " rows)");
+            throw new IllegalStateException(table + " row " + row.id() + " not found (" + rows + " rows)");
         }
     }
 
@@ -267,6 +263,19 @@ public final class RetryStore {
         try (var st = c.createStatement(); var rs = st.executeQuery(sql)) {
             rs.next();
             return rs.getLong(1);
+        }
+    }
+
+    /** The one timestamp {@code sql} selects with {@code shard} as its parameter; null for SQL null. */
+    @Nullable
+    static Instant minTimestamp(Connection c, String sql, int shard) throws SQLException {
+        try (var ps = c.prepareStatement(sql)) {
+            ps.setShort(1, (short) shard);
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                var min = rs.getObject(1, OffsetDateTime.class);
+                return min == null ? null : min.toInstant();
+            }
         }
     }
 

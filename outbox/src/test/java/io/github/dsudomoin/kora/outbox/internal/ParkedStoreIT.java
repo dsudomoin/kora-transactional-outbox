@@ -69,29 +69,42 @@ class ParkedStoreIT {
         var head = record("t", "h");
         var follower = record("t", "h");
         var dead = record("t", "d");
+        var failing = record("t", "x");
+        var carried = record("t", "x");
+        var poison = record("t", "p");
         store.apply(c, 0, List.of(
                 new Park(keyed, 1, NOW.plusSeconds(1)),
                 new Head(head, 1, NOW, "e"),
                 new Follower(follower),
                 new Dead(dead, 1, "boom"),
                 new Park(unkeyed, 1, NOW.plusSeconds(2)),
-                new Park(followed, 1, NOW.plusSeconds(3))), Set.of());
+                new Park(followed, 1, NOW.plusSeconds(3)),
+                new Park(failing, 1, NOW.plusSeconds(4)),
+                new Park(carried, 1, NOW.plusSeconds(5)),
+                new Park(poison, 1, NOW.plusSeconds(6))), Set.of());
 
         assertThat(parkedRows()).as("main-stream rows other than Park are not its business").containsExactly(
                 keyed.id() + ":0:0:1:" + NOW.plusSeconds(1),
                 unkeyed.id() + ":0:0:1:" + NOW.plusSeconds(2),
-                followed.id() + ":0:0:1:" + NOW.plusSeconds(3));
+                followed.id() + ":0:0:1:" + NOW.plusSeconds(3),
+                failing.id() + ":0:0:1:" + NOW.plusSeconds(4),
+                carried.id() + ":0:0:1:" + NOW.plusSeconds(5),
+                poison.id() + ":0:0:1:" + NOW.plusSeconds(6));
         assertThat(retries.size(c)).isZero();
         assertThat(retries.deadSize(c)).isZero();
         var stored = store.due(c, 0, LATER, 10).get(0);
         assertSameRecord(stored, keyed, 0, 1);
 
-        store.apply(c, 0, List.of(new Park(stored, 2, NOW), new Unpark(unkeyed), new Follower(followed)),
-                Set.of(keyed.id(), unkeyed.id(), followed.id()));
+        // followed: blocked by a retry head of its key in a retry-pass call; carried: by failing, whose move takes it
+        store.apply(c, 0, List.of(new Park(stored, 2, NOW), new Unpark(unkeyed), new Follower(followed),
+                        new Head(failing, 2, LATER, "e"), new Follower(carried), new Dead(poison, 1, "boom")),
+                Set.of(keyed.id(), unkeyed.id(), followed.id(), failing.id(), carried.id(), poison.id()));
 
         assertThat(parkedRows()).as("re-parked at the new due, even an earlier one; the follower untouched")
                 .containsExactly(keyed.id() + ":0:0:2:" + NOW, followed.id() + ":0:0:1:" + NOW.plusSeconds(3));
-        assertThat(retries.size(c)).isZero();
+        assertThat(retryRows()).containsExactly(
+                failing.id() + ":0:2:1:" + LATER + ":e", carried.id() + ":0:0:1:null:null");
+        assertThat(deadRow(poison.id())).isEqualTo("0|1|boom|p");
     }
 
     @Test
@@ -260,8 +273,8 @@ class ParkedStoreIT {
         var chunkK = record("t", "k");
         var chunkJ = record("t", "j");
 
-        assertThat(store.ofKeys(c, 0, List.of(chunkK), 10)).extracting(OutboxRecord::id)
-                .containsExactly(k1.id(), k2.id(), k3.id());
+        assertThat(store.ofKeys(c, 0, List.of(chunkK, record("t", null)), 10)).as("an unkeyed record matches nothing")
+                .extracting(OutboxRecord::id).containsExactly(k1.id(), k2.id(), k3.id());
         assertThat(store.ofKeys(c, 0, List.of(chunkK, record("t", "k")), 2)).as("the two oldest, once each")
                 .extracting(OutboxRecord::id).containsExactly(k1.id(), k2.id());
         assertThat(store.ofKeys(c, 0, List.of(chunkJ, chunkK), 10)).extracting(OutboxRecord::id)

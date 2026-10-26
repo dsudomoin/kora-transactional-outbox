@@ -3,6 +3,7 @@ package io.github.dsudomoin.kora.outbox.internal;
 import static io.github.dsudomoin.kora.outbox.internal.RetryStore.COLUMNS;
 import static io.github.dsudomoin.kora.outbox.internal.RetryStore.RECORD_COLUMNS;
 import static io.github.dsudomoin.kora.outbox.internal.RetryStore.errorText;
+import static io.github.dsudomoin.kora.outbox.internal.RetryStore.requireOneRow;
 import static io.github.dsudomoin.kora.outbox.internal.RetryStore.timestamp;
 
 import io.github.dsudomoin.kora.outbox.OutboxRecord;
@@ -18,7 +19,6 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
-import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -81,8 +81,15 @@ public final class ParkedStore {
      * Writes the actions of one handler call, routed by origin ({@code parkedIds}: rows handed from this table).
      * {@link Park}: a main-stream record is inserted, a parked one gets its new {@code requeues} and due time.
      * {@link Keep}: the due time moves later, never earlier. {@link Unpark}: {@link #unpark}. A parked {@link Head}:
-     * {@link #toRetry}; a parked {@link Dead}: {@link #toDead}; a parked follower: nothing, as its key's head moved it.
-     * Other actions of main-stream rows belong to {@link RetryStore#apply}.
+     * {@link #toRetry}; a parked {@link Dead}: {@link #toDead}. A parked follower: nothing, as a row before it in the
+     * call blocks its key: a parked head, whose {@link #toRetry} carries it, or, in the retry pass (retry heads first),
+     * a retry head of its key, whose id is higher, so the row stays parked below every retry row of its key. Other
+     * actions of main-stream rows belong to {@link RetryStore#apply}.
+     *
+     * <p>Precondition: {@code actions} are in the call's order, where every parked row precedes the newer main-stream
+     * rows of its key (the relay builds its calls that way). A parked head turns the later rows of its key into
+     * followers, so no main-stream {@link Park} of its key comes after it: moving the head at once, before the batched
+     * inserts, leaves behind no row it should have carried.
      */
     public void apply(Connection inTx, int shard, List<Action> actions, Set<Long> parkedIds) throws SQLException {
         var inserts = new ArrayList<Park>();
@@ -177,7 +184,7 @@ public final class ParkedStore {
             ps.setLong(14, row.id());
             try (var rs = ps.executeQuery()) {
                 rs.next();
-                requireOneRow(rs.getInt(1), row);
+                requireOneRow(rs.getInt(1), "parked", row);
             }
         }
     }
@@ -188,7 +195,7 @@ public final class ParkedStore {
             ps.setLong(1, row.id());
             ps.setInt(2, attempts);
             ps.setString(3, errorText(error));
-            requireOneRow(ps.executeUpdate(), row);
+            requireOneRow(ps.executeUpdate(), "parked", row);
         }
     }
 
@@ -198,7 +205,7 @@ public final class ParkedStore {
             ps.setLong(1, row.id());
             ps.setInt(2, requeues);
             ps.setObject(3, timestamp(dueAt));
-            requireOneRow(ps.executeUpdate(), row);
+            requireOneRow(ps.executeUpdate(), "retry", row);
         }
     }
 
@@ -212,7 +219,10 @@ public final class ParkedStore {
         }
     }
 
-    /** The parked rows of the (topic, key) pairs of {@code keyed}: the oldest {@code limit} of them, in id order. */
+    /**
+     * The parked rows of the (topic, key) pairs of {@code keyed}: the oldest {@code limit} of them, in id order. An
+     * unkeyed record matches nothing.
+     */
     public List<OutboxRecord> ofKeys(Connection c, int shard, Collection<OutboxRecord> keyed, int limit)
             throws SQLException {
         if (keyed.isEmpty()) {
@@ -230,14 +240,7 @@ public final class ParkedStore {
 
     /** Earliest {@code due_at} of the parked rows of {@code shard}; null without any. */
     public @Nullable Instant minDue(Connection c, int shard) throws SQLException {
-        try (var ps = c.prepareStatement(minDue)) {
-            ps.setShort(1, (short) shard);
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                var min = rs.getObject(1, OffsetDateTime.class);
-                return min == null ? null : min.toInstant();
-            }
-        }
+        return RetryStore.minTimestamp(c, minDue, shard);
     }
 
     public long size(Connection c) throws SQLException {
@@ -260,13 +263,6 @@ public final class ParkedStore {
                 records.add(RetryStore.record(rs, 1));
             }
             return records;
-        }
-    }
-
-    /** A row that is not where the step found it is a bug: fail so the shard transaction rolls back. */
-    private static void requireOneRow(int rows, OutboxRecord row) {
-        if (rows != 1) {
-            throw new IllegalStateException("row " + row.id() + " not found (" + rows + " rows)");
         }
     }
 }
