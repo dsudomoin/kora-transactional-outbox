@@ -57,12 +57,17 @@ public final class TestDb {
 
     /** {@link #newDatabase(int)} with pgjdbc connection properties, e.g. {@code defaultRowFetchSize}. */
     public static JdbcDatabase newDatabase(int maxPoolSize, Properties dsProperties) {
-        return newDatabase(maxPoolSize, dsProperties, user(), password());
+        return newDatabase(jdbcUrl(), user(), password(), maxPoolSize, dsProperties);
     }
 
     /** {@link #newDatabase(int)} logged in as {@code role}, made by {@link #newLoginRole()}. */
     public static JdbcDatabase newDatabase(int maxPoolSize, String role) {
-        return newDatabase(maxPoolSize, new Properties(), role, role);
+        return newDatabase(jdbcUrl(), role, role, maxPoolSize, new Properties());
+    }
+
+    /** Kora pool over any database, e.g. the bench stand's; the caller closes it with {@code release()}. */
+    public static JdbcDatabase newDatabase(String jdbcUrl, String user, String password, int maxPoolSize) {
+        return newDatabase(jdbcUrl, user, password, maxPoolSize, new Properties());
     }
 
     /**
@@ -78,7 +83,8 @@ public final class TestDb {
         return role;
     }
 
-    private static JdbcDatabase newDatabase(int maxPoolSize, Properties dsProperties, String user, String password) {
+    private static JdbcDatabase newDatabase(
+            String jdbcUrl, String user, String password, int maxPoolSize, Properties dsProperties) {
         var poolName = "test-" + POOLS.incrementAndGet();
         var config = new JdbcDatabaseConfig() {
             @Override
@@ -93,7 +99,7 @@ public final class TestDb {
 
             @Override
             public String jdbcUrl() {
-                return TestDb.jdbcUrl();
+                return jdbcUrl;
             }
 
             @Override
