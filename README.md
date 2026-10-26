@@ -50,6 +50,7 @@ flowchart TD
 - [Бенчмарки](#бенчмарки)
 - [Заметки о дизайне](#заметки-о-дизайне)
 - [Известные ограничения](#известные-ограничения)
+- [Скиллы для AI-агентов](#скиллы-для-ai-агентов)
 
 ## Гарантии
 
@@ -1603,6 +1604,39 @@ retry и dead пусты. Прогон на более ранней версии
 - Одна транзакция с миллионами строк outbox доставляется корректно, но медленно.
 - Inbox дедуплицирует только в пределах своего окна и своего scope.
 - Защиты от failover при асинхронной репликации нет (фантомные сообщения).
+
+## Скиллы для AI-агентов
+
+В каталоге [`skills/`](skills) лежат скиллы в открытом формате [Agent Skills](https://agentskills.io/specification):
+инструкции, по которым кодовый агент (Claude Code, Codex, Cursor и другие) правильно использует библиотеку в сервисе
+на Kora. Они дают агенту то, чего нет в javadoc: бюджет вызова обработчика, правило одного `sendAll` на транзакцию,
+подготовку Postgres и топиков Kafka, проверки в тестах и алерты. Тексты скиллов написаны по-английски.
+
+| Скилл | Когда агент его загружает |
+|---|---|
+| `using-kora-outbox` | Подключение, настройка и отправка; роль в базе, соединения, топики Kafka перед деплоем |
+| `writing-kora-outbox-handlers` | Свой `OutboxHandler`, `byTopic`, `batchSize` и `batchTimeout` под медленную цель, dead letters |
+| `consuming-with-kora-outbox-inbox` | Потребитель с `Inbox`: дедупликация, scope, записи без заголовка `outbox-message-id` |
+| `testing-kora-outbox` | Интеграционные тесты с Testcontainers и `OutboxRelay.drain()`, тесты, не проверяющие доставку |
+| `operating-kora-outbox` | Метрики, алерты, dead letters, процедуры восстановления, решардинг, деплои |
+
+**Claude Code.** Репозиторий — маркетплейс с одним плагином `kora-outbox`:
+
+```
+/plugin marketplace add dsudomoin/kora-transactional-outbox
+/plugin install kora-outbox@kora-transactional-outbox
+```
+
+**Другие агенты.** Скопируйте каталоги из `skills/` в каталог скиллов агента. Codex и Cursor читают
+`~/.agents/skills/` (для всех ваших проектов) и `.agents/skills/` в репозитории сервиса (для всех, кто с ним
+работает); Cursor также читает `.cursor/skills/` и `.claude/skills/`, а Claude Code без плагина — `~/.claude/skills/`
+и `.claude/skills/`.
+
+```bash
+git clone https://github.com/dsudomoin/kora-transactional-outbox
+mkdir -p ~/.agents/skills
+cp -R kora-transactional-outbox/skills/* ~/.agents/skills/
+```
 
 ## Лицензия
 
