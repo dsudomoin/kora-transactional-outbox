@@ -160,20 +160,25 @@ final class InboxPartitions {
     }
 
     /**
-     * Attaches an orphan {@link #dropOrphans} kept back with the bounds its name gives (ATTACH takes SHARE UPDATE
-     * EXCLUSIVE on the inbox, which no writer waits for), but only when its range lies in or next to the span of the
-     * attached ranges (the {@link #window} without its margins): the window takes them as contiguous, so one further
-     * off would put ranges that are missing into it, and inserts of their ids would fail; premake never makes ranges
-     * below the highest. Returns false then. A failed attach (an overlapping range, a row outside the bounds, a lock
-     * timeout) surfaces as {@link SQLException} and, in autocommit, changes nothing.
+     * Whether {@code orphan}'s range lies in or next to the span of the attached ranges (the {@link #window} without
+     * its margins), so attaching it, by {@link #attachBack} or by hand, leaves no gap: the window takes the attached
+     * ranges as contiguous, so one further off would put ranges that are missing into it, and inserts of their ids
+     * would fail; premake never makes ranges below the highest. One above the span is attached by premake once the
+     * ranges reach it, one below it is dropped once past retention.
      */
-    boolean attachBack(Connection c, Orphan orphan) throws SQLException {
+    boolean leavesNoGap(Connection c, Orphan orphan) throws SQLException {
         var w = window(c); // EMPTY gives no span, and its sums do not overflow
-        if (millis(orphan.from()) > w.to() + interval || millis(orphan.to()) < w.from() - interval) {
-            return false;
-        }
+        return millis(orphan.from()) <= w.to() + interval && millis(orphan.to()) >= w.from() - interval;
+    }
+
+    /**
+     * Attaches an orphan {@link #dropOrphans} kept back with the bounds its name gives; ATTACH takes SHARE UPDATE
+     * EXCLUSIVE on the inbox, which no writer waits for. Only for one that {@link #leavesNoGap}. A failed attach (an
+     * overlapping range, a row outside the bounds, a lock timeout) surfaces as {@link SQLException} and, in
+     * autocommit, changes nothing.
+     */
+    void attachBack(Connection c, Orphan orphan) throws SQLException {
         PartitionDdl.attach(c, table, orphan.table(), orphan.from(), orphan.to(), PartitionDdl.CREATE_LOCK_TIMEOUT);
-        return true;
     }
 
     /** The lower bound (ms) a range's name gives: {@code <inbox>_t<yyyyMMddHH[mm]>}, UTC. */

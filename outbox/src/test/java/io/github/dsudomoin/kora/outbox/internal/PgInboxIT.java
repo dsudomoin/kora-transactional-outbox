@@ -600,7 +600,8 @@ class PgInboxIT {
 
             assertThat(err.text()).contains("ERROR").contains(empty).contains("WARN").contains(feb30)
                     .as("not only the first by name").contains(month13)
-                    .as("not attached back: the ranges below it are missing").contains("no attached range lies next");
+                    .as("not attached back: the ranges below it are missing").contains("do not attach it by hand")
+                    .as("no statement that would open the gap").doesNotContain("attach partition " + empty);
         }
         assertThat(orphanRegistry.get("outbox.inbox.partitions.orphaned").gauge().value())
                 .as("the step completed: the empty one counted, the unparsable ones skipped").isEqualTo(1);
@@ -672,7 +673,7 @@ class PgInboxIT {
             inbox.runMaintenance();
 
             assertThat(err.text()).contains("ERROR").contains(low.get(1).name())
-                    .contains("no attached range lies next");
+                    .contains("do not attach it by hand").doesNotContain("attach partition " + low.get(1).name());
         }
         assertThat(ranges()).doesNotContain(low.get(1));
         assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isEqualTo(1);
@@ -683,8 +684,11 @@ class PgInboxIT {
         config.attachOrphans(false);
         start();
         var range = rangeOf(System.currentTimeMillis());
+        var far = table() + "_t" + DateTimeFormatter.ofPattern("yyyyMMddHH").withZone(ZoneOffset.UTC)
+                .format(Instant.ofEpochMilli(highest() + 10 * HOUR));
         try (var c = TestDb.connect()) {
             execute(c, "alter table " + table() + " detach partition " + range.name());
+            execute(c, "create table " + far + " (like " + table() + " including defaults)");
         }
 
         try (var err = new CapturedStderr()) {
@@ -692,10 +696,12 @@ class PgInboxIT {
 
             assertThat(err.text()).contains("ERROR").contains(range.name()).contains("23514")
                     .contains("alter table " + table() + " attach partition " + range.name() + " for values from ('"
-                            + range.from() + "') to ('" + range.to() + "')");
+                            + range.from() + "') to ('" + range.to() + "')")
+                    .as("the statement only where attaching is safe").contains(far)
+                    .doesNotContain("attach partition " + far);
         }
         assertThat(ranges()).doesNotContain(range);
-        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isEqualTo(1);
+        assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isEqualTo(2);
     }
 
     @Test
@@ -713,7 +719,8 @@ class PgInboxIT {
             inbox.runMaintenance();
 
             assertThat(err.text()).contains("ERROR").contains(overlapping.name()).contains("42P17")
-                    .contains("would overlap").doesNotContain(next.name() + " is a range");
+                    .contains("would overlap").doesNotContain(next.name() + " is a range")
+                    .contains("alter table " + table() + " attach partition " + overlapping.name() + " for values");
         }
         assertThat(ranges()).doesNotContain(overlapping).as("the failed attach does not stop the next").contains(next);
         assertThat(registry.get("outbox.inbox.partitions.orphaned").gauge().value()).isEqualTo(1);

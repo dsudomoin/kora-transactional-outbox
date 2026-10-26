@@ -298,8 +298,8 @@ public final class PgInbox implements Inbox, Lifecycle {
                 step("orphan drop", () -> {
                     int kept = 0;
                     for (var orphan : partitions.dropOrphans(c, now, timeout)) {
-                        var notAttached = config.inbox().attachOrphans() ? attachBack(c, orphan) : "";
-                        if (notAttached == null) {
+                        var advice = attachBack(c, orphan);
+                        if (advice == null) {
                             continue;
                         }
                         kept++;
@@ -307,9 +307,7 @@ public final class PgInbox implements Inbox, Lifecycle {
                                 + " left by an interrupted run) and not yet past outbox.inbox.retention: ids in its"
                                 + " range are not deduplicated, and where the inbox has ranges on both sides of it,"
                                 + " inserts of those ids fail (SQLState 23514). It is kept (gauge"
-                                + " outbox.inbox.partitions.orphaned); attach it back with alter table {} attach"
-                                + " partition {} for values from ('{}') to ('{}'){}", orphan.table(), names.base(),
-                                names.base(), orphan.table(), orphan.from(), orphan.to(), notAttached);
+                                + " outbox.inbox.partitions.orphaned); {}", orphan.table(), names.base(), advice);
                     }
                     orphaned = kept;
                 });
@@ -332,20 +330,31 @@ public final class PgInbox implements Inbox, Lifecycle {
         }
     }
 
-    /** {@link InboxPartitions#attachBack}: null when attached, else why not, to end the orphan's ERROR with. */
+    /**
+     * Attaches {@code orphan} back when {@code outbox.inbox.attachOrphans} is on and it
+     * {@link InboxPartitions#leavesNoGap}; null when attached, else the advice its ERROR ends with. The attach
+     * statement is advised only for one that leaves no gap: run on another, it would make inserts fail.
+     */
     @Nullable
-    private String attachBack(Connection c, InboxPartitions.Orphan orphan) {
-        try {
-            if (!partitions.attachBack(c, orphan)) {
-                return "; maintenance does not, as no attached range lies next to it: the ranges between would be"
-                        + " missing";
-            }
-            log.info("outbox inbox table {}, a range of {} detached inside the dedup window, is attached back",
-                    orphan.table(), names.base());
-            return null;
-        } catch (SQLException e) { // nothing changed, so the step goes on with the next orphan
-            return "; maintenance could not (SQLState " + e.getSQLState() + "): " + e.getMessage();
+    private String attachBack(Connection c, InboxPartitions.Orphan orphan) throws SQLException {
+        if (!partitions.leavesNoGap(c, orphan)) {
+            return "no attached range lies next to it, so do not attach it by hand either: the ranges between would be"
+                    + " missing, and inserts of their ids would fail. One above the attached ranges is attached by"
+                    + " premake once they reach it, one below them is dropped once past outbox.inbox.retention";
         }
+        var attach = "attach it back with alter table " + names.base() + " attach partition " + orphan.table() + " "
+                + PartitionDdl.bounds(orphan.from(), orphan.to());
+        if (!config.inbox().attachOrphans()) {
+            return attach;
+        }
+        try {
+            partitions.attachBack(c, orphan);
+        } catch (SQLException e) { // nothing changed, so the step goes on with the next orphan
+            return attach + "; maintenance could not (SQLState " + e.getSQLState() + "): " + e.getMessage();
+        }
+        log.info("outbox inbox table {}, a range of {} detached inside the dedup window, is attached back",
+                orphan.table(), names.base());
+        return null;
     }
 
     private boolean sessionStable(Connection c) throws SQLException {
