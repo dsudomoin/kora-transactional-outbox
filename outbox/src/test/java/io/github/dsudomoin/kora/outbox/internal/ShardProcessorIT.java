@@ -112,7 +112,7 @@ class ShardProcessorIT {
 
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(ids);
         assertThat(handler.delivered()).extracting(OutboxRecord::attempts).containsOnly(0);
-        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, null));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, null, null));
         assertThat(process()).isEqualTo(new ShardResult(NO_WORK, 0, true));
         assertThat(handler.delivered()).hasSize(4);
         assertThat(counter("outbox.messages.delivered", "topic", "t")).isEqualTo(3);
@@ -133,7 +133,7 @@ class ShardProcessorIT {
 
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 3, false));
         long lastId = handler.delivered().get(2).id();
-        assertThat(cursor()).isEqualTo(new Cursor(0, t0, t1, lastId, null, 0, null));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t0, t1, lastId, null, 0, null, null));
         longTx.commit();
         long t2 = tick();
         processUntilNoWork();
@@ -141,7 +141,7 @@ class ShardProcessorIT {
         var expected = new ArrayList<>(others);
         expected.add(late);
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(expected);
-        assertThat(cursor()).isEqualTo(new Cursor(0, t2, null, 0, null, 0, null));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t2, null, 0, null, 0, null, null));
     }
 
     @Test
@@ -201,7 +201,7 @@ class ShardProcessorIT {
         var due = now.plus(INITIAL);
         assertThat(delivered()).containsExactly("k2#1", "k3#1");
         assertThat(retryRows()).containsExactly("k1#1:1:" + due, "k1#2:0:-", "k1#3:0:-");
-        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, due));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, due, null));
         assertThat(counter("outbox.messages.failed", "topic", "t", "outcome", "retry")).isEqualTo(1);
 
         send(msg("t", "k1", "k1#4"), msg("t", "k2", "k2#2")); // k1 stays blocked by its retry rows
@@ -273,14 +273,14 @@ class ShardProcessorIT {
         assertThat(retryRows()).isEmpty();
         assertThat(deadRows()).isEmpty();
         var paused = cursor();
-        assertThat(paused).isEqualTo(new Cursor(0, t0, null, 0, paused.pausedUntil(), 1, null));
+        assertThat(paused).isEqualTo(new Cursor(0, t0, null, 0, paused.pausedUntil(), 1, null, null));
         assertPausedFor(paused, INITIAL);
         assertThat(process().status()).as("before pausedUntil").isEqualTo(NO_WORK);
 
         now = paused.pausedUntil();
         assertThat(process()).isEqualTo(new ShardResult(PAUSED, 0, false));
         paused = cursor();
-        assertThat(paused).isEqualTo(new Cursor(0, t0, null, 0, paused.pausedUntil(), 2, null));
+        assertThat(paused).isEqualTo(new Cursor(0, t0, null, 0, paused.pausedUntil(), 2, null, null));
         assertPausedFor(paused, INITIAL.multipliedBy(2));
         assertThat(counter("outbox.shard.paused")).isEqualTo(2);
 
@@ -314,7 +314,7 @@ class ShardProcessorIT {
         var due = now.plus(Backoff.delay(2, INITIAL, config.maxDelay()));
         assertThat(retryRows()).containsExactly("k#1:3:" + due);
         var cursor = cursor();
-        assertThat(cursor).isEqualTo(new Cursor(0, t0, t, retryIds().get(0), cursor.pausedUntil(), 3, due));
+        assertThat(cursor).isEqualTo(new Cursor(0, t0, t, retryIds().get(0), cursor.pausedUntil(), 3, due, null));
         assertPausedFor(cursor, Backoff.delay(2, INITIAL, config.maxDelay()));
     }
 
@@ -403,7 +403,7 @@ class ShardProcessorIT {
         hang.set(false);
         var due = now.plus(INITIAL);
         assertThat(retryRows()).containsExactly("k#1:1:" + due);
-        assertThat(cursor()).isEqualTo(new Cursor(0, t0, t, retryIds().get(0), null, 0, due));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t0, t, retryIds().get(0), null, 0, due, null));
 
         // read again: k#2 is blocked by k#1's retry row and follows it
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
@@ -425,7 +425,7 @@ class ShardProcessorIT {
 
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
         assertThat(retryRows()).containsExactly("b#1:0:" + until, "c#1:0:" + until);
-        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, until));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, until, null));
     }
 
     @Test
@@ -440,7 +440,7 @@ class ShardProcessorIT {
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, false));
         var due = now.plus(INITIAL);
         assertThat(retryRows()).containsExactly("k#1:1:" + due);
-        assertThat(cursor()).isEqualTo(new Cursor(0, t0, t, handler.delivered().get(0).id(), null, 0, due));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t0, t, handler.delivered().get(0).id(), null, 0, due, null));
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
         assertThat(retryRows()).containsExactly("k#1:1:" + due, "k#2:0:-");
     }
@@ -1165,7 +1165,7 @@ class ShardProcessorIT {
         assertThat(retryRows()).containsExactly("k#1:1:" + due, "k#2:0:-");
         assertThat(rows("select last_error from " + names.retry() + " where payload = 'k#1'::bytea",
                 rs -> rs.getString(1))).singleElement().asString().contains("StackOverflowError: deep k#1");
-        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, due));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, due, null));
     }
 
     @Test
@@ -1337,7 +1337,7 @@ class ShardProcessorIT {
         long lastId = handler.delivered().get(2).id();
         assertThat(process()).isEqualTo(new ShardResult(PAUSED, 0, false));
         var paused = cursor();
-        assertThat(paused).isEqualTo(new Cursor(0, t0, t1, lastId, paused.pausedUntil(), 1, null));
+        assertThat(paused).isEqualTo(new Cursor(0, t0, t1, lastId, paused.pausedUntil(), 1, null, null));
         assertThat(retryRows()).isEmpty();
 
         longTx.commit();
@@ -1348,7 +1348,7 @@ class ShardProcessorIT {
 
         assertThat(delivered()).containsExactly("a#1", "b#1", "c#1", "d#1", "e#1", "d#2", "late");
         assertThat(handler.delivered().get(6).messageId()).isEqualTo(late);
-        assertThat(cursor()).isEqualTo(new Cursor(0, t2, null, 0, null, 0, null));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t2, null, 0, null, 0, null, null));
     }
 
     @Test
@@ -1372,7 +1372,7 @@ class ShardProcessorIT {
         // 5 s old: the cursor moves on, for tick cleanup, partition drops and the lag gauge
         madeBefore(t0, t1, Duration.ofSeconds(5));
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
-        assertThat(cursor()).isEqualTo(new Cursor(0, t1, null, 0, null, 0, null));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t1, null, 0, null, 0, null, null));
 
         // a target below the latest tick (maxTicksPerBatch 1) appends however young, or maxTicksPerBatch ticks
         // within 5 s would hold the cursor on the same young target forever
@@ -1419,7 +1419,7 @@ class ShardProcessorIT {
         // nothing to read and no head due, but retry_due_at changes: not idle, the step appends
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
         assertThat(cursorRows()).isEqualTo(appends + 1);
-        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, moved));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, moved, null));
 
         tick(); // and once nothing but the tick would change, it is idle again
         assertThat(process()).isEqualTo(new ShardResult(IDLE, 0, true));

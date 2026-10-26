@@ -248,6 +248,20 @@ class RetryStoreIT {
     }
 
     @Test
+    void requeuesRoundTripThroughApplyDueHeadsAndFollowers() throws SQLException {
+        var head = requeued(record("t", "k"), 2);
+        var follower = requeued(record("t", "k"), 3);
+        store.apply(c, 0, List.of(new Head(head, 1, NOW, "e"), new Follower(follower)));
+
+        var due = store.dueHeads(c, 0, NOW, 10);
+
+        assertThat(due).extracting(OutboxRecord::requeues).containsExactly(2);
+        assertThat(store.followers(c, due, 10).get(head.id())).extracting(OutboxRecord::requeues).containsExactly(3);
+        store.deadFromRetry(c, due.get(0), 2, null); // the dead table does not keep it
+        assertThat(deadRow(head.id())).isEqualTo("0|2|e|k");
+    }
+
+    @Test
     void applyRejectsActionsOfOtherTables() throws SQLException {
         var head = new Head(record("t", "k"), 1, NOW, "e");
         var park = new Park(record("t", "k2"), 1, NOW);
@@ -299,6 +313,11 @@ class RetryStoreIT {
 
     private OutboxRecord record(String topic, @Nullable String key) {
         return record(topic, key, List.of());
+    }
+
+    private static OutboxRecord requeued(OutboxRecord r, int requeues) {
+        return new OutboxRecord(r.id(), r.messageId(), r.topic(), r.key(), r.payload(), r.headers(), r.createdAt(),
+                r.attempts(), requeues);
     }
 
     private OutboxRecord record(String topic, @Nullable String key, List<OutboxHeader> headers) {

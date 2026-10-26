@@ -25,6 +25,7 @@ public final class Cursors {
      * @param pausedUntil shard backoff while the target is down
      * @param failures consecutive whole-batch failures at this position
      * @param retryDueAt earliest {@code next_attempt_at} of the shard's retry heads
+     * @param parkedDueAt earliest {@code due_at} of the shard's parked rows; null when it has none
      */
     public record Cursor(
             int shard,
@@ -33,23 +34,28 @@ public final class Cursors {
             long lastId,
             @Nullable Instant pausedUntil,
             int failures,
-            @Nullable Instant retryDueAt) {
+            @Nullable Instant retryDueAt,
+            @Nullable Instant parkedDueAt) {
 
         public Cursor withProgress(long tickId, @Nullable Long target, long lastId) {
-            return new Cursor(shard, tickId, target, lastId, pausedUntil, failures, retryDueAt);
+            return new Cursor(shard, tickId, target, lastId, pausedUntil, failures, retryDueAt, parkedDueAt);
         }
 
         public Cursor withPause(Instant until, int failures) {
-            return new Cursor(shard, tickId, targetTickId, lastId, until, failures, retryDueAt);
+            return new Cursor(shard, tickId, targetTickId, lastId, until, failures, retryDueAt, parkedDueAt);
         }
 
         public Cursor withRetryDueAt(@Nullable Instant retryDueAt) {
-            return new Cursor(shard, tickId, targetTickId, lastId, pausedUntil, failures, retryDueAt);
+            return new Cursor(shard, tickId, targetTickId, lastId, pausedUntil, failures, retryDueAt, parkedDueAt);
+        }
+
+        public Cursor withParkedDueAt(@Nullable Instant parkedDueAt) {
+            return new Cursor(shard, tickId, targetTickId, lastId, pausedUntil, failures, retryDueAt, parkedDueAt);
         }
 
         /** No failures, not paused. */
         public Cursor cleared() {
-            return new Cursor(shard, tickId, targetTickId, lastId, null, 0, retryDueAt);
+            return new Cursor(shard, tickId, targetTickId, lastId, null, 0, retryDueAt, parkedDueAt);
         }
     }
 
@@ -62,7 +68,7 @@ public final class Cursors {
     public record Position(Cursor cursor, boolean behind) {}
 
     private static final String COLUMNS =
-            "shard, tick_id, target_tick_id, last_id, paused_until, failures, retry_due_at";
+            "shard, tick_id, target_tick_id, last_id, paused_until, failures, retry_due_at, parked_due_at";
 
     private final TableNames names;
     private final String positions;
@@ -112,7 +118,7 @@ public final class Cursors {
             try (var rs = ps.executeQuery()) {
                 var result = new ArrayList<Position>(shards);
                 while (rs.next()) {
-                    result.add(new Position(cursor(rs), rs.getBoolean(8)));
+                    result.add(new Position(cursor(rs), rs.getBoolean(9)));
                 }
                 return result;
             }
@@ -135,7 +141,7 @@ public final class Cursors {
 
     public void append(Connection c, Cursor cursor) throws SQLException {
         try (var ps = c.prepareStatement(
-                "insert into " + names.cursor() + " (" + COLUMNS + ") values (?, ?, ?, ?, ?, ?, ?)")) {
+                "insert into " + names.cursor() + " (" + COLUMNS + ") values (?, ?, ?, ?, ?, ?, ?, ?)")) {
             ps.setInt(1, cursor.shard());
             ps.setLong(2, cursor.tickId());
             ps.setObject(3, cursor.targetTickId(), Types.BIGINT);
@@ -143,6 +149,7 @@ public final class Cursors {
             ps.setObject(5, utc(cursor.pausedUntil()), Types.TIMESTAMP_WITH_TIMEZONE);
             ps.setInt(6, cursor.failures());
             ps.setObject(7, utc(cursor.retryDueAt()), Types.TIMESTAMP_WITH_TIMEZONE);
+            ps.setObject(8, utc(cursor.parkedDueAt()), Types.TIMESTAMP_WITH_TIMEZONE);
             ps.executeUpdate();
         }
     }
@@ -163,7 +170,8 @@ public final class Cursors {
                 rs.getLong(4),
                 instant(rs.getObject(5, OffsetDateTime.class)),
                 rs.getInt(6),
-                instant(rs.getObject(7, OffsetDateTime.class)));
+                instant(rs.getObject(7, OffsetDateTime.class)),
+                instant(rs.getObject(8, OffsetDateTime.class)));
     }
 
     @Nullable

@@ -175,8 +175,8 @@ psql_q() { docker exec -e PGOPTIONS='-c client_min_messages=warning' "$PG" psql 
 
 # drop_outbox BASE: the outbox tables of one run (partitions go with the parent).
 drop_outbox() {
-  psql_q "drop table if exists $1, ${1}_tick, ${1}_cursor, ${1}_retry, ${1}_dead, ${1}_halt, ${1}_maintenance,
-    ${1}_dropping cascade" > /dev/null
+  psql_q "drop table if exists $1, ${1}_tick, ${1}_cursor, ${1}_retry, ${1}_parked, ${1}_dead, ${1}_halt,
+    ${1}_maintenance, ${1}_dropping cascade" > /dev/null
 }
 
 # reconcile BASE TIMEOUT EXPECTED [CONSUMED_BEFORE]: call after the writers stopped, with the app (relay and consumer)

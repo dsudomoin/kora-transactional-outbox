@@ -67,8 +67,8 @@ public final class OutboxMetrics {
 
     /**
      * Registers the gauge once; later calls with the same name keep the first supplier. Names: {@code
-     * outbox.shard.lag}, {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.partitions.premade},
-     * {@code outbox.partitions.overflow}.
+     * outbox.shard.lag}, {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.parked.size},
+     * {@code outbox.partitions.premade}, {@code outbox.partitions.overflow}.
      */
     public void gauge(String name, Supplier<Number> value) {
         if (registry != null) {

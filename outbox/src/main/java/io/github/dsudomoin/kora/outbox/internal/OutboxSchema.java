@@ -26,8 +26,9 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * populated table, fails startup with SQLState 57014 and is left to run by hand. The schema lock is retried for a
  * minute, then startup fails. On existing tables the bootstrap takes no lock that writers wait behind (index creation
  * is skipped when the index exists, partition extension is optional and left to maintenance when it times out). A tick
- * table made before {@code max_id} or {@code shards} gets the column once; that ALTER waits for running relay
- * transactions and fails startup on timeout. Ticks without {@code shards} (null) count as holding rows of every shard.
+ * table made before {@code max_id} or {@code shards}, a cursor table made before {@code parked_due_at} and a retry
+ * table made before {@code requeues} get the column once; that ALTER waits for running relay transactions and fails
+ * startup on timeout. Ticks without {@code shards} (null) count as holding rows of every shard.
  */
 public final class OutboxSchema implements Lifecycle {
 
@@ -202,8 +203,12 @@ public final class OutboxSchema implements Lifecycle {
                       paused_until   timestamptz,
                       failures       int not null default 0,
                       retry_due_at   timestamptz,
+                      parked_due_at  timestamptz,
                       primary key (shard, seq)
                     )""");
+            if (!columnExists(c, n.cursor(), "parked_due_at")) { // made before requeue: metadata-only, rows get null
+                st.execute("alter table " + n.cursor() + " add column if not exists parked_due_at timestamptz");
+            }
             st.execute("create table if not exists " + n.retry() + """
                      (
                       id              bigint primary key,
@@ -216,11 +221,32 @@ public final class OutboxSchema implements Lifecycle {
                       created_at      timestamptz not null,
                       attempts        int not null default 0,
                       next_attempt_at timestamptz,
-                      last_error      text
+                      last_error      text,
+                      requeues        int not null default 0
                     )""");
+            if (!columnExists(c, n.retry(), "requeues")) { // made before requeue: likewise, a constant default
+                st.execute("alter table " + n.retry() + " add column if not exists requeues int not null default 0");
+            }
             createIndex(c, n.retry() + "_key", n.retry() + " (shard, topic, key, id)");
             createIndex(c, n.retry() + "_due",
                     n.retry() + " (shard, next_attempt_at) where next_attempt_at is not null");
+            // requeued records: unlike retry rows, they do not block their key
+            st.execute("create table if not exists " + n.parked() + """
+                     (
+                      id         bigint primary key,
+                      shard      smallint not null,
+                      message_id uuid not null,
+                      topic      text not null,
+                      key        bytea,
+                      payload    bytea,
+                      headers    bytea,
+                      created_at timestamptz not null,
+                      attempts   int not null default 0,
+                      requeues   int not null default 0,
+                      due_at     timestamptz not null
+                    )""");
+            createIndex(c, n.parked() + "_key", n.parked() + " (shard, topic, key, id)");
+            createIndex(c, n.parked() + "_due", n.parked() + " (shard, due_at)");
             st.execute("create table if not exists " + n.dead() + """
                      (
                       id         bigint primary key,

@@ -29,7 +29,9 @@ import java.util.UUID;
 public final class RetryStore {
 
     static final int MAX_ERROR_LENGTH = 2000;
-    private static final String COLUMNS = "id, shard, message_id, topic, key, payload, headers, created_at";
+    static final String COLUMNS = "id, shard, message_id, topic, key, payload, headers, created_at";
+    /** What {@link #record} reads. */
+    static final String RECORD_COLUMNS = "id, message_id, topic, key, payload, headers, created_at, attempts, requeues";
 
     private final String insertRetry;
     private final String insertDead;
@@ -46,14 +48,14 @@ public final class RetryStore {
     public RetryStore(TableNames names) {
         var retry = names.retry();
         var dead = names.dead();
-        insertRetry = "insert into " + retry + " (" + COLUMNS + ", attempts, next_attempt_at, last_error)"
-                + " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        insertRetry = "insert into " + retry + " (" + COLUMNS + ", attempts, next_attempt_at, last_error, requeues)"
+                + " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         insertDead = "insert into " + dead + " (" + COLUMNS + ", attempts, error)"
                 + " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        selectDue = "select id, message_id, topic, key, payload, headers, created_at, attempts from " + retry
+        selectDue = "select " + RECORD_COLUMNS + " from " + retry
                 + " where shard = ? and next_attempt_at <= ? order by id limit ?";
         selectFollowers = "select h.id, f.id, f.message_id, f.topic, f.key, f.payload, f.headers, f.created_at,"
-                + " f.attempts from " + retry + " h cross join lateral (select * from " + retry + " f"
+                + " f.attempts, f.requeues from " + retry + " h cross join lateral (select * from " + retry + " f"
                 + " where f.shard = h.shard and f.topic = h.topic and f.key = h.key and f.id > h.id"
                 + " order by f.id limit ?) f where h.id = any(?) order by f.id";
         delete = "delete from " + retry + " where id = any(?)";
@@ -97,6 +99,7 @@ public final class RetryStore {
                         retry.setObject(10, timestamp(head.nextAttemptAt()));
                     }
                     retry.setString(11, head == null ? null : errorText(head.error()));
+                    retry.setInt(12, action.r().requeues());
                     retry.addBatch();
                     retries++;
                 } else {
@@ -230,8 +233,8 @@ public final class RetryStore {
         }
     }
 
-    /** Columns {@code first..first+7}: id, message_id, topic, key, payload, headers, created_at, attempts. */
-    private static OutboxRecord record(ResultSet rs, int first) throws SQLException {
+    /** Columns {@code first..first+8}: {@link #RECORD_COLUMNS}. */
+    static OutboxRecord record(ResultSet rs, int first) throws SQLException {
         return new OutboxRecord(
                 rs.getLong(first),
                 rs.getObject(first + 1, UUID.class),
@@ -241,14 +244,15 @@ public final class RetryStore {
                 HeaderCodec.decode(rs.getBytes(first + 5)),
                 rs.getObject(first + 6, OffsetDateTime.class).toInstant(),
                 rs.getInt(first + 7),
-                0);
+                rs.getInt(first + 8));
     }
 
-    private static Array ids(Connection c, List<OutboxRecord> rows) throws SQLException {
+    static Array ids(Connection c, List<OutboxRecord> rows) throws SQLException {
         return c.createArrayOf("bigint", rows.stream().map(OutboxRecord::id).toArray());
     }
 
-    private static void bindRow(PreparedStatement ps, int shard, OutboxRecord r) throws SQLException {
+    /** Parameters 1..8: {@link #COLUMNS}. */
+    static void bindRow(PreparedStatement ps, int shard, OutboxRecord r) throws SQLException {
         ps.setLong(1, r.id());
         ps.setShort(2, (short) shard);
         ps.setObject(3, r.messageId());
@@ -259,14 +263,14 @@ public final class RetryStore {
         ps.setObject(8, timestamp(r.createdAt()));
     }
 
-    private static long count(Connection c, String sql) throws SQLException {
+    static long count(Connection c, String sql) throws SQLException {
         try (var st = c.createStatement(); var rs = st.executeQuery(sql)) {
             rs.next();
             return rs.getLong(1);
         }
     }
 
-    private static OffsetDateTime timestamp(Instant instant) {
+    static OffsetDateTime timestamp(Instant instant) {
         return instant.atOffset(ZoneOffset.UTC);
     }
 

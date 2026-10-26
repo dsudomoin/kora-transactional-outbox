@@ -95,6 +95,11 @@ public record TableNames(
         return base + "_maintenance";
     }
 
+    /** Requeued records, waiting for the next record of their key or their due time; they block nothing. */
+    public String parked() {
+        return base + "_parked";
+    }
+
     /** The ranges maintenance has decided to drop as relayed, from just before their detach until their drop. */
     public String dropping() {
         return base + "_dropping";

@@ -12,6 +12,7 @@ import io.github.dsudomoin.kora.outbox.OutboxMessage;
 import io.github.dsudomoin.kora.outbox.OutboxPermanentException;
 import io.github.dsudomoin.kora.outbox.OutboxRecord;
 import io.github.dsudomoin.kora.outbox.OutboxRelay;
+import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Park;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.kora.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.kora.outbox.testing.CapturedStderr;
@@ -21,9 +22,11 @@ import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -805,9 +808,10 @@ class MaintenanceIT {
         var registry = new SimpleMeterRegistry();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
         assertThat(registry.getMeters()).extracting(m -> m.getId().getName()).containsExactlyInAnyOrder(
-                "outbox.shard.lag", "outbox.retry.size", "outbox.dead.size", "outbox.partitions.premade",
-                "outbox.partitions.overflow", "outbox.partitions.xids_left", "outbox.partitions.orphaned",
-                "outbox.maintenance.transaction_pooling", "outbox.maintenance.since_success");
+                "outbox.shard.lag", "outbox.retry.size", "outbox.dead.size", "outbox.parked.size",
+                "outbox.partitions.premade", "outbox.partitions.overflow", "outbox.partitions.xids_left",
+                "outbox.partitions.orphaned", "outbox.maintenance.transaction_pooling",
+                "outbox.maintenance.since_success");
         var handler = new RecordingHandler()
                 .failAlways(r -> "poison".equals(key(r)), () -> new OutboxPermanentException("bad payload"))
                 .failAlways(r -> "slow".equals(key(r)), () -> new RuntimeException("target slow"));
@@ -818,6 +822,9 @@ class MaintenanceIT {
             assertThat(new Ticks(names, config.shards()).make(c, Duration.ZERO)).isTrue(); // not processed: 10 s ahead of the cursor
             execute(c, "update " + names.tick() + " set created_at = created_at - interval '10 seconds'"
                     + " where id = " + minCursorTickId());
+            var parked =
+                    new OutboxRecord(1_000_000, UUID.randomUUID(), "t", null, null, List.of(), Instant.now(), 0, 0);
+            new ParkedStore(names).apply(c, 0, List.of(new Park(parked, 1, Instant.now())), Set.of());
         }
 
         assertThat(maintenance.runOnce()).isTrue();
@@ -828,6 +835,9 @@ class MaintenanceIT {
                     .isEqualTo(2);
             assertThat(gauge(registry, "outbox.dead.size"))
                     .isEqualTo(queryLong(c, "select count(*) from " + names.dead()))
+                    .isEqualTo(1);
+            assertThat(gauge(registry, "outbox.parked.size"))
+                    .isEqualTo(queryLong(c, "select count(*) from " + names.parked()))
                     .isEqualTo(1);
             assertThat(gauge(registry, "outbox.partitions.premade"))
                     .isEqualTo(new XidPartitions(names, config.partitions()).premadeAhead(c));

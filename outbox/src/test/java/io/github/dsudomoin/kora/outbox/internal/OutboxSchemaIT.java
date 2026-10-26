@@ -48,9 +48,15 @@ class OutboxSchemaIT {
 
         try (var c = TestDb.connect()) {
             for (var table : List.of(n.base(), n.tick(), n.cursor(), n.retry(), n.dead(), n.halt(), n.tail(),
-                    n.maintenance())) {
+                    n.maintenance(), n.parked(), n.parked() + "_key", n.parked() + "_due")) {
                 assertThat(queryString(c, "select to_regclass(?)::text", table)).as(table).isEqualTo(table);
             }
+            assertThat(queryString(c, "select pg_get_indexdef(to_regclass(?))", n.parked() + "_key"))
+                    .endsWith("(shard, topic, key, id)");
+            assertThat(queryString(c, "select pg_get_indexdef(to_regclass(?))", n.parked() + "_due"))
+                    .endsWith("(shard, due_at)");
+            assertThat(OutboxSchema.columnExists(c, n.cursor(), "parked_due_at")).isTrue();
+            assertThat(OutboxSchema.columnExists(c, n.retry(), "requeues")).isTrue();
             assertThat(queryString(c, "select pg_get_partkeydef(to_regclass(?))", n.base())).isEqualTo("RANGE (xid)");
             assertThat(new XidPartitions(n, config.partitions()).premadeAhead(c))
                     .isGreaterThanOrEqualTo(config.premake());
@@ -177,6 +183,27 @@ class OutboxSchemaIT {
             assertThat(new Ticks(n, config.shards()).make(c, Duration.ZERO)).isTrue();
             assertThat(queryString(c, "select shards::text from " + n.tick() + " order by id desc limit 1"))
                     .isEqualTo("{}");
+        }
+    }
+
+    @Test
+    void bootstrapAddsParkedDueAtAndRequeuesToOlderTables() throws Exception {
+        new OutboxSchema(db, config).init();
+        var n = TableNames.of(config.table());
+        try (var c = TestDb.connect()) {
+            // cursor and retry tables of the previous version, with a retry row
+            execute(c, "alter table " + n.cursor() + " drop column parked_due_at");
+            execute(c, "alter table " + n.retry() + " drop column requeues");
+            execute(c, "insert into " + n.retry() + " (id, shard, message_id, topic, created_at, attempts)"
+                    + " values (1, 0, gen_random_uuid(), 't', now(), 2)");
+
+            new OutboxSchema(db, config).init();
+
+            assertThat(queryString(c, "select count(*) || ':' || count(parked_due_at) from " + n.cursor()))
+                    .isEqualTo(config.shards() + ":0");
+            assertThat(queryString(c, "select id || ':' || attempts || ':' || requeues from " + n.retry()))
+                    .isEqualTo("1:2:0");
+            assertThat(new Cursors(n).latestAll(c, config.shards())).hasSize(config.shards());
         }
     }
 

@@ -31,7 +31,7 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * when empty ({@code outbox.partitions.orphaned} counts the ones kept, with an ERROR each run, as their rows lie
  * outside the outbox), tick cleanup, cursor cleanup, gauges; when none failed, the run is recorded as the last success.
  * One long-lived instance per outbox table: it registers the gauges {@code outbox.shard.lag},
- * {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.partitions.premade},
+ * {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.parked.size}, {@code outbox.partitions.premade},
  * {@code outbox.partitions.overflow}, {@code outbox.partitions.xids_left} (xids before inserts fail while the tail is
  * not attached, with an ERROR each run; NaN while it is), {@code outbox.maintenance.transaction_pooling} and
  * {@code outbox.maintenance.since_success} (NaN until the first run).
@@ -51,6 +51,7 @@ public final class Maintenance {
     private final Ticks ticks;
     private final Cursors cursors;
     private final RetryStore retries;
+    private final ParkedStore parked;
     final String xidCheck; // for a test of its plan
     private final String haltInsert;
     private final String sinceSuccess;
@@ -65,6 +66,7 @@ public final class Maintenance {
     private volatile double lag = Double.NaN;
     private volatile double retrySize = Double.NaN;
     private volatile double deadSize = Double.NaN;
+    private volatile double parkedSize = Double.NaN;
     private volatile double premade = Double.NaN;
     private volatile double xidsLeft = Double.NaN;
     private volatile double orphaned = Double.NaN;
@@ -87,6 +89,7 @@ public final class Maintenance {
         this.ticks = new Ticks(names, config.shards());
         this.cursors = new Cursors(names);
         this.retries = new RetryStore(names);
+        this.parked = new ParkedStore(names);
         // every tick, not just the newest: workers keep ticking after a regression, and their new ticks look fine; the
         // highest xmax comes from the index <tick>_xmax, as ticks pile up while a paused shard holds cleanup back
         this.xidCheck = "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint,"
@@ -104,6 +107,7 @@ public final class Maintenance {
         metrics.gauge("outbox.shard.lag", () -> lag);
         metrics.gauge("outbox.retry.size", () -> retrySize);
         metrics.gauge("outbox.dead.size", () -> deadSize);
+        metrics.gauge("outbox.parked.size", () -> parkedSize);
         metrics.gauge("outbox.partitions.premade", () -> premade);
         metrics.gauge("outbox.partitions.overflow", () -> partitions.overflow() ? 1 : 0);
         metrics.gauge("outbox.partitions.xids_left", () -> xidsLeft);
@@ -292,6 +296,7 @@ public final class Maintenance {
                 : Duration.between(slowest.createdAt(), ticks.latest(c).createdAt()).toNanos() / 1e9;
         retrySize = retries.size(c);
         deadSize = retries.deadSize(c);
+        parkedSize = parked.size(c);
         int ahead = partitions.premadeAhead(c);
         premade = ahead;
         var left = partitions.xidsLeft(c);

@@ -37,11 +37,12 @@ class CursorsIT {
             assertThat(initial.get(0).targetTickId()).isNull();
             assertThat(initial.get(0).pausedUntil()).isNull();
             assertThat(initial.get(0).retryDueAt()).isNull();
+            assertThat(initial.get(0).parkedDueAt()).isNull();
 
             var s0 = initial.get(0);
             cursors.append(c, s0.withProgress(5, 9L, 100).withPause(T1, 2));
-            cursors.append(c, s0.withProgress(6, 9L, 200).withRetryDueAt(T2));
-            var newest0 = s0.withProgress(9, null, 0).withPause(T2, 3).withRetryDueAt(T1).cleared();
+            cursors.append(c, s0.withProgress(6, 9L, 200).withRetryDueAt(T2).withParkedDueAt(T1));
+            var newest0 = s0.withProgress(9, null, 0).withPause(T2, 3).withRetryDueAt(T1).withParkedDueAt(T2).cleared();
             cursors.append(c, newest0);
             var newest2 = initial.get(2).withProgress(7, 8L, 42).withPause(T1, 1).withRetryDueAt(T2);
             cursors.append(c, newest2);
@@ -49,19 +50,22 @@ class CursorsIT {
             assertThat(cursors.latestAll(c, 4)).containsExactly(newest0, initial.get(1), newest2, initial.get(3));
             assertThat(cursors.latest(c, 0)).isEqualTo(newest0);
             assertThat(cursors.latest(c, 2)).isEqualTo(newest2);
-            assertThat(newest0).isEqualTo(new Cursor(0, 9, null, 0, null, 0, T1));
+            assertThat(newest0).isEqualTo(new Cursor(0, 9, null, 0, null, 0, T1, T2));
+            assertThat(newest2.parkedDueAt()).isNull();
         }
     }
 
     @Test
     void withersChangeOnlyTheirFields() {
-        var c = new Cursor(1, 10, 20L, 30, T1, 4, T2);
+        var c = new Cursor(1, 10, 20L, 30, T1, 4, T2, T1);
 
-        assertThat(c.withProgress(11, null, 0)).isEqualTo(new Cursor(1, 11, null, 0, T1, 4, T2));
-        assertThat(c.withPause(T2, 5)).isEqualTo(new Cursor(1, 10, 20L, 30, T2, 5, T2));
-        assertThat(c.withRetryDueAt(null)).isEqualTo(new Cursor(1, 10, 20L, 30, T1, 4, null));
-        assertThat(c.withRetryDueAt(T1)).isEqualTo(new Cursor(1, 10, 20L, 30, T1, 4, T1));
-        assertThat(c.cleared()).isEqualTo(new Cursor(1, 10, 20L, 30, null, 0, T2));
+        assertThat(c.withProgress(11, null, 0)).isEqualTo(new Cursor(1, 11, null, 0, T1, 4, T2, T1));
+        assertThat(c.withPause(T2, 5)).isEqualTo(new Cursor(1, 10, 20L, 30, T2, 5, T2, T1));
+        assertThat(c.withRetryDueAt(null)).isEqualTo(new Cursor(1, 10, 20L, 30, T1, 4, null, T1));
+        assertThat(c.withRetryDueAt(T1)).isEqualTo(new Cursor(1, 10, 20L, 30, T1, 4, T1, T1));
+        assertThat(c.withParkedDueAt(null)).isEqualTo(new Cursor(1, 10, 20L, 30, T1, 4, T2, null));
+        assertThat(c.withParkedDueAt(T2)).isEqualTo(new Cursor(1, 10, 20L, 30, T1, 4, T2, T2));
+        assertThat(c.cleared()).isEqualTo(new Cursor(1, 10, 20L, 30, null, 0, T2, T1));
     }
 
     @Test
@@ -129,13 +133,16 @@ class CursorsIT {
             assertThat(behind(cursors.positions(c, 4, t1))).as("ticks above the latest passed in do not count")
                     .containsExactly(false, true, false, false);
 
-            var s1 = cursors.latest(c, 1).withProgress(t2, null, 0);
+            var s1 = cursors.latest(c, 1).withProgress(t2, null, 0).withParkedDueAt(T1);
             cursors.append(c, s1); // past the tick that held its rows
-            var s2 = cursors.latest(c, 2).withProgress(t1, t3, 7); // a batch in progress: candidate on its own
+            // a batch in progress: candidate on its own
+            var s2 = cursors.latest(c, 2).withProgress(t1, t3, 7).withParkedDueAt(T2);
             cursors.append(c, s2);
             var positions = cursors.positions(c, 4, t3);
             assertThat(behind(positions)).containsExactly(false, false, true, true);
             assertThat(positions).extracting(Cursors.Position::cursor).isEqualTo(cursors.latestAll(c, 4));
+            assertThat(positions.get(1).cursor()).isEqualTo(s1);
+            assertThat(positions.get(2).cursor()).isEqualTo(s2);
 
             long t4 = tick(c, names, "null", 40); // an older instance's tick: any shard may have rows
             assertThat(behind(cursors.positions(c, 4, t4))).containsExactly(true, true, true, true);
