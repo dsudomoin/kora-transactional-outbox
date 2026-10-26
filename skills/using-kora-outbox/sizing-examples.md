@@ -32,6 +32,8 @@ on Apple M5 Pro cores and a single Kafka broker with replication factor 1. Your 
 | Kafka call budget | `batchTimeout ≥ delivery.timeout.ms + 5 s + max.block.ms` (defaults 20 + 5 + 5 = 30 s) | `KafkaOutboxSender` |
 | Handler call budget | `batchSize × p99(record) ≤ 0.8 × batchTimeout − per-record timeout` | `OutboxHandler`, `OutboxConfig` |
 | Sequential handler throughput | ≤ min(shards, instances × workers) / mean seconds per record | Little's law; RESULTS «chaos: slow-handler» |
+| Concurrent handler throughput | rows/s ≤ min(shards, instances × workers) × `batchSize` / (call time + step overhead), call time ≈ ceil(route records / P) × p99; check with one instance down, aim for ≥ 2× | One call per shard step; P = requests in flight per call |
+| Requests in flight at a target | ≤ min(shards, instances × workers) × P | One call per running shard |
 | Idle relay cost | ≈ `1 / idlePollInterval + shards / 5` write transactions per second per cluster | README «Стоимость простоя» |
 | Time one xid range covers | `xidsPerPartition / cluster xid/s`; the outbox holds about 1–2 ranges of rows | README «Партиции» |
 | Long snapshots | `premake / 2 × xidsPerPartition ≥ peak xid/s × longest snapshot s` | README «Партиции» |
@@ -231,7 +233,7 @@ outbox {
   relay {
     workers = 3
     batchSize = 75              # (0.8 × 30 s − 1 s) / 0.3 s = 76; with p99 2 s and a 5 s timeout: (24 − 5) / 2 → 9
-    retry.maxAttempts = 20      # ≈ 1 h of retries, then <table>_dead (alert on outbox.dead.size > 0)
+    # retry.maxAttempts stays 0: orders need per-user order; the audit handler dead-letters its own records
   }
   kafka.driverProperties {
     "bootstrap.servers" = ${KAFKA_BOOTSTRAP}
@@ -252,10 +254,23 @@ httpClient.audit {
 - Sequential throughput is at most min(8, 3 × 3) / 0.3 s ≈ 26 audit msg/s (≈ 4 msg/s at 2 s). RESULTS «chaos:
   slow-handler» shows the cap: 20 ms per record with 8 workers (≤ 400 msg/s) moved about 380 msg/s end to end
   (178 080 orders in 300 s of load plus 167 s of drain) against 600 offered, and relay lag reached 204 s.
-- Above that rate, deliver concurrently inside `handleBatch` (writing-kora-outbox-handlers), or publish audit to Kafka
-  and call HTTP from a consumer.
-- `maxAttempts` 20 with backoff 1 s doubling to 5 min (1 + 2 + … + 256 s, then 300 s each) ≈ 59 min before dead
-  letters; it also applies to Kafka records. Keep 0 (retry forever) only with an alert on `outbox.shard.lag`.
+- Above that rate, deliver concurrently inside `handleBatch`
+  ([concurrent-delivery.md](../writing-kora-outbox-handlers/concurrent-delivery.md)), or publish audit to Kafka and call
+  HTTP from a consumer.
+- Concurrent variant for 2 000 orders/s with one audit event each (4 000 rows/s, about half of them audit): `workers`
+  4, `batchSize` 400, P = 200 requests in flight per call, `db.maxPoolSize` = own 20 + 4 + 2 = 26. Estimates, not
+  measured:
+  - Shards running: min(8, 3 × 4) = 8, and still 8 with one instance down (2 × 4).
+  - A call carries ≈ 200 audit records, one round of P: ≈ 0.3 s plus ≈ 0.05 s for the database step and the Kafka
+    route. 8 × 400 / 0.35 s ≈ 9 100 rows/s, ≈ 2.3× the 4 000 needed, also with one instance down.
+  - In flight at the audit service: ≈ 600 on average (2 000/s × 0.3 s), at most 8 × 200 = 1 600. Give its owner the
+    cap: a retry pass after an outage hands up to 400 due heads per call, all audit, still limited to P.
+  - Deadline: at worst ceil(400 / 200) × the 1 s request timeout = 2 s (plus connect time), far inside 24 s.
+- `relay.retry.maxAttempts` is global. A record moved to `<table>_dead` lets the later records of its key go on, and
+  a redrive delivers it after them, so with a Kafka route that needs per-key order keep `maxAttempts` = 0 and alert
+  on `outbox.shard.lag`. Bound only the HTTP route, in its handler: return `Outcome.permanent(e)` instead of
+  `Outcome.retry(e)` once `record.attempts() + 1 >= 20` (backoff 1 s doubling to 5 min: ≈ 59 min), and alert on
+  `outbox.dead.size > 0`.
 
 ## 5. Tests and CI
 

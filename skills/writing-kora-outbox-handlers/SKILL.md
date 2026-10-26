@@ -1,15 +1,14 @@
 ---
 name: writing-kora-outbox-handlers
-description: Use when writing or reviewing an OutboxHandler for kora-transactional-outbox (delivering outbox records to an HTTP API, another database or several targets, OutboxHandler.byTopic next to kafka.handler(), a wrapper around the Kafka handler), or when choosing outbox.relay.batchSize, batchTimeout or retry.maxAttempts for a slow target. Also «свой обработчик outbox», «доставка из аутбокса в HTTP», «dead letters», «Retry-After».
+description: Use when writing or reviewing an OutboxHandler for kora-transactional-outbox (delivering outbox records to an HTTP API, another database or several targets, OutboxHandler.byTopic next to kafka.handler(), a wrapper around the Kafka handler), or when choosing outbox.relay.batchSize, batchTimeout or retry.maxAttempts for a slow target, or delivering concurrently inside handleBatch. Also «свой обработчик outbox», «доставка из аутбокса в HTTP», «dead letters», «Retry-After».
 ---
 
 # Writing kora-outbox handlers
 
-## Overview
-
-One `handleBatch` call gets `outbox.relay.batchTimeout` (default 30 s). At 80 % (24 s) the relay asks it to wind
-down and interrupts the thread; at 100 % it abandons the call and retries every record, delivered ones included.
-**A handler is correct only if one call normally finishes well inside 80 % of `batchTimeout`.**
+A `handleBatch` call gets `outbox.relay.batchTimeout` (default 30 s): at 80 % the relay asks it to wind down and
+interrupts the thread, at 100 % it abandons the call and retries every record, delivered ones included.
+**A handler is correct only if one call normally finishes well inside 80 % of `batchTimeout`**, with a per-request
+timeout well below it (Kora's default read timeout: 2 min).
 
 ## The batch budget
 
@@ -21,15 +20,12 @@ Target p99 2 s, request timeout 5 s, defaults: (24 − 5) / 2 → `batchSize` �
 `batchSize` applies to every handler, Kafka included.
 
 Throughput: a sequential handler delivers at most min(shards, instances × workers) / mean seconds per record
-(8 / 0.3 s ≈ 26 msg/s). If too low, raise `batchTimeout` (still ≥ `delivery.timeout.ms + 5 s +
-max.block.ms`) or override `handleBatch` to deliver keys concurrently, one (topic, key) in order;
-`windDownRequested()` is per thread, so poll it on the calling thread. Worked numbers: profile 4 in
-[sizing-examples.md](../using-kora-outbox/sizing-examples.md).
+(8 / 0.3 s ≈ 26 msg/s), whatever the `batchSize`. If too low, deliver concurrently inside `handleBatch` following
+every rule in [concurrent-delivery.md](concurrent-delivery.md) (in-flight cap, breaker, per-key order, wind-down).
 
-| Rationalization | Reality |
-|---|---|
-| "The soft deadline returns NotAttempted for the rest anyway" | A safety net, not flow control. It interrupts a live request (`Retry`: an attempt spent, maybe a duplicate). `byTopic` routes run in turn, so routes behind the slow one, often `kafka.handler()`, wait. |
-| "The HTTP client has a timeout" | Kora's default read timeout is 2 min. Set a per-request timeout well below `batchTimeout`. |
+Not "the soft deadline returns NotAttempted for the rest anyway": it is a safety net, not flow control. It interrupts
+a live request (an attempt spent, maybe a duplicate), and `byTopic` routes behind the slow one, often
+`kafka.handler()`, wait.
 
 ## Outcomes
 
@@ -41,24 +37,28 @@ max.block.ms`) or override `handleBatch` to deliver keys concurrently, one (topi
 | 429 / Retry-After | throw: plain backoff only | `Outcome.retry(e, notBefore)`, capped at 24 h |
 | Not tried | | `Outcome.notAttempted()`, spends no attempt |
 
-- `relay.retry.maxAttempts` defaults to 0: retry forever. A target failing forever blocks its keys while
-  `outbox.shard.lag` grows. Alert on lag, or set `maxAttempts` knowing it applies to Kafka too.
-- A dead-letter path needs an alert on `outbox.dead.size > 0` and a redrive plan (operating-kora-outbox); say so.
+- `relay.retry.maxAttempts` = 0 (default) retries forever: alert on `outbox.shard.lag`. `maxAttempts` is global: a
+  dead-lettered Kafka record lets later records of its key overtake it, so with ordered Kafka topics keep it 0 and
+  bound only the slow route in its handler (`Outcome.permanent(e)` once `record.attempts() + 1 >= N`).
+- Dead letters need an alert on `outbox.dead.size > 0` and a redrive plan (operating-kora-outbox); say so.
 - Idempotency key = `record.messageId()` (stable across attempts and redrive), not `record.id()`.
 
 ## Overriding handleBatch
 
-`handle` alone suffices for status mapping; the default `handleBatch` keeps the contract. For Retry-After or
-concurrency, start from [AuditHandler.java](AuditHandler.java). Contract:
+`handle` alone suffices for status mapping. For Retry-After, start from [AuditHandler.java](AuditHandler.java); for
+concurrency, [concurrent-delivery.md](concurrent-delivery.md). Contract:
 
 - one `Outcome` per record, input order, no nulls;
-- never throw: a thrown call retries all its records, delivered ones included;
+- never throw: a thrown call retries all its records;
 - after a (topic, key) fails, its later records in the call are `notAttempted()`;
-- check `OutboxHandler.windDownRequested()` before each record (Kora's JDK-transport HTTP client clears the
-  interrupt flag); restore the flag after `InterruptedException`.
+- check `OutboxHandler.windDownRequested()` before starting each record and, if concurrent, while waiting (Kora's
+  JDK-transport HTTP client clears the interrupt flag); restore the flag after `InterruptedException`.
 
 ## Wiring
 
 - One untagged handler: a factory returning exactly `OutboxHandler`, e.g.
-  `OutboxHandler.byTopic(Map.of("audit", new AuditHandler(url)), kafka.handler())`, injecting `KafkaOutboxSender`.
-- A wrapper around `kafka.handler()` delegates `handleBatch` too, or each record becomes its own acks=all round trip.
+  `OutboxHandler.byTopic(Map.of("audit", new AuditHandler(url)), kafka.handler())`, injecting `KafkaOutboxSender`
+  and calling `kafka.handler()`. Never inject `KafkaOutboxHandler`: that keeps the module's default handler in the
+  graph next to your factory, and Kora 1.2.23 fails with «More than one component matches dependency type:
+  OutboxHandler (no tags)».
+- A wrapper around `kafka.handler()` delegates `handleBatch` too (else one acks=all round trip per record).

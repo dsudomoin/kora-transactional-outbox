@@ -40,7 +40,7 @@ outbox {
 |---|---|---|
 | `initialDelay` | `1s` | > 0. First backoff of a failed key and of a paused shard; doubles per failure. |
 | `maxDelay` | `5m` | ≥ `initialDelay`. Backoff ceiling. |
-| `maxAttempts` | `0` | ≥ 0. After this many failed attempts a record moves to `<table>_dead`. `0` = retry forever. `NotAttempted` does not count. |
+| `maxAttempts` | `0` | ≥ 0. After this many failed attempts a record moves to `<table>_dead`. `0` = retry forever. `NotAttempted` does not count. Global, Kafka included: a dead-lettered record lets the later records of its key go on, so with ordered topics keep 0 and bound a slow route in its handler (`record.attempts()`, writing-kora-outbox-handlers). |
 
 ## `outbox.partitions`
 
