@@ -56,15 +56,27 @@ public final class PartitionDdl {
     public static void createAndAttach(
             Connection c, String parent, String partition, String from, @Nullable String to, Duration lockTimeout)
             throws SQLException {
-        boolean existed = exists(c, partition);
-        if (!existed) {
-            execute(c, lockTimeout, "create table " + name(partition) + " (like " + name(parent)
-                    + " including defaults)");
+        create(c, parent, partition, lockTimeout);
+        attach(c, parent, partition, from, to, lockTimeout);
+    }
+
+    /**
+     * Creates {@code table} standalone, {@code like parent including defaults}, unless it exists (an earlier run that
+     * failed before its attach left it). {@code LIKE} takes ACCESS SHARE on the parent, which no writer waits for.
+     */
+    static void create(Connection c, String parent, String table, Duration lockTimeout) throws SQLException {
+        if (!exists(c, table)) {
+            execute(c, lockTimeout, "create table " + name(table) + " (like " + name(parent) + " including defaults)");
+            log.info("created table {} like {}", table, parent);
         }
+    }
+
+    /** Attaches the standalone {@code table} to {@code parent} {@code FOR VALUES FROM (from) TO (to)}. */
+    static void attach(Connection c, String parent, String table, String from, @Nullable String to,
+            Duration lockTimeout) throws SQLException {
         String bounds = bounds(from, to);
-        execute(c, lockTimeout, "alter table " + name(parent) + " attach partition " + name(partition) + " " + bounds);
-        log.info(existed ? "attached existing table {} to {} {}" : "created partition {} of {} {}",
-                partition, parent, bounds);
+        execute(c, lockTimeout, "alter table " + name(parent) + " attach partition " + name(table) + " " + bounds);
+        log.info("attached partition {} to {} {}", table, parent, bounds);
     }
 
     public static void detachConcurrentlyAndDrop(Connection c, String parent, String partition, Duration lockTimeout)
@@ -298,7 +310,8 @@ public final class PartitionDdl {
         }
     }
 
-    private static void execute(Connection c, Duration lockTimeout, String sql) throws SQLException {
+    /** Runs {@code sql} under the class's per-statement timeouts, then gives the session's own back. */
+    static void execute(Connection c, Duration lockTimeout, String sql) throws SQLException {
         String lock;
         String statement;
         try (var st = c.createStatement(); var rs = st.executeQuery(SESSION_TIMEOUTS)) {
@@ -337,7 +350,7 @@ public final class PartitionDdl {
         }
     }
 
-    private static String bounds(String from, @Nullable String to) {
+    static String bounds(String from, @Nullable String to) {
         return "for values from (" + literal(from) + ") to (" + (to == null ? "maxvalue" : literal(to)) + ")";
     }
 

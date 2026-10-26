@@ -21,67 +21,59 @@ import org.slf4j.LoggerFactory;
  * overflow"). The current xid is {@code pg_snapshot_xmax(pg_current_snapshot())}, the next xid Postgres will assign.
  * All methods need an autocommit connection, and callers serialise them under {@code LOCK_MAINTENANCE}: bootstrap
  * takes it after {@code LOCK_SCHEMA}; {@link Maintenance} takes it with {@code pg_try_advisory_lock} and never takes
- * {@code LOCK_SCHEMA}.
+ * {@code LOCK_SCHEMA}. The extension's tail swap ({@link #ensurePremade}) is the one place the library takes ACCESS
+ * EXCLUSIVE on the parent, for milliseconds after a wait of at most {@code outbox.partitions.swapLockTimeout}; range
+ * drops detach concurrently.
  */
 public final class XidPartitions {
 
     private static final Logger log = LoggerFactory.getLogger(XidPartitions.class);
 
     /**
-     * A transaction open this long, with a snapshot or a lock on the parent, is taken as one that may outlast the tail
-     * detach's {@link PartitionDdl#DETACH_LOCK_TIMEOUT}.
+     * A transaction open this long with a lock on the parent is taken as one that may outlast the swap's lock wait:
+     * the swap would stall writers for {@code swapLockTimeout} and time out.
      */
     private static final Duration LONG_TRANSACTION = Duration.ofSeconds(20);
+    /** A swap statement's {@code statement_timeout} past {@code swapLockTimeout}: room for its own work. */
+    private static final Duration SWAP_MARGIN = Duration.ofSeconds(2);
     /**
-     * Over {@code pg_stat_activity a}, one bind parameter (the threshold, seconds): a snapshot that may keep a tail
-     * detach pending. {@code FINALIZE} waits for every snapshot older than its own in the database, autovacuum aside.
-     * A pg_dump, or a walsender (a logical replication initial sync exports one; {@code xact_start} is always NULL for
-     * walsenders), counts at any age; any other once older than the threshold. Without {@code pg_read_all_stats},
-     * Postgres hides {@code backend_type} and {@code xact_start} of sessions logged in as another role, so their
-     * snapshots count only for pg_dump.
+     * Who would hold the swap's ACCESS EXCLUSIVE back: a description of the first, else null; and the virtual
+     * transactions of lock holders whose age is hidden. Snapshots do not count: a detach that is not concurrent waits
+     * for no snapshot. A relay step (it holds {@code LOCK_SWAP} shared) does not count either: the quiesce waits for
+     * it, without blocking writers. Of the rest, short holders are fine, the swap waits them out; a lock awaited on
+     * the parent counts at any age (the swap would queue behind it), as do a prepared transaction's and a pg_dump's.
+     * A visible holder counts once its transaction is older than the threshold; one without {@code xact_start} was
+     * between transactions when {@code pg_stat_activity} was read, so the lock seen is in a transaction that has
+     * ended or begun since: young either way. A holder logged in as another role (without {@code pg_read_all_stats})
+     * or with {@code track_activities = off} has its {@code state} and age hidden: it is returned for a second sample
+     * instead ({@link #swapBlocker}). {@code pg_locks} is read once, so a step's two locks are seen together.
      */
-    static final String SNAPSHOT_DEFERS = "a.backend_xmin is not null and (a.application_name like 'pg_dump%'"
-            + " or a.backend_type = 'walsender'"
-            + " or a.backend_type <> 'autovacuum worker' and a.xact_start < now() - make_interval(secs => ?))";
-    /**
-     * Who may keep a tail detach pending: a description of the first that does, else null; and the virtual
-     * transactions of lock holders whose age is hidden. Phase 2 of {@code DETACH CONCURRENTLY} waits for every
-     * transaction holding a lock on the parent; short ones are fine, the detach waits them out. A lock awaited on the
-     * parent counts at any age (the detach would queue behind it), as do a prepared transaction's and a pg_dump's. A
-     * visible holder counts once its transaction is older than the threshold; one without {@code xact_start} was
-     * between transactions when {@code pg_stat_activity} was read, before {@code pg_locks} (the first column reads it
-     * first), so its lock is in a transaction begun since. A holder logged in as another role (without
-     * {@code pg_read_all_stats}) or with {@code track_activities = off} has its {@code state} and age hidden: it is
-     * returned for a second sample instead ({@link #detachBlocker}).
-     */
-    private static final String DETACH_BLOCKERS = """
-            with l as (select * from pg_locks l
-                        where l.locktype = 'relation' and l.relation = to_regclass(?)
-                          and l.pid is distinct from pg_backend_pid()
-                          and l.database = (select oid from pg_database where datname = current_database()))
-            select coalesce(
-              (select format('pid %s (%s) holds a snapshot in a transaction open since %s', a.pid, a.application_name,
-                        coalesce(a.xact_start::text, 'a time hidden from this role'))
-                 from pg_stat_activity a
-                where a.datname = current_database() and a.pid <> pg_backend_pid() and ${SNAPSHOT_DEFERS}
-                order by a.xact_start limit 1),
-              (select format('%s %s %s on %s', coalesce('pid ' || l.pid, 'a prepared transaction'),
-                        case when l.granted then 'holds' else 'waits for' end, l.mode, ?)
-                 from l
-                where not l.granted or l.pid is null or exists (select 1 from pg_stat_activity a where a.pid = l.pid
-                        and (a.application_name like 'pg_dump%'
-                          or a.state <> 'disabled' and a.xact_start < now() - make_interval(secs => ?)))
-                limit 1)),
-              h.vxids, h.holders
+    private static final String SWAP_BLOCKERS = """
+            with p as materialized (select * from pg_locks
+                                     where database = (select oid from pg_database where datname = current_database())),
+                 l as (select * from p
+                        where p.locktype = 'relation' and p.relation = to_regclass(?)
+                          and p.pid is distinct from pg_backend_pid()
+                          and not exists (select 1 from p s where s.locktype = 'advisory' and s.pid = p.pid
+                                  and s.classid::bigint = ? and s.objid::bigint = ? and s.objsubid = 2
+                                  and s.mode = 'ShareLock' and s.granted))
+            select (select format('%s %s %s on %s',
+                             case when l.pid is null then 'a prepared transaction'
+                                  else format('pid %s (%s)', l.pid, a.application_name) end,
+                             case when l.granted then 'holds' else 'waits for' end, l.mode, ?)
+                      from l left join pg_stat_activity a on a.pid = l.pid
+                     where not l.granted or l.pid is null or a.application_name like 'pg_dump%'
+                        or a.state <> 'disabled' and a.xact_start < now() - make_interval(secs => ?)
+                     limit 1),
+                   h.vxids, h.holders
               from (select array_agg(l.virtualtransaction order by l.virtualtransaction) vxids,
                            array_agg(format('pid %s, which has held %s on %s', l.pid, l.mode, ?)
                                      order by l.virtualtransaction) holders
                       from l
                      where l.granted and exists (select 1 from pg_stat_activity a where a.pid = l.pid
                              and coalesce(a.application_name, '') not like 'pg_dump%'
-                             and (a.state is null or a.state = 'disabled'))) h"""
-            .replace("${SNAPSHOT_DEFERS}", SNAPSHOT_DEFERS);
-    /** One {@link #DETACH_BLOCKERS} read: who defers at once, and the lock holders whose age is hidden. */
+                             and (a.state is null or a.state = 'disabled'))) h""";
+    /** One {@link #SWAP_BLOCKERS} read: who defers at once, and the lock holders whose age is hidden. */
     private record Sample(@Nullable String blocker, List<String> hidden, List<String> holders) {}
     private static final long LOG_INTERVAL = TimeUnit.MINUTES.toNanos(1);
     /** A row of a standalone range at or above the bound, shard by shard through the (shard, xid) index it keeps. */
@@ -103,6 +95,9 @@ public final class XidPartitions {
     private final String deleteStaleMarkers;
     private final long size;
     private final int premake;
+    private final Duration swapLockTimeout;
+    private final String quiesce;
+    private final String unquiesce;
     private final Duration longTransaction;
     private final boolean resample;
     private final AtomicLong deferLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
@@ -135,28 +130,40 @@ public final class XidPartitions {
                 + " and c.relnamespace = (select p.relnamespace from pg_class p where p.oid = to_regclass(?)))";
         this.size = cfg.xidsPerPartition();
         this.premake = cfg.premake();
+        this.swapLockTimeout = cfg.swapLockTimeout();
+        this.quiesce = "select pg_advisory_lock(" + names.internalNamespace() + ", " + TableNames.LOCK_SWAP + ")";
+        this.unquiesce = "select pg_advisory_unlock(" + names.internalNamespace() + ", " + TableNames.LOCK_SWAP + ")";
         this.longTransaction = longTransaction;
         this.resample = resample;
     }
 
     /**
-     * Extends once half of the premade ranges are used up ({@link #premadeAhead} ≤ {@code premake / 2}): detaches the
-     * empty tail concurrently, drops it, creates ranges until {@code premake} whole ranges lie above the current xid,
-     * attaches a new tail. The tail is never detached once it is hot (holds rows, or the current xid is within one
-     * range of its lower bound): it stays attached and sets {@link #overflow()}. Nor while ({@link #detachBlocker}) a
-     * transaction open for 20 s holds a snapshot or a lock on the parent, or a lock on the parent is awaited: such a
-     * detach could stay pending (no partition above the last range) until that transaction ends, and inserts fail once
-     * the ranges run out. The run then leaves the extension to the next one with a WARN; if the margin runs out first,
-     * rows go to the attached tail, the overflow path. A tail left detached or detach-pending by an interrupted run is
-     * finished first: dropped when empty, attached back when it holds rows. Lock timeouts surface as
-     * {@link SQLException} (SQLState 55P03); the next run retries.
+     * Extends once half of the premade ranges are used up ({@link #premadeAhead} ≤ {@code premake / 2}), until
+     * {@code premake} whole ranges lie above the current xid, by swapping the attached empty tail for those ranges and
+     * a new tail above them in one short transaction ({@link #swap}), so the tail is never left detach-pending. First,
+     * under no lock that writers wait for, it creates the new ranges and {@code <base>_tail_next} as standalone tables
+     * (each skipped when it exists: a failed swap leaves them for the next run, or maintenance's orphan step sweeps
+     * the empty ranges). Then it waits up to {@code quiesceTimeout} for relay steps in flight, which hold
+     * {@code LOCK_SWAP} shared, by taking it exclusively ({@code pg_advisory_lock(internalNs, LOCK_SWAP)}, released
+     * after the swap). Writers stall while the swap waits for its lock, at most {@code swapLockTimeout}, and the
+     * milliseconds it holds it. Not while ({@link #swapBlocker}) a transaction open for 20 s holds a lock on the
+     * parent, or a lock on the parent is awaited: the swap would stall writers for {@code swapLockTimeout} and time
+     * out. The run then leaves the extension to the next one with a WARN; if the margin runs out first, rows go to the
+     * attached tail, the overflow path. The tail is never swapped once it is hot (holds rows, or the current xid is
+     * within one range of its lower bound): it stays attached and sets {@link #overflow()}. A tail left detached,
+     * detach-pending (an operator's {@code DETACH CONCURRENTLY}) or missing is finished first: dropped when empty,
+     * attached back when it holds rows; ranges and a new tail are then attached without a swap, nothing being attached
+     * above the last range. Lock timeouts surface as {@link SQLException} (SQLState 55P03), the tail still attached;
+     * the next run retries.
      */
     public void ensurePremade(Connection autocommit) throws SQLException {
-        ensurePremade(autocommit, PartitionDdl.DETACH_LOCK_TIMEOUT);
+        ensurePremade(autocommit, PartitionDdl.DETACH_LOCK_TIMEOUT, PartitionDdl.DETACH_LOCK_TIMEOUT);
     }
 
-    void ensurePremade(Connection c, Duration lockTimeout) throws SQLException {
+    void ensurePremade(Connection c, Duration lockTimeout, Duration quiesceTimeout) throws SQLException {
         var s = state(c);
+        long floor = Math.floorDiv(s.current, size) * size; // lower bound of the range holding the current xid
+        long target = floor + (premake + 1) * size; // premake whole ranges above the current xid's
         if (s.tail == Attachment.ATTACHED) {
             if (s.ahead > premake / 2) {
                 overflow = false;
@@ -166,45 +173,126 @@ public final class XidPartitions {
                 overflowed();
                 return;
             }
-            // a detach races writers only once they can route to the tail, so it needs a full range of margin
+            // rows may reach the tail any moment: the overflow path
             if (s.current + size > s.tailLower) {
                 overflow = true;
                 log.error("outbox partition horizon reached; maintenance fell behind: {},"
                         + " see README \"tail overflow\"", names.tail());
                 return;
             }
-            var blocker = detachBlocker(c);
-            if (blocker != null) { // never forced: a pending tail is worse than rows in the attached one
-                long now = System.nanoTime();
-                long last = deferLogged.get();
-                if (now - last < LOG_INTERVAL || !deferLogged.compareAndSet(last, now)) {
-                    return;
-                }
-                log.warn("outbox partition extension of {} deferred to the next run, {} ranges ahead: {}, and a tail"
-                        + " detach now could stay pending until it ends. Long transactions and snapshots (pg_dump,"
-                        + " repeatable-read reports, logical replication initial syncs) hold partition DDL back;"
-                        + " outbox.partitions.premake must outlast the longest. This WARN repeats at most once a"
-                        + " minute",
-                        names.base(), s.ahead, blocker);
-                return;
-            }
-            PartitionDdl.detach(c, names.base(), names.tail(), lockTimeout);
+            extend(c, s, target, quiesceTimeout);
+            return;
         }
         if (s.tail != Attachment.MISSING && !dropOrAttachBack(c, s, lockTimeout)) {
             return;
         }
         overflow = false;
-        long floor = Math.floorDiv(s.current, size) * size; // lower bound of the range holding the current xid
         long from = s.upper == null ? floor : s.upper;
         if (from < floor) { // ranges ended below the current xid (maintenance was down): bridge the gap in one range
             create(from, floor, c);
             from = floor;
         }
-        for (long target = floor + (premake + 1) * size; from < target; from += size) {
+        for (; from < target; from += size) {
             create(from, from + size, c);
         }
         PartitionDdl.createAndAttach(
                 c, names.base(), names.tail(), Long.toString(from), null, PartitionDdl.CREATE_LOCK_TIMEOUT);
+    }
+
+    /** The swap path of {@link #ensurePremade}: ranges from the tail's lower bound until {@code target}. */
+    private void extend(Connection c, State s, long target, Duration quiesceTimeout) throws SQLException {
+        long lower = s.tailLower;
+        long top = lower;
+        for (; top < target; top += size) {
+            PartitionDdl.create(c, names.base(), names.partitionPrefix() + top, PartitionDdl.CREATE_LOCK_TIMEOUT);
+        }
+        PartitionDdl.create(c, names.base(), names.tailNext(), PartitionDdl.CREATE_LOCK_TIMEOUT);
+        var blocker = swapBlocker(c);
+        if (blocker != null) { // never forced: the swap would stall writers and time out
+            long now = System.nanoTime();
+            long last = deferLogged.get();
+            if (now - last < LOG_INTERVAL || !deferLogged.compareAndSet(last, now)) {
+                return;
+            }
+            log.warn("outbox partition extension of {} deferred to the next run, {} ranges ahead: {}, so the tail swap"
+                    + " would wait for it, stalling writers for outbox.partitions.swapLockTimeout, and time out."
+                    + " Long transactions on the outbox table (pg_dump of it, long reports or batch jobs) hold the"
+                    + " extension back; outbox.partitions.premake must outlast the longest. This WARN repeats at most"
+                    + " once a minute",
+                    names.base(), s.ahead, blocker);
+            return;
+        }
+        PartitionDdl.execute(c, quiesceTimeout, quiesce); // under the session's own timeouts again afterwards
+        boolean swapped;
+        try {
+            swapped = swap(c, lower, top);
+        } catch (SQLException | RuntimeException e) {
+            try {
+                execute(c, unquiesce);
+            } catch (SQLException cleanup) { // a terminated session, its lock gone with it: keep the cause on top
+                e.addSuppressed(cleanup);
+            }
+            throw e;
+        }
+        execute(c, unquiesce);
+        if (swapped) {
+            overflow = false;
+        } else {
+            overflowed();
+        }
+    }
+
+    /**
+     * The swap, in one transaction under {@code swapLockTimeout} (a statement's {@code statement_timeout}
+     * {@link #SWAP_MARGIN} longer, so a shorter role default cannot cut the lock wait short; both {@code SET LOCAL},
+     * so the session's own come back at its end): ACCESS EXCLUSIVE on the parent, which waits for every writer's
+     * transaction to end, so a row routed to the tail before is committed or gone; detach the tail (not concurrently:
+     * it waits for no snapshot and is never left pending); if it holds a row, roll back and return false (the hot
+     * path); else drop it, attach the pre-created ranges {@code [lower, top)}, rename {@code <base>_tail_next} to the
+     * tail and attach it at {@code top}. The ranges are empty, so their attach has nothing to scan and builds the
+     * indexes on empty tables. Read committed whatever the session default: the row check takes its snapshot under the
+     * lock. One INFO says how long the lock was waited for and held.
+     */
+    private boolean swap(Connection c, long lower, long top) throws SQLException {
+        String base = names.base();
+        long asked;
+        long locked;
+        c.setAutoCommit(false);
+        try (var st = c.createStatement()) {
+            st.execute("set transaction isolation level read committed"); // first: before any statement of the tx
+            st.execute("set local lock_timeout = " + swapLockTimeout.toMillis());
+            st.execute("set local statement_timeout = " + swapLockTimeout.plus(SWAP_MARGIN).toMillis());
+            asked = System.nanoTime();
+            // as the detach would take it, but its own statement: the wait and the hold are timed apart
+            st.execute("lock table only " + base + " in access exclusive mode");
+            locked = System.nanoTime();
+            st.execute("alter table " + base + " detach partition " + names.tail());
+            try (var rs = st.executeQuery("select 1 from " + names.tail() + " limit 1")) {
+                if (rs.next()) {
+                    c.rollback();
+                    return false;
+                }
+            }
+            st.execute("drop table " + names.tail());
+            for (long from = lower; from < top; from += size) {
+                st.execute("alter table " + base + " attach partition " + names.partitionPrefix() + from + " "
+                        + PartitionDdl.bounds(Long.toString(from), Long.toString(from + size)));
+            }
+            st.execute("alter table " + names.tailNext() + " rename to " + names.unqualified(names.tail()));
+            st.execute("alter table " + base + " attach partition " + names.tail() + " "
+                    + PartitionDdl.bounds(Long.toString(top), null));
+            c.commit();
+        } catch (SQLException | RuntimeException e) {
+            c.rollback();
+            throw e;
+        } finally {
+            c.setAutoCommit(true);
+        }
+        long done = System.nanoTime();
+        log.info("swapped the partition tail of {}: attached {} ranges [{}, {}) and the tail at {}; held ACCESS"
+                + " EXCLUSIVE on {} for {} ms, after waiting {} ms for it", base, (top - lower) / size, lower, top, top,
+                base, (done - locked) / 100_000 / 10.0, (locked - asked) / 100_000 / 10.0);
+        return true;
     }
 
     /**
@@ -292,6 +380,12 @@ public final class XidPartitions {
         return kept;
     }
 
+    private static void execute(Connection c, String sql) throws SQLException {
+        try (var st = c.createStatement()) {
+            st.execute(sql);
+        }
+    }
+
     private static void marker(Connection c, String sql, String range) throws SQLException {
         try (var ps = c.prepareStatement(sql)) {
             ps.setString(1, range);
@@ -355,7 +449,7 @@ public final class XidPartitions {
 
     /**
      * WARNs when this role cannot see how long the transactions of sessions logged in as another role have run (no
-     * {@code pg_read_all_stats}), which changes the check before a tail detach ({@link #detachBlocker}).
+     * {@code pg_read_all_stats}), which changes the check before a tail swap ({@link #swapBlocker}).
      */
     void warnIfActivityHidden(Connection c) throws SQLException {
         try (var st = c.createStatement();
@@ -365,24 +459,24 @@ public final class XidPartitions {
                 log.warn("outbox role {} is not a member of pg_read_all_stats, so Postgres hides how long the"
                         + " transactions of sessions logged in as another role have run. That includes this app's own"
                         + " sessions when they log in as a role other than {} (SET ROLE, options=-c role=...,"
-                        + " per-instance credentials). Before detaching the partition tail of {}, maintenance then"
+                        + " per-instance credentials). Before swapping the partition tail of {}, maintenance then"
                         + " samples such sessions' locks on it twice, 20 s apart, and defers the extension when one"
-                        + " transaction holds a lock across both; it sees their snapshots only for pg_dump. Grant"
-                        + " pg_read_all_stats (or pg_monitor) to {} to read their age directly, without the 20 s wait",
+                        + " transaction holds a lock across both. Grant pg_read_all_stats (or pg_monitor) to {} to"
+                        + " read their age directly, without the 20 s wait",
                         rs.getString(1), rs.getString(1), names.base(), rs.getString(1));
             }
         }
     }
 
     /**
-     * Who may keep a tail detach pending, described, or null ({@link #DETACH_BLOCKERS}). A lock holder whose age is
+     * Who would hold the tail swap back, described, or null ({@link #SWAP_BLOCKERS}). A lock holder whose age is
      * hidden counts only when the same transaction still holds a lock on the parent a threshold later: this sleeps for
      * it, between two autocommit statements (no transaction open, only the caller's session locks held), and only
      * when the first sample finds such a holder. A short transaction of the app's own (under another login role)
      * has ended by then.
      */
     @Nullable
-    String detachBlocker(Connection c) throws SQLException {
+    String swapBlocker(Connection c) throws SQLException {
         var first = sample(c);
         if (first.blocker() != null || first.hidden().isEmpty()) {
             return first.blocker();
@@ -414,12 +508,13 @@ public final class XidPartitions {
 
     private Sample sample(Connection c) throws SQLException {
         double seconds = longTransaction.toMillis() / 1e3;
-        try (var ps = c.prepareStatement(DETACH_BLOCKERS)) {
+        try (var ps = c.prepareStatement(SWAP_BLOCKERS)) {
             ps.setString(1, names.base());
-            ps.setDouble(2, seconds);
-            ps.setString(3, names.base());
-            ps.setDouble(4, seconds);
-            ps.setString(5, names.base());
+            ps.setLong(2, Integer.toUnsignedLong(names.internalNamespace())); // pg_locks shows the key as an oid
+            ps.setLong(3, TableNames.LOCK_SWAP);
+            ps.setString(4, names.base());
+            ps.setDouble(5, seconds);
+            ps.setString(6, names.base());
             try (var rs = ps.executeQuery()) {
                 rs.next();
                 return new Sample(rs.getString(1), strings(rs.getArray(2)), strings(rs.getArray(3)));

@@ -80,6 +80,15 @@ class OutboxConfigTest {
     }
 
     @Test
+    void subMillisecondSwapLockTimeoutIsRejected() { // sent as whole milliseconds, and lock_timeout = 0 is no limit
+        var config = parse("outbox.partitions.swapLockTimeout = 500us");
+
+        assertThatThrownBy(() -> OutboxSchema.validate(config))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("outbox.partitions.swapLockTimeout must be positive: PT0.0005S");
+    }
+
+    @Test
     void requeueKeysAreReadAndValidated() {
         var requeue = parse("outbox.relay.requeue { delay = 250ms, maxRequeues = 5 }").relay().requeue();
 

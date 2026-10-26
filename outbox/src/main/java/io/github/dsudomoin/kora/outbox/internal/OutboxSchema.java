@@ -103,7 +103,8 @@ public final class OutboxSchema implements Lifecycle {
         require(partitions.premake() >= 2, "outbox.partitions.premake must be at least 2: " + partitions.premake());
         require(partitions.maintenanceInterval().compareTo(Duration.ZERO) > 0,
                 "outbox.partitions.maintenanceInterval must be positive: " + partitions.maintenanceInterval());
-        require(partitions.swapLockTimeout().compareTo(Duration.ZERO) > 0,
+        // sent as whole milliseconds, and lock_timeout = 0 is no limit at all
+        require(partitions.swapLockTimeout().toMillis() > 0,
                 "outbox.partitions.swapLockTimeout must be positive: " + partitions.swapLockTimeout());
     }
 
@@ -310,10 +311,12 @@ public final class OutboxSchema implements Lifecycle {
     }
 
     /**
-     * Fresh table: creates {@code premake} ranges and the tail. Existing table: first finishes a detach an interrupted
-     * maintenance run left pending (one per parent: it would fail the extension's own detach with 55000), then the
-     * same extension check maintenance runs; a lock timeout there (a detach waiting for running transactions in a
-     * rolling deploy) is logged and left to maintenance while inserts at the current xid still find a partition.
+     * Fresh table: creates {@code premake} ranges and the tail. Existing table: first finishes a detach left pending
+     * (an interrupted range drop's, which would fail the next one with 55000, or an operator's tail detach), then the
+     * same extension maintenance runs: the tail swap, the one ACCESS EXCLUSIVE on the parent, under
+     * {@code outbox.partitions.swapLockTimeout}, after waiting up to {@code LOCK_TIMEOUT} for relay steps in flight. A
+     * lock timeout there (the swap waiting for running transactions in a rolling deploy) is logged and left to
+     * maintenance while inserts at the current xid still find a partition.
      * Partition DDL is serialised by {@code LOCK_MAINTENANCE}, taken here after {@code LOCK_SCHEMA};
      * {@link Maintenance} takes it with {@code pg_try_advisory_lock} and never takes {@code LOCK_SCHEMA}, so the two
      * can never deadlock.
@@ -325,7 +328,7 @@ public final class OutboxSchema implements Lifecycle {
             advisory(c, "pg_advisory_lock", n, TableNames.LOCK_MAINTENANCE); // bounded by the session lock_timeout
             try {
                 partitions.finishPendingDetach(c, LOCK_TIMEOUT);
-                partitions.ensurePremade(c, LOCK_TIMEOUT);
+                partitions.ensurePremade(c, LOCK_TIMEOUT, LOCK_TIMEOUT);
             } finally {
                 advisory(c, "pg_advisory_unlock", n, TableNames.LOCK_MAINTENANCE);
             }

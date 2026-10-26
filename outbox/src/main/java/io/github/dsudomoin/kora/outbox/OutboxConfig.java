@@ -138,7 +138,10 @@ public interface OutboxConfig {
             return Duration.ofMillis(200);
         }
 
-        /** Move rows above the horizon in a range marked for drop back to the outbox; false only logs. Default true. */
+        /**
+         * Move rows at or above the horizon in a range marked for drop back to the outbox; false only logs. Default
+         * true.
+         */
         default boolean restoreOrphans() {
             return true;
         }

@@ -102,7 +102,7 @@ class OutboxSchemaIT {
             assertThat(queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)",
                             lowest.name()))
                     .isEqualTo("true");
-            // into the extension window: the tail detach of the extension would meet the pending range (55000)
+            // into the extension window, so the same start also extends beside the pending range
             while (partitions.premadeAhead(c) > config.premake() / 2) {
                 TestDb.burnXids(200);
             }

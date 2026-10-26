@@ -428,6 +428,38 @@ class MaintenanceIT {
     }
 
     @Test
+    void oneRunExtendsWhenHalfOfPremadeIsUsed() throws Exception {
+        bootstrap();
+        try (var c = TestDb.connect()) {
+            var partitions = new XidPartitions(names, config.partitions());
+            while (partitions.premadeAhead(c) > config.premake() / 2) {
+                TestDb.burnXids(200);
+            }
+            long offset = queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint % 1000");
+            if (offset > 900) { // the run's own xids must not carry the counter into the next range
+                TestDb.burnXids((int) (1000 - offset) + 10);
+            }
+        }
+        var registry = new SimpleMeterRegistry();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
+
+        String log;
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+            log = err.text();
+        }
+
+        assertThat(log).contains("swapped the partition tail of " + names.base());
+        assertThat(gauge(registry, "outbox.partitions.premade")).isGreaterThanOrEqualTo(config.premake());
+        assertThat(gauge(registry, "outbox.partitions.overflow")).isZero();
+        long top = ranges().stream().filter(b -> b.to() != null).mapToLong(b -> Long.parseLong(b.to())).max()
+                .orElseThrow();
+        assertThat(ranges()).filteredOn(b -> b.to() == null).singleElement()
+                .satisfies(tail -> assertThat(tail.name()).isEqualTo(names.tail()))
+                .satisfies(tail -> assertThat(Long.parseLong(tail.from())).isEqualTo(top));
+    }
+
+    @Test
     void pendingRangeDetachDoesNotJamExtension() throws Exception {
         bootstrap();
         var relay = relay(new RecordingHandler(), maintenance());
@@ -451,7 +483,7 @@ class MaintenanceIT {
             assertThat(queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)",
                             pending.name()))
                     .isEqualTo("true");
-            // into the extension window (at most premake / 2 ahead), whose tail detach a pending range would fail
+            // into the extension window (at most premake / 2 ahead): the same run also extends beside the range
             var partitions = new XidPartitions(names, config.partitions());
             while (partitions.premadeAhead(c) > config.premake() / 2) {
                 TestDb.burnXids(200);
