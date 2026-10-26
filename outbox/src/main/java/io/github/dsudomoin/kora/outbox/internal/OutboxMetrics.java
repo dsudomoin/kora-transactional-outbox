@@ -47,6 +47,13 @@ public final class OutboxMetrics {
         }
     }
 
+    /** A record set aside with {@code Outcome.requeue()} and parked. */
+    public void requeued(String topic) {
+        if (registry != null) {
+            meters(topic).requeued.increment();
+        }
+    }
+
     public void batch(Duration duration) {
         if (registry != null) {
             Timer.builder("outbox.batch.duration").publishPercentileHistogram().register(registry).record(duration);
@@ -87,6 +94,7 @@ public final class OutboxMetrics {
         final Timer delay;
         final Counter failedRetry;
         final Counter failedDead;
+        final Counter requeued;
 
         TopicMeters(MeterRegistry registry, String topic) {
             enqueued = registry.counter("outbox.messages.enqueued", "topic", topic);
@@ -100,6 +108,7 @@ public final class OutboxMetrics {
                     .register(registry);
             failedRetry = registry.counter("outbox.messages.failed", "topic", topic, "outcome", "retry");
             failedDead = registry.counter("outbox.messages.failed", "topic", topic, "outcome", "dead");
+            requeued = registry.counter("outbox.messages.requeued", "topic", topic);
         }
     }
 }

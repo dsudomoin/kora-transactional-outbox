@@ -27,6 +27,7 @@ class OutboxMetricsTest {
             noop.enqueued("orders");
             noop.delivered("orders", Duration.ofMillis(5));
             noop.failed("orders", "retry");
+            noop.requeued("orders");
             noop.batch(Duration.ofMillis(5));
             noop.shardPaused();
             noop.inboxOutsideWindow();
@@ -104,6 +105,16 @@ class OutboxMetricsTest {
         assertThat(registry.get("outbox.inbox.outside_window").counter().count()).isEqualTo(1);
         assertThat(registry.get("outbox.retry.size").gauges()).hasSize(1);
         assertThat(registry.get("outbox.retry.size").gauge().value()).isEqualTo(42);
+    }
+
+    @Test
+    void requeuedCountsPerTopic() {
+        metrics.requeued("orders");
+        metrics.requeued("orders");
+        metrics.requeued("payments");
+
+        assertThat(registry.get("outbox.messages.requeued").tag("topic", "orders").counter().count()).isEqualTo(2);
+        assertThat(registry.get("outbox.messages.requeued").tag("topic", "payments").counter().count()).isEqualTo(1);
     }
 
     /** SimpleMeterRegistry never materializes percentile-histogram buckets; Prometheus does, like this one. */

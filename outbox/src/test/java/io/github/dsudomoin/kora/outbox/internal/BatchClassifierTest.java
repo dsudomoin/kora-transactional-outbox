@@ -288,6 +288,21 @@ class BatchClassifierTest {
     }
 
     @Test
+    void requeueOfAParkedRowParksItAgain() {
+        var veteran = record("t", "k", 1, 3);
+
+        assertThat(classify(0, parked(veteran, Outcome.requeue())))
+                .isEqualTo(advance(new Park(veteran, 4, NOW.plus(DELAY))));
+    }
+
+    @Test
+    void anUnkeyedRecordIsParkedToo() {
+        var unkeyed = record("t", null);
+
+        assertThat(classify(0, requeue(unkeyed))).isEqualTo(advance(new Park(unkeyed, 1, NOW.plus(DELAY))));
+    }
+
+    @Test
     void parkedItemsCannotBeDbBlocked() {
         assertThatThrownBy(() -> new Item(record("t", "k"), true, null, true))
                 .isInstanceOf(IllegalArgumentException.class);

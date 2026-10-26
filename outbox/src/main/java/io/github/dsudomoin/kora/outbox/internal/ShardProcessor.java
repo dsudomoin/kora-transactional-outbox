@@ -5,9 +5,12 @@ import io.github.dsudomoin.kora.outbox.OutboxHandler;
 import io.github.dsudomoin.kora.outbox.OutboxPermanentException;
 import io.github.dsudomoin.kora.outbox.OutboxRecord;
 import io.github.dsudomoin.kora.outbox.Outcome;
+import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Action;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Dead;
+import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Follower;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Head;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Item;
+import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Park;
 import io.github.dsudomoin.kora.outbox.internal.BatchReader.BatchRow;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.kora.outbox.internal.Ticks.Tick;
@@ -32,6 +35,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.RandomAccess;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -50,15 +54,16 @@ import org.slf4j.LoggerFactory;
 
 /**
  * One relay step for one shard, inside the caller's transaction: take the shard lock, re-read the cursor, deliver
- * due retry heads, then the next chunk of the batch {@code (tickId, target]}, classify and append the new cursor. A
- * failed attempt halves the rows the shard's next step reads and a delivery doubles them (up to {@code batchSize}), so
- * a record that fails its whole call deep in a chunk is soon read alone. After {@code headFailuresBeforeDivert}
- * failed attempts in a row the shard probes: it reads the head row alone, so a slow or poison head is diverted as a
- * single failing key, and a down target loses at most one row to the retry table per (backed-off) probe. Handler calls
- * run on this processor's own bounded pool of daemon threads, each bounded by {@code batchTimeout}. A call that throws
- * (an Error included) or returns an invalid outcome list fails each of its records transiently, so a poison record
- * takes that same path and no handler failure reaches the caller. The caller commits on return and rolls back on an
- * exception (SQL), so a failed step is redelivered.
+ * due retry heads, then the next chunk of the batch {@code (tickId, target]} with the parked rows of its keys first in
+ * its call, classify and append the new cursor. A failed attempt halves the rows the shard's next step reads and a
+ * delivery doubles them (up to {@code batchSize}), so a record that fails its whole call deep in a chunk is soon read
+ * alone; a requeue is neither. After {@code headFailuresBeforeDivert} failed attempts in a row the shard probes: it
+ * reads the head row alone, so a slow or poison head is diverted as a single failing key, and a down target loses at
+ * most one row to the retry table per (backed-off) probe. Handler calls run on this processor's own bounded pool of
+ * daemon threads, each bounded by {@code batchTimeout}. A call that throws (an Error included) or returns an invalid
+ * outcome list fails each of its records transiently, so a poison record takes that same path and no handler failure
+ * reaches the caller. The caller commits on return and rolls back on an exception (SQL), so a failed step is
+ * redelivered, and a record it parked stays where it was.
  */
 public final class ShardProcessor implements AutoCloseable {
 
@@ -93,6 +98,7 @@ public final class ShardProcessor implements AutoCloseable {
     private final int internalNamespace;
     private final OutboxConfig.RelayConfig relay;
     private final OutboxConfig.RetryConfig retry;
+    private final OutboxConfig.RequeueConfig requeue;
     private final OutboxHandler handler;
     private final OutboxMetrics metrics;
     @Nullable
@@ -101,6 +107,7 @@ public final class ShardProcessor implements AutoCloseable {
     private final Cursors cursors;
     private final BatchReader reader;
     private final RetryStore retries;
+    private final ParkedStore parked;
     private final String hasRetryRows;
     /** Failed attempts that divert a single key: {@code headFailuresBeforeDivert}, at most {@code maxAttempts}. */
     private final int divertAt;
@@ -141,6 +148,7 @@ public final class ShardProcessor implements AutoCloseable {
         OutboxSchema.validate(config);
         this.relay = config.relay();
         this.retry = relay.retry();
+        this.requeue = relay.requeue();
         this.internalNamespace = names.internalNamespace();
         this.handler = handler;
         this.metrics = metrics;
@@ -149,6 +157,7 @@ public final class ShardProcessor implements AutoCloseable {
         this.cursors = new Cursors(names);
         this.reader = new BatchReader(names);
         this.retries = new RetryStore(names);
+        this.parked = new ParkedStore(names);
         this.hasRetryRows = "select exists (select 1 from " + names.retry() + " where shard = ?)";
         this.divertAt = retry.maxAttempts() > 0
                 ? Math.min(relay.headFailuresBeforeDivert(), retry.maxAttempts())
@@ -247,10 +256,14 @@ public final class ShardProcessor implements AutoCloseable {
             }
             return new ShardResult(ShardStatus.NO_WORK, 0, true);
         }
+        // parked_due_at works as retry_due_at: every step that writes to the parked table stores min(due_at), so
+        // null means no parked rows, and a step looks up parked rows only then or on its full check
+        var parkedDue = full ? parked.minDue(inTx, shard) : cursor.parkedDueAt();
 
         var pass = retryPass(inTx, shard, heads, now);
         int delivered = pass.delivered;
         boolean wroteRetry = !heads.isEmpty(); // the retry pass settles one head at least: it wrote
+        boolean wroteParked = false;
         boolean busy = pass.busy; // no handler thread free: the main pass would find none either
         boolean called = pass.called; // a handler thread was free
         var status = ShardStatus.PROGRESS;
@@ -267,21 +280,32 @@ public final class ShardProcessor implements AutoCloseable {
             // (P, C] read nothing, so the next step's (P, C'] reads (C, C'] exactly: the cursor may stay on P; not
             // when the target is below the latest tick, or maxTicksPerBatch ticks within IDLE_APPEND_AFTER keep it on P
             idle = !draining && rows.isEmpty() && target.id() == latestTickId && young(prev, target);
-            var items = deliverBatch(rows, now);
+            // a parked record comes back right before the next record of its key: the oldest limit parked rows of
+            // the chunk's keys go first in its call (a key blocked in the retry table hands no record, so none)
+            var parkedRows = parkedDue == null ? List.<OutboxRecord>of() : parked.ofKeys(inTx, shard, rows.stream()
+                    .filter(row -> !row.blocked() && row.record().key() != null).map(BatchRow::record).toList(), limit);
+            var items = deliverBatch(parkedRows, rows, now);
             busy = items.stream().anyMatch(item -> item.outcome() == BUSY); // nothing handed: nothing read, no items
             called |= !busy && items.stream().anyMatch(item -> !item.dbBlocked());
-            int read = busy ? 0 : read(items);
-            items = items.subList(0, read);
+            var chunk = items.subList(parkedRows.size(), items.size());
+            int read = busy ? 0
+                    : read(chunk, items.subList(0, parkedRows.size()).stream().anyMatch(ShardProcessor::attempted));
+            items = items.subList(0, busy ? 0 : parkedRows.size() + read);
             // the shard's failures may stem from other rows than a probed head: it is diverted with divertAt attempts
             var decision = BatchClassifier.classify(items, Math.min(cursor.failures(), divertAt - 1), divertAt, now,
-                    retry.initialDelay(), retry.maxDelay(), relay.requeue().delay(), relay.requeue().maxRequeues());
+                    retry.initialDelay(), retry.maxDelay(), requeue.delay(), requeue.maxRequeues());
             if (!decision.pause() && !busy) {
-                retries.apply(inTx, shard, decision.actions());
-                wroteRetry |= decision.actions().stream().anyMatch(action -> !(action instanceof Dead));
+                var parkedIds = new HashSet<Long>();
+                parkedRows.forEach(row -> parkedIds.add(row.id()));
+                wroteParked = apply(inTx, shard, decision.actions(), parkedIds);
+                wroteRetry |= decision.actions().stream()
+                        .anyMatch(action -> action instanceof Head || action instanceof Follower);
                 delivered += recordOutcomes(items, decision.actions(), shard, now);
-                next = rows.size() < limit && read == rows.size()
-                        ? cursor.withProgress(target.id(), null, 0)
-                        : cursor.withProgress(cursor.tickId(), target.id(), items.get(read - 1).record().id());
+                if (read == rows.size() && rows.size() < limit) {
+                    next = cursor.withProgress(target.id(), null, 0);
+                } else if (read > 0) {
+                    next = cursor.withProgress(cursor.tickId(), target.id(), rows.get(read - 1).record().id());
+                } // else only parked rows read: the position stays, as on a pause
             } // else no progress: a batch in progress keeps its target, a fresh one is not stored (lastId is still 0)
             if (failedAttempt(items)) { // paused, or a single failing key diverted: either way back off
                 limits.set(shard, Math.max(1, limit / 2));
@@ -296,7 +320,8 @@ public final class ShardProcessor implements AutoCloseable {
             } else if (items.stream().anyMatch(item -> item.outcome() instanceof Outcome.Delivered)) {
                 limits.set(shard, limit > relay.batchSize() / 2 ? relay.batchSize() : 2 * limit); // no int overflow
                 next = next.cleared();
-            } // else only blocked or dead rows: nothing about the target, the backoff and the limit stay as they are
+            } // else only blocked, dead or requeued rows (a requeue is no failure): nothing about the target, the
+            // backoff and the limit stay as they are
         }
         if (busy) { // calls that outlived batchTimeout hold every handler thread: no attempt and no failure (so no
             // probe, no divert); from the rejection, the shard pauses initialDelay for all relay instances, and this
@@ -317,7 +342,11 @@ public final class ShardProcessor implements AutoCloseable {
         if (full || wroteRetry) {
             next = next.withRetryDueAt(retries.minDue(inTx, shard));
         }
-        // after retry_due_at is settled: a full check that corrects it is a change, so the step appends
+        if (full || wroteParked) {
+            next = next.withParkedDueAt(wroteParked ? parked.minDue(inTx, shard) : parkedDue);
+        }
+        // after retry_due_at and parked_due_at are settled: a full check that corrects one is a change, so the step
+        // appends; an idle step read no row, so it handed no parked row either
         if (idle && heads.isEmpty()
                 && next.equals(cursor.withProgress(next.tickId(), cursor.targetTickId(), cursor.lastId()))) {
             return new ShardResult(ShardStatus.IDLE, 0, true);
@@ -640,17 +669,25 @@ public final class ShardProcessor implements AutoCloseable {
         logDead(row, attempts, error != null ? error : "maxAttempts reached");
     }
 
-    /** Hands the non-blocked rows to the handler; blocked rows get no outcome. */
-    private List<Item> deliverBatch(List<BatchRow> rows, Instant now) throws InterruptedException {
-        var records = new ArrayList<OutboxRecord>(rows.size());
+    /**
+     * Hands {@code parkedRows}, then the non-blocked rows, to the handler in one call: the items of both, in that
+     * order; blocked rows get no outcome.
+     */
+    private List<Item> deliverBatch(List<OutboxRecord> parkedRows, List<BatchRow> rows, Instant now)
+            throws InterruptedException {
+        var records = new ArrayList<OutboxRecord>(parkedRows.size() + rows.size());
+        records.addAll(parkedRows);
         for (var row : rows) {
             if (!row.blocked()) {
                 records.add(row.record());
             }
         }
         var outcomes = records.isEmpty() ? List.<Outcome>of() : deliver(records, now);
-        var items = new ArrayList<Item>(rows.size());
+        var items = new ArrayList<Item>(parkedRows.size() + rows.size());
         int i = 0;
+        for (var row : parkedRows) {
+            items.add(new Item(row, false, outcomes.get(i++), true));
+        }
         for (var row : rows) {
             items.add(row.blocked()
                     ? new Item(row.record(), true, null)
@@ -659,7 +696,29 @@ public final class ShardProcessor implements AutoCloseable {
         return items;
     }
 
-    /** Metrics and logs of an applied batch decision; returns the number delivered. */
+    /**
+     * Writes a main-pass decision: the retry and dead rows of main-stream records through {@link RetryStore#apply},
+     * every {@link Park} and every action of a parked row through {@link ParkedStore#apply}, which runs no statement
+     * when there is none. Returns whether the parked table was written.
+     */
+    private boolean apply(Connection c, int shard, List<Action> actions, Set<Long> parkedIds) throws SQLException {
+        var mainStream = new ArrayList<Action>(actions.size());
+        boolean toParked = false;
+        for (var action : actions) {
+            if (action instanceof Park || parkedIds.contains(action.r().id())) {
+                toParked = true;
+            } else {
+                mainStream.add(action);
+            }
+        }
+        retries.apply(c, shard, mainStream);
+        if (toParked) {
+            parked.apply(c, shard, actions, parkedIds);
+        }
+        return toParked;
+    }
+
+    /** Metrics and logs of an applied batch decision; returns the number delivered, parked rows included. */
     private int recordOutcomes(List<Item> items, List<BatchClassifier.Action> actions, int shard, Instant now) {
         int delivered = 0;
         for (var item : items) {
@@ -678,6 +737,8 @@ public final class ShardProcessor implements AutoCloseable {
             } else if (action instanceof Dead d) {
                 metrics.failed(d.r().topic(), "dead");
                 logDead(d.r(), d.attempts(), d.error());
+            } else if (action instanceof Park p) {
+                metrics.requeued(p.r().topic());
             }
         }
         if (firstHead != null) {
@@ -802,20 +863,24 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /**
-     * Rows the step has read: all of them, except the NotAttempted rows without {@code notBefore} after the last
+     * Chunk rows the step has read: all of them, except the NotAttempted rows without {@code notBefore} after the last
      * attempted row (a call cut at the soft deadline, a handler that stopped early), with any blocked rows among them:
      * the next step reads those again. A NotAttempted with {@code notBefore} is the handler's decision (e.g. a Kafka
-     * partition cooling down) and counts as attempted. Nothing attempted at all: every row is read, the batch fails as
-     * a whole.
+     * partition cooling down) and counts as attempted. No chunk row attempted: every row is read, the batch fails as a
+     * whole, unless a parked row of the call was attempted ({@code parkedAttempted}); then none is.
      */
-    private static int read(List<Item> items) {
-        int read = items.size();
+    private static int read(List<Item> chunk, boolean parkedAttempted) {
+        int read = chunk.size();
         boolean unread = false;
-        while (read > 0 && (items.get(read - 1).dbBlocked()
-                || items.get(read - 1).outcome() instanceof Outcome.NotAttempted n && n.notBefore() == null)) {
-            unread |= !items.get(--read).dbBlocked();
+        while (read > 0 && !attempted(chunk.get(read - 1))) {
+            unread |= !chunk.get(--read).dbBlocked();
         }
-        return unread && read > 0 ? read : items.size();
+        return unread && (read > 0 || parkedAttempted) ? read : chunk.size();
+    }
+
+    /** Handed and not a NotAttempted without {@code notBefore}. */
+    private static boolean attempted(Item item) {
+        return !item.dbBlocked() && !(item.outcome() instanceof Outcome.NotAttempted n && n.notBefore() == null);
     }
 
     /**
@@ -928,6 +993,8 @@ public final class ShardProcessor implements AutoCloseable {
             error = p.error();
         } else if (outcome instanceof Outcome.NotAttempted) {
             name = "not_attempted";
+        } else if (outcome instanceof Outcome.Requeue) {
+            name = "requeued";
         } else {
             name = "delivered";
         }
