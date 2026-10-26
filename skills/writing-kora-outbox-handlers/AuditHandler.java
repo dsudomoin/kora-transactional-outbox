@@ -30,7 +30,7 @@ public final class AuditHandler implements OutboxHandler {
     private final URI events;
 
     public AuditHandler(URI baseUrl) {
-        this.events = baseUrl.resolve("/events");
+        this.events = URI.create(baseUrl.toString().replaceAll("/+$", "") + "/events"); // keeps a base path
     }
 
     @Override

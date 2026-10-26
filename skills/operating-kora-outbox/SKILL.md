@@ -37,10 +37,10 @@ Also watch `outbox.delivery.delay` p99 and `outbox.messages.failed{outcome}`. Ev
 
 ## Sizing
 
-- **Shards** (default 32): one worker per shard at a time, sequentially; parallelism = min(shards, instances ×
-  workers). Idle shards cost DB CPU today (bench, 100 msg/s: 1/32/128 shards = 9/49/111 %), so use 4–8 at low or
-  medium traffic; a fix is in progress. Changing `outbox.shards` needs an empty outbox («Решардинг»).
-- **Workers** (default 4): each holds a connection while working; `db.maxPoolSize` += workers + 2.
+- **Shards** (default 32): one worker per shard at a time; parallelism = min(shards, instances × workers).
+  Idle shards cost DB CPU (bench, 100 msg/s: 1/32/128 shards = 9/49/111 %): use 4–8 at low or medium traffic (a fix
+  is in progress). Changing `outbox.shards` needs an empty outbox («Решардинг»).
+- **Workers** (default 4): each holds a connection while working; `db.maxPoolSize` ≥ own peak + workers + 2.
 - **Idle cost** («Стоимость простоя»): about `1 / idlePollInterval + shards / 5` write transactions per second per
   cluster (11.4 with defaults); a larger `idlePollInterval` idles cheaper.
 - **premake** («Партиции»): `premake / 2 × xidsPerPartition ≥ peak xid/s × longest snapshot seconds`.

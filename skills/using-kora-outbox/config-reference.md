@@ -6,7 +6,7 @@ here is silently ignored.
 
 ```hocon
 outbox {
-  table = "app.outbox"               # schema-qualified, identical on every instance
+  table = "app.outbox"               # the schema of the service's own tables, identical on every instance
   kafka.driverProperties {
     "bootstrap.servers" = "kafka-1:9092,kafka-2:9092,kafka-3:9092"
   }
