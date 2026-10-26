@@ -4,7 +4,8 @@ import ru.tinkoff.kora.http.server.common.HttpServerRequest;
 
 /**
  * Decides who may call the admin API; the app provides one as a component, an app without it does not build. Runs
- * before every admin route: {@link Deny} answers with its status and an {@code Error} body, the route never runs.
+ * before every admin route: {@link Deny} answers with its status and an {@code Error} body, the route never runs. It
+ * runs on the HTTP server's blocking executor, not on an I/O thread, so it may block (a database or remote lookup).
  */
 public interface OutboxAdminAuthorizer {
 

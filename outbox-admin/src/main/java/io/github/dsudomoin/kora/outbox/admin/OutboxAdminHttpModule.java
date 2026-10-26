@@ -3,6 +3,7 @@ package io.github.dsudomoin.kora.outbox.admin;
 import io.github.dsudomoin.kora.outbox.admin.api.OutboxAdminApiControllerModule;
 import io.github.dsudomoin.kora.outbox.admin.api.OutboxAdminApiDelegate;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
+import ru.tinkoff.kora.http.server.common.handler.BlockingRequestExecutor;
 
 /**
  * The admin HTTP API on the app's public HTTP server, routes under {@code /kora-outbox/admin/v1}; contract at
@@ -16,8 +17,9 @@ import io.github.dsudomoin.kora.outbox.internal.Maintenance;
  */
 public interface OutboxAdminHttpModule extends OutboxAdminApiControllerModule {
 
-    default OutboxAdminInterceptor outboxAdminInterceptor(OutboxAdminAuthorizer authorizer) {
-        return new OutboxAdminInterceptor(authorizer);
+    default OutboxAdminInterceptor outboxAdminInterceptor(OutboxAdminAuthorizer authorizer,
+            BlockingRequestExecutor executor) {
+        return new OutboxAdminInterceptor(authorizer, executor);
     }
 
     default OutboxAdminApiDelegate outboxAdminDelegate(Maintenance maintenance) {

@@ -2,6 +2,8 @@ package io.github.dsudomoin.kora.outbox.admin;
 
 import io.github.dsudomoin.kora.outbox.OutboxModule;
 import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import ru.tinkoff.kora.common.Component;
 import ru.tinkoff.kora.common.KoraApp;
 import ru.tinkoff.kora.common.Tag;
@@ -11,6 +13,7 @@ import ru.tinkoff.kora.http.common.HttpMethod;
 import ru.tinkoff.kora.http.common.annotation.HttpRoute;
 import ru.tinkoff.kora.http.server.common.HttpServerInterceptor;
 import ru.tinkoff.kora.http.server.common.HttpServerModule;
+import ru.tinkoff.kora.http.server.common.HttpServerRequest;
 import ru.tinkoff.kora.http.server.common.annotation.HttpController;
 import ru.tinkoff.kora.http.server.undertow.UndertowHttpServerModule;
 import ru.tinkoff.kora.json.module.JsonModule;
@@ -43,14 +46,24 @@ public interface AdminTestApp extends HoconConfigModule, JdbcDatabaseModule, Out
         return new RecordingHandler();
     }
 
-    default OutboxAdminAuthorizer outboxAdminAuthorizer() {
-        return request -> {
+    default KeyAuthorizer outboxAdminAuthorizer() {
+        return new KeyAuthorizer();
+    }
+
+    /** Allows the key {@code secret} as {@code tester}; records the threads it runs on. */
+    final class KeyAuthorizer implements OutboxAdminAuthorizer {
+
+        final List<String> threads = new CopyOnWriteArrayList<>();
+
+        @Override
+        public Decision authorize(HttpServerRequest request) {
+            threads.add(Thread.currentThread().getName());
             var key = request.headers().getFirst("X-Api-Key");
             if (key == null) {
                 return OutboxAdminAuthorizer.unauthorized("X-Api-Key required");
             }
             return key.equals("secret") ? OutboxAdminAuthorizer.allow("tester")
                     : OutboxAdminAuthorizer.forbidden("unknown key");
-        };
+        }
     }
 }

@@ -17,12 +17,16 @@ import ru.tinkoff.kora.http.server.undertow.UndertowHttpServer;
 import ru.tinkoff.kora.test.extension.junit5.KoraAppTest;
 import ru.tinkoff.kora.test.extension.junit5.KoraAppTestConfigModifier;
 import ru.tinkoff.kora.test.extension.junit5.KoraConfigModification;
+import ru.tinkoff.kora.test.extension.junit5.TestComponent;
 
 /** The admin routes, the app's own route and both specs are served by one app server, behind the global interceptor. */
 @KoraAppTest(value = AdminTestApp.class, components = UndertowHttpServer.class)
 class AdminWiringIT implements KoraAppTestConfigModifier {
 
     private static final String STATUS = "/kora-outbox/admin/v1/status";
+
+    @TestComponent
+    private AdminTestApp.KeyAuthorizer authorizer;
 
     private final HttpClient client = HttpClient.newHttpClient();
     private final int port = freePort();
@@ -81,8 +85,21 @@ class AdminWiringIT implements KoraAppTestConfigModifier {
         for (var response : new HttpResponse<?>[] {noKey, wrongKey, allowed}) {
             assertThat(response.headers().firstValue("X-Test-Global")).hasValue("1");
         }
-        assertThat(log).as("one audit line, for the allowed call").containsOnlyOnce("outbox admin ")
-                .contains("outbox admin GET " + STATUS + " by tester: 200");
+        assertThat(log.lines().filter(l -> l.contains("outbox admin ")).map(l -> l.substring(l.indexOf("outbox admin "))))
+                .as("one audit line per call").containsExactly(
+                        "outbox admin GET " + STATUS + " denied: 401",
+                        "outbox admin GET " + STATUS + " denied: 403",
+                        "outbox admin GET " + STATUS + " by tester: 200");
+    }
+
+    /** XNIO names its I/O threads {@code kora-undertow I/O-<n>}, the blocking pool {@code kora-undertow task-<n>}. */
+    @Test
+    void authorizerRunsOffTheIoThreads() throws Exception {
+        get(STATUS, null);
+        get(STATUS, "secret");
+
+        assertThat(authorizer.threads).as("a blocking authorizer must not stall the server's I/O threads")
+                .hasSize(2).allSatisfy(t -> assertThat(t).startsWith("kora-undertow task-"));
     }
 
     /** With two files, {@code openapi.management} serves each at {@code <endpoint>/<file name without extension>}. */
