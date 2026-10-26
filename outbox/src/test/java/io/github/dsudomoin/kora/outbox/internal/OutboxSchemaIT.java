@@ -323,7 +323,8 @@ class OutboxSchemaIT {
                         c -> c.retry(Duration.ofSeconds(1), Duration.ofSeconds(1), -1)),
                 Map.entry("outbox.partitions.xidsPerPartition", c -> c.xidsPerPartition(999)),
                 Map.entry("outbox.partitions.premake", c -> c.premake(1)),
-                Map.entry("outbox.partitions.maintenanceInterval", c -> c.maintenanceInterval(Duration.ZERO)));
+                Map.entry("outbox.partitions.maintenanceInterval", c -> c.maintenanceInterval(Duration.ZERO)),
+                Map.entry("outbox.partitions.swapLockTimeout", c -> c.swapLockTimeout(Duration.ZERO)));
 
         try (var c = TestDb.connect()) {
             for (var e : cases) {

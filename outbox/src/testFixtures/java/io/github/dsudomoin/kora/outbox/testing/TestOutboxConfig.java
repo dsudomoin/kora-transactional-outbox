@@ -31,10 +31,13 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private long xidsPerPartition = 1_000_000L;
     private int premake = 4;
     private Duration maintenanceInterval = Duration.ofHours(1); // tests call maintenance directly
+    private Duration swapLockTimeout = Duration.ofMillis(200);
+    private boolean restoreOrphans = true;
     private String inboxTable = TestDb.uniqueTable();
     private Duration inboxPartitionInterval = Duration.ofHours(1);
     private Duration inboxPremake = Duration.ofHours(24);
     private Duration inboxRetention = Duration.ofHours(24);
+    private boolean inboxAttachOrphans = true;
 
     // OutboxConfig
 
@@ -89,6 +92,11 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
             @Override
             public Duration retention() {
                 return inboxRetention;
+            }
+
+            @Override
+            public boolean attachOrphans() {
+                return inboxAttachOrphans;
             }
         };
     }
@@ -273,6 +281,26 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
         return this;
     }
 
+    @Override
+    public Duration swapLockTimeout() {
+        return swapLockTimeout;
+    }
+
+    public TestOutboxConfig swapLockTimeout(Duration swapLockTimeout) {
+        this.swapLockTimeout = swapLockTimeout;
+        return this;
+    }
+
+    @Override
+    public boolean restoreOrphans() {
+        return restoreOrphans;
+    }
+
+    public TestOutboxConfig restoreOrphans(boolean restoreOrphans) {
+        this.restoreOrphans = restoreOrphans;
+        return this;
+    }
+
     // InboxConfig
 
     public TestOutboxConfig inboxTable(String inboxTable) {
@@ -292,6 +320,11 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
 
     public TestOutboxConfig inboxRetention(Duration inboxRetention) {
         this.inboxRetention = inboxRetention;
+        return this;
+    }
+
+    public TestOutboxConfig attachOrphans(boolean attachOrphans) {
+        this.inboxAttachOrphans = attachOrphans;
         return this;
     }
 }

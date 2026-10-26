@@ -54,7 +54,9 @@ class OutboxConfigTest {
                   relay.minTickInterval = 20ms
                   relay.retry.maxAttempts = 5
                   partitions.xidsPerPartition = 1000
+                  partitions.restoreOrphans = false
                   inbox.retention = 2h
+                  inbox.attachOrphans = false
                 }
                 """);
 
@@ -63,7 +65,18 @@ class OutboxConfigTest {
         assertThat(config.relay().minTickInterval()).isEqualTo(Duration.ofMillis(20));
         assertThat(config.relay().retry().maxAttempts()).isEqualTo(5);
         assertThat(config.partitions().xidsPerPartition()).isEqualTo(1000L);
+        assertThat(config.partitions().restoreOrphans()).isFalse();
         assertThat(config.inbox().retention()).isEqualTo(Duration.ofHours(2));
+        assertThat(config.inbox().attachOrphans()).isFalse();
+    }
+
+    @Test
+    void zeroSwapLockTimeoutIsRejected() {
+        var config = parse("outbox.partitions.swapLockTimeout = 0ms");
+
+        assertThatThrownBy(() -> OutboxSchema.validate(config))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("outbox.partitions.swapLockTimeout must be positive: PT0S");
     }
 
     @Test
@@ -104,11 +117,14 @@ class OutboxConfigTest {
         assertThat(partitions.xidsPerPartition()).isEqualTo(16_777_216L);
         assertThat(partitions.premake()).isEqualTo(64);
         assertThat(partitions.maintenanceInterval()).isEqualTo(Duration.ofSeconds(30));
+        assertThat(partitions.swapLockTimeout()).isEqualTo(Duration.ofMillis(200));
+        assertThat(partitions.restoreOrphans()).isTrue();
 
         var inbox = config.inbox();
         assertThat(inbox.table()).isEqualTo("inbox");
         assertThat(inbox.partitionInterval()).isEqualTo(Duration.ofHours(1));
         assertThat(inbox.premake()).isEqualTo(Duration.ofHours(24));
         assertThat(inbox.retention()).isEqualTo(Duration.ofHours(24));
+        assertThat(inbox.attachOrphans()).isTrue();
     }
 }

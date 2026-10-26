@@ -132,6 +132,16 @@ public interface OutboxConfig {
         default Duration maintenanceInterval() {
             return Duration.ofSeconds(30);
         }
+
+        /** Lock wait bound of the short tail-swap transaction, so of a writer's stall per attempt. Default 200 ms. */
+        default Duration swapLockTimeout() {
+            return Duration.ofMillis(200);
+        }
+
+        /** Move rows above the horizon in a range marked for drop back to the outbox; false only logs. Default true. */
+        default boolean restoreOrphans() {
+            return true;
+        }
     }
 
     @ConfigValueExtractor
@@ -151,6 +161,11 @@ public interface OutboxConfig {
 
         default Duration retention() {
             return Duration.ofHours(24);
+        }
+
+        /** Attach a range detached inside the dedup window back by its name's bounds; false only logs. Default true. */
+        default boolean attachOrphans() {
+            return true;
         }
     }
 }

@@ -103,6 +103,8 @@ public final class OutboxSchema implements Lifecycle {
         require(partitions.premake() >= 2, "outbox.partitions.premake must be at least 2: " + partitions.premake());
         require(partitions.maintenanceInterval().compareTo(Duration.ZERO) > 0,
                 "outbox.partitions.maintenanceInterval must be positive: " + partitions.maintenanceInterval());
+        require(partitions.swapLockTimeout().compareTo(Duration.ZERO) > 0,
+                "outbox.partitions.swapLockTimeout must be positive: " + partitions.swapLockTimeout());
     }
 
     static void validateShards(int shards) {

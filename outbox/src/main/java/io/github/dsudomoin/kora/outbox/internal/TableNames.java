@@ -27,6 +27,7 @@ public record TableNames(
     public static final int LOCK_TICK = 2;
     public static final int LOCK_MAINTENANCE = 3;
     public static final int LOCK_INBOX_MAINTENANCE = 4;
+    public static final int LOCK_SWAP = 5;
     public static final int LOCK_SHARD_BASE = 1000;
 
     private static final Pattern NAME =
@@ -103,6 +104,11 @@ public record TableNames(
     /** The ranges maintenance has decided to drop as relayed, from just before their detach until their drop. */
     public String dropping() {
         return base + "_dropping";
+    }
+
+    /** The next tail, created beside the current one before the swap that replaces it. */
+    public String tailNext() {
+        return base + "_tail_next";
     }
 
     public String unqualified(String name) {
