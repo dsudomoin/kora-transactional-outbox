@@ -1,0 +1,15 @@
+{
+  "name": "kora-transactional-outbox",
+  "description": "Agent skills for the kora-transactional-outbox library",
+  "owner": {
+    "name": "d.sudomoin",
+    "url": "https://github.com/dsudomoin"
+  },
+  "plugins": [
+    {
+      "name": "kora-outbox",
+      "source": "./",
+      "description": "Skills for kora-transactional-outbox in Kora 1.x services: sending events, writing handlers, inbox deduplication, testing and operations"
+    }
+  ]
+}
