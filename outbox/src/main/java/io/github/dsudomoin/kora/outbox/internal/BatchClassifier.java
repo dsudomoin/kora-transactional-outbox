@@ -124,7 +124,7 @@ public final class BatchClassifier {
                     actions.add(new Unpark(r));
                 }
             } else if (outcome instanceof Outcome.Requeue requeue) {
-                actions.add(maxRequeues > 0 && r.requeues() >= maxRequeues
+                actions.add(requeueLimitReached(r, maxRequeues)
                         ? new Dead(r, r.attempts(), REQUEUE_LIMIT)
                         : new Park(r, r.requeues() + 1, dueAt(requeueDue, requeue.notBefore(), now)));
             } else if (outcome instanceof Outcome.Permanent p) {
@@ -142,6 +142,11 @@ public final class BatchClassifier {
             }
         }
         return new Decision(false, actions);
+    }
+
+    /** A requeue of {@code r} now goes past a positive {@code maxRequeues}: dead instead of parked. */
+    static boolean requeueLimitReached(OutboxRecord r, int maxRequeues) {
+        return maxRequeues > 0 && r.requeues() >= maxRequeues;
     }
 
     /** {@code max(due, notBefore)}, with {@code notBefore} capped at {@code now + 24h}. */

@@ -73,7 +73,11 @@ public final class ShardProcessor implements AutoCloseable {
      */
     public enum ShardStatus { NOT_LOCKED, NO_WORK, IDLE, PROGRESS, PAUSED }
 
-    /** {@code batchFinished}: no batch is in progress on the shard after the call (false when not locked or paused). */
+    /**
+     * {@code batchFinished}: no batch is in progress on the shard after the call (false when not locked or paused), as
+     * the cursor stands: a step that handed only parked rows and left the chunk of a fresh batch unread stores no
+     * target, so it reports true.
+     */
     public record ShardResult(ShardStatus status, int delivered, boolean batchFinished) {}
 
     private static final Logger log = LoggerFactory.getLogger(ShardProcessor.class);
@@ -289,7 +293,7 @@ public final class ShardProcessor implements AutoCloseable {
             called |= !busy && items.stream().anyMatch(item -> !item.dbBlocked());
             var chunk = items.subList(parkedRows.size(), items.size());
             int read = busy ? 0
-                    : read(chunk, items.subList(0, parkedRows.size()).stream().anyMatch(ShardProcessor::attempted));
+                    : read(chunk, items.subList(0, parkedRows.size()).stream().anyMatch(this::leavesParked));
             items = items.subList(0, busy ? 0 : parkedRows.size() + read);
             // the shard's failures may stem from other rows than a probed head: it is diverted with divertAt attempts
             var decision = BatchClassifier.classify(items, Math.min(cursor.failures(), divertAt - 1), divertAt, now,
@@ -867,15 +871,29 @@ public final class ShardProcessor implements AutoCloseable {
      * attempted row (a call cut at the soft deadline, a handler that stopped early), with any blocked rows among them:
      * the next step reads those again. A NotAttempted with {@code notBefore} is the handler's decision (e.g. a Kafka
      * partition cooling down) and counts as attempted. No chunk row attempted: every row is read, the batch fails as a
-     * whole, unless a parked row of the call was attempted ({@code parkedAttempted}); then none is.
+     * whole, unless a parked row of the call leaves the parked table ({@code parkedLeft}, see {@link #leavesParked});
+     * then none is. Parked rows that were only parked again or kept are no progress: a call of those and an
+     * unattempted chunk fails as a whole too, or a handler cut after them would hand the same call on every step.
      */
-    private static int read(List<Item> chunk, boolean parkedAttempted) {
+    private static int read(List<Item> chunk, boolean parkedLeft) {
         int read = chunk.size();
         boolean unread = false;
         while (read > 0 && !attempted(chunk.get(read - 1))) {
             unread |= !chunk.get(--read).dbBlocked();
         }
-        return unread && (read > 0 || parkedAttempted) ? read : chunk.size();
+        return unread && (read > 0 || parkedLeft) ? read : chunk.size();
+    }
+
+    /**
+     * A parked item whose outcome takes it out of the parked table, as {@link BatchClassifier#classify} settles it
+     * unless the call pauses: delivered (unparked), retried (to the retry table), permanent or past the requeue limit
+     * (to dead). A requeue below the limit (parked again) and a NotAttempted (kept) leave it parked.
+     */
+    private boolean leavesParked(Item item) {
+        var outcome = item.outcome();
+        return outcome instanceof Outcome.Delivered || outcome instanceof Outcome.Retry
+                || outcome instanceof Outcome.Permanent || outcome instanceof Outcome.Requeue
+                && BatchClassifier.requeueLimitReached(item.record(), requeue.maxRequeues());
     }
 
     /** Handed and not a NotAttempted without {@code notBefore}. */

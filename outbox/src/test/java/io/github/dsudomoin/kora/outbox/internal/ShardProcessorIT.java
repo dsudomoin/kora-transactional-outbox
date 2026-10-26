@@ -1954,7 +1954,7 @@ class ShardProcessorIT {
     }
 
     @Test
-    void chunkRowsNotAttemptedAfterAnAttemptedParkedRowAreReadAgain() throws Exception {
+    void chunkRowsNotAttemptedAfterADeliveredParkedRowAreReadAgain() throws Exception {
         bootstrap();
         script = answering(Map.of("k#1", Outcome.requeue()));
         send(msg("t", "k", "k#1"));
@@ -1965,6 +1965,7 @@ class ShardProcessorIT {
         send(msg("t", "k", "k#2"));
         tick();
 
+        // k#1 left the parked table: progress, so the chunk is read again rather than failed
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
 
         assertThat(delivered()).containsExactly("k#1");
@@ -1975,6 +1976,44 @@ class ShardProcessorIT {
         calls.clear();
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
         assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#2"));
+    }
+
+    @Test
+    void aCallOfReParkedRowsAndAnUnattemptedChunkFailsAsAWhole() throws Exception {
+        bootstrap();
+        var later = now.plus(Duration.ofHours(1)); // k#1 is due long after this test
+        script = answering(Map.of("k#1", Outcome.requeue(later)));
+        send(msg("t", "k", "k#1"));
+        tick();
+        process();
+        // k#1 is parked again on every call and the rest is never attempted, e.g. the call is cut right after it
+        script = answering(Map.of("k#1", Outcome.requeue(later), "k#2", Outcome.notAttempted(),
+                "j#1", Outcome.notAttempted()));
+        send(msg("t", "k", "k#2"), msg("t", "j", "j#1"));
+        tick();
+
+        // nothing attempted but a requeue: two keys fail, the call pauses and its requeue is not applied
+        for (int failures = 1; failures <= config.headFailuresBeforeDivert(); failures++) {
+            assertThat(process().status()).isEqualTo(PAUSED);
+            assertThat(cursor().failures()).isEqualTo(failures);
+            assertThat(parkedRows()).containsExactly("k#1:1:" + later);
+            now = cursor().pausedUntil();
+        }
+        // the probe reads k#2 alone, merged with k#1: a single failing key, diverted
+        calls.clear();
+        assertThat(process().status()).isEqualTo(PAUSED);
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1", "k#2"));
+        assertThat(retryRows()).containsExactly("k#2:0:" + now.plus(INITIAL));
+        assertThat(parkedRows()).containsExactly("k#1:2:" + later);
+
+        // k blocked in the retry table hands no record, so k#1 is no longer merged, and the shard goes on with j#1
+        script = answering(Map.of("k#2", Outcome.notAttempted()));
+        now = cursor().pausedUntil();
+        calls.clear();
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, false));
+        assertThat(calls).extracting(call -> payloads(call)).containsExactly(List.of("k#2"), List.of("j#1"));
+        assertThat(delivered()).containsExactly("j#1");
+        assertThat(parkedRows()).containsExactly("k#1:2:" + later);
     }
 
     @Test
