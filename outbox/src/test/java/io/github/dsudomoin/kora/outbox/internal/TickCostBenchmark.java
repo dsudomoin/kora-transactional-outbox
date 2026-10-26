@@ -24,9 +24,11 @@ import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
  * «Заметки о дизайне»). Per shard count: a fresh outbox, partitions at the library defaults, seeded with 1 000 000
  * rows in 100 transactions over every shard. Per ended count E and round: E open transactions each take an xid (variant
  * {@code withRows}: and insert one row into a random shard), one later transaction ends (so P.xip lists the E), tick P
- * is made, the E commit, and the making of tick C is timed: its second probe looks up every xid of P.xip \ C.xip in
- * each shard where the first found nothing. Timed is the whole {@link Ticks#make}, round trips and commit included.
- * Prints p50 and p99 of tick C per (shards, E, variant), after 10 untimed rounds.
+ * is made, the E commit, and tick C is timed twice: its probe alone, then the whole {@link Ticks#make}. The probe's
+ * second branch looks up every xid of P.xip \ C.xip in each shard where the first found nothing. The probe alone is
+ * the statement the tick runs, bound as it binds it, under the tick lock with the tick's settings, then rolled back:
+ * read-only, so its time (one round trip included) does not depend on the WAL flush, unlike the whole make (about 7
+ * round trips and a commit). Prints p50 and p99 of both per (shards, E, variant), after 10 untimed rounds.
  *
  * <p>Not part of the build: {@code ./gradlew :outbox:test -Pbenchmark --tests '*TickCostBenchmark'}. Properties:
  * {@code bench.jdbcUrl}, {@code bench.user}, {@code bench.password} (default: the test container), {@code bench.shards}
@@ -99,7 +101,8 @@ class TickCostBenchmark {
             for (int ended : endedCounts) {
                 var held = open.subList(0, Math.min(ended, open.size()));
                 for (boolean withRows : new boolean[] {false, true}) {
-                    long[] nanos = new long[rounds];
+                    long[] probe = new long[rounds];
+                    long[] make = new long[rounds];
                     for (int r = -WARMUP_ROUNDS; r < rounds; r++) {
                         each(held, c -> execute(c, withRows ? withRow : takeXid));
                         // a later xid ends first, so P's xmax passes the E and P.xip lists them, as among concurrent
@@ -107,19 +110,23 @@ class TickCostBenchmark {
                         execute(tick, takeXid);
                         assertThat(ticks.make(tick, Duration.ZERO)).isTrue(); // P: the E running
                         each(held, Connection::commit);
+                        long probed = probeNanos(ticks, tick, shards); // C's probe alone, P still the newest tick
                         long start = System.nanoTime();
                         boolean made = ticks.make(tick, Duration.ZERO); // C: the E ended since P
                         long took = System.nanoTime() - start;
                         assertThat(made).isTrue();
                         if (r >= 0) {
-                            nanos[r] = took;
+                            probe[r] = probed;
+                            make[r] = took;
                         }
                     }
-                    Arrays.sort(nanos);
-                    System.out.printf(Locale.ROOT,
-                            "tick C | shards %5d | ended %4d%-22s | %-8s | p50 %8.3f ms | p99 %8.3f ms%n", shards,
-                            ended, held.size() < ended ? " (only " + held.size() + " opened)" : "",
-                            withRows ? "withRows" : "noRows", ms(nanos, 0.50), ms(nanos, 0.99));
+                    Arrays.sort(probe);
+                    Arrays.sort(make);
+                    System.out.printf(Locale.ROOT, "tick C | shards %5d | ended %4d%-22s | %-8s"
+                                    + " | probe p50 %8.3f ms, p99 %8.3f ms | make p50 %8.3f ms, p99 %8.3f ms%n",
+                            shards, ended, held.size() < ended ? " (only " + held.size() + " opened)" : "",
+                            withRows ? "withRows" : "noRows", ms(probe, 0.50), ms(probe, 0.99), ms(make, 0.50),
+                            ms(make, 0.99));
                 }
             }
         } finally {
@@ -128,6 +135,31 @@ class TickCostBenchmark {
             }
             execute(tick, "drop table if exists " + String.join(", ", names.base(), names.tick(), names.cursor(),
                     names.retry(), names.dead(), names.halt(), names.maintenance(), names.dropping()) + " cascade");
+        }
+    }
+
+    /**
+     * The nanoseconds of the probe of a tick made now, alone: {@link Ticks#make}'s settings and tick lock, then its
+     * probe statement bound as {@code Ticks.insert} binds it (minimum interval 0), executed and its row read; rolled
+     * back, so no tick is made.
+     */
+    private static long probeNanos(Ticks ticks, Connection c, int shards) throws SQLException {
+        c.setAutoCommit(false);
+        try {
+            ticks.lockForTest(c);
+            try (var ps = c.prepareStatement(ticks.probe(c))) {
+                ps.setInt(1, shards);
+                ps.setLong(2, 0);
+                long start = System.nanoTime();
+                try (var rs = ps.executeQuery()) {
+                    assertThat(rs.next()).isTrue();
+                    rs.getString(3);
+                }
+                return System.nanoTime() - start;
+            }
+        } finally {
+            c.rollback();
+            c.setAutoCommit(true);
         }
     }
 

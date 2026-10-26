@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # shard-cost: what the shard count costs at the library defaults (the §10.2 criteria of the zero-touch operations
-# design). Once, the stand's background with the app stopped; then per shard count in the arguments or RUNS (default
-# 32), each phase on a fresh outbox table: idle (relay on, no load, no consumer), bulk (2 writers x 10 000 messages,
-# noop handler, no consumer) and low-load at 100 and 1000 msg/s (order mode, Kafka handler, consumer 12 threads, as
-# low-load.sh). Every shard count runs the same sequence, so each phase follows the same predecessor. The relay at the
+# design), for the shard counts in the arguments or RUNS (default 32), each phase on a fresh outbox table. First the
+# quiet phases: the stand's background with the app stopped, then idle (relay on, no load, no consumer) for every shard
+# count, so no idle window follows a load phase (autovacuum, vacuum after drops and full-page writes of a load run would
+# land in it). Then per shard count the load phases: bulk (2 writers x 10 000 messages, noop handler, no consumer) and
+# low-load at 100 and 1000 msg/s (order mode, Kafka handler, consumer 12 threads, as low-load.sh). The relay at the
 # library defaults: workers 4 and batchSize 1000 set (the bench app's own defaults are 8 and 2000), every other outbox
 # setting unset. Each phase: WARMUP s, then a STEADY s window. Appends its section (in Russian) to RESULTS.
 source "$(dirname "$0")/lib.sh"
@@ -32,15 +33,15 @@ counters_stop() {
   COMMIT_S=$(calc "($c1 - $C0) / ($T1 - $T0)")
 }
 
-# sizes BASE: "total partitions rest" in MB: the partitions of BASE, and its tick, cursor, retry, dead and (once it
-# exists) parked tables.
+# sizes BASE: "partitions rest" in bytes: the partitions of BASE, and its tick, cursor, retry, dead and (once it exists)
+# parked tables.
 sizes() {
-  psql_q "select round(p / 1048576.0, 1) + round(r / 1048576.0, 1), round(p / 1048576.0, 1), round(r / 1048576.0, 1)
-    from (select (select coalesce(sum(pg_total_relation_size(relid)), 0) from pg_partition_tree('$1')) p,
-      pg_total_relation_size('${1}_tick') + pg_total_relation_size('${1}_cursor')
-        + pg_total_relation_size('${1}_retry') + pg_total_relation_size('${1}_dead')
-        + coalesce(pg_total_relation_size(to_regclass('${1}_parked')), 0) r) s" | tr '|' ' '
+  psql_q "select (select coalesce(sum(pg_total_relation_size(relid)), 0) from pg_partition_tree('$1')),
+    pg_total_relation_size('${1}_tick') + pg_total_relation_size('${1}_cursor')
+      + pg_total_relation_size('${1}_retry') + pg_total_relation_size('${1}_dead')
+      + coalesce(pg_total_relation_size(to_regclass('${1}_parked')), 0)" | tr '|' ' '
 }
+mb() { f1 "$(calc "$1 / 1048576")"; }
 
 drop_all() { drop_outbox "$1"; psql_q "drop table if exists ${1}_parked" > /dev/null; }
 span() { echo "$(utc "$1" | cut -c12-) – $(utc "$2" | cut -c12-)"; }
@@ -71,7 +72,7 @@ idle() { # idle SHARDS
 }
 
 bulk() { # bulk SHARDS
-  local shards=$1 table=bench_shardcost_s$1_bulk id d0 d1 total parts rest
+  local shards=$1 table=bench_shardcost_s$1_bulk id d0 d1 stored parts rest
   log "shard-cost-s$shards-bulk"
   drop_all "$table"
   app_start "shard-cost-s$shards-bulk" "${DEFAULTS[@]}" CONSUMER_THREADS=0 BENCH_HANDLER=noop OUTBOX_TABLE="$table" \
@@ -82,7 +83,9 @@ bulk() { # bulk SHARDS
   d0=$(metric outbox_messages_delivered_total); counters_start; cpu_start
   sleep "$STEADY"
   counters_stop; d1=$(metric outbox_messages_delivered_total); cpu_stop
-  read -r total parts rest <<< "$(sizes "$table")"
+  # every committed message is still stored: a partition holds 16M xids, so maintenance drops none during the run
+  stored=$(metric bench_messages_sent_total)
+  read -r parts rest <<< "$(sizes "$table")"
   load_stop
   mark_end "$id"
   window "$T0" "$T1"
@@ -90,7 +93,8 @@ bulk() { # bulk SHARDS
   app_stop
   drop_all "$table"
   row BULK_ROWS "| $shards | $(f0 "$COMMITTED") | $(f0 "$DELIVERED") | $(f3 "$P50") / $(f3 "$P99") s | $(f0 "$GROWTH") \
-| $CPU % | $(f0 "$(calc "$WAL_B / max($d1 - $d0, 1)")") | $(f1 "$batches") | $total ($parts + $rest) | $(span "$T0" "$T1") |"
+| $CPU % | $(f0 "$(calc "$WAL_B / max($d1 - $d0, 1)")") | $(f1 "$batches") | $(mb "$parts") \
+| $(f0 "$(calc "$parts / max($stored, 1)")") | $(mb "$rest") | $(span "$T0" "$T1") |"
 }
 
 low() { # low SHARDS RATE
@@ -121,8 +125,8 @@ started=$(date -u +'%Y-%m-%d %H:%M')
 commit=$(git -C "$ROOT" rev-parse --short HEAD)
 git -C "$ROOT" diff --quiet HEAD -- || commit="$commit + незакоммиченные изменения"
 background
+for s in $RUNS; do idle "$s"; done
 for s in $RUNS; do
-  idle "$s"
   bulk "$s"
   low "$s" 100
   low "$s" 1000
@@ -136,10 +140,12 @@ out << EOF
 
 Библиотека на настройках по умолчанию (relay workers 4, \`batchSize = 1000\`, \`minTickInterval = 50ms\`,
 \`idlePollInterval = 200ms\`, партиции по умолчанию), меняется только \`outbox.shards\`. Каждый прогон: новая
-таблица outbox, ${WARMUP} с прогрева, затем окно ${STEADY} с; для каждого числа шардов одна и та же последовательность
-прогонов (простой, bulk, малая нагрузка 100 и 1000 msg/s). xid/с — прирост следующего xid кластера (транзакции с
-записью), WAL B/с — прирост \`pg_current_wal_lsn()\`, коммитов/с — прирост \`pg_stat_database.xact_commit\` базы
-(вместе с читающими транзакциями, postgres-exporter включён). CPU БД — среднее по \`docker stats\` (200 % = оба CPU).
+таблица outbox, ${WARMUP} с прогрева, затем окно ${STEADY} с. Сначала тихие прогоны: фон, затем простой для всех
+чисел шардов, чтобы окно простоя не шло сразу после нагрузки (autovacuum, очистка после удаления таблиц и full-page
+writes нагрузочного прогона попали бы в него); затем для каждого числа шардов bulk и малая нагрузка 100 и 1000 msg/s.
+xid/с — прирост следующего xid кластера (транзакции с записью), WAL B/с — прирост \`pg_current_wal_lsn()\`,
+коммитов/с — прирост \`pg_stat_database.xact_commit\` базы (вместе с читающими транзакциями, postgres-exporter
+включён). CPU БД — среднее по \`docker stats\` (200 % = оба CPU).
 
 ### Простой
 
@@ -152,11 +158,13 @@ $IDLE_ROWS
 ### bulk
 
 2 писателя × 10 000 сообщений на транзакцию, payload 100 байт, обработчик noop, без консьюмера. WAL на сообщение —
-прирост WAL за окно, делённый на прирост \`outbox_messages_delivered_total\` за то же окно. Размер — в конце окна,
-\`pg_total_relation_size\` партиций таблицы плюс её tick, cursor, retry и dead.
+прирост WAL за окно, делённый на прирост \`outbox_messages_delivered_total\` за то же окно. Размеры — в конце окна,
+\`pg_total_relation_size\`: партиции таблицы и служебные таблицы (tick, cursor, retry, dead). Размер партиций растёт с
+числом записанных сообщений, поэтому рядом он поделён на число хранимых сообщений (\`bench_messages_sent_total\` в
+конце окна: обслуживание за прогон не удаляет ни одной партиции, в каждой 16M xid).
 
-| шарды | записано msg/s | доставлено msg/s | задержка p50 / p99 | Δ очереди | CPU БД | WAL B/сообщение | пакетов relay/с | размер МБ (партиции + служебные) | окно (UTC) |
-|---|---|---|---|---|---|---|---|---|---|
+| шарды | записано msg/s | доставлено msg/s | задержка p50 / p99 | Δ очереди | CPU БД | WAL B/сообщение | пакетов relay/с | партиции МБ | партиции B/сообщение | служебные МБ | окно (UTC) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
 $BULK_ROWS
 ### Малая нагрузка
 
