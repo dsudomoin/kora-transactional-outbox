@@ -45,11 +45,15 @@ Measured in RESULTS «Задержка при малой нагрузке и ч�
 
 | msg/s | shards | DB CPU (of 200 %) | delivery p50 / p99 |
 |---|---|---|---|
-| 100 | 1 / 32 / 128 | 9 / 49 / 111 % | 30 / 42 / 81 ms, 104 / 121 / 167 ms |
-| 1 000 | 1 / 32 | 24 / 75 % | 35 / 76 ms, 108 / 152 ms |
+| 100 | 1 / 32 / 128 | 10 / 20 / 34 % | 31 / 34 / 36 ms, 105 / 110 / 113 ms |
+| 1 000 | 1 / 32 | 26 / 81 % | 37 / 77 ms, 109 / 153 ms |
 
-- Idle shards cost database CPU and latency today, so use modest counts for low and medium traffic: **4–8**.
-  **A fix that makes idle shards cheap is in progress; this guidance will be updated.**
+- A shard without new rows is stepped once every 5 s and costs almost nothing. A shard that got rows since the last
+  tick costs one step transaction (~12 statements) per tick. So the cost follows how many shards get rows per tick:
+  small at 100 msg/s, but at 1 000 msg/s nearly every one of 32 shards gets rows on every tick (81 % against 26 % DB
+  CPU, +40 ms p50).
+- Size shards for the parallelism you need, not more: **4–8** for low and medium traffic, more only when the shards
+  that run at once (min(shards, instances × workers)) cannot keep up.
 - One shard covered 1 000 msg/s with one relay batch every ~65 ms taking 9 ms (15.5 batches/s × 9 ms ≈ 14 % of one
   worker).
 - High throughput needs at least 2 shards. In RESULTS «bulk» / «Повторная проверка производительности на финальном
@@ -83,8 +87,9 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic orders --partitions
 **Postgres:** 2 × 12 = 24 connections. Each transaction holds 1 key lock, so the default `max_locks_per_transaction`
 (64) is enough.
 
-**Why these numbers:** 4 shards instead of 32 at 100 msg/s: 9–49 % DB CPU range measured for 1–32 shards, and idle
-cost 1/0.2 + 4/5 = 5.8 against 11.4 write transactions per second. Several shards still let a stalled handler call
+**Why these numbers:** 4 shards instead of 32: fewer shards get rows per tick, so fewer step transactions (at 100
+msg/s, 32 shards measured 20 % DB CPU against 10 % for one), and idle cost 1/0.2 + 4/5 = 5.8 against 11.4 write
+transactions per second. Several shards still let a stalled handler call
 hold only its own shard. Workers = shards / instances gives every shard a worker with no idle extras. Producer
 timeouts stay at the defaults, so `batchTimeout` 30 s meets 20 + 5 + 5.
 
