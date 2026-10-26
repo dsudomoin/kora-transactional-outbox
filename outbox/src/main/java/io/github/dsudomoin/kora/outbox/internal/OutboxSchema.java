@@ -70,6 +70,7 @@ public final class OutboxSchema implements Lifecycle {
     public static void validate(OutboxConfig config) {
         var relay = config.relay();
         var retry = relay.retry();
+        var requeue = relay.requeue();
         var partitions = config.partitions();
         validateShards(config.shards());
         require(relay.workers() >= 1, "outbox.relay.workers must be at least 1: " + relay.workers());
@@ -92,6 +93,10 @@ public final class OutboxSchema implements Lifecycle {
                 "outbox.relay.retry.maxDelay must be at least outbox.relay.retry.initialDelay: " + retry.maxDelay());
         require(retry.maxAttempts() >= 0,
                 "outbox.relay.retry.maxAttempts must not be negative: " + retry.maxAttempts());
+        require(requeue.delay().compareTo(Duration.ZERO) > 0,
+                "outbox.relay.requeue.delay must be positive: " + requeue.delay());
+        require(requeue.maxRequeues() >= 0,
+                "outbox.relay.requeue.maxRequeues must not be negative: " + requeue.maxRequeues());
         require(partitions.xidsPerPartition() >= 1000,
                 "outbox.partitions.xidsPerPartition must be at least 1000: " + partitions.xidsPerPartition());
         require(partitions.premake() >= 2, "outbox.partitions.premake must be at least 2: " + partitions.premake());

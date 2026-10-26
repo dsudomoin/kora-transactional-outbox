@@ -13,6 +13,9 @@ import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Decision;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Follower;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Head;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Item;
+import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Keep;
+import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Park;
+import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Unpark;
 import jakarta.annotation.Nullable;
 import java.time.Duration;
 import java.time.Instant;
@@ -27,6 +30,7 @@ class BatchClassifierTest {
     private static final Duration INITIAL = Duration.ofSeconds(1);
     private static final Duration MAX = Duration.ofMinutes(5);
     private static final int THRESHOLD = 3;
+    private static final Duration DELAY = Duration.ofSeconds(1);
     private static final RuntimeException DOWN = new RuntimeException("down");
     private static final Decision PAUSE = new Decision(true, List.of());
 
@@ -196,8 +200,106 @@ class BatchClassifierTest {
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
+    @Test
+    void requeueParksTheRecordAndLetsItsKeyGo() {
+        var k1 = record("t", "k");
+        var k2 = record("t", "k");
+        var k3 = record("t", "k");
+
+        assertThat(classify(0, requeue(k1), delivered(k2), retry(k3)))
+                .isEqualTo(advance(new Park(k1, 1, NOW.plus(DELAY)), head(k3, 1)));
+    }
+
+    @Test
+    void requeueOnlyAdvancesWithoutPause() {
+        var a = record("t", "a");
+        var b = record("t", "b");
+
+        assertThat(classify(0, requeue(a), requeue(b)))
+                .isEqualTo(advance(new Park(a, 1, NOW.plus(DELAY)), new Park(b, 1, NOW.plus(DELAY))));
+    }
+
+    @Test
+    void requeueAfterItsKeyFailedIsAFollower() {
+        var k1 = record("t", "k");
+        var k2 = record("t", "k");
+
+        assertThat(classify(THRESHOLD - 1, retry(k1), requeue(k2)))
+                .as("parked, k2 would overtake its failed predecessor")
+                .isEqualTo(advance(head(k1, THRESHOLD), new Follower(k2)));
+    }
+
+    @Test
+    void requeueInAPausedCallIsNotApplied() {
+        assertThat(classify(0, requeue(record("t", "a")), retry(record("t", "b")), retry(record("t", "c"))))
+                .isEqualTo(PAUSE);
+    }
+
+    @Test
+    void requeueDueTime() {
+        var plain = record("t", "a");
+        var later = record("t", "b");
+        var past = record("t", "c");
+        var early = record("t", "d");
+        var farAway = record("t", "e");
+
+        assertThat(classify(0, requeue(plain), requeue(later, NOW.plusSeconds(10)),
+                requeue(past, NOW.minusSeconds(1)), requeue(early, NOW.plusMillis(100)),
+                requeue(farAway, NOW.plus(Duration.ofHours(30))))).isEqualTo(advance(
+                new Park(plain, 1, NOW.plus(DELAY)),
+                new Park(later, 1, NOW.plusSeconds(10)),
+                new Park(past, 1, NOW.plus(DELAY)), // never before the delay: no busy loop
+                new Park(early, 1, NOW.plus(DELAY)),
+                new Park(farAway, 1, NOW.plus(Duration.ofHours(24))))); // notBefore capped at 24 h
+    }
+
+    @Test
+    void requeueLimitGoesToDead() {
+        var atLimit = record("t", "a", 4, 2);
+        var belowLimit = record("t", "b", 0, 1);
+        var veteran = record("t", "c", 0, 1_000);
+
+        assertThat(classify(0, 2, requeue(atLimit), requeue(belowLimit))).isEqualTo(advance(
+                new Dead(atLimit, 4, "requeue limit reached"), // attempts unchanged: a requeue is no attempt
+                new Park(belowLimit, 2, NOW.plus(DELAY))));
+        assertThat(classify(0, requeue(veteran)))
+                .as("maxRequeues 0 never dead-letters")
+                .isEqualTo(advance(new Park(veteran, 1_001, NOW.plus(DELAY))));
+    }
+
+    @Test
+    void parkedItemOutcomes() {
+        var delivered = record("t", "a", 0, 1);
+        var skipped = record("t", "b", 0, 1);
+        var afterSkipped = record("t", "b");
+        var failed = record("t", "c", 2, 1);
+        var afterFailed = record("t", "c", 0, 1);
+        var bad = record("t", "d", 2, 1);
+        var error = new OutboxPermanentException("bad");
+
+        assertThat(classify(0, parked(delivered, Outcome.delivered()), parked(skipped, Outcome.notAttempted()),
+                delivered(afterSkipped), parked(failed, Outcome.retry(DOWN)), parked(afterFailed, Outcome.delivered()),
+                parked(bad, Outcome.permanent(error)))).isEqualTo(advance(
+                new Unpark(delivered),
+                new Keep(skipped, NOW.plus(DELAY)), // stays parked and lets its key go: afterSkipped is no follower
+                head(failed, 3), // its 2 earlier attempts count: due after backoff(2)
+                new Follower(afterFailed),
+                new Dead(bad, 3, error.toString())));
+    }
+
+    @Test
+    void parkedItemsCannotBeDbBlocked() {
+        assertThatThrownBy(() -> new Item(record("t", "k"), true, null, true))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
     private static Decision classify(int priorFailures, Item... items) {
-        return BatchClassifier.classify(List.of(items), priorFailures, THRESHOLD, NOW, INITIAL, MAX);
+        return classify(priorFailures, 0, items);
+    }
+
+    private static Decision classify(int priorFailures, int maxRequeues, Item... items) {
+        return BatchClassifier.classify(List.of(items), priorFailures, THRESHOLD, NOW, INITIAL, MAX, DELAY,
+                maxRequeues);
     }
 
     private static Decision advance(Action... actions) {
@@ -230,8 +332,24 @@ class BatchClassifierTest {
         return new Item(r, true, null);
     }
 
+    private static Item requeue(OutboxRecord r) {
+        return new Item(r, false, Outcome.requeue());
+    }
+
+    private static Item requeue(OutboxRecord r, Instant notBefore) {
+        return new Item(r, false, Outcome.requeue(notBefore));
+    }
+
+    private static Item parked(OutboxRecord r, Outcome outcome) {
+        return new Item(r, false, outcome, true);
+    }
+
     private OutboxRecord record(String topic, @Nullable String key) {
+        return record(topic, key, 0, 0);
+    }
+
+    private OutboxRecord record(String topic, @Nullable String key, int attempts, int requeues) {
         return new OutboxRecord(ids.incrementAndGet(), UUID.randomUUID(), topic,
-                key == null ? null : key.getBytes(UTF_8), null, List.of(), NOW, 0);
+                key == null ? null : key.getBytes(UTF_8), null, List.of(), NOW, attempts, requeues);
     }
 }

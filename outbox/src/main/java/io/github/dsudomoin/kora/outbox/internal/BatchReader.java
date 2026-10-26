@@ -89,6 +89,7 @@ public final class BatchReader {
                             rs.getBytes(5),
                             HeaderCodec.decode(rs.getBytes(6)),
                             rs.getObject(7, OffsetDateTime.class).toInstant(),
+                            0,
                             0);
                     rows.add(new BatchRow(record, rs.getBoolean(8)));
                 }

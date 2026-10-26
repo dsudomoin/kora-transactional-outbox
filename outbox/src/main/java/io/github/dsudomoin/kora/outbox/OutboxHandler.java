@@ -29,6 +29,9 @@ public interface OutboxHandler {
      * Delivers records in list order and returns one {@link Outcome} per record, in the same order. Contract: never
      * deliver a record whose (topic, key) already failed earlier in this call.
      *
+     * <p>{@link Outcome#requeue()} sets a record aside without blocking its key. The default never returns it: a
+     * handler that needs it overrides {@code handleBatch}; {@link #byTopic} passes it through like any outcome.
+     *
      * <p>Report failures as outcomes. A call that throws (an {@link Error} included) or returns an invalid list (null,
      * wrong size, a null element) fails every record of the call transiently ({@code Retry}), records it already
      * delivered included, which are delivered again; only a call of a single record that throws

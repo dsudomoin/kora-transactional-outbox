@@ -259,6 +259,23 @@ class OutboxHandlerTest {
     }
 
     @Test
+    void byTopicPassesRequeueThrough() {
+        OutboxHandler requeueing = new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {}
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                return records.stream().map(r -> Outcome.requeue()).toList();
+            }
+        };
+        var handler = OutboxHandler.byTopic(Map.of("q", requeueing), new RecordingHandler());
+
+        assertThat(handler.handleBatch(List.of(record("t", "k"), record("q", "k"), record("t", null))))
+                .containsExactly(Outcome.delivered(), Outcome.requeue(), Outcome.delivered());
+    }
+
+    @Test
     void handleSeesTraceContextOfRecord() {
         var traceIds = new ArrayList<String>();
         OutboxHandler handler = r -> traceIds.add(OpentelemetryContext.getSpan() == null
@@ -283,6 +300,9 @@ class OutboxHandlerTest {
         assertThat(Outcome.permanent(e)).isEqualTo(new Outcome.Permanent(e));
         assertThat(Outcome.notAttempted()).isEqualTo(new Outcome.NotAttempted(null));
         assertThat(Outcome.notAttempted(at)).isEqualTo(new Outcome.NotAttempted(at));
+        assertThat(Outcome.requeue()).isEqualTo(new Outcome.Requeue(null));
+        assertThat(Outcome.requeue(at)).isEqualTo(new Outcome.Requeue(at));
+        assertThatThrownBy(() -> Outcome.requeue(null)).isInstanceOf(NullPointerException.class);
         assertThat(new OutboxPermanentException("m", e)).hasMessage("m").hasCause(e);
     }
 
@@ -292,6 +312,6 @@ class OutboxHandlerTest {
 
     private static OutboxRecord record(String topic, @Nullable String key, List<OutboxHeader> headers) {
         return new OutboxRecord(IDS.incrementAndGet(), UUID.randomUUID(), topic,
-                key == null ? null : key.getBytes(UTF_8), new byte[] {1}, headers, Instant.now(), 0);
+                key == null ? null : key.getBytes(UTF_8), new byte[] {1}, headers, Instant.now(), 0, 0);
     }
 }

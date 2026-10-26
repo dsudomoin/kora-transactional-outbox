@@ -3,6 +3,7 @@ package io.github.dsudomoin.kora.outbox.internal;
 import io.github.dsudomoin.kora.outbox.OutboxRecord;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Action;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Dead;
+import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Follower;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Head;
 import jakarta.annotation.Nullable;
 import java.sql.Array;
@@ -68,7 +69,10 @@ public final class RetryStore {
         deadSize = "select count(*) from " + dead;
     }
 
-    /** Heads and followers into the retry table, dead rows into the dead table; one JDBC batch each. */
+    /**
+     * Heads and followers into the retry table, dead rows into the dead table; one JDBC batch each. Any other action
+     * fails, so the shard step rolls back.
+     */
     public void apply(Connection inTx, int shard, List<Action> actions) throws SQLException {
         if (actions.isEmpty()) {
             return;
@@ -83,7 +87,7 @@ public final class RetryStore {
                     dead.setString(10, errorText(d.error()));
                     dead.addBatch();
                     deads++;
-                } else {
+                } else if (action instanceof Head || action instanceof Follower) {
                     var head = action instanceof Head h ? h : null;
                     bindRow(retry, shard, action.r());
                     retry.setInt(9, head == null ? 0 : head.attempts());
@@ -95,6 +99,8 @@ public final class RetryStore {
                     retry.setString(11, head == null ? null : errorText(head.error()));
                     retry.addBatch();
                     retries++;
+                } else {
+                    throw new IllegalStateException("not a retry or dead table action: " + action);
                 }
             }
             if (retries > 0) {
@@ -234,7 +240,8 @@ public final class RetryStore {
                 rs.getBytes(first + 4),
                 HeaderCodec.decode(rs.getBytes(first + 5)),
                 rs.getObject(first + 6, OffsetDateTime.class).toInstant(),
-                rs.getInt(first + 7));
+                rs.getInt(first + 7),
+                0);
     }
 
     private static Array ids(Connection c, List<OutboxRecord> rows) throws SQLException {

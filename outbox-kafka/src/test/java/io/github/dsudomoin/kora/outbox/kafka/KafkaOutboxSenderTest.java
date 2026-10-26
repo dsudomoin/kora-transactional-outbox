@@ -505,7 +505,7 @@ class KafkaOutboxSenderTest {
         var messageId = UUID.randomUUID();
         var headers = List.of(new OutboxHeader("traceparent", "00-trace".getBytes(UTF_8)), new OutboxHeader("x", null));
         var record = new OutboxRecord(1, messageId, TOPIC, "k".getBytes(UTF_8), "v".getBytes(UTF_8), headers,
-                Instant.now(), 0);
+                Instant.now(), 0, 0);
 
         var result = sendAsync(sender, List.of(record));
         var producer = awaitSent(0, 1);
@@ -1100,7 +1100,7 @@ class KafkaOutboxSenderTest {
 
     private static OutboxRecord record(long id, String topic, @Nullable String key, String payload) {
         return new OutboxRecord(id, UUID.randomUUID(), topic, key == null ? null : key.getBytes(UTF_8),
-                payload.getBytes(UTF_8), List.of(), Instant.now(), 0);
+                payload.getBytes(UTF_8), List.of(), Instant.now(), 0, 0);
     }
 
     private static void sleep(long millis) {

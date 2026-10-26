@@ -4,13 +4,13 @@ import io.github.dsudomoin.kora.outbox.OutboxConfig;
 import java.time.Duration;
 
 /**
- * Mutable config with fast test defaults and fresh {@link TestDb#uniqueTable()} names for both tables. Relay, retry
- * and partition settings live on this object itself ({@link #relay()}, {@link #retry()} and {@link #partitions()}
- * return {@code this}); the inbox block is separate because its {@code table()} and {@code premake()} clash with the
- * outbox ones.
+ * Mutable config with fast test defaults and fresh {@link TestDb#uniqueTable()} names for both tables. Relay, retry,
+ * requeue and partition settings live on this object itself ({@link #relay()}, {@link #retry()}, {@link #requeue()}
+ * and {@link #partitions()} return {@code this}); the inbox block is separate because its {@code table()} and
+ * {@code premake()} clash with the outbox ones.
  */
-public final class TestOutboxConfig
-        implements OutboxConfig, OutboxConfig.RelayConfig, OutboxConfig.RetryConfig, OutboxConfig.PartitionsConfig {
+public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayConfig, OutboxConfig.RetryConfig,
+        OutboxConfig.RequeueConfig, OutboxConfig.PartitionsConfig {
 
     private String table = TestDb.uniqueTable();
     private int shards = 4;
@@ -26,6 +26,8 @@ public final class TestOutboxConfig
     private Duration retryInitial = Duration.ofMillis(50);
     private Duration retryMax = Duration.ofMillis(500);
     private int retryMaxAttempts = 0;
+    private Duration requeueDelay = Duration.ofMillis(100);
+    private int maxRequeues = 0;
     private long xidsPerPartition = 1_000_000L;
     private int premake = 4;
     private Duration maintenanceInterval = Duration.ofHours(1); // tests call maintenance directly
@@ -195,6 +197,11 @@ public final class TestOutboxConfig
         return this;
     }
 
+    @Override
+    public RequeueConfig requeue() {
+        return this;
+    }
+
     // RetryConfig
 
     @Override
@@ -210,6 +217,28 @@ public final class TestOutboxConfig
     @Override
     public int maxAttempts() {
         return retryMaxAttempts;
+    }
+
+    // RequeueConfig
+
+    @Override
+    public Duration delay() {
+        return requeueDelay;
+    }
+
+    public TestOutboxConfig requeueDelay(Duration requeueDelay) {
+        this.requeueDelay = requeueDelay;
+        return this;
+    }
+
+    @Override
+    public int maxRequeues() {
+        return maxRequeues;
+    }
+
+    public TestOutboxConfig maxRequeues(int maxRequeues) {
+        this.maxRequeues = maxRequeues;
+        return this;
     }
 
     // PartitionsConfig

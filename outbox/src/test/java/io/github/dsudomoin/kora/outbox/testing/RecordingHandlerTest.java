@@ -13,8 +13,10 @@ import org.junit.jupiter.api.Test;
 
 class RecordingHandlerTest {
 
-    private final OutboxRecord a = new OutboxRecord(1, UUID.randomUUID(), "a", null, null, List.of(), Instant.now(), 0);
-    private final OutboxRecord b = new OutboxRecord(2, UUID.randomUUID(), "b", null, null, List.of(), Instant.now(), 0);
+    private final OutboxRecord a =
+            new OutboxRecord(1, UUID.randomUUID(), "a", null, null, List.of(), Instant.now(), 0, 0);
+    private final OutboxRecord b =
+            new OutboxRecord(2, UUID.randomUUID(), "b", null, null, List.of(), Instant.now(), 0, 0);
 
     @Test
     void scriptsFailuresBatchThrowsAndDelay() {

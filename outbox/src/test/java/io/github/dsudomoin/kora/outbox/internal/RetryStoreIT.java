@@ -10,6 +10,7 @@ import io.github.dsudomoin.kora.outbox.OutboxRecord;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Dead;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Follower;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Head;
+import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Park;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
 import jakarta.annotation.Nullable;
@@ -246,6 +247,15 @@ class RetryStoreIT {
         assertThat(store.deadSize(c)).isZero();
     }
 
+    @Test
+    void applyRejectsActionsOfOtherTables() throws SQLException {
+        var head = new Head(record("t", "k"), 1, NOW, "e");
+        var park = new Park(record("t", "k2"), 1, NOW);
+
+        assertThatThrownBy(() -> store.apply(c, 0, List.of(head, park))).isInstanceOf(IllegalStateException.class);
+        assertThat(store.size(c)).as("nothing written").isZero();
+    }
+
     private String lastError(long id) throws SQLException {
         return retryRow(id).split("\\|", 3)[2];
     }
@@ -294,6 +304,6 @@ class RetryStoreIT {
     private OutboxRecord record(String topic, @Nullable String key, List<OutboxHeader> headers) {
         long id = ++nextId;
         return new OutboxRecord(id, UUID.randomUUID(), topic, key == null ? null : key.getBytes(UTF_8),
-                ("payload" + id).getBytes(UTF_8), headers, NOW.minusSeconds(60), 0);
+                ("payload" + id).getBytes(UTF_8), headers, NOW.minusSeconds(60), 0, 0);
     }
 }

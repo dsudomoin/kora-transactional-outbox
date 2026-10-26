@@ -35,6 +35,21 @@ public sealed interface Outcome {
         return new NotAttempted(Objects.requireNonNull(notBefore, "notBefore"));
     }
 
+    /**
+     * Not now: the record steps aside (it is parked) so the later records of its (topic, key) go on, and is handed
+     * again ahead of the next record of its key, or at {@code now + outbox.relay.requeue.delay} if none comes first.
+     * Not a failure: it counts no attempt and does not pause the shard. Each requeue adds one to
+     * {@link OutboxRecord#requeues()}; past {@code outbox.relay.requeue.maxRequeues} the record goes to the dead table.
+     */
+    static Outcome requeue() {
+        return new Requeue(null);
+    }
+
+    /** {@link #requeue()} due at {@code max(now + delay, notBefore)}, {@code notBefore} capped at 24 h from now. */
+    static Outcome requeue(Instant notBefore) {
+        return new Requeue(Objects.requireNonNull(notBefore, "notBefore"));
+    }
+
     enum Delivered implements Outcome {
         INSTANCE;
 
@@ -57,4 +72,6 @@ public sealed interface Outcome {
     }
 
     record NotAttempted(@Nullable Instant notBefore) implements Outcome {}
+
+    record Requeue(@Nullable Instant notBefore) implements Outcome {}
 }

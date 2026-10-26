@@ -80,6 +80,10 @@ public interface OutboxConfig {
         default RetryConfig retry() {
             return new RetryConfig() {};
         }
+
+        default RequeueConfig requeue() {
+            return new RequeueConfig() {};
+        }
     }
 
     @ConfigValueExtractor
@@ -95,6 +99,21 @@ public interface OutboxConfig {
 
         /** 0 = retry forever. */
         default int maxAttempts() {
+            return 0;
+        }
+    }
+
+    /** Records the handler set aside with {@link Outcome#requeue()}. */
+    @ConfigValueExtractor
+    interface RequeueConfig {
+
+        /** A requeued record is due {@code delay} later, or at the handler's later {@code notBefore}. */
+        default Duration delay() {
+            return Duration.ofSeconds(1);
+        }
+
+        /** Requeues a record may take; the one past it moves the record to the dead table. 0 = unlimited. */
+        default int maxRequeues() {
             return 0;
         }
     }

@@ -142,7 +142,7 @@ class ShardProcessorTest {
     }
 
     private static OutboxRecord record(long id, String key) {
-        return new OutboxRecord(id, UUID.randomUUID(), "t", key.getBytes(), new byte[0], List.of(), Instant.EPOCH, 0);
+        return new OutboxRecord(id, UUID.randomUUID(), "t", key.getBytes(), new byte[0], List.of(), Instant.EPOCH, 0, 0);
     }
 
     /** Ticks with consecutive ids from {@code firstId}. */

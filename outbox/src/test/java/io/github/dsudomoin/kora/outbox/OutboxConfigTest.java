@@ -1,8 +1,10 @@
 package io.github.dsudomoin.kora.outbox;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.typesafe.config.ConfigFactory;
+import io.github.dsudomoin.kora.outbox.internal.OutboxSchema;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.config.common.extractor.DurationConfigValueExtractor;
@@ -13,8 +15,9 @@ class OutboxConfigTest {
 
     private static final DurationConfigValueExtractor DURATION = new DurationConfigValueExtractor();
     private static final $OutboxConfig_ConfigValueExtractor EXTRACTOR = new $OutboxConfig_ConfigValueExtractor(
-            new $OutboxConfig_RelayConfig_ConfigValueExtractor(
-                    DURATION, new $OutboxConfig_RetryConfig_ConfigValueExtractor(DURATION)),
+            new $OutboxConfig_RelayConfig_ConfigValueExtractor(DURATION,
+                    new $OutboxConfig_RetryConfig_ConfigValueExtractor(DURATION),
+                    new $OutboxConfig_RequeueConfig_ConfigValueExtractor(DURATION)),
             new $OutboxConfig_PartitionsConfig_ConfigValueExtractor(DURATION),
             new $OutboxConfig_InboxConfig_ConfigValueExtractor(DURATION));
 
@@ -63,6 +66,20 @@ class OutboxConfigTest {
         assertThat(config.inbox().retention()).isEqualTo(Duration.ofHours(2));
     }
 
+    @Test
+    void requeueKeysAreReadAndValidated() {
+        var requeue = parse("outbox.relay.requeue { delay = 250ms, maxRequeues = 5 }").relay().requeue();
+
+        assertThat(requeue.delay()).isEqualTo(Duration.ofMillis(250));
+        assertThat(requeue.maxRequeues()).isEqualTo(5);
+        assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox.relay.requeue.delay = 0s")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("outbox.relay.requeue.delay must be positive: PT0S");
+        assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox.relay.requeue.maxRequeues = -1")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("outbox.relay.requeue.maxRequeues must not be negative: -1");
+    }
+
     private static void assertDefaults(OutboxConfig config) {
         assertThat(config.table()).isEqualTo("outbox");
         assertThat(config.shards()).isEqualTo(32);
@@ -80,6 +97,8 @@ class OutboxConfigTest {
         assertThat(relay.retry().initialDelay()).isEqualTo(Duration.ofSeconds(1));
         assertThat(relay.retry().maxDelay()).isEqualTo(Duration.ofMinutes(5));
         assertThat(relay.retry().maxAttempts()).isZero();
+        assertThat(relay.requeue().delay()).isEqualTo(Duration.ofSeconds(1));
+        assertThat(relay.requeue().maxRequeues()).isZero();
 
         var partitions = config.partitions();
         assertThat(partitions.xidsPerPartition()).isEqualTo(16_777_216L);

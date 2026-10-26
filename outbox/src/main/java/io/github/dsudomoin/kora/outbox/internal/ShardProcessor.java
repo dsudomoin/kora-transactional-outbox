@@ -274,7 +274,7 @@ public final class ShardProcessor implements AutoCloseable {
             items = items.subList(0, read);
             // the shard's failures may stem from other rows than a probed head: it is diverted with divertAt attempts
             var decision = BatchClassifier.classify(items, Math.min(cursor.failures(), divertAt - 1), divertAt, now,
-                    retry.initialDelay(), retry.maxDelay());
+                    retry.initialDelay(), retry.maxDelay(), relay.requeue().delay(), relay.requeue().maxRequeues());
             if (!decision.pause() && !busy) {
                 retries.apply(inTx, shard, decision.actions());
                 wroteRetry |= decision.actions().stream().anyMatch(action -> !(action instanceof Dead));
