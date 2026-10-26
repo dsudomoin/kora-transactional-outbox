@@ -19,6 +19,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -341,6 +342,36 @@ class TicksIT {
             assertThat(shards(c)).isNull();
             assertThat(ticks.make(c, Duration.ZERO)).isTrue();
             assertThat(shards(c)).isEmpty();
+        }
+    }
+
+    @Test
+    void aTickProbesEachShardOnceHoweverManyRowsItCovers() throws Exception {
+        try (var c = TestDb.connect()) {
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            execute(c, "insert into " + names.base() + " (shard, message_id, topic, payload)"
+                    + " select g % " + SHARDS + ", gen_random_uuid(), 't', repeat('x', 100)::bytea"
+                    + " from generate_series(1, 20000) g");
+
+            // the plan Ticks.make runs: generic (see Ticks.lock), where an exists per shard may become one hashed pass
+            // over all 20 000 rows
+            c.setAutoCommit(false);
+            execute(c, "set local plan_cache_mode = force_generic_plan");
+            execute(c, "prepare tick_insert(int, bigint) as " + ticks.insert(c).replaceFirst("\\?", "\\$1")
+                    .replaceFirst("\\?", "\\$2"));
+            long buffers = 0;
+            try (var st = c.createStatement();
+                    var rs = st.executeQuery("explain (analyze, buffers) execute tick_insert(" + SHARDS + ", 0)")) {
+                while (rs.next() && buffers == 0) { // the first Buffers line: the whole statement's
+                    var m = Pattern.compile("(hit|read)=(\\d+)").matcher(rs.getString(1));
+                    while (m.find()) {
+                        buffers += Long.parseLong(m.group(2));
+                    }
+                }
+            }
+            c.rollback();
+
+            assertThat(buffers).as("buffers of a tick over 20 000 new rows on %d shards", SHARDS).isLessThan(200);
         }
     }
 

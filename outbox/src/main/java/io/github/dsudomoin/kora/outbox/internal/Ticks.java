@@ -90,25 +90,27 @@ public final class Ticks {
 
     /**
      * The tick insert: the snapshot C, the id high-water mark and the shards with rows in (P, C] for the newest tick P
-     * (see the class comment), probing each shard's {@code (shard, xid)} index once for branch 1 and once per xid of
-     * P.xip \ C.xip for branch 2. Unless the newest tick is younger than the bound interval: then it inserts and
-     * computes nothing. Every {@code c.snapshot} is {@code pg_current_snapshot()}, stable, so the same snapshot in the
-     * whole statement; as such it prunes the premade partitions above C.xmax when the executor starts (the redundant
-     * bound in branch 2 is there for that), and the probed xids prune the rest as the probes run.
+     * (see the class comment), probing each shard's {@code (shard, xid)} index once for branch 1 and, only when that
+     * finds nothing, once per xid of P.xip \ C.xip for branch 2, each stopping at its first row (a lateral
+     * {@code union all ... limit 1}: an {@code exists} there may be planned as one hashed pass over every row of the
+     * range, which a busy tick makes slow). Unless the newest tick is younger than the bound interval: then it inserts
+     * and computes nothing. Every {@code c.snapshot} is {@code pg_current_snapshot()}, stable, so the same snapshot in
+     * the whole statement; as such it prunes the premade partitions above C.xmax when the executor starts (the
+     * redundant bound in branch 2 is there for that), and the probed xids prune the rest as the probes run.
      */
-    private String insert(Connection c) throws SQLException {
+    String insert(Connection c) throws SQLException {
         var sql = insert;
         if (sql == null) {
             // a future created_at (the clock stepped back) counts as stale, so a wrong clock cannot stop ticks
             insert = sql = "insert into " + names.tick() + " (snapshot, max_id, shards)"
                     + " select c.snapshot, " + maxIdQuery(c, names) + ", case when p.snapshot is not null then"
                     + " coalesce((select array_agg(s::smallint order by s) from generate_series(0, ? - 1) s"
-                    + " where exists (select 1 from " + names.base() + " o where o.shard = s"
+                    + " cross join lateral ((select 1 from " + names.base() + " o where o.shard = s"
                     + " and o.xid >= pg_snapshot_xmax(p.snapshot) and o.xid < pg_snapshot_xmax(c.snapshot)"
-                    + " and o.xid <> all(x.running))"
-                    + " or exists (select 1 from unnest(x.ended) e(xid) cross join lateral (select 1 from "
+                    + " and o.xid <> all(x.running) limit 1)"
+                    + " union all (select 1 from unnest(x.ended) e(xid) cross join lateral (select 1 from "
                     + names.base() + " o where o.shard = s and o.xid = e.xid"
-                    + " and o.xid < pg_snapshot_xmax(c.snapshot) limit 1) o)), '{}') end"
+                    + " and o.xid < pg_snapshot_xmax(c.snapshot) limit 1) o limit 1) limit 1) d), '{}') end"
                     + " from (select pg_current_snapshot() snapshot) c"
                     + " left join lateral (select snapshot from " + names.tick() + " order by id desc limit 1) p"
                     + " on true"
