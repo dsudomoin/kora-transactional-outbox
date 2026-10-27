@@ -237,8 +237,9 @@ public final class Cursors {
      * <em>anchor</em> for a shard idle at the newest checkpoint (bit 0), with no batch in progress, whose latest
      * cursor row is on a tick below its effective tick made {@code anchorInterval} or more ago (or gone, or dated in
      * the future, or more than {@link #ANCHOR_TICKS} ids below the latest tick): that row at the effective tick, no
-     * batch in progress, {@code paused_until} and {@code failures} kept; a <em>due repair</em> for a shard with rows in {@code <retry>} or {@code <parked>} whose latest cursor row
-     * has the matching due null, whatever its position: that row as it is. Both carry {@code retry_due_at} and
+     * batch in progress, {@code paused_until} and {@code failures} kept; a <em>due repair</em> for a shard with rows
+     * in {@code <retry>} or {@code <parked>} whose latest cursor row has the matching due null, whatever its position:
+     * that row as it is. Both carry {@code retry_due_at} and
      * {@code parked_due_at} as the tables hold them now ({@link RetryStore#minDue}, {@link ParkedStore#minDue}), so
      * only under the shard's lock are they exact.
      */

@@ -540,12 +540,13 @@ public final class OutboxSchema implements Lifecycle {
      * release without the heartbeat still runs. That guard alone is waited out, up to {@link #tickWait}, before it
      * refuses. Then one read-committed transaction: {@code pg_advisory_xact_lock} on {@code LOCK_MAINTENANCE},
      * {@code LOCK_SWAP} (relay steps hold it shared) and {@code LOCK_TICK}, in that order, so no maintenance run, step
-     * or tick interleaves; then {@code SHARE} on the outbox, so no write commits between the checks and the switch (writers wait and go on after the commit);
-     * each lock wait is bounded by the session's {@code lock_timeout}, and a timeout fails startup with the drain
-     * procedure; the drain checks: the retry and parked tables empty, no batch in progress, no committed row that its
-     * shard's effective tick ({@link Cursors}) does not see, no standalone range, no xid regression. All pass: the
-     * cursors and checkpoints are replaced by one cursor per new shard at a new tick, with an INFO; otherwise startup
-     * fails naming every failed check with its count. Dead letters keep their shard: a redrive computes it again.
+     * or tick interleaves; then {@code SHARE} on the outbox, so no write commits between the checks and the switch
+     * (writers wait and go on after the commit); each lock wait is bounded by the session's {@code lock_timeout}, and a
+     * timeout fails startup with the drain procedure; the drain checks: the retry and parked tables empty, no batch in
+     * progress, no committed row that its shard's effective tick ({@link Cursors}) does not see, no standalone range,
+     * no xid regression. All pass: the cursors and checkpoints are replaced by one cursor per new shard at a new tick,
+     * with an INFO; otherwise startup fails naming every failed check with its count. Dead letters keep their shard: a
+     * redrive computes it again.
      */
     private void reshard(Connection c, TableNames n, int from, int to) throws SQLException {
         var keep = " To keep the current count, start with outbox.shards = " + from + " or leave it unset.";
