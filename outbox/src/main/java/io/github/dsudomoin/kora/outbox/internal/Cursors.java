@@ -26,7 +26,8 @@ import java.util.Map;
  * {@code greatest(cursor.tick_id, ckpt.tick_id)} when the newest checkpoint has {@code outbox.shards} bits and the
  * shard's bit is 0, {@code greatest(cursor.tick_id, ckpt.busy_tick_id)} when it is 1, else {@code cursor.tick_id}; a
  * checkpoint counts only while the tick at its {@code tick_id} exists and was made no later than the checkpoint (both
- * {@code created_at} on the database clock): one whose tick is gone, or newer than itself, belongs to another history
+ * {@code created_at} on the database clock, the checkpoint's never below its tick's, so a clock stepped back between
+ * the two cannot make it look older): one whose tick is gone, or newer than itself, belongs to another history
  * (tick ids went backwards under it, as in a partial restore, and new ticks may since have passed its id) and counts for
  * nothing, and the next maintenance run replaces it.
  * Every step starts from it, and tick cleanup, the partition drop horizon and {@code outbox.shard.lag} go by it.
@@ -160,8 +161,12 @@ public final class Cursors {
                 + " select c.*, c.target_tick_id is null and c.eff < ? and case when w.id is null then true"
                 + " when w.after is null then false else get_bit(w.after, c.shard) = 1 end"
                 + " from c left join w on w.id = c.eff order by c.shard";
+        // created no earlier than its tick, by the clock that dated the tick: a clock stepped back since must not make
+        // the checkpoint look older than its tick, which reads as another history; a tick of another history at that
+        // id (one made after this run) is still newer
         this.checkpoint = "with gone as (delete from " + names.checkpoint() + ") insert into " + names.checkpoint()
-                + " (tick_id, busy, busy_tick_id) values (?, ?::varbit, ?)";
+                + " (tick_id, busy, busy_tick_id, created_at) values (?, ?::varbit, ?, greatest(clock_timestamp(),"
+                + " (select created_at from " + names.tick() + " where id = ?)))";
     }
 
     /**
@@ -254,6 +259,7 @@ public final class Cursors {
             ps.setLong(1, latestTickId);
             ps.setString(2, busy.toString());
             ps.setLong(3, busyTick(positions, latestTickId));
+            ps.setLong(4, latestTickId);
             ps.executeUpdate();
         }
     }

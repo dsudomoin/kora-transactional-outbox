@@ -357,6 +357,37 @@ class BatchReaderIT {
         }
     }
 
+    @Test
+    void readManyKeepsAnXipRowInAPartitionBelowTheRange() throws Exception {
+        config.shards(4).xidsPerPartition(1000).premake(20);
+        bootstrap();
+        var a = begin();
+        var aId = outbox.send(a, OutboxMessage.of("t", "a", PAYLOAD));
+        long aXid = queryLong(a, "select pg_current_xact_id()::text::bigint");
+        TestDb.burnXids(1500); // P's xmax lies ranges above a's xid
+        var p = tick();
+        a.commit();
+        var c = tick();
+        assertThat(p.xip()).contains(aXid);
+        assertThat(p.xmax() / 1000).as("a's range is outside [p.xmax, c.xmax)").isGreaterThan(aXid / 1000);
+        int shard = shardOf(aId);
+        var reads = IntStream.range(0, 4).mapToObj(s -> new ShardRead(s, p, c, 0, 100, true)).toList();
+
+        var batch = readMany(reads, 1000);
+
+        assertThat(messageIds(batch.rows().get(shard))).containsExactly(aId);
+        try (var conn = TestDb.connect()) {
+            assertThat(partitionsScanned(conn, reads)).as("the lo/hi bounds keep a's range")
+                    .contains(names.unqualified(names.partitionPrefix()) + aXid / 1000 * 1000);
+        }
+    }
+
+    private int shardOf(UUID messageId) throws SQLException {
+        try (var c = TestDb.connect()) {
+            return (int) queryLong(c, "select shard from " + names.base() + " where message_id = '" + messageId + "'");
+        }
+    }
+
     /**
      * EXPLAIN of the statement {@code read} runs with the parameters bound exactly as {@code read} binds them, under a
      * custom plan. Inlined literals would hide a parameter cast the planner cannot fold (a varchar bound to

@@ -131,8 +131,8 @@ public final class BatchReader {
             pmax[i] = Long.toString(r.prev().xmax());
             tmax[i] = Long.toString(r.target().xmax());
             // null bounds when none: the branch then matches nothing and prunes every partition
-            lo[i] = candidates.length == 0 ? null : Long.toString(candidates[0]); // xip is ascending
-            hi[i] = candidates.length == 0 ? null : Long.toString(candidates[candidates.length - 1]);
+            lo[i] = candidates.length == 0 ? null : Long.toString(Arrays.stream(candidates).min().getAsLong());
+            hi[i] = candidates.length == 0 ? null : Long.toString(Arrays.stream(candidates).max().getAsLong());
             xip[i] = Arrays.stream(candidates).mapToObj(Long::toString).collect(Collectors.joining(",", "{", "}"));
             snap[i] = r.target().text();
             lastId[i] = r.lastId();

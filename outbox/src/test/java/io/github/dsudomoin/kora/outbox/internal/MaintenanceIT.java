@@ -512,7 +512,76 @@ class MaintenanceIT {
             execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + ahead
                     + ", B'0000', " + ahead + ")");
             assertThat(maintenance.runOnce()).isTrue();
-            assertThat(err.text()).doesNotContain("another history");
+            // the cursors' tick is gone by now, so the shards are stranded: that ERROR is its own
+            assertThat(err.text()).doesNotContain("It counted for nothing");
+        }
+    }
+
+    @Test
+    void aClockSteppedBackAfterATickDoesNotVoidTheCheckpointOnIt() throws Exception {
+        bootstrap(); // 4 shards, every cursor on the bootstrap tick
+        var handler = new RecordingHandler();
+        var relay = relay(handler, maintenance());
+        long latest;
+        try (var c = TestDb.connect()) {
+            var ticks = new Ticks(names, config.shards());
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            latest = ticks.latest(c).id();
+            // the clock that dated the tick ran an hour ahead, and has stepped back since
+            execute(c, "update " + names.tick() + " set created_at = clock_timestamp() + interval '1 hour'"
+                    + " where id = " + latest);
+        }
+        var maintenance = maintenance();
+
+        assertThat(maintenance.runOnce()).isTrue(); // checkpoints on the tick, cleanup deletes the bootstrap tick
+        assertThat(maintenance.runOnce()).isTrue(); // reads by that checkpoint
+
+        try (var c = TestDb.connect()) {
+            assertThat(new Cursors(names, config.shards()).ignoredCheckpointTick(c)).as("the checkpoint counts")
+                    .isNull();
+            assertThat(queryString(c, "select tick_id || ':' || busy::text from " + names.checkpoint()))
+                    .isEqualTo(latest + ":0000");
+        }
+        assertThat(tickIds()).as("the idle shards' cursor ticks are gone").containsExactly(latest);
+        var ids = send(msg("t", "k", "a"));
+        assertThat(relay.drain()).isOne();
+        assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(ids);
+    }
+
+    @Test
+    void shardsStrandedByAnIgnoredCheckpointAreReportedNotAFailedRead() throws Exception {
+        bootstrap(); // 4 shards, every cursor on the bootstrap tick
+        long latest;
+        try (var c = TestDb.connect()) {
+            var ticks = new Ticks(names, config.shards());
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            latest = ticks.latest(c).id();
+        }
+        var maintenance = maintenance();
+        assertThat(maintenance.runOnce()).isTrue(); // the checkpoint moves every shard on; the bootstrap tick goes
+        long bootstrapTick = latestCursors().get(0).tickId();
+        try (var c = TestDb.connect()) { // as if the tick at its id came from another history, made after it
+            execute(c, "update " + names.checkpoint() + " set created_at = created_at - interval '1 hour'");
+        }
+
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).as("the read does not fail").isTrue();
+
+            assertThat(err.text()).doesNotContain("no tick in").contains("ERROR")
+                    .contains("outbox shards [0, 1, 2, 3] of " + names.base() + " start from ticks [" + bootstrapTick
+                            + "] that no longer exist")
+                    .contains("the relay is stopped for them").contains("deletes no ticks");
+        }
+        assertThat(tickIds()).as("no cleanup while shards are stranded").containsExactly(latest);
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select tick_id || ':' || busy::text || ':' || busy_tick_id from "
+                    + names.checkpoint())).as("replaced; the stranded shards stay at their ticks")
+                    .isEqualTo(latest + ":1111:" + bootstrapTick);
+            assertThat(maintenance.lagSeconds(c)).as("from the oldest tick left").isGreaterThanOrEqualTo(0.0);
+        }
+        try (var err = new CapturedStderr()) { // within a minute: no second ERROR
+            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(err.text()).doesNotContain("no longer exist");
         }
     }
 

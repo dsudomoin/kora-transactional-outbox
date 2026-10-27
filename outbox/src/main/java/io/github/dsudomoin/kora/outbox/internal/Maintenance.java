@@ -8,6 +8,9 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
@@ -91,6 +94,7 @@ public final class Maintenance {
     private final AtomicLong staleLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong haltLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong checkpointLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    private final AtomicLong strandedLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private volatile boolean halted;
     private volatile boolean stepFailed; // in the current run, under LOCK_MAINTENANCE
 
@@ -256,24 +260,61 @@ public final class Maintenance {
 
     /**
      * One read of every shard's position at the latest tick L. {@code slowest}: the tick of the lowest effective tick
-     * of the shards busy at L ({@link Cursors#busyTick}), L when none: the lag gauge's, and the lowest effective tick
-     * of all once the checkpoint of this read is written. {@code ignoredCheckpointTick}: the newest checkpoint's tick
-     * before this run's when that checkpoint counts for nothing ({@link Cursors#ignoredCheckpointTick}), else null.
+     * of the shards busy at L ({@link Cursors#busyTick}), L when none: the lowest effective tick of all once the
+     * checkpoint of this read is written, by which the drops and tick cleanup go; null when {@code stranded} is not
+     * empty. {@code stranded}: the shards whose effective tick has no row, by shard, with that tick; a step of such a
+     * shard fails, so the relay is stopped for it (see {@link #logStranded}). {@code lagFrom}: the tick
+     * {@code outbox.shard.lag} measures from, {@code slowest}, or the oldest tick left when some shards are stranded.
+     * {@code ignoredCheckpointTick}: the newest checkpoint's tick before this run's when that checkpoint counts for
+     * nothing ({@link Cursors#ignoredCheckpointTick}), else null.
      */
-    private record Read(Tick latest, List<Position> positions, Tick slowest, @Nullable Long ignoredCheckpointTick) {
+    private record Read(Tick latest, List<Position> positions, @Nullable Tick slowest, Map<Integer, Long> stranded,
+            Tick lagFrom, @Nullable Long ignoredCheckpointTick) {
 
         /** {@code outbox.shard.lag}: from the slowest busy shard's effective tick to L, 0 when no shard is busy. */
         double lagSeconds() {
-            return Duration.between(slowest.createdAt(), latest.createdAt()).toNanos() / 1e9;
+            return Duration.between(lagFrom.createdAt(), latest.createdAt()).toNanos() / 1e9;
         }
     }
 
     private Read read(Connection c) throws SQLException {
         var latest = ticks.latest(c);
         var positions = cursors.positions(c, latest.id());
-        long slowest = Cursors.busyTick(positions, latest.id());
-        return new Read(latest, positions, slowest == latest.id() ? latest : ticks.get(c, slowest),
+        var wanted = new TreeSet<Long>();
+        for (var p : positions) {
+            if (Cursors.busy(p) && p.effectiveTickId() != latest.id()) {
+                wanted.add(p.effectiveTickId());
+            }
+        }
+        var found = ticks.get(c, wanted);
+        var stranded = new TreeMap<Integer, Long>();
+        for (var p : positions) {
+            if (Cursors.busy(p) && wanted.contains(p.effectiveTickId()) && !found.containsKey(p.effectiveTickId())) {
+                stranded.put(p.cursor().shard(), p.effectiveTickId());
+            }
+        }
+        long slowestId = Cursors.busyTick(positions, latest.id());
+        var slowest = !stranded.isEmpty() ? null : slowestId == latest.id() ? latest : found.get(slowestId);
+        return new Read(latest, positions, slowest, stranded, slowest != null ? slowest : ticks.oldestAfter(c, 0),
                 cursors.ignoredCheckpointTick(c));
+    }
+
+    /**
+     * The ERROR for shards whose effective tick has no row: their batches cannot be read from it, so every step of
+     * theirs fails and the relay is stopped for them, and maintenance drops no partitions and deletes no ticks while
+     * any is, as the horizon they need is unknown. Their rows stay in the outbox. Nothing moves them on by itself:
+     * which rows their lost tick had seen is gone with it.
+     */
+    private void logStranded(Read read) {
+        log.error("outbox shards {} of {} start from ticks {} that no longer exist: deleted by hand, or by cleanup"
+                + " while a checkpoint moved those shards past them, a checkpoint that now counts for nothing (from"
+                + " another history: restoring {} without {}?). Their batches cannot be read, so the relay is stopped"
+                + " for them (each step fails with «its effective tick was deleted»), and maintenance drops no"
+                + " partitions and deletes no ticks until they move; their rows stay in the outbox, and"
+                + " outbox.shard.lag counts from the oldest tick left. To recover, save their unrelayed rows and reset"
+                + " the cursors as the README describes for a restore («Восстановление после регрессии xid»); this"
+                + " ERROR repeats at most once a minute", read.stranded().keySet(), names.base(),
+                read.stranded().values().stream().distinct().sorted().toList(), names.tick(), names.checkpoint());
     }
 
     private boolean sessionStable(Connection c) throws SQLException {
@@ -355,7 +396,12 @@ public final class Maintenance {
                     + " repeats at most once a minute", names.base(), read.ignoredCheckpointTick(), read.latest().id(),
                     names.tick(), names.checkpoint());
         }
-        // the drops and tick cleanup go by the effective ticks of this run's checkpoint: without it, none this run
+        if (read != null && !read.stranded().isEmpty() && due(strandedLogged)) {
+            logStranded(read);
+        }
+        // the drops and tick cleanup go by the effective ticks of this run's checkpoint: without it, none this run.
+        // The checkpoint is written with stranded shards too: it moves the others on, and keeps them busy at their own
+        // ticks (the lowest of which is busy_tick_id), as they were
         var slowest = read == null ? null : step("checkpoint", () -> {
             cursors.checkpoint(c, read.latest().id(), read.positions());
             return read.slowest();
