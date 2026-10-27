@@ -143,12 +143,12 @@ class XidRecoveryIT {
      */
     @Test
     void aRecoveryThatFailedHoldingTheOutboxLockIsNotTriedAgain() throws Exception {
-        config.relayEnabled(false).recoveryTimeout(Duration.ofMillis(100));
+        config.relayEnabled(false).recoveryTimeout(Duration.ofMillis(300));
         bootstrap();
-        try (var c = TestDb.connect()) { // 10 000 rows of 8 kB out of line: the count is quick, their copy is not
+        try (var c = TestDb.connect()) { // 20 000 rows of 8 kB out of line: the count is quick, their copy is not
             execute(c, "insert into " + names.base() + " (shard, message_id, topic, payload) select s % "
                     + config.shards() + ", gen_random_uuid(), 't', (select decode(string_agg(md5(random()::text || s"
-                    + " || i), ''), 'hex') from generate_series(1, 500) i) from generate_series(1, 10000) s");
+                    + " || i), ''), 'hex') from generate_series(1, 500) i) from generate_series(1, 20000) s");
         }
         forgeRegression();
         var outbox = outbox(null);
