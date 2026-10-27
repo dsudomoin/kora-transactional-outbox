@@ -629,6 +629,38 @@ class TicksIT {
         }
     }
 
+    @Test
+    void aSnapshotBelowTheNewestTicksXmaxMakesNoTickAndRecordsTheHalt() throws Exception {
+        var role = TestDb.newLoginRole();
+        try (var c = TestDb.connect()) { // a role whose probe fails (42501), so it inserts without one
+            execute(c, "grant select, insert on " + names.tick() + " to " + role);
+            execute(c, "grant select on sequence "
+                    + queryString(c, "select pg_get_serial_sequence('" + names.base() + "', 'id')") + " to " + role);
+        }
+        var login = new Properties();
+        login.setProperty("user", role);
+        login.setProperty("password", role);
+        try (var asRole = TestDb.connect(login); var c = TestDb.connect()) {
+            // the newest tick from a history 10 000 xids ahead, as a logical cutover onto a younger cluster leaves it
+            long shifted = queryLong(c, "insert into " + names.tick() + " (snapshot, max_id) select ("
+                    + "(pg_snapshot_xmin(s)::text::bigint + 10000) || ':' || (pg_snapshot_xmax(s)::text::bigint"
+                    + " + 10000) || ':' || array_to_string(array(select x::text::bigint + 10000 from"
+                    + " pg_snapshot_xip(s) x), ','))::pg_snapshot, 0 from (select pg_current_snapshot() s) q"
+                    + " returning pg_snapshot_xmax(snapshot)::text::bigint");
+            long ticksBefore = queryLong(c, "select count(*) from " + names.tick());
+
+            assertThat(new Ticks(names, SHARDS).tick(asRole, Duration.ZERO)).as("without a probe: no tick, no halt")
+                    .isEqualTo(Ticks.Made.SKIPPED);
+            assertThat(queryLong(c, "select count(*) from " + names.halt())).isZero();
+
+            assertThat(ticks.tick(c, Duration.ZERO)).isEqualTo(Ticks.Made.REGRESSED);
+            assertThat(queryLong(c, "select count(*) from " + names.tick())).isEqualTo(ticksBefore);
+            assertThat(queryLong(c, "select max_tick_xmax::text::bigint from " + names.halt())).isEqualTo(shifted);
+            assertThat(queryString(c, "select recovery_failed from " + names.halt())).isNull();
+            assertSessionRestored(c);
+        }
+    }
+
     /**
      * The shared buffers the probe of a tick made now touches, in the plan {@link Ticks#make} runs (generic, see
      * {@code Ticks.lock}); rolled back, so no tick is made.

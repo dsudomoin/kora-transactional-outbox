@@ -88,6 +88,18 @@ public final class Ticks {
      */
     public record Tick(long id, @Nullable PgSnapshot snapshot, Instant createdAt, @Nullable Long maxId) {}
 
+    /** What {@link #tick} did. */
+    public enum Made {
+        INSERTED,
+        /** No tick: the newest is younger than the bound, the tick lock stayed taken, or as for REGRESSED. */
+        SKIPPED,
+        /**
+         * No tick, and the xid-regression halt recorded: the snapshot's xmax is below the newest tick's, which one
+         * history never gives (see {@link #insert}).
+         */
+        REGRESSED
+    }
+
     private static final Logger log = LoggerFactory.getLogger(Ticks.class);
     private static final String LOCK_NOT_AVAILABLE = "55P03";
     private static final String SELECT = "select id, snapshot::text, created_at, max_id from ";
@@ -198,7 +210,10 @@ public final class Ticks {
                     + " union all (select 1 from unnest(x.lo, x.hi) k(lo, hi) cross join lateral (select 1 from "
                     + names.base() + " o where o.shard = s and o.xid >= k.lo and o.xid <= k.hi"
                     + " and o.xid < pg_snapshot_xmax(c.snapshot) and not pg_visible_in_snapshot(o.xid, p.snapshot)"
-                    + " limit 1) o limit 1) limit 1) d on true) end"
+                    + " limit 1) o limit 1) limit 1) d on true) end,"
+                    // the regression guard: C's xmax below P's (see insert)
+                    + " pg_snapshot_xmax(c.snapshot) < pg_snapshot_xmax(p.snapshot) is true,"
+                    + " pg_snapshot_xmax(p.snapshot)::text::bigint"
                     + " from (select pg_current_snapshot() snapshot) c"
                     // through text once: a snapshot of a few hundred xids is stored compressed, and each function
                     // given the stored value would decompress it again, for every row a range scans
@@ -246,16 +261,19 @@ public final class Ticks {
         if (sql == null) {
             insertUnprobed = sql = "insert into " + names.tick() + " (snapshot, max_id)"
                     + " select pg_current_snapshot(), " + maxIdQuery(c, names)
-                    + " where not exists (select 1 from (select created_at from " + names.tick()
+                    + " where not exists (select 1 from (select snapshot, created_at from " + names.tick()
                     + " order by id desc limit 1) t"
                     + " where t.created_at > clock_timestamp() - ? * interval '1 microsecond'"
-                    + " and t.created_at <= clock_timestamp())";
+                    + " and t.created_at <= clock_timestamp()"
+                    // the regression guard of the probing insert, without its halt: the next probe records that
+                    + " or pg_snapshot_xmax(pg_current_snapshot()) < pg_snapshot_xmax(t.snapshot))";
         }
         return sql;
     }
 
     /**
-     * Makes a tick unless the newest one is younger than {@code minInterval}; returns whether a tick was inserted.
+     * Makes a tick unless the newest one is younger than {@code minInterval} or its xmax is above the current one
+     * (see {@link #insert}); returns whether a tick was inserted.
      * Returns false without a tick when the tick lock stays taken for 1 s ({@code lock_timeout} on the lock statement,
      * SQLState 55P03). When the probing insert fails short of a broken connection, the tick is made without its shard
      * set and a WARN names the cause, at most once a minute: a lock it waited for longer than 50 ms (any partition held
@@ -264,17 +282,22 @@ public final class Ticks {
      * transaction-scoped.
      */
     public boolean make(Connection autocommit, Duration minInterval) throws SQLException {
+        return tick(autocommit, minInterval) == Made.INSERTED;
+    }
+
+    /** {@link #make}, telling a regression apart: see {@link Made#REGRESSED}. */
+    public Made tick(Connection autocommit, Duration minInterval) throws SQLException {
         var c = autocommit;
         boolean autoCommit = c.getAutoCommit();
         c.setAutoCommit(false);
-        boolean inserted;
+        Made made;
         try {
             if (!lock(c)) {
                 c.rollback();
                 c.setAutoCommit(autoCommit);
-                return false;
+                return Made.SKIPPED;
             }
-            inserted = insert(c, minInterval);
+            made = insert(c, minInterval);
             c.commit();
         } catch (SQLException e) {
             try {
@@ -286,7 +309,7 @@ public final class Ticks {
             throw e;
         }
         c.setAutoCommit(autoCommit);
-        return inserted;
+        return made;
     }
 
     /**
@@ -298,13 +321,24 @@ public final class Ticks {
      * shorter {@code lock_timeout}, keeps the tick lock, and leaves a failed probe without effect. The tick row is
      * written at the top level, from the probe's row or, after a failure, without a shard set: a write inside the
      * savepoint would take a second transaction id for every tick.
+     *
+     * <p>No tick when C's xmax is below P's, as after a logical cutover onto a cluster whose xid counter is behind: the
+     * batch (P, C] would read nothing of {@code [C.xmax, P.xmax)}, and rows of the new history with such xids would
+     * pass for visible in P, so be skipped. One history never gives it: xmax only grows from snapshot to snapshot
+     * under the tick lock, and a physical replica that replayed P's commit has passed P's xid, itself at or above
+     * P.xmax. Instead, the xid-regression halt ({@link XidRecovery}) is recorded with P's xmax, at the top level under
+     * the tick lock, so it holds once the counter has caught up, and no tick of the new history moves the recovery's
+     * T past the rows written since. The insert after a failed probe skips such a tick too and leaves the halt to the
+     * next probe.
      */
-    private boolean insert(Connection c, Duration minInterval) throws SQLException {
+    private Made insert(Connection c, Duration minInterval) throws SQLException {
         long micros = TimeUnit.MICROSECONDS.convert(minInterval);
         try (var st = c.createStatement()) {
             st.execute("savepoint tick_probe; set local lock_timeout = '50ms'");
         }
         boolean young = false;
+        boolean regressed = false;
+        long newestXmax = 0;
         String snapshot = null;
         long maxId = 0;
         String dirty = null;
@@ -318,6 +352,8 @@ public final class Ticks {
                     snapshot = rs.getString(1);
                     maxId = rs.getLong(2);
                     dirty = rs.getString(3);
+                    regressed = rs.getBoolean(4);
+                    newestXmax = rs.getLong(5);
                 }
             }
         } catch (SQLException e) {
@@ -334,7 +370,14 @@ public final class Ticks {
         }
         if (failed == null) {
             if (young) {
-                return false;
+                return Made.SKIPPED;
+            }
+            if (regressed) {
+                try (var ps = c.prepareStatement(XidRecovery.haltInsert(names))) {
+                    ps.setLong(1, newestXmax);
+                    ps.executeUpdate();
+                    return Made.REGRESSED;
+                }
             }
             try (var ps = c.prepareStatement("insert into " + names.tick() + " (snapshot, max_id, dirty)"
                     + " values (?::pg_snapshot, ?, ?::varbit)")) {
@@ -342,13 +385,13 @@ public final class Ticks {
                 ps.setLong(2, maxId);
                 ps.setString(3, dirty);
                 ps.executeUpdate();
-                return true;
+                return Made.INSERTED;
             }
         }
         warnProbeFailed(failed);
         try (var ps = c.prepareStatement(insertUnprobed(c))) {
             ps.setLong(1, micros);
-            return ps.executeUpdate() == 1;
+            return ps.executeUpdate() == 1 ? Made.INSERTED : Made.SKIPPED;
         }
     }
 

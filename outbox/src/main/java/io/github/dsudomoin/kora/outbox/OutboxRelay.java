@@ -326,7 +326,12 @@ public final class OutboxRelay implements Lifecycle {
         try (var c = db.newConnection()) {
             c.setAutoCommit(true);
             long since = System.nanoTime();
-            while (!ticks.make(c, Duration.ZERO)) { // false only on the 1 s tick lock timeout
+            Ticks.Made made;
+            while ((made = ticks.tick(c, Duration.ZERO)) != Ticks.Made.INSERTED) { // the 1 s tick lock timeout
+                if (made == Ticks.Made.REGRESSED) { // the halt it recorded; trying again would only burn xids
+                    maintenance.checkHalt();
+                    requireNotHalted();
+                }
                 if (System.nanoTime() - since > stall) {
                     throw new IllegalStateException("outbox drain could not make a tick for " + stallAfter);
                 }
@@ -768,7 +773,7 @@ public final class OutboxRelay implements Lifecycle {
                 tickIfDue(c, seen);
                 readRound(c);
                 boolean worked = false;
-                while (!stopping) {
+                while (!stopping && !maintenance.halted()) {
                     // the tick attempts of a long pass (a backlog keeps its round from running out), each followed by
                     // a look at the latest tick: without them ticks would wait for the pass, and each would hold ever
                     // more rows, read again in full by every chunk of a batch
@@ -927,7 +932,8 @@ public final class OutboxRelay implements Lifecycle {
      * tick of another instance then stands for this one's. An inserted tick covers the commits seen before the
      * attempt; one {@link Ticks#make} skipped for a younger tick covers only those seen {@code minTickInterval} before
      * it, since that younger tick may predate the rest, which therefore get another attempt {@code minTickInterval}
-     * later. Each inserted tick wakes all workers. Returns whether it made the attempt.
+     * later. Each inserted tick wakes all workers; one refused for an xid regression refreshes the halt at once.
+     * Returns whether it made the attempt.
      */
     private boolean tickIfDue(Connection c, long seen) throws SQLException {
         long attempt;
@@ -940,7 +946,11 @@ public final class OutboxRelay implements Lifecycle {
             lastTickAttempt = attempt = now;
             youngest = wakePending ? relay.minTickInterval() : idleTickAge;
         }
-        boolean inserted = ticks.make(c, youngest);
+        var made = ticks.tick(c, youngest);
+        if (made == Ticks.Made.REGRESSED) {
+            maintenance.checkHalt(); // the halt it recorded: the workers stop now, not at the next maintenance run
+        }
+        boolean inserted = made == Ticks.Made.INSERTED;
         synchronized (tickState) {
             if (wakePending && wakeAt - attempt <= (inserted ? 0 : -minTickNanos)) {
                 wakePending = false;

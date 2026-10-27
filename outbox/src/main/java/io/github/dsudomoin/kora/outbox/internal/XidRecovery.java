@@ -112,8 +112,7 @@ public final class XidRecovery {
                 + " (select pg_snapshot_xmax(snapshot)::text::bigint from " + names.tick()
                 + " order by pg_snapshot_xmax(snapshot) desc limit 1),"
                 + " (select max_tick_xmax::text::bigint from " + names.halt() + ")";
-        this.haltInsert = "insert into " + names.halt() + " as h (max_tick_xmax) values (?::text::xid8)"
-                + " on conflict (id) do update set max_tick_xmax = greatest(h.max_tick_xmax, excluded.max_tick_xmax)";
+        this.haltInsert = haltInsert(names);
         this.holding = names.base() + "_recovery";
     }
 
@@ -122,6 +121,12 @@ public final class XidRecovery {
             rs.next();
             return new Check(rs.getLong(1), rs.getLong(2), rs.getObject(3, Long.class));
         }
+    }
+
+    /** The halt record with the tick xmax as its parameter, keeping a higher one recorded before ({@link Ticks}). */
+    static String haltInsert(TableNames names) {
+        return "insert into " + names.halt() + " as h (max_tick_xmax) values (?::text::xid8)"
+                + " on conflict (id) do update set max_tick_xmax = greatest(h.max_tick_xmax, excluded.max_tick_xmax)";
     }
 
     /** Records the halt with {@code tickXmax}, keeping a higher one recorded before. */

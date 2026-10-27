@@ -1558,6 +1558,64 @@ class OutboxRelayIT {
     }
 
     @Test
+    void drainFailsWithTheHaltWhenTheNewestTickTurnsOutAboveTheXidCounterAndRecoverySavesTheRowsSentBefore()
+            throws Exception {
+        bootstrap();
+        var handler = new RecordingHandler();
+        var injected = new AtomicBoolean();
+        // a stale instance's tick from a history ahead, committed after drain's own halt check, before its probe
+        var relay = relay(observed(sql -> {
+            if (sql.contains("pg_current_snapshot") && injected.compareAndSet(false, true)) {
+                try (var c = TestDb.connect()) {
+                    insertTickAhead(c);
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            }
+        }), handler);
+        var ids = send(outbox(() -> {}), msg("t", "k", "m")); // its xid passes for visible in the tick ahead
+
+        assertThatThrownBy(relay::drain).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("xid counter below a tick's xmax");
+        assertThat(injected).isTrue();
+        assertThat(handler.delivered()).isEmpty();
+
+        assertThat(maintenance(db).runOnce()).isTrue(); // outbox.recovery.xidRegression = auto
+        relay.drain();
+        assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(ids);
+    }
+
+    @Test
+    void aWorkerTickBelowTheNewestXmaxHaltsTheRelayBeforeMaintenanceRuns() throws Exception {
+        bootstrap(); // maintenance runs at start, then not for an hour
+        var maintenance = maintenance(db);
+        var relay = new OutboxRelay(db, config, schema, new RecordingHandler(), new OutboxMetrics(null), null,
+                maintenance, noHook(db));
+        relays.add(relay);
+        relay.init();
+        awaitParked();
+        assertThat(maintenance.halted()).isFalse();
+        try (var c = TestDb.connect()) {
+            insertTickAhead(c);
+        }
+
+        send(outbox(relay::wake), msg("t", "k", "m"));
+
+        await(Duration.ofSeconds(5), maintenance::halted);
+        try (var c = TestDb.connect()) {
+            assertThat(queryLong(c, "select count(*) from " + schema.names().halt())).isOne();
+        }
+    }
+
+    /** A tick whose snapshot is 10 000 xids ahead of the counter, as a logical cutover onto a younger cluster. */
+    private void insertTickAhead(Connection c) throws Exception {
+        execute(c, "insert into " + schema.names().tick() + " (snapshot, max_id) select ("
+                + "(pg_snapshot_xmin(s)::text::bigint + 10000) || ':' || (pg_snapshot_xmax(s)::text::bigint + 10000)"
+                + " || ':' || array_to_string(array(select x::text::bigint + 10000 from pg_snapshot_xip(s) x), ','))"
+                + "::pg_snapshot, 0 from (select pg_current_snapshot() s) q");
+    }
+
+    @Test
     void idleShardsAreSteppedAgainWhenTickIdsGoBackwardsAfterAHaltIsLifted() throws Exception {
         bootstrap(); // 4 shards, 2 workers
         var names = schema.names();
