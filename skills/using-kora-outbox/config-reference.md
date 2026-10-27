@@ -33,7 +33,7 @@ outbox {
 | `batchTimeout` | `30s` | > 0. Bound of one handler call: wind-down at 80 %, abandoned (all records retried) at 100 %. With Kafka ≥ `delivery.timeout.ms + 5 s + max.block.ms`. `drain()` gives up after 2 × this without progress. |
 | `shutdownTimeout` | `30s` | ≥ 0. Grace for in-flight batches at shutdown; then they are interrupted and redelivered later. |
 | `headFailuresBeforeDivert` | `3` | ≥ 1. Consecutive failures before a shard isolates a single failing key. |
-| `cursorAnchorInterval` | `1h` | > 0 and ≥ `partitions.maintenanceInterval`. Maintenance writes an idle shard one cursor row this often; ticks are kept about this long, so a rollback to the previous release resumes from these anchors. |
+| `cursorAnchorInterval` | `1h` | > 0 and ≥ `partitions.maintenanceInterval`. Maintenance writes an idle shard one cursor row this often; ticks are kept about this long (at most about 10 000: a shard that far behind is anchored at the next run), so a rollback to the previous release resumes from these anchors. |
 
 ## `outbox.relay.retry`
 

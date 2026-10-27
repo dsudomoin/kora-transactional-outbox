@@ -313,6 +313,32 @@ class CursorsIT {
     }
 
     @Test
+    void anchorsAlsoMoveAnIdleShardWhoseTickIsTooManyTicksBelowTheLatest() throws Exception {
+        var names = bootstrap(); // 4 shards, every cursor on the bootstrap tick
+        var cursors = new Cursors(names, config.shards());
+        var all = List.of(0, 1, 2, 3);
+        try (var c = TestDb.connect()) {
+            long b = queryLong(c, "select max(id) from " + names.tick());
+            long edge = b + Cursors.ANCHOR_TICKS; // as under load: every tick young, the cursor far below
+            idleAt(c, names, edge);
+            assertThat(cursors.anchors(c, all, Duration.ofHours(1))).as("young, and not more ticks behind").isEmpty();
+
+            idleAt(c, names, edge + 1);
+
+            assertThat(cursors.anchors(c, all, Duration.ofHours(1))).extracting(Cursor::tickId)
+                    .containsExactly(edge + 1, edge + 1, edge + 1, edge + 1);
+        }
+    }
+
+    /** A tick at {@code id}, made now, and the checkpoint at it with every shard idle. */
+    private static void idleAt(Connection c, TableNames names, long id) throws Exception {
+        execute(c, "insert into " + names.tick() + " (id, snapshot, max_id) overriding system value values (" + id
+                + ", pg_current_snapshot(), 0)");
+        execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + id + ", B'0000', "
+                + id + ")");
+    }
+
+    @Test
     void aCheckpointAboveTheNewestTickCountsForNothing() throws Exception {
         var names = bootstrap();
         var cursors = new Cursors(names, config.shards());

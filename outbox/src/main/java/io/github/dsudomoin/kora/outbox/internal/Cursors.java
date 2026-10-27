@@ -71,8 +71,10 @@ import java.util.concurrent.TimeUnit;
  *       {@code outbox.relay.cursorAnchorInterval} or more ago, that row at E (no batch in progress,
  *       {@code paused_until} and {@code failures} kept). By the 0 bit no row of the shard is visible in E and not in
  *       the row's tick, so it changes neither the shard's rows to read nor its effective tick, and keeps cursors
- *       moving forward; it is written under the shard's lock, from the row a step left. So ticks are kept for about
- *       one anchor interval, and an idle relay appends one row per shard per interval.</li>
+ *       moving forward; it is written under the shard's lock, from the row a step left. A shard whose row lies
+ *       more than {@link #ANCHOR_TICKS} ticks below the latest is anchored however young they are. So ticks are kept
+ *       for about one anchor interval and at most about that many, and an idle relay appends one row per shard per
+ *       interval.</li>
  *   <li>Every anchor, and every run's <em>due repair</em> for a shard whose latest row has {@code retry_due_at} or
  *       {@code parked_due_at} null while {@code <retry>} or {@code <parked>} hold rows of it (a row of a pre-requeue
  *       instance, a hand edit), carries both dues as the tables hold them: a step of an idle shard looks at those
@@ -149,6 +151,12 @@ public final class Cursors {
 
     private static final String COLUMNS =
             "shard, tick_id, target_tick_id, last_id, paused_until, failures, retry_due_at, parked_due_at";
+    /**
+     * How many ticks an idle shard's latest cursor row may lie below the latest before it is anchored, however young
+     * those ticks: under load a tick comes every {@code minTickInterval}, and a shard that gets no row for an anchor
+     * interval (skewed keys) would keep tens of thousands of ticks, each with its snapshot.
+     */
+    static final int ANCHOR_TICKS = 10_000;
 
     private final TableNames names;
     private final int shards;
@@ -215,7 +223,9 @@ public final class Cursors {
                 // keep a shard's tick, and every tick above it, forever
                 + " cross join lateral (select c.idle and c.target_tick_id is null and c.tick_id < c.eff"
                 + " and (t.created_at is null or t.created_at <= clock_timestamp() - ? * interval '1 microsecond'"
-                + " or t.created_at > clock_timestamp()) anchor) a"
+                + " or t.created_at > clock_timestamp()"
+                // or too many ticks back, young as they are (ANCHOR_TICKS): computed once, the tick table's last id
+                + " or c.tick_id < (select max(id) from " + names.tick() + ") - " + ANCHOR_TICKS + ") anchor) a"
                 + " where a.anchor or c.retry_due_at is null and d.retry_due is not null"
                 + " or c.parked_due_at is null and d.parked_due is not null order by c.shard";
         this.lowestTick = "select min(c.tick_id) from generate_series(0, " + shards + " - 1) s cross join lateral"
@@ -226,8 +236,8 @@ public final class Cursors {
      * The cursor rows maintenance appends for {@code shards} (see the class comment), in shard order: an
      * <em>anchor</em> for a shard idle at the newest checkpoint (bit 0), with no batch in progress, whose latest
      * cursor row is on a tick below its effective tick made {@code anchorInterval} or more ago (or gone, or dated in
-     * the future): that row at the effective tick, no batch in progress, {@code paused_until} and {@code failures}
-     * kept; a <em>due repair</em> for a shard with rows in {@code <retry>} or {@code <parked>} whose latest cursor row
+     * the future, or more than {@link #ANCHOR_TICKS} ids below the latest tick): that row at the effective tick, no
+     * batch in progress, {@code paused_until} and {@code failures} kept; a <em>due repair</em> for a shard with rows in {@code <retry>} or {@code <parked>} whose latest cursor row
      * has the matching due null, whatever its position: that row as it is. Both carry {@code retry_due_at} and
      * {@code parked_due_at} as the tables hold them now ({@link RetryStore#minDue}, {@link ParkedStore#minDue}), so
      * only under the shard's lock are they exact.
