@@ -36,7 +36,10 @@ public final class Resender {
     private final ShardGuard guard;
     private final String insertAll;
 
-    /** Without the instance's {@link ShardGuard}, as tests build it. */
+    /**
+     * Without the instance's {@link ShardGuard}: for tests. Main code builds it from the resolved config
+     * ({@link #Resender(TableNames, OutboxConfig)}) or, in {@link PgOutbox}, with the guard itself.
+     */
     public Resender(TableNames names, int shards) {
         this(names, shards, ShardGuard.NONE);
     }

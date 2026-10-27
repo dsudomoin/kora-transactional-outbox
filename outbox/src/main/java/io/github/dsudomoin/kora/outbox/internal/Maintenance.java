@@ -157,7 +157,7 @@ public final class Maintenance {
         this.retries = new RetryStore(names, false); // counts rows only, writes no dead row
         this.parked = new ParkedStore(names, retries);
         this.orphanRestore = new OrphanRestore(
-                names, new Resender(names, config.shards()), config.partitions().swapLockTimeout());
+                names, new Resender(names, config), config.partitions().swapLockTimeout());
         this.restoreOrphans = config.partitions().restoreOrphans();
         this.recovery = new XidRecovery(names, config);
         this.autoRecovery = config.recovery().xidRegression().equals("auto");
@@ -285,8 +285,8 @@ public final class Maintenance {
         return names.cursor() + " holds cursors for " + present + " shards, but this instance runs with outbox.shards = "
                 + shards + ": another instance resharded " + names.base() + " since this one started, or this"
                 + " one runs an old config. Its relay takes no shards and its maintenance runs no step until they"
-                + " match; restart it with outbox.shards = " + present + " or unset, which takes the cursors' count"
-                + " (its writes go on meanwhile, sharded by " + shards + ")";
+                + " match, and its writes are refused from its heartbeat's next beat on; restart it with"
+                + " outbox.shards = " + present + " or unset, which takes the cursors' count";
     }
 
     /**

@@ -270,6 +270,8 @@ public final class OutboxSchema implements Lifecycle {
                 // before the schema lock, so that wait is bounded too
                 st.execute("set lock_timeout = " + LOCK_TIMEOUT.toMillis());
                 st.execute("set statement_timeout = " + STATEMENT_TIMEOUT.toMillis());
+                // a role's own value would end the session during the reshard's tick wait
+                st.execute("set idle_session_timeout = 0");
                 try {
                     // where the table is or will be created, so every spelling of it takes the same schema lock
                     var resolved = spelled.resolve(c);
@@ -283,6 +285,7 @@ public final class OutboxSchema implements Lifecycle {
                 } finally {
                     st.execute("reset lock_timeout");
                     st.execute("reset statement_timeout");
+                    st.execute("reset idle_session_timeout");
                 }
             } finally {
                 c.setAutoCommit(autoCommit);
@@ -581,6 +584,11 @@ public final class OutboxSchema implements Lifecycle {
                         + ". A reshard needs every instance stopped: stop writers, wait for outbox.shard.lag 0, stop"
                         + " all instances, start with the new value." + keep, e);
             }
+            // a relay that ticked between the wait and the locks: no tick is made while LOCK_TICK is held
+            var age = tickAge(c, n);
+            if (age != null && age.ago() < age.bound()) {
+                throw relayRunning(n, from, to, keep, age);
+            }
             var failed = drainChecks(c, n, from);
             if (!failed.isEmpty()) {
                 throw new IllegalStateException("outbox.shards = " + to + " but " + n.cursor() + " holds cursors for "
@@ -619,36 +627,17 @@ public final class OutboxSchema implements Lifecycle {
      * up to {@link #tickWait}, rechecking: a relay that stops meanwhile lets the reshard go on, not a restart loop.
      */
     private void awaitNoTicks(Connection c, TableNames n, int from, int to, String keep) throws SQLException {
-        var relay = config.relay();
-        var own = max(relay.idlePollInterval(), relay.minTickInterval()).multipliedBy(2).plus(TICK_MARGIN);
         long deadline = System.nanoTime() + tickWait.toNanos();
         while (true) {
-            long ago;
-            long bound;
-            try (var st = c.createStatement(); var rs = st.executeQuery("select round(extract(epoch from"
-                    + " clock_timestamp() - max(created_at)) * 1000)::bigint, coalesce(round(extract(epoch from"
-                    + " max(gap)) * 1000)::bigint, 0) from (select created_at, created_at - lag(created_at) over"
-                    + " (order by id) gap from (select id, created_at from " + n.tick() + " order by id desc limit "
-                    + TICK_GAPS + ") l) g")) {
-                rs.next();
-                ago = rs.getLong(1);
-                if (rs.wasNull()) {
-                    return; // no tick at all
-                }
-                // the cadence term capped at the wait: one old long pause among the ticks cannot block a reshard
-                long cadence = Math.min(3 * rs.getLong(2), tickWait.toMillis());
-                bound = Math.max(Math.max(own.toMillis(), cadence), tickFloor.toMillis());
-            }
-            if (ago >= bound) {
+            var age = tickAge(c, n);
+            if (age == null || age.ago() >= age.bound()) {
                 return;
             }
+            long ago = age.ago();
+            long bound = age.bound();
             long left = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
             if (bound - ago > left) {
-                throw new IllegalStateException("outbox.shards = " + to + " but " + n.cursor() + " holds cursors for "
-                        + from + " shards, and a relay is still running (latest tick " + ago + " ms ago): a reshard"
-                        + " needs every instance stopped, those of releases without the heartbeat too, and no tick for "
-                        + bound + " ms (waited up to " + tickWait.toSeconds() + " s). Stop writers, wait for"
-                        + " outbox.shard.lag 0, stop all instances, start with the new value." + keep);
+                throw relayRunning(n, from, to, keep, age);
             }
             log.info("outbox reshard of {} waits {} ms for the latest tick to be {} ms old: a relay may still run",
                     n.base(), bound - ago, bound);
@@ -659,6 +648,37 @@ public final class OutboxSchema implements Lifecycle {
                 throw new IllegalStateException("outbox reshard of " + n.base() + " interrupted", e);
             }
         }
+    }
+
+    /** The newest tick's age and the tick guard's bound, in ms; null without ticks. */
+    private record TickAge(long ago, long bound) {}
+
+    @Nullable
+    private TickAge tickAge(Connection c, TableNames n) throws SQLException {
+        var relay = config.relay();
+        var own = max(relay.idlePollInterval(), relay.minTickInterval()).multipliedBy(2).plus(TICK_MARGIN);
+        try (var st = c.createStatement(); var rs = st.executeQuery("select round(extract(epoch from"
+                + " clock_timestamp() - max(created_at)) * 1000)::bigint, coalesce(round(extract(epoch from"
+                + " max(gap)) * 1000)::bigint, 0) from (select created_at, created_at - lag(created_at) over"
+                + " (order by id) gap from (select id, created_at from " + n.tick() + " order by id desc limit "
+                + TICK_GAPS + ") l) g")) {
+            rs.next();
+            long ago = rs.getLong(1);
+            if (rs.wasNull()) {
+                return null;
+            }
+            // the cadence term capped at the wait: one old long pause among the ticks cannot block a reshard
+            long cadence = Math.min(3 * rs.getLong(2), tickWait.toMillis());
+            return new TickAge(ago, Math.max(Math.max(own.toMillis(), cadence), tickFloor.toMillis()));
+        }
+    }
+
+    private IllegalStateException relayRunning(TableNames n, int from, int to, String keep, TickAge age) {
+        return new IllegalStateException("outbox.shards = " + to + " but " + n.cursor() + " holds cursors for " + from
+                + " shards, and a relay is still running (latest tick " + age.ago() + " ms ago): a reshard needs every"
+                + " instance stopped, those of releases without the heartbeat too, and no tick for " + age.bound()
+                + " ms (waited up to " + tickWait.toSeconds() + " s). Stop writers, wait for outbox.shard.lag 0, stop"
+                + " all instances, start with the new value." + keep);
     }
 
     /**
