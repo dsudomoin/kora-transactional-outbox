@@ -465,6 +465,34 @@ class TicksIT {
     }
 
     @Test
+    void withTheRowsPerXidUnknownTheProbeHasNoBudget() throws Exception {
+        var wide = new Ticks(names, 1024);
+        var ended = new ArrayList<Connection>();
+        try (var c = TestDb.connect()) {
+            for (int i = 0; i < 6; i++) { // 6 clusters: 6 × 1024 range probes, over the budget if it applied
+                var tx = TestDb.connect();
+                ended.add(tx);
+                tx.setAutoCommit(false);
+                xid(tx); // ends with no row
+                execute(c, "do $$ begin for i in 1..1100 loop perform pg_current_xact_id(); commit; end loop; end $$");
+            }
+            xid(c); // a later xid completes: P's xmax passes the 6
+            assertThat(wide.make(c, Duration.ZERO)).isTrue(); // P
+            wide.deleteBelow(c, wide.latest(c).id()); // P alone: no tick before it, so no rows per xid
+            for (var tx : ended) {
+                tx.commit();
+            }
+
+            assertThat(wide.make(c, Duration.ZERO)).isTrue(); // C
+            assertThat(dirty(c)).as("probed: the budget needs the rows per xid").isNotNull().doesNotContain("1");
+        } finally {
+            for (var tx : ended) {
+                tx.close();
+            }
+        }
+    }
+
+    @Test
     void aTickTakesOneTransactionIdItsProbeNone() throws Exception {
         try (var c = TestDb.connect()) {
             insertRow(c, 1);
