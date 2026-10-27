@@ -52,7 +52,8 @@ maintenance, dead-letter hook failures, letters the Kafka DLQ kept and failed he
 ... failed»); ERROR for dead letters, handler errors, stranded shards, the shard-count mismatch after a reshard («...
 holds cursors for N shards, but this instance runs with outbox.shards = M ...»), the xid regression, `premade < 2`, a
 detached tail, a swap not run on 10 due runs or with ranges running out (hourly, names the cause), a hot tail over
-`maxTailScan` outside the window (hourly), orphans and transaction pooling. WARN «outbox tick made without its shard set» (at most once a minute): a
+`maxTailScan` outside the window (hourly), a window that ended without converting it («... ended without a
+conversion», once), orphans and transaction pooling. WARN «outbox tick made without its shard set» (at most once a minute): a
 partition is held by an `ACCESS EXCLUSIVE` lock (`ALTER TABLE`, `VACUUM FULL`, `TRUNCATE`, a manual `LOCK`), so ticks
 step every shard and lag grows while it lasts.
 
