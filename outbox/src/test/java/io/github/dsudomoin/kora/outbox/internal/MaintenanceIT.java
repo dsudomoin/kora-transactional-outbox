@@ -224,8 +224,8 @@ class MaintenanceIT {
             long ahead = currentXid() + 2000;
             execute(c, "update " + names.tick() + " set snapshot = '" + ahead + ":" + ahead + ":'::pg_snapshot"
                     + " where id = " + forged);
-            // a tick made after the regression, as running workers would: it is consistent, the forged one is not
-            assertThat(new Ticks(names, config.shards()).make(c, Duration.ZERO)).isTrue();
+            // a tick attempt after the regression, as running workers make: refused, the halt recorded
+            assertThat(new Ticks(names, config.shards()).tick(c, Duration.ZERO)).isEqualTo(Ticks.Made.REGRESSED);
         }
         try (err) {
             try (var otherRunner = TestDb.connect()) {
