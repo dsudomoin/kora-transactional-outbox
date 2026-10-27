@@ -49,6 +49,42 @@ class TicksIT {
     }
 
     @Test
+    void lastUnmarkedSkipsOnlyTheTicksThatDoNotMarkTheShard() throws Exception {
+        try (var c = TestDb.connect()) {
+            long p = ticks.latest(c).id(); // the bootstrap tick
+            long a = tick(c, "''");
+            long b = tick(c, "B'01000000'");
+            long n = tick(c, "null");
+            long d = tick(c, "B'01'"); // drawn from another shard count: every shard
+            long e1 = tick(c, "''");
+            long e2 = tick(c, "''");
+            long latest = tick(c, "''");
+
+            assertThat(lastUnmarked(c, 0, p, latest)).as("shard 0: first marked by the null tick").isEqualTo(b);
+            assertThat(lastUnmarked(c, 1, p, latest)).as("shard 1: by its bit").isEqualTo(a);
+            assertThat(lastUnmarked(c, 0, n, latest)).as("from the null tick: by the other length").isNull();
+            assertThat(lastUnmarked(c, 0, d, latest)).as("only the latest marks it").isEqualTo(e2);
+            assertThat(lastUnmarked(c, 0, p, a)).as("the latest marks it, first after p").isNull();
+
+            execute(c, "delete from " + names.tick() + " where id = " + e1); // by hand: a gap before e2
+            assertThat(lastUnmarked(c, 0, d, latest)).as("the tick after the gap marks it").isNull();
+        }
+    }
+
+    /** {@link Ticks#lastUnmarked}'s tick id, null for none. */
+    @Nullable
+    private Long lastUnmarked(Connection c, int shard, long afterId, long latestId) throws Exception {
+        var tick = ticks.lastUnmarked(c, shard, afterId, latestId);
+        return tick == null ? null : tick.id();
+    }
+
+    /** A tick with {@code dirty} (SQL); returns its id. */
+    private long tick(Connection c, String dirty) throws Exception {
+        return queryLong(c, "insert into " + names.tick() + " (snapshot, max_id, dirty) select pg_current_snapshot(),"
+                + " 0, " + dirty + "::varbit returning id");
+    }
+
+    @Test
     void makeRespectsMinInterval() throws Exception {
         try (var c = TestDb.connect()) {
             execute(c, "update " + names.tick() + " set created_at = created_at - interval '1 hour'");

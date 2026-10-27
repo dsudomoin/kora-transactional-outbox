@@ -1523,19 +1523,23 @@ class ShardProcessorIT {
         assertThat(process()).isEqualTo(new ShardResult(NO_WORK, 0, true));
         assertThat(cursorRows()).isEqualTo(appends + 1);
 
-        // a target below the latest tick (maxTicksPerBatch 1): one tick a step, each appended
-        long t2 = tick();
+        // ticks that do not mark the shard are skipped: one step to the latest, however many there are
+        tick();
         long t3 = tick();
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
-        assertThat(cursor().tickId()).isEqualTo(t2);
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
         assertThat(cursor().tickId()).isEqualTo(t3);
+        assertThat(cursorRows()).isEqualTo(appends + 2);
 
-        // rows read: appended as before
+        // ticks that mark it: maxTicksPerBatch (1) a step, each appended
         send(msg("t", "a", "a#1"));
         long t4 = tick();
+        send(msg("t", "b", "b#1"));
+        long t5 = tick();
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
         assertThat(cursor().tickId()).isEqualTo(t4);
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(cursor().tickId()).isEqualTo(t5);
+        assertThat(cursorRows()).isEqualTo(appends + 4);
     }
 
     @Test
@@ -1561,6 +1565,23 @@ class ShardProcessorIT {
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
         assertThat(cursor()).isEqualTo(new Cursor(0, t3, null, 0, null, 0, null, null));
         assertThat(delivered()).containsExactly("a#1");
+    }
+
+    @Test
+    void aSparseShardsFirstRowFarPastItsEffectiveTickIsDeliveredInOneStep() throws Exception {
+        bootstrap(); // maxTicksPerBatch 100
+        try (var c = TestDb.connect()) { // 150 idle ticks, none marking the shard
+            execute(c, "insert into " + names.tick() + " (snapshot, max_id, dirty) select pg_current_snapshot(),"
+                    + " 0, ''::varbit from generate_series(1, 150)");
+        }
+        send(msg("t", "a", "a#1"));
+        long t = tick();
+        long appends = cursorRows();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(cursorRows()).isEqualTo(appends + 1);
+        assertThat(cursor().tickId()).isEqualTo(t);
+        assertThat(process()).isEqualTo(new ShardResult(NO_WORK, 0, true));
     }
 
     @Test

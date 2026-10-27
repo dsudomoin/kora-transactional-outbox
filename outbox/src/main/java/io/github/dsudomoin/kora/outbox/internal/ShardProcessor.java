@@ -58,7 +58,11 @@ import org.slf4j.LoggerFactory;
 /**
  * One relay step for one shard, inside the caller's transaction: take the shard lock and the tail swap's lock shared
  * ({@link #tryLock}), re-read the cursor, deliver due retry heads and due parked rows, then the next chunk of the batch
- * {@code (tickId, target]} with the parked rows of its keys first in its call, classify and append the new cursor. A
+ * {@code (tickId, target]} with the parked rows of its keys first in its call, classify and append the new cursor. The
+ * batch starts from the shard's effective tick ({@link Cursors}); a fresh one skips the leading ticks that do not mark
+ * the shard ({@link Ticks#lastUnmarked}), which hold none of its rows, so its {@code maxTicksPerBatch} ticks start at
+ * the first that may: an idle shard far behind the latest tick (an effective tick a maintenance interval old, or a
+ * cursor's) reaches its first row, or the latest tick, in one step, not one step per {@code maxTicksPerBatch} ticks. A
  * failed attempt halves the rows the shard's next step reads and a delivery doubles them (up to {@code batchSize}), so
  * a record that fails its whole call deep in a chunk is soon read alone; a requeue is neither. After
  * {@code headFailuresBeforeDivert} failed attempts in a row the shard probes: it reads the head row alone and merges no
@@ -242,6 +246,11 @@ public final class ShardProcessor implements AutoCloseable {
             target = ticks.get(inTx, cursor.targetTickId());
         } else if (latestTickId > cursor.tickId()) {
             prev = effectiveTick(current);
+            var skipped = ticks.lastUnmarked(inTx, shard, cursor.tickId(), latestTickId);
+            if (skipped != null) { // the ticks up to it hold no row of the shard: the position moves there too
+                prev = skipped;
+                cursor = cursor.withProgress(skipped.id(), null, 0);
+            }
             var candidates = ticks.between(inTx, cursor.tickId(),
                     Math.min(latestTickId, cursor.tickId() + relay.maxTicksPerBatch()));
             // a gap in tick ids (e.g. a rolled-back tick insert) must not stop the shard

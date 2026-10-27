@@ -114,7 +114,9 @@ public final class Ticks {
      * batch through {@link BatchReader}, whose second branch looks up every xid of E ({@code xid = any(...)}), so about
      * shards × |E| index descents in all, roughly the work of the per-xid probe the clusters replaced (about 266 ms at
      * 1024 shards and 400 ended xids), and appending its cursor row: one capped tick costs one sweep of every shard
-     * plus one cursor row per shard, outside the tick lock and spread over the relay workers. The rows
+     * plus one cursor row per shard, outside the tick lock and spread over the relay workers, however far the shards'
+     * effective ticks lie behind it, as a fresh batch starts at the last tick before C that does not mark its shard
+     * ({@link #lastUnmarked}). The rows
      * inside the ranges are not read: for a shard at P they are no candidates of the batch (P, C], being visible in P.
      * That the heavy load such ranges need has branch 1 mark nearly every shard anyway is an expectation, not a
      * measurement. At 1024 shards a probe estimated just below the budget took about 5 ms (on a scratch Postgres 16,
@@ -399,6 +401,33 @@ public final class Ticks {
 
     public Tick get(Connection c, long id) throws SQLException {
         return one(c, " where id = ?", id);
+    }
+
+    /**
+     * For a fresh batch of {@code shard} from the tick {@code afterId}: the last tick before the first one after it, up
+     * to {@code latestId}, that marks the shard, when that is past {@code afterId}; null when none is. A tick marks the
+     * shard when its {@code dirty} has the shard's bit or is null (or of another non-zero length), when it follows a
+     * gap in tick ids, or when it is the latest. The ticks skipped mark nothing of the shard and chain (see the class
+     * comment), so the shard has no row visible in the tick returned and not in {@code afterId}: its batch can start
+     * there, read the same rows and cover its {@code maxTicksPerBatch} ticks from the first that may hold them. One
+     * statement, an index scan from {@code afterId} that stops at the first marking tick.
+     */
+    @Nullable
+    public Tick lastUnmarked(Connection c, int shard, long afterId, long latestId) throws SQLException {
+        try (var ps = c.prepareStatement(SELECT + names.tick() + " where id = (select max(m.id) from " + names.tick()
+                + " m where m.id > ? and m.id < (select n.id from " + names.tick() + " n where n.id > ? and n.id <= ?"
+                + " and (n.id = ? or n.dirty is null or not exists (select 1 from " + names.tick() + " g where g.id"
+                + " = n.id - 1) or case when length(n.dirty) = 0 then false when length(n.dirty) <> " + shards
+                + " then true else get_bit(n.dirty, ?) = 1 end) order by n.id limit 1))")) {
+            ps.setLong(1, afterId);
+            ps.setLong(2, afterId);
+            ps.setLong(3, latestId);
+            ps.setLong(4, latestId);
+            ps.setInt(5, shard);
+            try (var rs = ps.executeQuery()) {
+                return rs.next() ? tick(rs) : null;
+            }
+        }
     }
 
     /** The ticks with {@code afterId < id <= upToId}, in id order. */

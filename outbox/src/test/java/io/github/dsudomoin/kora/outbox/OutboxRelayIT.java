@@ -1297,12 +1297,25 @@ class OutboxRelayIT {
 
     @Test
     void aTickWithoutAShardSetStepsEachShardOnce() throws Exception {
+        aTickWithoutAShardSetStepsEachShardOnce(0);
+    }
+
+    @Test
+    void aTickWithoutAShardSetFarPastTheCheckpointStepsEachShardOnce() throws Exception {
+        aTickWithoutAShardSetStepsEachShardOnce(150); // 30 s of idle ticks, beyond maxTicksPerBatch (100)
+    }
+
+    private void aTickWithoutAShardSetStepsEachShardOnce(int idleTicksBefore) throws Exception {
         config.shards(32).workers(4).minTickInterval(Duration.ofMillis(50)).idlePollInterval(Duration.ofMillis(200));
         bootstrap();
         var relay = start(new RecordingHandler());
         awaitParked();
         long seq = maxCursorSeq();
-        try (var c = TestDb.connect()) { // as a capped or failed probe leaves it: every shard may have rows
+        try (var c = TestDb.connect()) {
+            execute(c, "insert into " + schema.names().tick() + " (snapshot, max_id, dirty) select"
+                    + " pg_current_snapshot(), t.max_id, ''::varbit from (select max_id from " + schema.names().tick()
+                    + " order by id desc limit 1) t, generate_series(1, " + idleTicksBefore + ")");
+            // as a capped or failed probe leaves it: every shard may have rows
             execute(c, "insert into " + schema.names().tick() + " (snapshot, max_id) select pg_current_snapshot(),"
                     + " max_id from " + schema.names().tick() + " order by id desc limit 1");
         }
