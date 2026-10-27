@@ -129,6 +129,12 @@ class OutboxConfigTest {
         assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox.partitions.tailConversion.window = 3-5")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("outbox.partitions.tailConversion.window").hasMessageContaining("HH:mm-HH:mm");
+        assertThat(tail.zone()).isEqualTo(java.time.ZoneId.systemDefault().getId());
+        assertThat(parse("outbox.partitions.tailConversion.zone = UTC").partitions().tailConversion().zone())
+                .isEqualTo("UTC");
+        assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox.partitions.tailConversion.zone = Mars/Olympus")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("outbox.partitions.tailConversion.zone").hasMessageContaining("Mars/Olympus");
         assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox.partitions.tailConversion.maxStall = 0s")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("outbox.partitions.tailConversion.maxStall must be at least 1ms: PT0S");

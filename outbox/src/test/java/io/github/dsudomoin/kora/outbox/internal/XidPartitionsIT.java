@@ -129,7 +129,7 @@ class XidPartitionsIT {
                 while (extensions < 2) {
                     assertThat(System.nanoTime()).as("two extensions within 60 s").isLessThan(cap);
                     TestDb.burnXids(3000);
-                    partitions.ensurePremade(c);
+                    ensurePremadeAsMaintenance(partitions, c); // flat-out writers may leave no moment: next run
                     long moved = tail(c, names);
                     if (moved != tail) {
                         extensions++;
@@ -572,7 +572,7 @@ class XidPartitionsIT {
         });
 
         try (var c = TestDb.connect()) {
-            long lower = overflowTail(c, names, 300_000);
+            long lower = overflowTail(c, names, 600_000);
             var before = PartitionDdl.listRanges(c, names.base());
             writer.start();
             while (inserts.get() == 0 && errors.isEmpty()) {
@@ -597,7 +597,7 @@ class XidPartitionsIT {
             assertThat(detachPending(c, names.tail())).as("still attached").isEqualTo("false");
             assertThat(partitions.overflow()).isTrue();
             assertThat(swapLocks(c, names)).as("the quiesce lock released").isZero();
-            assertThat(queryLong(c, "select count(*) from " + names.tail())).isEqualTo(300_000 + inserts.get());
+            assertThat(queryLong(c, "select count(*) from " + names.tail())).isEqualTo(600_000 + inserts.get());
         }
     }
 
@@ -701,7 +701,8 @@ class XidPartitionsIT {
             PartitionDdl.create(c, names.base(), names.tailNext(), PartitionDdl.CREATE_LOCK_TIMEOUT);
             var before = PartitionDdl.listRanges(c, names.base());
 
-            assertThat(partitions.swap(c, lower, passed, passed + 4000, Duration.ofSeconds(5))).isFalse();
+            assertThat(partitions.swap(c, lower, passed, passed + 4000, Duration.ofSeconds(5), Long.MAX_VALUE))
+                    .contains("the current xid passed");
 
             assertThat(c.getAutoCommit()).isTrue();
             assertThat(PartitionDdl.listRanges(c, names.base())).containsExactlyInAnyOrderElementsOf(before);
@@ -1066,6 +1067,199 @@ class XidPartitionsIT {
         }
     }
 
+    /**
+     * The swap's hold is one statement on the server, bounded by its own {@code statement_timeout}: a stall inside it
+     * (here a delay where the maintenance JVM could pause between statements) is cut there, the swap rolls back with
+     * the tail attached, and a writer waits about that bound, not the stall.
+     */
+    @Test
+    void aStallInsideTheHoldIsCutByTheServerAndWritersGoOn() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+        var done = new AtomicBoolean();
+        var slowest = new AtomicLong();
+        var errors = new ConcurrentLinkedQueue<Throwable>();
+        var writer = new Thread(() -> {
+            try (var w = TestDb.connect()) {
+                while (!done.get()) {
+                    long start = System.nanoTime();
+                    send(w, names, 1);
+                    slowest.accumulateAndGet(System.nanoTime() - start, Math::max);
+                    Thread.sleep(2);
+                }
+            } catch (Throwable e) {
+                errors.add(e);
+            }
+        });
+
+        try (var c = TestDb.connect()) {
+            long lower = tail(c, names);
+            TestDb.burnXids(2500);
+            long offset = currentXid(c) % 1000;
+            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
+                TestDb.burnXids((int) (1000 - offset) + 10);
+            }
+            stallInsideTheHold(partitions);
+            writer.start();
+            Thread.sleep(100);
+
+            try {
+                assertThatThrownBy(() -> partitions.ensurePremade(c)).isInstanceOf(SQLException.class);
+                Thread.sleep(100);
+            } finally {
+                done.set(true);
+                writer.join();
+            }
+
+            assertThat(errors).isEmpty();
+            assertThat(Duration.ofNanos(slowest.get())).as("the slowest insert, the hold cut at its bound")
+                    .isLessThan(Duration.ofMillis(800));
+            assertThat(tail(c, names)).isEqualTo(lower);
+            assertThat(detachPending(c, names.tail())).as("still attached").isEqualTo("false");
+            assertThat(swapLocks(c, names)).as("the quiesce lock released").isZero();
+            noStallInsideTheHold(partitions);
+            partitions.ensurePremade(c);
+
+            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
+            assertTailAboveLastRange(c, names);
+        }
+    }
+
+    /**
+     * A swap attaches at most four ranges and the new tail, each made ahead of it with its indexes, which the attach
+     * takes over instead of building them under the lock; the extension goes on, a swap a run, until premake ranges
+     * lie ahead, the new tail always right after the last range.
+     */
+    @Test
+    void aSwapAttachesAtMostFourRangesWithTheIndexesMadeAheadOfIt() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(16);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
+
+        try (var holder = TestDb.connect(); var c = TestDb.connect()) {
+            long lower = tail(c, names);
+            TestDb.burnXids(9000);
+            long offset = currentXid(c) % 1000;
+            if (offset > 900) {
+                TestDb.burnXids((int) (1000 - offset) + 10);
+            }
+            holder.setAutoCommit(false); // old: the first run makes the ranges ahead, then defers
+            queryLong(holder, "select count(*) from " + names.base());
+            Thread.sleep(1100);
+            ensurePremadeAsMaintenance(partitions, c);
+            holder.commit();
+            String range = names.partitionPrefix() + lower;
+            long index = queryLong(c, "select coalesce(min(indexrelid::bigint), 0) from pg_index"
+                    + " where indrelid = to_regclass('" + range + "')");
+            assertThat(index).as("an index made with the range, ahead of the swap").isPositive();
+
+            String log;
+            try (var err = new CapturedStderr()) {
+                for (int run = 0; run < 10 && partitions.premadeAhead(c) < config.premake(); run++) {
+                    partitions.ensurePremade(c);
+                    assertTailAboveLastRange(c, names);
+                }
+                log = err.text();
+            }
+
+            assertThat(queryLong(c, "select min(indexrelid::bigint) from pg_index where indrelid = to_regclass('"
+                    + range + "')")).as("the same index, attached").isEqualTo(index);
+            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(config.premake());
+            var attached = java.util.regex.Pattern.compile("attached (\\d+) ranges").matcher(log).results()
+                    .map(m -> Integer.parseInt(m.group(1))).toList();
+            assertThat(attached).as("ranges per swap").hasSizeGreaterThan(1).allSatisfy(n -> assertThat(n)
+                    .isBetween(1, 4));
+        }
+    }
+
+    /**
+     * The size gate is read again under the swap's lock: a tail that grew past maxTailScan since is not scanned, the
+     * swap is left with nothing changed, and the run counts as one without a swap.
+     */
+    @Test
+    void aTailThatGrewPastTheCapBeforeTheLockIsNotScanned() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(256 * 1024);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+
+        try (var c = TestDb.connect()) {
+            long lower = overflowTail(c, names, 10);
+            partitions.afterGate = () -> { // after the gate read the tail, rows keep arriving
+                try (var w = TestDb.connect()) {
+                    execute(w, "insert into " + names.base() + " (shard, message_id, topic, payload) select s % 4,"
+                            + " gen_random_uuid(), 't', convert_to(repeat('p', 300), 'UTF8')"
+                            + " from generate_series(1, 2000) s");
+                } catch (SQLException e) {
+                    throw new IllegalStateException(e);
+                }
+            };
+
+            String log;
+            try (var err = new CapturedStderr()) {
+                ensurePremadeAsMaintenance(partitions, c);
+                log = err.text();
+            }
+
+            assertThat(tail(c, names)).as("not converted").isEqualTo(lower);
+            assertThat(queryLong(c, "select count(*) from " + names.tail())).isEqualTo(2010);
+            assertThat(partitions.overflow()).isTrue();
+            assertThat(log).contains("grew past outbox.partitions.maxTailScan under the swap's lock");
+        }
+    }
+
+    /**
+     * An oversized attempt cut by maxStall is not tried again in the same window on this instance; once the window
+     * ends without a fit, one ERROR names the size, maxStall and the advice; the next night tries again.
+     */
+    @Test
+    void anOversizedAttemptCutByMaxStallWaitsForTheNextWindow() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
+                .tailConversion("23:00-01:00", Duration.ofMillis(1));
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+
+        try (var c = TestDb.connect()) {
+            overflowTail(c, names, 600_000);
+            partitions.clock = at(0, 30);
+            ensurePremadeAsMaintenance(partitions, c);
+            assertThat(partitions.oversizedAttempts).as("cut by maxStall").hasValue(1);
+            partitions.clock = at(0, 40);
+            ensurePremadeAsMaintenance(partitions, c);
+            assertThat(partitions.oversizedAttempts).as("not again in this window").hasValue(1);
+
+            String log;
+            try (var err = new CapturedStderr()) {
+                partitions.clock = at(1, 10);
+                ensurePremadeAsMaintenance(partitions, c);
+                partitions.clock = at(1, 20);
+                ensurePremadeAsMaintenance(partitions, c);
+                log = err.text();
+            }
+
+            assertThat(log.split("ended without a conversion", -1)).as("one ERROR").hasSize(2);
+            assertThat(log).contains("ERROR").contains(" MB").contains("maxStall 1 ms").contains("raise");
+            partitions.clock = at(23, 30);
+            ensurePremadeAsMaintenance(partitions, c);
+            assertThat(partitions.oversizedAttempts).as("the next night").hasValue(2);
+        }
+    }
+
+    @Test
+    void bootstrapSaysTheTailConversionWindowAndItsZone() throws Exception {
+        var config = new TestOutboxConfig().tailConversion("02:00-04:30", Duration.ofMillis(800))
+                .tailConversionZone("Asia/Tokyo");
+
+        String log;
+        try (var err = new CapturedStderr()) {
+            bootstrap(config);
+            log = err.text();
+        }
+
+        assertThat(log).contains("INFO").contains("tail conversion window 02:00-04:30 in zone Asia/Tokyo")
+                .contains("maxStall 800 ms");
+    }
+
     @Test
     void quiesceWaitsForARelayStepAndTimesOutWithoutALock() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
@@ -1117,18 +1311,17 @@ class XidPartitionsIT {
                 TestDb.burnXids((int) (1000 - offset) + 10);
             }
             var before = PartitionDdl.listRanges(c, names.base());
-            partitions.inSwap = () -> { // an OutOfMemoryError, say: neither an SQLException nor a RuntimeException
-                throw new Error("mid-swap");
-            };
+            partitions.inHold = "raise exception 'mid-swap';"; // any failure inside the swap's statement
 
-            assertThatThrownBy(() -> partitions.ensurePremade(c)).isExactlyInstanceOf(Error.class);
+            assertThatThrownBy(() -> partitions.ensurePremade(c)).isInstanceOf(SQLException.class)
+                    .hasMessageContaining("mid-swap");
 
             assertThat(c.getAutoCommit()).isTrue();
             assertThat(swapLocks(c, names)).as("the quiesce lock released, not left to the pool").isZero();
             assertThat(PartitionDdl.listRanges(c, names.base())).as("the detach rolled back, nothing committed")
                     .containsExactlyInAnyOrderElementsOf(before);
             assertThat(detachPending(c, names.tail())).as("still attached").isEqualTo("false");
-            partitions.inSwap = null;
+            partitions.inHold = null;
             partitions.ensurePremade(c);
 
             assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
@@ -1255,6 +1448,10 @@ class XidPartitionsIT {
                 execute(c, "set lock_timeout = '7s'"); // a session value, which the DDL must give back
                 long lower = tail(c, names);
                 TestDb.burnXids(2500);
+                long offset = currentXid(c) % 1000;
+                if (offset > 400) { // its DDL and tries (two xids each) must not carry the counter into the next range
+                    TestDb.burnXids((int) (1000 - offset) + 10);
+                }
                 holder.setAutoCommit(false); // a young reader the swap waits over 1 s for
                 queryLong(holder, "select count(*) from " + names.base());
                 var errors = new ConcurrentLinkedQueue<Throwable>();
@@ -1434,6 +1631,15 @@ class XidPartitionsIT {
                 .filter(b -> names.unqualified(b.name()).equals(names.unqualified(names.partitionPrefix()) + lower))
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("no range " + names.partitionPrefix() + lower));
+    }
+
+    /** Makes the hold stall for 3 s where the swap could once wait on its own client. */
+    private static void stallInsideTheHold(XidPartitions partitions) {
+        partitions.inHold = "perform pg_sleep(3);";
+    }
+
+    private static void noStallInsideTheHold(XidPartitions partitions) {
+        partitions.inHold = null;
     }
 
     /** A clock at {@code hour:minute} today in the JVM's zone. */

@@ -156,6 +156,12 @@ public final class OutboxSchema implements Lifecycle {
         require(partitions.maxTailScan() >= 0,
                 "outbox.partitions.maxTailScan must not be negative: " + partitions.maxTailScan());
         XidPartitions.Window.parse(partitions.tailConversion().window()); // its message names the key
+        try {
+            java.time.ZoneId.of(partitions.tailConversion().zone());
+        } catch (java.time.DateTimeException e) {
+            throw new IllegalArgumentException("outbox.partitions.tailConversion.zone must be a time zone id such as"
+                    + " Europe/Moscow or UTC: " + partitions.tailConversion().zone(), e);
+        }
         require(partitions.tailConversion().maxStall().toMillis() >= 1,
                 "outbox.partitions.tailConversion.maxStall must be at least 1ms: "
                         + partitions.tailConversion().maxStall());
@@ -773,6 +779,7 @@ public final class OutboxSchema implements Lifecycle {
     private void ensurePartitions(Connection c, TableNames n) throws SQLException {
         var partitions = XidPartitions.forBootstrap(n, config.partitions());
         partitions.warnIfActivityHidden(c); // once per start
+        partitions.logTailConversion();
         try {
             advisory(c, "pg_advisory_lock", n, TableNames.LOCK_MAINTENANCE); // bounded by the session lock_timeout
             try {

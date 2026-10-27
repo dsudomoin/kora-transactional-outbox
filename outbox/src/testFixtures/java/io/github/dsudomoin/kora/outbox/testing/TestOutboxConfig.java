@@ -40,6 +40,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private boolean restoreOrphans = true;
     private String tailConversionWindow = ""; // off, whatever time the test runs at
     private Duration tailConversionMaxStall = Duration.ofSeconds(1);
+    private String tailConversionZone = java.time.ZoneId.systemDefault().getId();
     private String inboxTable = TestDb.uniqueTable();
     private Duration inboxPartitionInterval = Duration.ofHours(1);
     private Duration inboxPremake = Duration.ofHours(24);
@@ -370,6 +371,16 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     @Override
     public Duration maxStall() {
         return tailConversionMaxStall;
+    }
+
+    @Override
+    public String zone() {
+        return tailConversionZone;
+    }
+
+    public TestOutboxConfig tailConversionZone(String zone) {
+        this.tailConversionZone = zone;
+        return this;
     }
 
     public TestOutboxConfig tailConversion(String window, Duration maxStall) {

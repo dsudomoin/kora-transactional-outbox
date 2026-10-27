@@ -211,6 +211,11 @@ public interface OutboxConfig {
         default Duration maxStall() {
             return Duration.ofSeconds(1);
         }
+
+        /** The IANA time zone {@link #window()} is read in. Default: the JVM's default zone. */
+        default String zone() {
+            return java.time.ZoneId.systemDefault().getId();
+        }
     }
 
     @ConfigValueExtractor

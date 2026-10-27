@@ -210,11 +210,17 @@ class TailSwapIT {
      */
     @Test
     void writersWithAShortLockTimeoutNeverFailDuringSwaps() throws Exception {
+        var defaults = new OutboxConfig.PartitionsConfig() {};
+        config.xidsPerPartition(defaults.xidsPerPartition()).premake(defaults.premake());
         writerLockTimeout = Duration.ofMillis(50);
         writerPause = Duration.ofMillis(20);
-        burnBatch = 10;
         bootstrap();
-        start();
+        try (var pause = TestDb.connect(); var c = TestDb.connect()) {
+            maintenanceLock(pause, "pg_advisory_lock");
+            useUpHalfOfPremake(c);
+            start();
+            maintenanceLock(pause, "pg_advisory_unlock");
+        }
         var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new OutboxMetrics(null));
         run("slow-writer", () -> {
             while (!stopping.get()) {
@@ -235,11 +241,10 @@ class TailSwapIT {
                 Thread.sleep(150);
             }
         });
-        burning = true;
         await(Duration.ofSeconds(90), () -> swaps().size() >= 3);
-        burning = false;
 
-        finish("writersWithAShortLockTimeoutNeverFailDuringSwaps");
+        finish("writersWithAShortLockTimeoutNeverFailDuringSwaps (xidsPerPartition " + config.xidsPerPartition()
+                + ", premake " + config.premake() + ")");
     }
 
     /**
@@ -318,8 +323,9 @@ class TailSwapIT {
     }
 
     /**
-     * The swap at the library's default {@code xidsPerPartition} and {@code premake}, once premake / 2 ranges were used
-     * up since the last extension: it attaches premake / 2 new ranges. For the README's lock-hold figure.
+     * The swaps at the library's default {@code xidsPerPartition} and {@code premake}, once premake / 2 ranges were
+     * used up since the last extension: four ranges a swap, a swap a run, until premake lie ahead again. For the
+     * README's lock-hold figure.
      */
     @Test
     void swapAtTheDefaultPartitionSizes() throws Exception {
@@ -328,27 +334,37 @@ class TailSwapIT {
         bootstrap();
         try (var pause = TestDb.connect(); var c = TestDb.connect()) {
             maintenanceLock(pause, "pg_advisory_lock");
-            var ranges = PartitionDdl.listRanges(c, names.base()).stream().filter(b -> b.to() != null)
-                    .sorted(Comparator.comparingLong(b -> Long.parseLong(b.from()))).toList();
-            var used = ranges.subList(ranges.size() - config.premake() / 2, ranges.size());
-            execute(c, "alter table " + names.base() + " detach partition " + names.tail());
-            for (var range : used) {
-                execute(c, "drop table " + range.name());
-            }
-            execute(c, "alter table " + names.base() + " attach partition " + names.tail() + " for values from ('"
-                    + used.get(0).from() + "') to (maxvalue)");
-            assertThat(new XidPartitions(names, config.partitions()).premadeAhead(c)).isEqualTo(config.premake() / 2);
+            useUpHalfOfPremake(c);
             start();
             await(Duration.ofSeconds(10), () -> commits.get() > 1000);
             maintenanceLock(pause, "pg_advisory_unlock");
         }
-        await(Duration.ofSeconds(60), () -> !swaps().isEmpty());
+        int expected = config.premake() / 2 / 4; // premake / 2 ranges used up, four a swap
+        await(Duration.ofSeconds(60), () -> swaps().size() >= expected);
 
         var swaps = finish("swapAtTheDefaultPartitionSizes (xidsPerPartition " + config.xidsPerPartition()
                 + ", premake " + config.premake() + ")");
 
-        assertThat(swaps).singleElement().satisfies(swap -> assertThat(swap.group()).contains("attached "
-                + config.premake() / 2 + " ranges"));
+        assertThat(swaps).hasSize(expected).allSatisfy(swap -> assertThat(swap.group())
+                .contains("attached 4 ranges"));
+        try (var c = TestDb.connect()) {
+            assertThat(new XidPartitions(names, config.partitions()).premadeAhead(c))
+                    .isGreaterThanOrEqualTo(config.premake());
+        }
+    }
+
+    /** The ranges premake / 2 above the tail dropped and the tail moved down to them: the extension is due. */
+    private void useUpHalfOfPremake(Connection c) throws SQLException {
+        var ranges = PartitionDdl.listRanges(c, names.base()).stream().filter(b -> b.to() != null)
+                .sorted(Comparator.comparingLong(b -> Long.parseLong(b.from()))).toList();
+        var used = ranges.subList(ranges.size() - config.premake() / 2, ranges.size());
+        execute(c, "alter table " + names.base() + " detach partition " + names.tail());
+        for (var range : used) {
+            execute(c, "drop table " + range.name());
+        }
+        execute(c, "alter table " + names.base() + " attach partition " + names.tail() + " for values from ('"
+                + used.get(0).from() + "') to (maxvalue)");
+        assertThat(new XidPartitions(names, config.partitions()).premadeAhead(c)).isEqualTo(config.premake() / 2);
     }
 
     private void bootstrap() throws Exception {

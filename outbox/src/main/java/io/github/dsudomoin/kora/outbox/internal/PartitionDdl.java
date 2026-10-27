@@ -69,8 +69,18 @@ public final class PartitionDdl {
      * failed before its attach left it). {@code LIKE} takes ACCESS SHARE on the parent, which no writer waits for.
      */
     static void create(Connection c, String parent, String table, Duration lockTimeout) throws SQLException {
+        create(c, parent, table, lockTimeout, false);
+    }
+
+    /**
+     * {@link #create}; with {@code indexes}, also the parent's indexes, which an attach to it then takes over instead
+     * of building them under its lock.
+     */
+    static void create(Connection c, String parent, String table, Duration lockTimeout, boolean indexes)
+            throws SQLException {
         if (!exists(c, table)) {
-            execute(c, lockTimeout, "create table " + name(table) + " (like " + name(parent) + " including defaults)");
+            execute(c, lockTimeout, "create table " + name(table) + " (like " + name(parent) + " including defaults"
+                    + (indexes ? " including indexes)" : ")"));
             log.info("created table {} like {}", table, parent);
         }
     }
@@ -328,6 +338,29 @@ public final class PartitionDdl {
     /** {@link #execute(Connection, Duration, String)} with its own {@code statementTimeout}, zero for none. */
     static void execute(Connection c, Duration lockTimeout, Duration statementTimeout, String sql)
             throws SQLException {
+        execute(c, lockTimeout, statementTimeout, sql, null);
+    }
+
+    /** {@link #execute(Connection, Duration, Duration, String)}, its statement's warnings, if any, to {@code warnings}. */
+    static void execute(Connection c, Duration lockTimeout, Duration statementTimeout, String sql,
+            @Nullable java.util.function.Consumer<java.sql.SQLWarning> warnings) throws SQLException {
+        withTimeouts(c, lockTimeout, statementTimeout, () -> {
+            try (var st = c.createStatement()) {
+                st.execute(sql);
+                if (warnings != null) {
+                    warnings.accept(st.getWarnings());
+                }
+            }
+            return null;
+        });
+    }
+
+    /**
+     * {@code body} with {@code lock_timeout} and {@code statement_timeout} set (and, on Postgres 17+,
+     * {@code transaction_timeout} off) for each of its statements, the session's own given back afterwards.
+     */
+    static <T> T withTimeouts(Connection c, Duration lockTimeout, Duration statementTimeout,
+            ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0<T> body) throws SQLException {
         String lock;
         String statement;
         String transaction;
@@ -339,13 +372,14 @@ public final class PartitionDdl {
         }
         boolean local = !c.getAutoCommit();
         boolean pg17 = c.getMetaData().getDatabaseMajorVersion() >= 17; // before it, no such setting
+        T result;
         try (var st = c.createStatement()) {
             st.execute((local ? "set local" : "set") + " lock_timeout = " + lockTimeout.toMillis());
             st.execute((local ? "set local" : "set") + " statement_timeout = " + statementTimeout.toMillis());
             if (pg17) {
                 st.execute((local ? "set local" : "set") + " transaction_timeout = 0");
             }
-            st.execute(sql);
+            result = body.apply();
         } catch (SQLException | RuntimeException e) {
             try {
                 restore(c, lock, statement, transaction, local, pg17);
@@ -355,6 +389,7 @@ public final class PartitionDdl {
             throw e;
         }
         restore(c, lock, statement, transaction, local, pg17);
+        return result;
     }
 
     private static void restore(Connection c, @Nullable String lock, @Nullable String statement,
