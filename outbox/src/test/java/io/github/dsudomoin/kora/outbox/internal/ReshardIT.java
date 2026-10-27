@@ -21,6 +21,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -391,6 +392,34 @@ class ReshardIT {
         var next = start(config(8));
         next.relay().drain();
         assertThat(recording.delivered()).extracting(r -> new String(r.payload(), UTF_8)).containsExactly("during");
+    }
+
+    @Test
+    void aWriteCommittedWhileTheReshardWaitsForItsLockIsSeenUnderARepeatableReadDefault() throws Exception {
+        start(config(4));
+        stopped();
+        var options = new Properties();
+        options.setProperty("options", "-c default_transaction_isolation=repeatable\\ read");
+        var repeatableRead = TestDb.newDatabase(2, options);
+        try (var writer = TestDb.connect()) {
+            // a writer of the old count mid-transaction, e.g. a frozen instance or one of a release without heartbeat
+            writer.setAutoCommit(false);
+            TestSql.execute(writer, "insert into " + table + " (shard, message_id, topic) values (3, gen_random_uuid(),"
+                    + " 't')");
+            var resharding = pool.submit(() -> {
+                new OutboxSchema(repeatableRead, config(8)).init();
+                return null;
+            });
+            await(() -> queryLong("select count(*) from pg_locks where relation = '" + table + "'::regclass"
+                    + " and mode = 'ShareLock' and not granted") == 1);
+            writer.commit();
+
+            assertThatThrownBy(() -> resharding.get(10, SECONDS)).hasCauseInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("1 committed rows not relayed");
+        } finally {
+            repeatableRead.release();
+        }
+        assertThat(cursorShards()).isEqualTo(4);
     }
 
     @Test

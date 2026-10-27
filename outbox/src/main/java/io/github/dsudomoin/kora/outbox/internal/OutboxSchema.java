@@ -537,10 +537,10 @@ public final class OutboxSchema implements Lifecycle {
      * while the newest tick is younger than the longest of: 2 × the longer of {@code idlePollInterval} and
      * {@code minTickInterval} plus {@link #TICK_MARGIN}; 3 × the largest gap among the last {@value #TICK_GAPS} ticks
      * (relays with longer intervals than this instance's), at most {@link #tickWait}; {@link #tickFloor}: a relay of a
-     * release without the heartbeat still runs. That guard alone is waited out, up to {@link #tickWait}, before it refuses. Then one
-     * transaction: {@code pg_advisory_xact_lock} on {@code LOCK_MAINTENANCE}, {@code LOCK_SWAP} (relay steps hold it
-     * shared) and {@code LOCK_TICK}, in that order, so no maintenance run, step or tick interleaves; then {@code SHARE}
-     * on the outbox, so no write commits between the checks and the switch (writers wait and go on after the commit);
+     * release without the heartbeat still runs. That guard alone is waited out, up to {@link #tickWait}, before it
+     * refuses. Then one read-committed transaction: {@code pg_advisory_xact_lock} on {@code LOCK_MAINTENANCE},
+     * {@code LOCK_SWAP} (relay steps hold it shared) and {@code LOCK_TICK}, in that order, so no maintenance run, step
+     * or tick interleaves; then {@code SHARE} on the outbox, so no write commits between the checks and the switch (writers wait and go on after the commit);
      * each lock wait is bounded by the session's {@code lock_timeout}, and a timeout fails startup with the drain
      * procedure; the drain checks: the retry and parked tables empty, no batch in progress, no committed row that its
      * shard's effective tick ({@link Cursors}) does not see, no standalone range, no xid regression. All pass: the
@@ -571,6 +571,12 @@ public final class OutboxSchema implements Lifecycle {
         c.setAutoCommit(false);
         try {
             try {
+                // read committed whatever the session default: under repeatable read the lock statement would fix the
+                // snapshot before SHARE is granted, so the checks and the new tick would miss a write committed while
+                // the reshard waited for it, and its row would be read under its old shard
+                try (var st = c.createStatement()) {
+                    st.execute("set transaction isolation level read committed");
+                }
                 try (var ps = c.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
                     for (int lock : List.of(TableNames.LOCK_MAINTENANCE, TableNames.LOCK_SWAP, TableNames.LOCK_TICK)) {
                         ps.setInt(1, n.internalNamespace());
