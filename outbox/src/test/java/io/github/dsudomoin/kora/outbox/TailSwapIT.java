@@ -251,7 +251,7 @@ class TailSwapIT {
             }
             var stuck = Pattern.compile("ERROR .*outbox partition tail swap of " + Pattern.quote(names.base())
                     + " timed out waiting for writers' locks on (\\S+) on (\\d+) due runs in a row, (\\d+) ranges"
-                    + " ahead of the current xid: .* swapLockTimeout (\\d+) ms after their send, and overlap, so the"
+                    + " ahead of the current xid: .*\\.swapLockTimeout (\\d+) ms after their send, and overlap, so the"
                     + " swap never gets its gap \\((\\d+) transactions hold a lock on (\\S+) right after, the oldest:"
                     + " (pid \\d+ \\(.*?\\) in a transaction open [\\d.]+ s)");
             await(Duration.ofSeconds(60), () -> stuck.matcher(log.text()).find());
@@ -270,7 +270,9 @@ class TailSwapIT {
                     .as("%d runs in a row, %d ahead: the ERROR's condition", runs, ahead).isTrue();
             assertThat(Long.parseLong(error.group(4))).isEqualTo(SWAP_LOCK_TIMEOUT.toMillis());
             assertThat(Integer.parseInt(error.group(5))).as("holders").isPositive();
-            assertThat(error.group()).contains("Send last in the transaction, or raise swapLockTimeout");
+            int end = text.indexOf('\n', error.end());
+            assertThat(text.substring(error.start(), end < 0 ? text.length() : end)).as("the whole ERROR line")
+                    .contains("Send last in the transaction, or raise swapLockTimeout");
             stopLoad();
             assertThat(errors).as("writer failures").isEmpty();
             relay.drain();
