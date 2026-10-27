@@ -41,9 +41,9 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
 
 ## Shards and pool
 
-- **`outbox.shards`: leave it unset.** A new outbox gets 256, an existing one keeps its count: upgrades need no
-  setting. A differing set value is the **emergency reshard**, never routine: stop writers, wait for
-  `outbox.shard.lag` 0, stop all instances, start with the new value («Решардинг»). Startup refuses while another
+- **`outbox.shards`: leave it unset.** A new outbox gets 256, an existing one keeps its count: upgrades need no setting.
+  A differing set value is the **emergency reshard**, never routine: stop writers, wait for `outbox.shard.lag` 0, stop
+  all instances (previous-release ones too), start with the new value («Решардинг»). Startup refuses while another
   instance or relay runs or anything is undelivered; an old-count instance refuses `send` («refuses this write»).
   Details: [config-reference.md](../using-kora-outbox/config-reference.md).
 - **Pool:** `db.maxPoolSize` ≥ own peak + `relay.workers` + 3, + 1 while `drain()` runs. Profiles:

@@ -30,7 +30,7 @@ on Apple M5 Pro cores and a single Kafka broker with replication factor 1. Your 
 
 | Quantity | Formula | Source |
 |---|---|---|
-| Pool per instance | `db.maxPoolSize` = own need + `relay.workers` + 3 (+1 while `drain()` runs); the 3 are outbox maintenance, inbox maintenance and the dead-letter thread | README «Размер пула соединений» |
+| Pool per instance | `db.maxPoolSize` = own need + `relay.workers` + 3 (+1 while `drain()` runs); the 3 are outbox maintenance, inbox maintenance and the dead-letter thread. Besides: the `outbox-heartbeat` thread takes a connection for one short statement every `maintenanceInterval`, and after an upgrade the one-time `<table>_dead_due` build (thread `outbox-dead-index`) holds one while it runs | README «Размер пула соединений» |
 | Postgres connections | Σ over services and instances of `maxPoolSize` + other clients + `superuser_reserved_connections` (3) ≤ `max_connections` (Postgres default 100) | Postgres |
 | Advisory lock slots | `max_locks_per_transaction × (max_connections + max_prepared_transactions)` ≥ concurrent writer transactions × distinct keys each + other locks | README «max_locks_per_transaction для массовой отправки» |
 | Kafka call budget | `batchTimeout ≥ delivery.timeout.ms + 5 s + max.block.ms` (defaults 20 + 5 + 5 = 30 s) | `KafkaOutboxSender` |

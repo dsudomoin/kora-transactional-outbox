@@ -106,12 +106,15 @@ The dead-letter hook and the dead table (writing-kora-outbox-handlers, `dead-let
 - An explicit `shards` that differs from the cursors' count takes the emergency reshard path at bootstrap. It refuses
   while another instance with a different count has a live heartbeat, and while any relay ticks: the newest tick must
   be at least 1 min old (more for slow tick rates), which it waits up to 2 min for, so a relay of a release without
-  the heartbeat counts too. Under locks it
+  the heartbeat counts too. An instance of the previous release (5fc60dd) with its relay disabled is invisible to
+  both checks: stop every old instance before an explicit reshard. Under locks it
   then requires a drained outbox: empty retry and parked tables, no batch in progress, no committed row unrelayed, no
   standalone range, no xid regression. Each failed check is named with its count, and startup fails. Procedure: stop
   writers, wait for `outbox.shard.lag` 0, stop all instances, start with the new value (README «Решардинг»).
-- After a reshard, an instance still running with the old count refuses `send` and redrives within one heartbeat
-  (`IllegalStateException` «... refuses this write ...»): restart it with the new count or with `shards` unset. Dead
+- After a reshard, an instance still running with the old count halts: ERROR «... holds cursors for N shards, but
+  this instance runs with outbox.shards = M ...», its relay takes no shards, its maintenance runs no step, `drain()`
+  throws, and `send` and redrives are refused within one heartbeat (`IllegalStateException` «... refuses this write
+  ...»): restart it with the new count or with `shards` unset. Dead
   letters keep their old shard; a redrive computes it again.
 
 ## `outbox.kafka` (`KafkaOutboxModule`)
