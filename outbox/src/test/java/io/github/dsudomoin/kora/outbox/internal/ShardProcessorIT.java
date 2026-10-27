@@ -3208,6 +3208,55 @@ class ShardProcessorIT {
     }
 
     @Test
+    void rowsNotAttemptedFromTheFirstRowOfTheNextBatchLeaveTheCursorAtTheBatchBefore() throws Exception {
+        config.shards(2).batchSize(1000);
+        bootstrap();
+        var keys = keysOnShard(0, 3);
+        lagTick(keys, "t1#", 30, 2100);
+        long t1 = tick();
+        lagTick(keys, "t2#", 30, 2100);
+        long t2 = tick();
+        script = records -> records.stream().map(r -> new String(r.payload(), UTF_8).startsWith("t2#")
+                ? Outcome.notAttempted() : handler.handleBatch(List.of(r)).get(0)).toList();
+
+        assertThat(processGroup(0)).as("the first batch finished, the next not begun")
+                .containsExactly(new ShardResult(PROGRESS, 90, true));
+        assertThat(calls).as("one call over both batches").hasSize(1);
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, t1, null, 0, null, 0, null, null));
+
+        script = null;
+        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 90, true));
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, t2, null, 0, null, 0, null, null));
+        assertThat(handler.delivered()).hasSize(180).extracting(OutboxRecord::messageId).doesNotHaveDuplicates();
+        assertIdOrderPerKey(handler.delivered());
+    }
+
+    @Test
+    void rowsNotAttemptedInsideTheNextBatchLeaveTheCursorAtItsLastAttemptedRow() throws Exception {
+        config.shards(2).batchSize(1000);
+        bootstrap();
+        var keys = keysOnShard(0, 3);
+        lagTick(keys, "t1#", 30, 2100);
+        long t1 = tick();
+        lagTick(keys, "t2#", 30, 2100); // key by key: the last key's 30 rows end the batch
+        long t2 = tick();
+        var unattempted = "t2#" + keys.get(2) + "#";
+        script = records -> records.stream().map(r -> new String(r.payload(), UTF_8).startsWith(unattempted)
+                ? Outcome.notAttempted() : handler.handleBatch(List.of(r)).get(0)).toList();
+
+        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 150, false));
+        var last = handler.delivered().get(149);
+        assertThat(new String(last.payload(), UTF_8)).isEqualTo("t2#" + keys.get(1) + "#29");
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, t1, t2, last.id(), null, 0, null, null));
+
+        script = null;
+        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 30, true));
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, t2, null, 0, null, 0, null, null));
+        assertThat(handler.delivered()).hasSize(180).extracting(OutboxRecord::messageId).doesNotHaveDuplicates();
+        assertIdOrderPerKey(handler.delivered());
+    }
+
+    @Test
     void aStepDoesNotGoOnIntoABatchThatWouldNotFit() throws Exception {
         config.shards(2).batchSize(1000);
         bootstrap();
