@@ -215,6 +215,24 @@ class CursorsIT {
     }
 
     @Test
+    void aCheckpointAboveTheNewestTickCountsForNothing() throws Exception {
+        var names = bootstrap();
+        var cursors = new Cursors(names, config.shards());
+        try (var c = TestDb.connect()) {
+            long b = queryLong(c, "select max(id) from " + names.tick());
+            long latest = tick(c, names, "B'0010'", 10);
+            // from another history: tick ids went backwards under it; its 0 bits would hide shard 2's rows
+            execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + (latest + 1)
+                    + ", B'0000', " + (latest + 1) + ")");
+
+            assertThat(cursors.positions(c, latest)).extracting(Cursors.Position::effectiveTickId).containsOnly(b);
+            assertThat(behind(cursors.positions(c, latest))).containsExactly(false, false, true, false);
+            assertThat(cursors.latest(c, 2).effectiveTickId()).isEqualTo(b);
+            assertThat(cursors.checkpointTick(c)).as("still there for maintenance to see").isEqualTo(latest + 1);
+        }
+    }
+
+    @Test
     void theTickAfterAGapInTickIdsCountsAsEveryShard() throws Exception {
         var names = bootstrap();
         var cursors = new Cursors(names, config.shards());

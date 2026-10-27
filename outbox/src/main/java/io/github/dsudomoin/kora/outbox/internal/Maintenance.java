@@ -36,8 +36,8 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * every shard; a step running longer, as one may, defers the swap to the next run), the checkpoint ({@link Cursors}:
  * the latest tick and the shards busy at it, by which a shard without new rows moves on without a cursor row; the
  * drops and the tick cleanup go by its effective ticks, and a run that fails to write it does neither; a checkpoint
- * above the newest tick, as tick ids going backwards in a partial restore leave it, stops both, with an ERROR at most
- * once a minute), drop of
+ * above the newest tick, as tick ids going backwards in a partial restore leave it, counts for nothing and is replaced,
+ * with an ERROR at most once a minute), drop of
  * processed partitions, drop of ranges left detached but not dropped: by a crash of this library's maintenance once
  * relayed (one still holding rows at or above the horizon first has those moved back into the outbox as new messages,
  * {@link OrphanRestore}, unless {@code outbox.partitions.restoreOrphans} is off), by anyone else only when empty
@@ -262,7 +262,7 @@ public final class Maintenance {
      */
     private record Read(Tick latest, List<Position> positions, Tick slowest, @Nullable Long checkpointTick) {
 
-        /** The checkpoint is on a tick above L: tick ids went backwards under it. */
+        /** The checkpoint is on a tick above L: from another history, ignored by the read and replaced by the run. */
         boolean checkpointAhead() {
             return checkpointTick != null && checkpointTick > latest.id();
         }
@@ -353,19 +353,15 @@ public final class Maintenance {
             return null;
         });
         var read = step("cursor read", () -> read(c));
-        if (read != null && read.checkpointAhead()) {
-            stepFailed = true; // no success recorded: outbox.maintenance.since_success grows
-            if (due(checkpointLogged)) {
-                log.error("outbox checkpoint of {} is on tick {}, above the newest tick {}: tick ids went backwards"
-                        + " under it, as after restoring {} without {} (a partial restore). Every shard counts as"
-                        + " relayed up to the checkpoint's tick, so maintenance writes no checkpoint and drops no"
-                        + " partition or tick until it is fixed; once the cursors and ticks agree, delete it: delete"
-                        + " from {}; this ERROR repeats at most once a minute", names.base(), read.checkpointTick(),
-                        read.latest().id(), names.tick(), names.checkpoint(), names.checkpoint());
-            }
+        if (read != null && read.checkpointAhead() && due(checkpointLogged)) {
+            // the read went by the cursors alone (Cursors ignores such a checkpoint); the checkpoint below replaces it
+            log.error("outbox checkpoint of {} was on tick {}, above the newest tick {}: it belongs to another"
+                    + " history, as tick ids went backwards under it (restoring {} without {}?). It counted for"
+                    + " nothing and is replaced by this run's; this ERROR repeats at most once a minute", names.base(),
+                    read.checkpointTick(), read.latest().id(), names.tick(), names.checkpoint());
         }
         // the drops and tick cleanup go by the effective ticks of this run's checkpoint: without it, none this run
-        var slowest = read == null || read.checkpointAhead() ? null : step("checkpoint", () -> {
+        var slowest = read == null ? null : step("checkpoint", () -> {
             cursors.checkpoint(c, read.latest().id(), read.positions());
             return read.slowest();
         });
@@ -456,7 +452,7 @@ public final class Maintenance {
     }
 
     private void refreshGauges(Connection c, @Nullable Read read) throws SQLException {
-        lag = read == null || read.checkpointAhead() ? Double.NaN : read.lagSeconds();
+        lag = read == null ? Double.NaN : read.lagSeconds();
         retrySize = retries.size(c);
         deadSize = retries.deadSize(c);
         try (var st = c.createStatement(); var rs = st.executeQuery(deadPending)) {

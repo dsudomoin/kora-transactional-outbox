@@ -1250,6 +1250,30 @@ class OutboxRelayIT {
     }
 
     @Test
+    void aCheckpointFromAnotherHistoryIsIgnoredAndReplaced() throws Exception {
+        bootstrap(); // 4 shards; maintenance runs at start, then not for an hour
+        var handler = new RecordingHandler();
+        var relay = start(handler);
+        awaitParked();
+        var names = schema.names();
+        long ahead = ticksMade() + 1000;
+        try (var c = TestDb.connect()) { // as a partial restore leaves it: above every tick, every shard idle
+            execute(c, "delete from " + names.checkpoint());
+            execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + ahead
+                    + ", B'0000', " + ahead + ")");
+        }
+
+        var ids = send(outbox(relay::wake), msg("t", keyOnShard(2, "k"), "m"));
+        await(Duration.ofSeconds(5), () -> handler.delivered().size() == ids.size()); // the relay alone delivers
+        assertThat(checkpointTick()).as("no maintenance ran meanwhile").isEqualTo(ahead);
+
+        assertThat(maintenance(db).runOnce()).isTrue();
+
+        assertThat(checkpointTick()).as("replaced").isLessThanOrEqualTo(ticksMade());
+        assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(ids);
+    }
+
+    @Test
     void drainOnAnIdleRunningRelayReturnsAtOnce() throws Exception {
         config.shards(8);
         bootstrap();

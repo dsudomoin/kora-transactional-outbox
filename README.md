@@ -1374,8 +1374,10 @@ Relay находит новые сообщения, сравнивая иден�
                                                     else k.busy_tick_id end)
                       else c.tick_id end tick_id
                  from (select distinct on (shard) shard, tick_id from outbox_cursor order by shard, seq desc) c
-                 left join (select tick_id, busy, busy_tick_id from outbox_checkpoint
-                             order by seq desc limit 1) k on true) e on e.shard = o.shard
+                 left join (select * from (select tick_id, busy, busy_tick_id from outbox_checkpoint
+                                            order by seq desc limit 1) n
+                             where tick_id <= (select max(id) from outbox_tick)  -- иначе из другой истории
+                           ) k on true) e on e.shard = o.shard
      left join outbox_tick t on t.id = e.tick_id
     where (t.snapshot is null                                      -- шард без курсора или без тика: все его строки
            or not pg_visible_in_snapshot(o.xid, t.snapshot)
@@ -1468,8 +1470,10 @@ Inbox это не затрагивает: он партиционирован п
                                                     else k.busy_tick_id end)
                       else c.tick_id end tick_id
                  from (select distinct on (shard) shard, tick_id from outbox_cursor order by shard, seq desc) c
-                 left join (select tick_id, busy, busy_tick_id from outbox_checkpoint
-                             order by seq desc limit 1) k on true) e on e.shard = o.shard
+                 left join (select * from (select tick_id, busy, busy_tick_id from outbox_checkpoint
+                                            order by seq desc limit 1) n
+                             where tick_id <= (select max(id) from outbox_tick)  -- иначе из другой истории
+                           ) k on true) e on e.shard = o.shard
      left join outbox_tick t on t.id = e.tick_id
     where t.snapshot is null                                       -- шард без курсора или без тика: все его строки
        or o.xid >= pg_snapshot_xmin(t.snapshot)

@@ -480,34 +480,38 @@ class MaintenanceIT {
     }
 
     @Test
-    void aCheckpointAboveTheNewestTickStopsTheCheckpointAndTheDrops() throws Exception {
+    void aCheckpointFromAnotherHistoryIsReplaced() throws Exception {
         bootstrap();
-        var registry = new SimpleMeterRegistry();
-        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
+        var maintenance = maintenance();
         long ahead;
+        long latest;
         try (var c = TestDb.connect()) { // as after restoring the tick table without the checkpoint
             var ticks = new Ticks(names, config.shards());
             assertThat(ticks.make(c, Duration.ZERO)).isTrue();
-            ahead = ticks.latest(c).id() + 1000;
+            latest = ticks.latest(c).id();
+            ahead = latest + 1000;
             execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + ahead
                     + ", B'0000', " + ahead + ")");
         }
-        var ticksBefore = tickIds();
         String succeeded = lastSuccess();
 
         try (var err = new CapturedStderr()) {
             assertThat(maintenance.runOnce()).isTrue();
-            assertThat(maintenance.runOnce()).isTrue();
 
-            assertThat(err.text()).contains("ERROR").contains("above the newest tick");
-            assertThat(err.text().split("above the newest tick", -1)).as("logged once a minute").hasSize(2);
+            assertThat(err.text()).contains("ERROR").contains("above the newest tick").contains("another history");
         }
-        assertThat(tickIds()).as("no tick cleanup").isEqualTo(ticksBefore);
-        assertThat(lastSuccess()).as("no success recorded").isEqualTo(succeeded);
-        assertThat(gauge(registry, "outbox.shard.lag")).isNaN();
         try (var c = TestDb.connect()) {
             assertThat(queryString(c, "select string_agg(tick_id::text, ',') from " + names.checkpoint()))
-                    .as("left as it is").isEqualTo(Long.toString(ahead));
+                    .as("replaced by the run's").isEqualTo(Long.toString(latest));
+        }
+        assertThat(tickIds()).as("cleanup went by the cursors").containsExactly(latest);
+        assertThat(lastSuccess()).isGreaterThan(succeeded);
+
+        try (var c = TestDb.connect(); var err = new CapturedStderr()) { // forged again within a minute: no ERROR
+            execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + ahead
+                    + ", B'0000', " + ahead + ")");
+            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(err.text()).doesNotContain("another history");
         }
     }
 

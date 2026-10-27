@@ -21,7 +21,9 @@ import java.util.List;
  * for a shard with a batch in progress or {@link Position#behind() behind} at L) and {@code busy_tick_id}, the lowest
  * effective tick of the busy shards (L when none). A shard's <em>effective tick</em> is
  * {@code greatest(cursor.tick_id, ckpt.tick_id)} when the newest checkpoint has {@code outbox.shards} bits and the
- * shard's bit is 0, {@code greatest(cursor.tick_id, ckpt.busy_tick_id)} when it is 1, else {@code cursor.tick_id}.
+ * shard's bit is 0, {@code greatest(cursor.tick_id, ckpt.busy_tick_id)} when it is 1, else {@code cursor.tick_id}; a
+ * checkpoint on a tick above the newest belongs to another history (tick ids went backwards under it, as in a partial
+ * restore) and counts for nothing, and the next maintenance run replaces it.
  * Every step starts from it, and tick cleanup, the partition drop horizon and {@code outbox.shard.lag} go by it.
  * Writing E for a shard's effective tick, every committed row of the shard visible in E is visible in its cursor's
  * tick, so relayed (a batch in progress: up to {@code lastId}, rows past it lie above E). By induction over the
@@ -149,9 +151,14 @@ public final class Cursors {
                 + " (tick_id, busy, busy_tick_id) values (?, ?::varbit, ?)";
     }
 
-    /** A subquery of the newest checkpoint's {@code tick_id, busy, busy_tick_id}, for {@link #effective}. */
+    /**
+     * A subquery of the newest checkpoint's {@code tick_id, busy, busy_tick_id}, for {@link #effective}; none when its
+     * tick is above the newest tick (an index probe): it then belongs to another history, as tick ids went backwards
+     * under it in a partial restore, and maintenance replaces it.
+     */
     static String newestCheckpoint(TableNames names) {
-        return "(select tick_id, busy, busy_tick_id from " + names.checkpoint() + " order by seq desc limit 1)";
+        return "(select tick_id, busy, busy_tick_id from (select tick_id, busy, busy_tick_id from " + names.checkpoint()
+                + " order by seq desc limit 1) n where tick_id <= (select max(id) from " + names.tick() + "))";
     }
 
     /**
@@ -184,11 +191,11 @@ public final class Cursors {
         }
     }
 
-    /** The newest checkpoint's tick, null without one. */
+    /** The newest checkpoint's tick, valid or not, null without one. */
     @Nullable
     public Long checkpointTick(Connection c) throws SQLException {
-        try (var st = c.createStatement(); var rs = st.executeQuery("select tick_id from " + newestCheckpoint(names)
-                + " k")) {
+        try (var st = c.createStatement(); var rs = st.executeQuery("select tick_id from " + names.checkpoint()
+                + " order by seq desc limit 1")) {
             return rs.next() ? rs.getLong(1) : null;
         }
     }
