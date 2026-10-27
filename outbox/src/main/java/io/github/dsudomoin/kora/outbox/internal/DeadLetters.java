@@ -10,8 +10,6 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Objects;
-import java.util.Set;
 import java.util.UUID;
 
 /** Dead rows as {@link DeadLetter}s and their redrive: what {@link DeadLetterPass} and {@link PgOutboxAdmin} share. */
@@ -28,19 +26,13 @@ final class DeadLetters {
     record Split(List<Claimed> ready, List<Claimed> held) {}
 
     private final Resender resender;
-    private final int keyNamespace;
     private final String lockTimeout;
-    private final String heldKeys;
     private final String remember;
     private final String delete;
 
     DeadLetters(TableNames names, OutboxConfig config) {
         this.resender = new Resender(names, config);
-        this.keyNamespace = names.keyNamespace();
         this.lockTimeout = "set local lock_timeout = '" + config.partitions().swapLockTimeout().toMillis() + "ms'";
-        // one row whatever the driver's fetch size, so every hash is tried (see Resender.LOCK_ALL); never waits
-        this.heldKeys = "select array_agg(h) filter (where not pg_try_advisory_xact_lock(?, h))"
-                + " from unnest(?::int[]) h";
         // one row per message, should two of its letters be redriven together
         this.remember = "insert into " + names.redriven() + " (message_id, redrives)"
                 + " select m, max(r) from unnest(?::uuid[], ?::int[]) u(m, r) group by m"
@@ -78,30 +70,13 @@ final class DeadLetters {
         var hashes = letters.stream()
                 .map(c -> c.letter().key() == null ? null : Hashing.keyHash(c.letter().topic(), c.letter().key()))
                 .toList();
-        var held = held(tx, hashes);
+        var held = resender.tryKeyLocks(tx, hashes);
         var ready = new ArrayList<Claimed>();
         var waiting = new ArrayList<Claimed>();
         for (int i = 0; i < letters.size(); i++) {
             (hashes.get(i) != null && held.contains(hashes.get(i)) ? waiting : ready).add(letters.get(i));
         }
         return new Split(ready, waiting);
-    }
-
-    /** Tries the key lock of each distinct hash without waiting; returns the hashes another transaction holds. */
-    private Set<Integer> held(Connection tx, List<Integer> hashes) throws SQLException {
-        var distinct = hashes.stream().filter(Objects::nonNull).distinct().toArray(Integer[]::new);
-        if (distinct.length == 0) {
-            return Set.of();
-        }
-        try (var ps = tx.prepareStatement(heldKeys)) {
-            ps.setInt(1, keyNamespace);
-            ps.setArray(2, tx.createArrayOf("int4", distinct));
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                var held = rs.getArray(1);
-                return held == null ? Set.of() : Set.of((Integer[]) held.getArray());
-            }
-        }
     }
 
     /**

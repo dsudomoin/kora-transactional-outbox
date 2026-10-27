@@ -5,7 +5,10 @@ import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
+import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -25,6 +28,9 @@ public final class Resender {
      */
     private static final String LOCK_ALL = "select count(*) from (select pg_advisory_xact_lock(?, h)"
             + " from (select distinct unnest(?::int[]) as h order by 1) s) l";
+    /** One row whatever the fetch size too, so every hash is tried; never waits. */
+    private static final String TRY_LOCKS = "select array_agg(h) filter (where not pg_try_advisory_xact_lock(?, h))"
+            + " from unnest(?::int[]) h";
 
     /** A row to insert; {@code headers} in the stored encoding ({@link HeaderCodec}). */
     public record Row(
@@ -58,6 +64,27 @@ public final class Resender {
                 + " select u.shard, u.mid, u.topic, u.key, u.payload, u.headers"
                 + " from unnest(?::smallint[], ?::uuid[], ?::text[], ?::bytea[], ?::bytea[], ?::bytea[])"
                 + " with ordinality u(shard, mid, topic, key, payload, headers, ord) order by u.ord";
+    }
+
+    /**
+     * Tries the key lock of each distinct hash in {@code hashes} (nulls skipped) without waiting, held until
+     * {@code inTx} ends; returns the hashes another transaction holds, an open {@code send} of the key. A row whose
+     * hash is not among them can go through {@link #insertAll} without waiting for its key.
+     */
+    public Set<Integer> tryKeyLocks(Connection inTx, Collection<Integer> hashes) throws SQLException {
+        var distinct = hashes.stream().filter(Objects::nonNull).distinct().toArray(Integer[]::new);
+        if (distinct.length == 0) {
+            return Set.of();
+        }
+        try (var ps = inTx.prepareStatement(TRY_LOCKS)) {
+            ps.setInt(1, keyNamespace);
+            ps.setArray(2, inTx.createArrayOf("int4", distinct));
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                var held = rs.getArray(1);
+                return held == null ? Set.of() : Set.of((Integer[]) held.getArray());
+            }
+        }
     }
 
     /**

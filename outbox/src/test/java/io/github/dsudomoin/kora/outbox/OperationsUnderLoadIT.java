@@ -71,7 +71,7 @@ class OperationsUnderLoadIT {
 
     private static final int WRITERS = 8;
     private static final int KEYS = 200;
-    /** The key the holder keeps; no row of a restore's first chunk has it. */
+    /** The key the holder keeps; no row of a restore's first chunk has it, so its rows lie in later ones. */
     private static final String HELD = "k7";
     /** Three restore chunks, the first without {@link #HELD}. */
     private static final int ORPHAN_ROWS = 2500;
@@ -79,12 +79,12 @@ class OperationsUnderLoadIT {
     private static final long ORPHAN_IDS = 1_000_000_000L;
     private static final Duration SWAP_LOCK_TIMEOUT = Duration.ofMillis(200);
     /**
-     * A writer of a key a restore chunk holds waits for the chunk, which waits for each of its key locks at most
-     * {@code swapLockTimeout}, as the tail swap may stall one; the margin covers the chunk's own work and a loaded
-     * machine, as in {@link TailSwapIT}.
+     * A writer of a key a restore chunk holds waits for the chunk, which waits for no key lock (it leaves a held key's
+     * rows) and for any other lock at most {@code swapLockTimeout}, as the tail swap may stall one; the margin covers
+     * the chunk's own work and a loaded machine, as in {@link TailSwapIT}.
      */
     private static final Duration WRITER_BOUND = SWAP_LOCK_TIMEOUT.plusMillis(500);
-    /** The first chunk that meets {@link #HELD} gives up within this: its key lock waits {@code swapLockTimeout}. */
+    /** A restore that meets {@link #HELD} moves the other rows and gives up within this: it waits for no key lock. */
     private static final Duration FIRST_FAILURE_CAP = Duration.ofSeconds(1);
     /** For every other wait on the library, and every loop of calls. */
     private static final Duration BOUND = Duration.ofSeconds(60);
@@ -168,17 +168,13 @@ class OperationsUnderLoadIT {
             restoreStarted = System.nanoTime();
             maintenanceLock(pause, "pg_advisory_unlock");
 
-            // a run may also give up in the first chunk, on a writer's key, moving nothing: wait for one that gave up
-            // once the first chunk was in, which stayed moved, so the next run resumes, not restarts
+            // a run moves every row but those of keys an open send holds, the holder's and maybe a writer's, and
+            // gives up; the next runs move the writers' ones, so only the holder's stay
             var failed = failedRuns(orphan);
-            var before = new AtomicLong(-1); // failed runs logged before the first chunk was seen in
-            await(FIRST_FAILURE_CAP, "a maintenance run giving up on " + HELD + " past the first chunk", () -> {
-                // read before the count, which waits for a chunk in progress
-                long failures = failed.matcher(log.text()).results().count();
-                return remaining(orphan) == ORPHAN_ROWS - CHUNK && !before.compareAndSet(-1, failures)
-                        && failures > before.get();
-            });
+            await(FIRST_FAILURE_CAP, "a maintenance run giving up on " + HELD,
+                    () -> failed.matcher(log.text()).results().findAny().isPresent());
             firstFailure = System.nanoTime() - restoreStarted;
+            await(BOUND, "only the rows of " + HELD + " left", () -> remaining(orphan) == heldRows(orphan));
             release.countDown();
             holder.join(BOUND.toMillis());
             skipHeld = false;
@@ -195,9 +191,9 @@ class OperationsUnderLoadIT {
                     + names.unqualified(orphan.table()) + "'")).as("its <base>_dropping marker").isZero();
         }
 
-        var delivered = finish("oursOrphanIsRestoredUnderLoad", failed.size() + " maintenance runs gave up, one past"
-                + " the first chunk seen " + TimeUnit.NANOSECONDS.toMillis(firstFailure) + " ms in, then one restored"
-                + " the rest of " + orphan.rows().size() + " rows");
+        var delivered = finish("oursOrphanIsRestoredUnderLoad", failed.size() + " maintenance runs gave up, the first "
+                + TimeUnit.NANOSECONDS.toMillis(firstFailure) + " ms in, leaving the rows of held keys, then one"
+                + " restored the rest of " + orphan.rows().size() + " rows");
 
         assertThat(Duration.ofNanos(maxLatency.get())).as("the slowest writer transaction").isLessThan(WRITER_BOUND);
         assertPutBackInOrder(delivered, orphan.rows().stream().collect(Collectors.toMap(r -> r, r -> restoreStarted)));
@@ -211,7 +207,7 @@ class OperationsUnderLoadIT {
         var admin = new PgOutboxAdmin(db, names, config, maintenance, relay::wake);
         Orphan orphan;
         long restoreStarted;
-        long firstFailure;
+        long firstFailure = 0;
         int calls = 0;
         int failedCalls = 0;
         try (var pause = TestDb.connect(); var c = TestDb.connect(); var pin = TestDb.connect()) {
@@ -227,32 +223,34 @@ class OperationsUnderLoadIT {
 
             var holder = holdKey();
             restoreStarted = System.nanoTime();
-            // a call may also give up in the first chunk, on a writer's key, moving nothing: call until one gave up
-            // past it, which stayed moved, so the next call resumes, not restarts
-            long cap = restoreStarted + FIRST_FAILURE_CAP.toNanos();
+            // a call moves every row but those of keys an open send holds, the holder's and maybe a writer's, and gives
+            // up: call until only the holder's stay
+            long held = heldRows(orphan);
             while (true) {
                 calls++;
                 var call = CompletableFuture.supplyAsync(() -> admin.restoreOrphan(orphan.table(), orphan.from()));
                 Throwable failure = null;
                 try {
-                    call.get(Math.max(0, cap - System.nanoTime()), TimeUnit.NANOSECONDS);
+                    call.get(FIRST_FAILURE_CAP.toNanos(), TimeUnit.NANOSECONDS);
                 } catch (ExecutionException e) {
                     failure = e.getCause();
                 } catch (TimeoutException e) {
                     throw new AssertionError("restoreOrphan did not give up on " + HELD + " within "
                             + FIRST_FAILURE_CAP + ", call " + calls, e);
                 }
+                if (calls == 1) {
+                    firstFailure = System.nanoTime() - restoreStarted;
+                }
                 assertThat(failure).as("call %d, while %s is held", calls, HELD).isInstanceOfSatisfying(
                         RuntimeSqlException.class, OperationsUnderLoadIT::assertLockNotAvailable);
                 failedCalls++;
                 long left = remaining(orphan);
-                assertThat(left).as("rows left after call %d", calls)
-                        .isIn((long) ORPHAN_ROWS, (long) (ORPHAN_ROWS - CHUNK));
-                if (left == ORPHAN_ROWS - CHUNK) {
+                assertThat(left).as("rows left after call %d", calls).isGreaterThanOrEqualTo(held);
+                if (left == held) {
                     break;
                 }
+                assertThat(System.nanoTime() - restoreStarted).as("calls within %s", BOUND).isLessThan(BOUND.toNanos());
             }
-            firstFailure = System.nanoTime() - restoreStarted;
             release.countDown();
             holder.join(BOUND.toMillis());
             skipHeld = false;
@@ -272,7 +270,7 @@ class OperationsUnderLoadIT {
         await(BOUND, "the orphan gauge back to 0", () -> gauge("outbox.partitions.orphaned") == 0);
 
         var delivered = finish("foreignOrphanIsRestoredByTheAdminUnderLoad", calls + " restoreOrphan calls, "
-                + failedCalls + " gave up (one past the first chunk " + TimeUnit.NANOSECONDS.toMillis(firstFailure)
+                + failedCalls + " gave up (the first " + TimeUnit.NANOSECONDS.toMillis(firstFailure)
                 + " ms in), restored " + orphan.rows().size() + " rows");
 
         assertThat(Duration.ofNanos(maxLatency.get())).as("the slowest writer transaction").isLessThan(WRITER_BOUND);
@@ -576,7 +574,7 @@ class OperationsUnderLoadIT {
         assertThat(early).as("delivered before a message of its key committed earlier").isEmpty();
     }
 
-    /** The restored rows of {@link #HELD}, all in later chunks, waited for the holder: delivered after its message. */
+    /** The restored rows of {@link #HELD}, left while the holder's send was open: delivered after its message. */
     private void assertHeldRowsAfterTheHolder(Map<UUID, Integer> delivered, Orphan orphan) {
         int holder = delivered.get(holderSent.get().id());
         assertThat(orphan.rows().stream().filter(r -> HELD.equals(r.key())).toList()).as("restored rows of " + HELD)
@@ -663,6 +661,11 @@ class OperationsUnderLoadIT {
             return queryLong(c, "select count(*) from " + orphan.table() + " where xid >= '" + orphan.from()
                     + "'::xid8");
         }
+    }
+
+    /** The orphan's rows of {@link #HELD}, which stay while the holder's send is open. */
+    private static long heldRows(Orphan orphan) {
+        return orphan.rows().stream().filter(r -> HELD.equals(r.key())).count();
     }
 
     /** Each restored message is in the outbox once: no chunk moved twice, none lost (the pin keeps every range). */

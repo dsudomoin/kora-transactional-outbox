@@ -1184,60 +1184,49 @@ class MaintenanceIT {
         assertThat(gauge(registry, "outbox.partitions.orphaned")).as("the foreign one").isEqualTo(1);
     }
 
+    /**
+     * A key held by an open send: its rows stay, in every chunk, without a wait, so they go back behind that send; the
+     * other keys' rows go on, and the call fails with 55P03 for the next one to finish.
+     */
     @Test
-    void restoreGivesUpOnABusyKeyWithinSwapLockTimeout() throws Exception {
+    void restoreLeavesABusyKeysRowsWithoutWaitingForIt() throws Exception {
         bootstrap(); // swapLockTimeout 200 ms
-        var orphan = oursOrphan(relay(new RecordingHandler(), maintenance()), 100);
-        var keys = new ArrayList<String>();
-        try (var c = TestDb.connect(); var st = c.createStatement();
-                var rs = st.executeQuery("select distinct convert_from(key, 'UTF8') from " + orphan.table()
-                        + " where key is not null")) {
-            while (rs.next()) {
-                keys.add(rs.getString(1));
-            }
+        var orphan = oursOrphan(relay(new RecordingHandler(), maintenance()), 2500); // every key in each of 3 chunks
+        var busy = "k7";
+        long busyRows;
+        try (var c = TestDb.connect()) {
+            busyRows = queryLong(c, "select count(*) from " + orphan.table() + " where key = convert_to('" + busy
+                    + "', 'UTF8')");
         }
-        keys.sort(Comparator.comparingInt(k -> Hashing.keyHash("t", k.getBytes(UTF_8))));
-        var busy = keys.get(keys.size() - 1); // locked last: the chunk holds every other key while it waits for it
-        var held = keys.get(0);
+        assertThat(busyRows).isEqualTo(50);
         var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
         var restore = maintenance().orphanRestore;
-        var sendTook = new AtomicLong(-1);
-        var errors = new ConcurrentLinkedQueue<Throwable>();
         try (var business = TestDb.connect()) {
             business.setAutoCommit(false); // a business transaction that sent the key and goes on working
             outbox.send(business, msg("t", busy, "busy"));
-            var sender = new Thread(() -> { // a writer of a key the chunk holds, once the chunk waits
-                try (var c = TestDb.connect()) {
-                    while (queryLong(c, "select count(*) from pg_locks where locktype = 'advisory' and not granted"
-                            + " and classid::bigint = " + Integer.toUnsignedLong(names.keyNamespace())) == 0) {
-                        Thread.sleep(1);
-                    }
-                    long start = System.nanoTime();
-                    send(outbox, msg("t", held, "sent meanwhile"));
-                    sendTook.set(System.nanoTime() - start);
-                } catch (Throwable e) {
-                    errors.add(e);
-                }
-            });
-            sender.start();
 
             long start = System.nanoTime();
             try (var c = TestDb.connect()) {
                 assertThatThrownBy(() -> restore.restore(c, orphan.table(), orphan.horizon(), Duration.ofSeconds(30)))
-                        .isInstanceOfSatisfying(
-                                SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("55P03"));
+                        .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("55P03"))
+                        .hasMessageContaining(busyRows + " rows of 1 keys another transaction held");
             }
-            var restoreTook = Duration.ofNanos(System.nanoTime() - start);
+            var took = Duration.ofNanos(System.nanoTime() - start);
 
-            sender.join();
-            assertThat(errors).isEmpty();
-            assertThat(restoreTook).as("the key lock waited for swapLockTimeout, not the 30 s table lock timeout")
-                    .isLessThan(config.swapLockTimeout().plusSeconds(1));
-            assertThat(Duration.ofNanos(sendTook.get())).as("the writer of a held key")
-                    .isLessThan(config.swapLockTimeout().plusSeconds(1));
-            assertThat(count(orphan.table(), orphan.above())).as("nothing moved").isEqualTo(100);
-            assertThat(count(names.base(), orphan.above())).isZero();
-            business.rollback();
+            assertThat(count(orphan.table(), orphan.above())).as("the busy key's rows stay").isEqualTo(busyRows);
+            assertThat(count(names.base(), orphan.above())).as("the others moved").isEqualTo(2500 - busyRows);
+            System.out.printf("MaintenanceIT: restored %d rows around a busy key in %d ms%n", 2500 - busyRows,
+                    took.toMillis());
+            business.commit();
+        }
+
+        try (var c = TestDb.connect()) {
+            assertThat(restore.restore(c, orphan.table(), orphan.horizon(), Duration.ofSeconds(30)))
+                    .isEqualTo(busyRows);
+            assertThat(exists(orphan.table())).isFalse();
+            assertThat(queryLong(c, "select count(*) from " + names.base() + " where key = convert_to('" + busy
+                    + "', 'UTF8') and id < (select id from " + names.base() + " where payload = convert_to('busy',"
+                    + " 'UTF8'))")).as("the busy key's restored rows after its send").isZero();
         }
     }
 
