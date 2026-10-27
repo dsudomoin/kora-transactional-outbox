@@ -1,6 +1,6 @@
 ---
 name: operating-kora-outbox
-description: Use when monitoring, alerting on, sizing or troubleshooting kora-transactional-outbox in a running Kora service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, rows in outbox_retry or outbox_dead, redrive, tail overflow, orphaned partitions, «outbox relay halted» or «xid counter went backwards», changing outbox.shards, rolling deploys, pg_dump/restore or failover. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox».
+description: Use when monitoring, alerting on, sizing or troubleshooting kora-transactional-outbox in a running Kora service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, rows in outbox_retry, outbox_parked or outbox_dead, redrive, tail overflow, orphaned partitions, «outbox relay halted» or «xid counter went backwards», changing outbox.shards, rolling deploys, pg_dump/restore or failover. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox».
 ---
 
 # Operating kora-outbox
@@ -8,8 +8,8 @@ description: Use when monitoring, alerting on, sizing or troubleshooting kora-tr
 ## Overview
 
 Recovery procedures live in the library README (https://github.com/dsudomoin/kora-transactional-outbox#readme),
-under the Russian section names quoted below. Follow them as written, on a staging copy first (the README marks them
-as not rehearsed on a live database). **Never improvise SQL against the library's tables.**
+under the Russian section names quoted below. Follow them as written, on a staging copy first (not yet rehearsed on
+a live database). **Never improvise SQL against the library's tables.**
 
 ## Alerts (need a Micrometer `MeterRegistry` in the graph)
 
@@ -29,8 +29,9 @@ Also watch `outbox.delivery.delay` p99 and `outbox.messages.failed{outcome}`. Ev
 
 ## Never
 
-- Touch `<table>_retry` rows by hand. Redrive dead letters by moving rows from `<table>_dead` back into `<table>` in
-  one transaction («Dead letters»): `message_id` is kept, so inbox consumers deduplicate within their window.
+- Touch `<table>_retry` or `<table>_parked` rows by hand. Redrive dead letters by moving rows from `<table>_dead`
+  back into `<table>` in one transaction («Dead letters»): `message_id` is kept, so inbox consumers deduplicate within
+  their window.
 - Detach outbox partitions by hand, or drop or truncate library tables while instances run.
 - Delete the `<table>_halt` row without the repair steps of the xid procedure.
 - Disable the relay on every instance: maintenance runs only where the relay runs.

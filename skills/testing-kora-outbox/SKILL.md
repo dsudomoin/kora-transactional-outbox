@@ -28,7 +28,8 @@ instead of 66.
 5. Assert on the target, not on outbox rows: the Kafka record's value, key, and
    `KafkaOutboxHeaders.messageId(record)` equal to the id `send` returned, or the HTTP stub's body and
    `Idempotency-Key` equal to that id.
-6. Assert `select count(*) from <table>_retry` = 0 (and `<table>_dead` = 0 unless the test expects a dead letter).
+6. Assert `select count(*) from <table>_retry` = 0 (and `<table>_dead` = 0 unless the test expects a dead letter;
+   `<table>_parked` = 0 if the handler requeues: `drain()` leaves parked records not yet due).
 
 ```java
 @KoraAppTest(Application.class)

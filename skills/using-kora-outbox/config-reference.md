@@ -17,7 +17,7 @@ outbox {
 
 | Key | Default | Rule and meaning |
 |---|---|---|
-| `table` | `"outbox"` | `[schema.]name`, each part `[A-Za-z_][A-Za-z0-9_]{0,40}`, lowercased. Base name of `<table>`, `_retry`, `_dead`, `_tick`, `_cursor`, `_halt`, `_maintenance`, `_dropping`. Unqualified = `current_schema()` of each connection. |
+| `table` | `"outbox"` | `[schema.]name`, each part `[A-Za-z_][A-Za-z0-9_]{0,40}`, lowercased. Base name of `<table>`, `_retry`, `_parked`, `_dead`, `_tick`, `_cursor`, `_halt`, `_maintenance`, `_dropping`. Unqualified = `current_schema()` of each connection. |
 | `shards` | `32` | 1..32767. A shard is processed by one worker at a time across all instances; a key always maps to one shard. Changing it needs an empty outbox (README «Решардинг»); startup fails on a mismatch. |
 
 ## `outbox.relay`
@@ -26,7 +26,7 @@ outbox {
 |---|---|---|
 | `enabled` | `true` | `false`: no relay workers and no partition maintenance on this instance; `OutboxRelay.drain()` still works. Keep it on for at least one production instance. |
 | `workers` | `4` | ≥ 1. Relay threads per instance; each holds a DB connection while working. |
-| `batchSize` | `1000` | ≥ 1. Rows per chunk read and per handler call, for every handler. |
+| `batchSize` | `1000` | ≥ 1. Rows per chunk read and per handler call, for every handler. A call may also carry up to the chunk limit of parked (requeued) records of the chunk's keys: up to 2 × `batchSize` records. |
 | `maxTicksPerBatch` | `100` | ≥ 1. |
 | `minTickInterval` | `50ms` | ≥ 0. Under load, at most one tick per interval. |
 | `idlePollInterval` | `200ms` | > 0. Idle tick rate; how fast a commit on another instance is noticed. |
@@ -41,6 +41,15 @@ outbox {
 | `initialDelay` | `1s` | > 0. First backoff of a failed key and of a paused shard; doubles per failure. |
 | `maxDelay` | `5m` | ≥ `initialDelay`. Backoff ceiling. |
 | `maxAttempts` | `0` | ≥ 0. After this many failed attempts a record moves to `<table>_dead`. `0` = retry forever. `NotAttempted` does not count. Global, Kafka included: a dead-lettered record lets the later records of its key go on, so with ordered topics keep 0 and bound a slow route in its handler (`record.attempts()`, writing-kora-outbox-handlers). |
+
+## `outbox.relay.requeue`
+
+Records a `handleBatch` override set aside with `Outcome.requeue()` (writing-kora-outbox-handlers, `requeue.md`).
+
+| Key | Default | Rule and meaning |
+|---|---|---|
+| `delay` | `1s` | > 0. A requeued record comes back after this unless a new record of its key brings it back first; `requeue(notBefore)` not before `notBefore` (capped at 24 h). A parked record handed back and not attempted waits at least this too. |
+| `maxRequeues` | `0` | ≥ 0. The requeue past this moves the record to `<table>_dead` with «requeue limit reached», attempts unchanged. Every hand-back answered with `requeue` counts, merges ahead of a new record of the key included. `0` = unlimited. Global; a handler can bound per route with `record.requeues()`. |
 
 ## `outbox.partitions`
 

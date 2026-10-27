@@ -71,9 +71,10 @@ flowchart TD
 - **Доставка в порядке коммитов для каждой пары (topic, key).** Для двух сообщений с одним и тем же топиком и одним и
   тем же ненулевым ключом (сравнение побайтовое): если транзакция T1 закоммичена до того, как транзакция T2 отправила
   своё сообщение, обработчик получит сообщение T1 первым и не получит сообщение T2, пока сообщение T1 не доставлено.
-  Сообщения одного ключа внутри одной транзакции сохраняют порядок вызовов `send` и `sendAll`. Единственное
-  исключение: сообщение, перенесённое в dead-таблицу, больше не удерживает свой ключ, и ключ продолжает со следующего
-  сообщения.
+  Сообщения одного ключа внутри одной транзакции сохраняют порядок вызовов `send` и `sendAll`. Исключений два:
+  сообщение, перенесённое в dead-таблицу, больше не удерживает свой ключ, и ключ продолжает со следующего сообщения;
+  сообщение, отложенное через [`Outcome.requeue()`](#свой-обработчик), доставляется после тех сообщений своего ключа,
+  которые были доставлены, пока оно было отложено.
 - **Стабильный id сообщения.** Каждое сообщение при отправке получает id в формате UUIDv7. `send` возвращает его, relay
   передаёт его при каждой попытке, а обработчик Kafka добавляет его в заголовок `outbox-message-id`. Потребители
   дедуплицируют по нему через [inbox](#потребление-через-inbox).
@@ -480,8 +481,8 @@ public interface OutboxHandler {
 }
 ```
 
-`OutboxRecord` несёт `id`, `messageId`, `topic`, `key`, `payload`, `headers`, `createdAt` и `attempts` (число
-предыдущих неудачных попыток).
+`OutboxRecord` несёт `id`, `messageId`, `topic`, `key`, `payload`, `headers`, `createdAt`, `attempts` (число
+предыдущих неудачных попыток) и `requeues` (сколько раз запись уже откладывали через `Outcome.requeue()`).
 
 **`handle`: простая форма.** Доставьте одну запись и верните управление. Для записи, которая никогда не сможет пройти,
 бросьте `OutboxPermanentException`: она переносится в dead-таблицу, а её ключ продолжает со следующего сообщения.
@@ -540,8 +541,9 @@ httpClient.audit {
 делает обработчик Kafka. Контракт:
 
 - Верните по одному `Outcome` на запись, в том же порядке: `Outcome.delivered()`, `Outcome.retry(error)`,
-  `Outcome.retry(error, notBefore)`, `Outcome.permanent(error)`, `Outcome.notAttempted()` или
-  `Outcome.notAttempted(notBefore)`. `notBefore` ограничен 24 ч. `NotAttempted` не тратит попытку записи.
+  `Outcome.retry(error, notBefore)`, `Outcome.permanent(error)`, `Outcome.notAttempted()`,
+  `Outcome.notAttempted(notBefore)`, `Outcome.requeue()` или `Outcome.requeue(notBefore)` (см. ниже). `notBefore`
+  ограничен 24 ч. `NotAttempted` не тратит попытку записи.
 - Никогда не доставляйте запись, чья пара (topic, key) уже дала сбой раньше в этом же вызове.
 - **Сообщайте о сбоях через outcome, а не исключениями.** Вызов, который бросил исключение (включая `Error`) или
   вернул некорректный список (null, неверный размер, элемент null), проваливает все свои записи как `Retry`, в том
@@ -550,18 +552,101 @@ httpClient.audit {
   только из вызова с одной этой записью, который бросил `OutboxPermanentException`. Исключения и некорректные списки
   пишутся в лог с уровнем ERROR.
 
+**Отложить запись: `Outcome.requeue()`.** Нужен обработчику, который ведёт по ключу очередь задач (ключ — id счёта),
+когда запись пока нельзя обработать: идёт другой процесс того же счёта, и он закончится сам. `Outcome.retry` тут не
+подходит: он блокирует ключ, и остальные события счёта ждут за этой записью. `requeue` значит «не сейчас: пропусти
+дальше остальные записи моего ключа и верни меня позже»:
+
+- В той же транзакции, что и шаг relay, запись переносится в `<base>_parked` с тем же `message_id`, топиком, ключом,
+  payload, заголовками и `created_at`. Откаченный шаг ничего не переносит, и запись приходит снова: ни потери, ни
+  лишней копии.
+- Отложенная запись не блокирует ключ: пока она ждёт, следующие записи ключа доставляются.
+- Обработчик снова получает её при первом из двух событий. Первое — следующая новая запись её ключа: отложенные
+  записи ключа идут в том же вызове перед ней, в исходном порядке. Второе — наступил её срок: через
+  `outbox.relay.requeue.delay` (по умолчанию 1 с), для `requeue(notBefore)` — в `max(now + delay, notBefore)`. Запись
+  без ключа возвращается только по сроку; запись, чей ключ ждёт в retry-таблице, — тоже, пока он там.
+- Это не сбой: попытка не тратится, шард не встаёт на паузу, backoff и число записей на вызов не меняются. Каждый
+  `requeue` прибавляет 1 к `record.requeues()`, и ответ `requeue` на запись, подмешанную перед новой записью ключа,
+  тоже. `requeue` сверх `outbox.relay.requeue.maxRequeues` (по умолчанию 0 — без предела) переносит запись в
+  dead-таблицу с ошибкой «requeue limit reached».
+- Outcome вернувшейся записи: `Delivered` убирает её из `<base>_parked`; `Requeue` и `NotAttempted` оставляют там
+  (срок не раньше `now + delay`); `Permanent` переносит в dead-таблицу; `Retry` делает её головой ключа в
+  retry-таблице, как любую сбойную запись (и `maxAttempts` действует так же): с этого момента ключ заблокирован, а
+  более поздние отложенные записи ключа встают за ней.
+- Вызов с чанком несёт сверх него до лимита чанка (не больше `batchSize`) отложенных записей ключей чанка, самые
+  старые первыми: всего до `2 × batchSize` записей.
+- `requeue` головы из retry-таблицы переносит её в `<base>_parked`, и ключ продолжает со следующей записи. `requeue`
+  записи, чей ключ уже дал сбой раньше в этом вызове, не откладывает её: она встаёт в retry-таблицу за сбойной
+  записью. Вызов, после которого шард встаёт на паузу, ничего не откладывает: эти записи придут снова.
+- `handleBatch` по умолчанию никогда не возвращает `requeue`: обработчик, которому он нужен, переопределяет
+  `handleBatch`. `byTopic` передаёт `requeue` маршрута дальше, как любой outcome.
+
+```java
+@Component
+public final class AccountJobsHandler implements OutboxHandler {
+
+    private static final int GIVE_UP_AFTER = 1000; // отложена столько раз: в dead letters
+
+    private final AccountProcesses processes; // какие процессы счетов идут сейчас
+    private final AccountJobs jobs;
+
+    public AccountJobsHandler(AccountProcesses processes, AccountJobs jobs) {
+        this.processes = processes;
+        this.jobs = jobs;
+    }
+
+    @Override
+    public void handle(OutboxRecord record) throws Exception {
+        jobs.start(record);
+    }
+
+    @Override
+    public List<Outcome> handleBatch(List<OutboxRecord> records) { // один топик, ключ = id счёта
+        var outcomes = new ArrayList<Outcome>(records.size());
+        var failedKeys = new HashSet<ByteBuffer>();
+        for (var record : records) {
+            var key = ByteBuffer.wrap(record.key());
+            if (failedKeys.contains(key) || OutboxHandler.windDownRequested()) {
+                outcomes.add(Outcome.notAttempted());
+            } else if (processes.blocks(record)) { // идёт процесс того же счёта, который мешает этому событию
+                outcomes.add(record.requeues() < GIVE_UP_AFTER
+                        ? Outcome.requeue()
+                        : Outcome.permanent(new IllegalStateException("blocked " + record.requeues() + " times")));
+            } else {
+                try {
+                    handle(record);
+                    outcomes.add(Outcome.delivered());
+                } catch (Exception e) {
+                    if (e instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                    }
+                    outcomes.add(Outcome.retry(e));
+                    failedKeys.add(key);
+                }
+            }
+        }
+        return outcomes;
+    }
+}
+```
+
+Тот же предел без кода — `outbox.relay.requeue.maxRequeues`; в обоих случаях запись уходит в dead letters.
+
 **Дедлайны.** Каждый вызов выполняется на потоке обработчика relay и ограничен `outbox.relay.batchTimeout` (по
 умолчанию 30 с):
 
 - На 80 % от него (24 с) relay просит вызов свернуться: `OutboxHandler.windDownRequested()` становится true, а поток
   прерывается. С этого момента не начинайте новые записи и верните `NotAttempted` для остальных, как делает реализация
-  по умолчанию. Relay сохраняет фактические outcome и перечитывает непопробованные записи на следующем шаге.
+  по умолчанию. Relay сохраняет фактические outcome и перечитывает непопробованные записи на следующем шаге. Вызов,
+  который только отложил (или не попробовал) подмешанные отложенные записи и не попробовал ни одной новой,
+  проваливается целиком, как вызов, где не попробовано ничего: пауза шарда, вдвое меньший чанк, проба, отвод ключа.
 - Проверяйте `windDownRequested()`, а не только флаг прерывания: некоторые клиенты сбрасывают флаг (блокирующий
   HTTP-клиент Kora на транспорте JDK оборачивает `InterruptedException`, не восстанавливая флаг).
 - От вызова, который всё ещё выполняется по истечении `batchTimeout`, relay отказывается, и все его записи
   повторяются, включая доставленные.
 - Поэтому держите таймауты на одну запись (таймауты HTTP-запросов, собственные таймауты каждого маршрута `byTopic`)
-  заметно ниже `batchTimeout`, а `batchSize ×` время на запись — тоже ниже него.
+  заметно ниже `batchTimeout`, а `batchSize ×` время на запись — тоже ниже него (если обработчик откладывает записи,
+  вызов несёт до `2 × batchSize`).
 - Вызов, который игнорирует прерывания и переживает `batchTimeout`, удерживает свой поток. У каждого инстанса
   `max(4, 2 × workers)` потоков обработчика. Когда заняты все потоки инстанса, этот инстанс пропускает свои шарды с
   растущим backoff, пока эти вызовы не вернутся; другие инстансы забирают шарды через `relay.retry.initialDelay`.
@@ -668,10 +753,9 @@ fun process(records: ConsumerRecords<String, ByteArray>) = db.inTx<Unit> { _: Co
 
 Каждый relay-воркер (`outbox-relay-N`, `relay.workers` на инстанс) делает тик, когда пора, читает курсоры всех шардов
 и выполняет по шагу на каждом шарде, где есть работа. Работа есть, если в шард пришли строки после тика его курсора
-(каждый тик записывает, в каких шардах они появились), у головы в retry-таблице наступил срок, батч шарда начат и не
-закончен, или курсор шарда не двигался 5 с (тогда шаг просто сдвигает его вперёд для обслуживания). Шаг шарда — одна
-транзакция (имена таблиц для базового имени
-`outbox`):
+(каждый тик записывает, в каких шардах они появились), у головы в retry-таблице или у отложенной записи наступил
+срок, батч шарда начат и не закончен, или курсор шарда не двигался 5 с (тогда шаг просто сдвигает его вперёд для
+обслуживания). Шаг шарда — одна транзакция (имена таблиц для базового имени `outbox`):
 
 ```mermaid
 sequenceDiagram
@@ -687,19 +771,19 @@ sequenceDiagram
     end
     W->>DB: последняя строка курсора шарда
     DB-->>W: тик P, last_id, цель C (начатого батча или новая)
-    opt в outbox_retry есть головы, срок которых наступил
-        W->>H: handleBatch(головы и следующие за ними строки)
+    opt есть головы в outbox_retry или отложенные записи в outbox_parked, срок которых наступил
+        W->>H: handleBatch(головы и следующие за ними строки, отложенные записи)
         H-->>W: outcomes
         W->>DB: удалить доставленные, перепланировать, перенести в outbox_dead
     end
     W->>DB: строки шарда из транзакций, закоммиченных между тиками P и C
     DB-->>W: чанк после last_id, не больше batchSize строк
-    W->>H: handleBatch(чанк без строк ключей, ждущих в outbox_retry)
+    W->>H: handleBatch(отложенные записи ключей чанка,<br/>затем чанк без строк ключей, ждущих в outbox_retry)
     Note over W,H: 80 % batchTimeout: windDownRequested() и прерывание<br/>100 %: от вызова отказываются, все его записи Retry
-    H-->>W: Delivered / Retry / Permanent / NotAttempted
+    H-->>W: Delivered / Retry / Permanent / NotAttempted / Requeue
     W->>W: BatchClassifier: дальше или пауза
     alt дальше
-        W->>DB: сбойные ключи в outbox_retry, Permanent в outbox_dead
+        W->>DB: сбойные ключи в outbox_retry, Permanent в outbox_dead, Requeue в outbox_parked
     else пауза: ничего не доставлено
         Note over W,DB: ни одна строка не отводится, курсор встаёт на паузу с backoff
     end
@@ -723,11 +807,13 @@ flowchart TD
     pause -->|нет| outcome{"outcome записи"}
     outcome -->|Delivered| ok(["доставлена"])
     outcome -->|Permanent| dead(["outbox_dead: ERROR в логе,<br/>ключ идёт дальше"])
+    outcome -->|Requeue| parked(["outbox_parked: не сбой, ключ идёт дальше;<br/>запись вернётся перед следующей<br/>записью ключа или по сроку"])
     outcome -->|"Retry / NotAttempted"| head["ключ отведён в outbox_retry:<br/>запись — голова с next_attempt_at,<br/>следующие записи ключа — последователи"]
     head -.-> others(["остальные ключи идут дальше,<br/>новые записи этого ключа<br/>встают в последователи"])
     head --> due{{"срок головы наступил:<br/>голова и последователи<br/>снова у обработчика"}}
     due -->|"Retry / NotAttempted:<br/>новый backoff"| due
     due -->|"Permanent или<br/>исчерпан maxAttempts"| dead
+    due -->|Requeue| parked
     due -->|Delivered| next{{"у ключа остались<br/>записи в outbox_retry?"}}
     next -->|"да: следующая<br/>становится головой"| due
     next -->|нет| free(["ключ разблокирован"])
@@ -752,6 +838,9 @@ flowchart TD
   изоляция занимает до нескольких раз больше пауз.
 - **`Permanent`:** запись переносится в `<base>_dead` (ERROR, `outbox.messages.failed{outcome="dead"}`), а её ключ
   идёт дальше.
+- **`Requeue`** — не сбой: запись переносится в `<base>_parked`, ключ идёт дальше, паузы и backoff нет, попытка не
+  тратится. Запись вернётся перед следующей записью своего ключа или по сроку ([Свой обработчик](#свой-обработчик)).
+  Счётчик `outbox.messages.requeued`.
 - **Головы в retry-таблице** повторяются на последующих шагах шарда вместе со следующими за ними записями. Ключ, у
   которого в retry-таблице не осталось строк, разблокируется. При `relay.retry.maxAttempts = N > 0` запись, провалившая
   N попыток, переносится в dead-таблицу. При значении по умолчанию 0 временные сбои никогда не приводят в dead letters.
@@ -777,7 +866,7 @@ flowchart TD
 |---|---|---|
 | `enabled` | `true` | `false`: этот инстанс не запускает relay-воркеров **и обслуживание партиций**; `OutboxRelay.drain()` по-прежнему работает. Держите хотя бы один инстанс с включённым relay ([Обслуживание работает там же, где relay](#обслуживание-работает-там-же-где-relay)). |
 | `workers` | `4` | Число потоков relay на инстанс (`outbox-relay-N`), ≥ 1. Каждый держит соединение с БД, пока работает. |
-| `batchSize` | `1000` | ≥ 1. Максимум строк на одно чтение чанка и на один вызов обработчика. Новый батч охватывает около `batchSize × shards` id, а проход по retry-таблице передаёт не больше `batchSize` строк за шаг. |
+| `batchSize` | `1000` | ≥ 1. Максимум строк на одно чтение чанка и на один вызов обработчика. Вызов с чанком несёт сверх него до текущего лимита чанка (не больше `batchSize`) отложенных записей ключей чанка, то есть всего до `2 × batchSize` записей. Новый батч охватывает около `batchSize × shards` id, а проход по retry-таблице передаёт не больше `batchSize` строк за шаг (головы со следующими за ними строками и отложенные записи, срок которых наступил). |
 | `maxTicksPerBatch` | `100` | ≥ 1. Наибольшее число тиков, которое может охватить один батч. |
 | `minTickInterval` | `50ms` | ≥ 0. Под нагрузкой тики идут не чаще, чем раз в этот интервал; коммит ждёт своего тика примерно до удвоенного интервала. |
 | `idlePollInterval` | `200ms` | > 0. Частота idle-тиков (примерно один тик за интервал на весь кластер) и то, как быстро замечается коммит на инстансе без локального пробуждения. |
@@ -793,13 +882,22 @@ flowchart TD
 | `maxDelay` | `5m` | ≥ `initialDelay`. Потолок backoff. |
 | `maxAttempts` | `0` | ≥ 0. Запись, провалившая столько попыток, переносится в dead-таблицу; `0` — повторять вечно. `NotAttempted` не считается. |
 
+### `outbox.relay.requeue`
+
+Записи, отложенные обработчиком через `Outcome.requeue()` ([Свой обработчик](#свой-обработчик)).
+
+| Ключ | По умолчанию | Значение |
+|---|---|---|
+| `delay` | `1s` | > 0. Через сколько отложенная запись возвращается к обработчику, если раньше не придёт новая запись её ключа; с `requeue(notBefore)` — не раньше `notBefore` (не дальше 24 ч). Отложенная запись, которую обработчик не попробовал, тоже ждёт не меньше `delay`. |
+| `maxRequeues` | `0` | ≥ 0. Сколько раз запись можно отложить: `requeue` сверх этого переносит её в dead-таблицу с ошибкой «requeue limit reached», `attempts` не меняется. Считается каждый ответ `requeue`, в том числе на запись, подмешанную в вызов перед новой записью ключа. `0` — без предела. |
+
 ### `outbox.partitions`
 
 | Ключ | По умолчанию | Значение |
 |---|---|---|
 | `xidsPerPartition` | `16777216` | ≥ 1000. Размер одной партиции-диапазона по xid (2^24 xid, около 5.6 мин при 50 000 transaction id в секунду на весь кластер). |
 | `premake` | `64` | ≥ 2. Сколько диапазонов поддерживается выше текущего xid. Обслуживание расширяет их, когда израсходована половина. Их должно хватить на вашу самую длинную транзакцию или снапшот ([Партиции](#партиции)). |
-| `maintenanceInterval` | `30s` | > 0. Периодичность обслуживания outbox и обслуживания inbox. Также то, как часто каждый шард заново полностью перепроверяет retry-таблицу. |
+| `maintenanceInterval` | `30s` | > 0. Периодичность обслуживания outbox и обслуживания inbox. Также то, как часто каждый шард заново полностью перепроверяет retry-таблицу и таблицу отложенных записей. |
 
 ### `outbox.inbox` (`InboxModule`)
 
@@ -915,16 +1013,25 @@ create table outbox_cursor (   -- прогресс по шардам, журна
   paused_until   timestamptz,
   failures       int not null default 0,
   retry_due_at   timestamptz,
+  parked_due_at  timestamptz,
   primary key (shard, seq)
 );
 
 create table outbox_retry (    -- заблокированные потоки (topic, key): голова (с заданным next_attempt_at) и следующие за ней строки
   id bigint primary key, shard smallint not null, message_id uuid not null, topic text not null,
   key bytea, payload bytea, headers bytea, created_at timestamptz not null,
-  attempts int not null default 0, next_attempt_at timestamptz, last_error text
+  attempts int not null default 0, next_attempt_at timestamptz, last_error text, requeues int not null default 0
 );
 create index outbox_retry_key on outbox_retry (shard, topic, key, id);
 create index outbox_retry_due on outbox_retry (shard, next_attempt_at) where next_attempt_at is not null;
+
+create table outbox_parked (   -- отложенные через Outcome.requeue: ключ не блокируют, ждут новой записи ключа или срока
+  id bigint primary key, shard smallint not null, message_id uuid not null, topic text not null,
+  key bytea, payload bytea, headers bytea, created_at timestamptz not null,
+  attempts int not null default 0, requeues int not null default 0, due_at timestamptz not null
+);
+create index outbox_parked_key on outbox_parked (shard, topic, key, id);
+create index outbox_parked_due on outbox_parked (shard, due_at);
 
 create table outbox_dead (     -- dead letters, хранятся, пока вы их не удалите
   id bigint primary key, shard smallint not null, message_id uuid not null, topic text not null,
@@ -1052,8 +1159,9 @@ premake / 2 × xidsPerPartition  ≥  пиковое число transaction id �
 ### Dead letters
 
 Запись переносится в `<base>_dead`, когда сбоит постоянно (`OutboxPermanentException`, `Outcome.permanent`,
-`RecordTooLargeException` из Kafka и подобные) или исчерпывает `maxAttempts`. Каждый перенос пишет ERROR с id
-сообщения. Мёртвые строки хранятся, пока вы их не удалите; их считает `outbox.dead.size`.
+`RecordTooLargeException` из Kafka и подобные), исчерпывает `maxAttempts` или откладывается сверх
+`relay.requeue.maxRequeues` (ошибка «requeue limit reached»). Каждый перенос пишет ERROR с id сообщения. Мёртвые
+строки хранятся, пока вы их не удалите; их считает `outbox.dead.size`.
 
 Просмотр:
 
@@ -1086,9 +1194,9 @@ select shard, message_id, topic, key, payload, headers from moved order by id;
   если это важно, переотправляйте, когда по ключу нет трафика.
 - Сохранённый `shard` корректен, только пока `outbox.shards` не менялся. После решардинга переотправляйте через
   `Outbox.send` (тогда сообщение получит новый id).
-- Не вставляйте строки в `<base>_retry`, не удаляйте их оттуда и не меняйте их порядок вручную. Relay полностью
-  перечитывает эту таблицу только раз в `maintenanceInterval` на шард; до этого он может доставить более поздние строки
-  такого ключа первыми или создать для него вторую голову.
+- Не вставляйте строки в `<base>_retry` и `<base>_parked`, не удаляйте их оттуда и не меняйте их порядок вручную.
+  Relay полностью перечитывает эти таблицы только раз в `maintenanceInterval` на шард; до этого он может доставить
+  более поздние строки такого ключа первыми или создать для него вторую голову.
 
 ### Переполнение хвоста (tail overflow)
 
@@ -1234,8 +1342,8 @@ Relay находит новые сообщения, сравнивая иден�
    записанные в восстановленную базу (T — момент, когда был снят снапшот бэкапа, или момент логического переключения;
    более раннее T лишь добавляет дубликаты). Записывайте T со смещением относительно UTC, например
    `timestamptz '2026-10-26 09:00+00'`: без смещения Postgres читает значение в TimeZone сессии, и если T окажется
-   позже реального момента, строки, записанные в промежутке, потеряются. Строки, которые уже лежат в retry-таблице,
-   остаются там, а мёртвые строки повторно не отправляются.
+   позже реального момента, строки, записанные в промежутке, потеряются. Строки, которые уже лежат в retry-таблице
+   или среди отложенных (`outbox_parked`), остаются там, а мёртвые строки повторно не отправляются.
 
    ```sql
    create table outbox_unrelayed as
@@ -1247,6 +1355,7 @@ Relay находит новые сообщения, сравнивая иден�
     where (not pg_visible_in_snapshot(o.xid, t.snapshot)
            or o.created_at >= timestamptz '<T>' - interval '10 minutes')  -- записаны после бэкапа или переключения
       and not exists (select 1 from outbox_retry r where r.id = o.id and r.message_id = o.message_id)
+      and not exists (select 1 from outbox_parked p where p.id = o.id and p.message_id = o.message_id)
       and not exists (select 1 from outbox_dead d where d.id = o.id and d.message_id = o.message_id);
    ```
 
@@ -1256,7 +1365,7 @@ Relay находит новые сообщения, сравнивая иден�
    ```sql
    select setval(pg_get_serial_sequence('outbox', 'id'), greatest(
      (select coalesce(max(id), 0) from outbox), (select coalesce(max(id), 0) from outbox_retry),
-     (select coalesce(max(id), 0) from outbox_dead), 1));
+     (select coalesce(max(id), 0) from outbox_parked), (select coalesce(max(id), 0) from outbox_dead), 1));
    ```
 
 5. Починка: удалите все партиции (включая хвост), тики, курсоры и маркеры удаления, которые описывают старый счётчик
@@ -1313,14 +1422,16 @@ Inbox это не затрагивает: он партиционирован п
 
 Процедура ещё не отрепетирована авторами на живой базе — прогоните её на копии (staging) перед использованием в продакшене.
 
-1. Остановите пишущий трафик и дайте relay доставить всё: писатели остановлены, а retry-таблица пуста (строки в ней
-   сохраняют старый шард).
+1. Остановите пишущий трафик и дайте relay доставить всё: писатели остановлены, а retry-таблица и `outbox_parked`
+   пусты (строки в них сохраняют старый шард; отложенные записи возвращаются по сроку, пока обработчик не перестанет
+   их откладывать).
 2. Остановите все инстансы.
-3. При остановленных инстансах проверьте, что для relay ничего не осталось. Все четыре запроса должны вернуть 0; если
+3. При остановленных инстансах проверьте, что для relay ничего не осталось. Все пять запросов должны вернуть 0; если
    какой-то не вернул, снова запустите инстансы со старым `outbox.shards` и вернитесь к шагу 1.
 
    ```sql
    select count(*) from outbox_retry;
+   select count(*) from outbox_parked;
    select count(*) from (select distinct on (shard) shard, target_tick_id from outbox_cursor
                           order by shard, seq desc) c
     where c.target_tick_id is not null;                          -- незавершённый батч
@@ -1352,6 +1463,12 @@ Inbox это не затрагивает: он партиционирован п
 - **Уменьшение `retention` или изменение `partitionInterval` у inbox:** выкатывайте на все инстансы разом. Пока старые
   и новые инстансы работают бок о бок, старый может вставить id в диапазон, который новый только что удалил, и это
   валит транзакцию этого потребителя (SQLState 23514).
+- **Переход на версию с `Outcome.requeue`.** Первый новый инстанс создаёт `<base>_parked` и один раз добавляет столбцы
+  `<base>_cursor.parked_due_at` и `<base>_retry.requeues` (только метаданные; `ALTER` ждёт идущих шагов relay не
+  больше 5 с, иначе старт падает, и его можно повторить). Пока рядом работают инстансы прежней версии, их строки
+  курсора не несут `parked_due_at`, поэтому отложенная запись может ждать возвращения до `maintenanceInterval`. После
+  отката на версию без requeue отложенные записи лежат в `<base>_parked` недоставленными, пока снова не запустится
+  версия с ним.
 - **Остановка** мягкая: воркеры перестают брать шарды, выполняющиеся вызовы обработчика получают
   `relay.shutdownTimeout`, затем прерываются, а их незакоммиченные батчи позже доставляются снова — другим инстансом
   или после рестарта (дубликаты, а не потери).
@@ -1385,11 +1502,12 @@ Gauges регистрируются один раз на имя, и побежд
 | `outbox.messages.enqueued` | counter | `topic` | Отправленные сообщения, считаются в `send`, включая отправки, чья транзакция откатилась. Не вычисляйте отставание как enqueued − delivered; используйте `outbox.shard.lag`. |
 | `outbox.messages.delivered` | counter | `topic` | Записи, о доставке которых сообщил обработчик. |
 | `outbox.messages.failed` | counter | `topic`, `outcome` = `retry` / `dead` | Записи, отведённые в retry-таблицу (или снова не прошедшие в ней), и записи, ушедшие в dead letters. |
+| `outbox.messages.requeued` | counter | `topic` | Записи, отложенные через `Outcome.requeue()`: каждый раз, включая повторные. `requeue` сверх `maxRequeues` считается в `failed{outcome="dead"}`. |
 | `outbox.delivery.delay` | timer, percentile histogram | `topic` | От вставки строки до outcome «доставлено». Бакеты от 1 мс до 6 ч, чтобы сбои оставались видны в p99; около 110 серий бакетов на топик. |
 | `outbox.batch.duration` | timer, percentile histogram | — | Один шаг шарда, записавший строку курсора (прогресс или пауза). |
 | `outbox.shard.paused` | counter | — | Паузы шардов (цель недоступна, сбойная голова, нет свободного потока обработчика). |
 | `outbox.shard.lag` | gauge, с | — | Насколько тик самого медленного шарда отстаёт от последнего тика. |
-| `outbox.retry.size`, `outbox.dead.size` | gauges | — | Число строк в retry- и dead-таблицах. |
+| `outbox.retry.size`, `outbox.parked.size`, `outbox.dead.size` | gauges | — | Число строк в retry-таблице, среди отложенных записей (`<base>_parked`) и в dead-таблице. |
 | `outbox.partitions.premade` | gauge | — | Диапазоны выше текущего xid. |
 | `outbox.partitions.overflow` | gauge | — | 1, пока используется хвост («tail overflow»). |
 | `outbox.partitions.xids_left` | gauge | — | Сколько xid осталось до того, как вставки начнут падать, пока хвост не присоединён; NaN, пока присоединён. |
@@ -1415,7 +1533,8 @@ Gauges outbox обновляет обслуживание каждые `maintena
 1. `send` сохраняет трассу писателя (`traceparent`, `tracestate`) в заголовках сообщения.
 2. Relay начинает один span на каждую попытку доставки, **`outbox deliver <topic>`**, kind `PRODUCER`, дочерний к
    трассе писателя, с атрибутами `messaging.destination.name`, `outbox.message_id`, `outbox.attempt`,
-   `outbox.delay_ms` и `outbox.outcome` (`delivered`, `retry`, `permanent`, `not_attempted`); сбои записываются в него.
+   `outbox.delay_ms` и `outbox.outcome` (`delivered`, `retry`, `permanent`, `not_attempted`, `requeued`); сбои
+   записываются в него.
 3. Обработчик получает запись, в которой заголовки трассы заменены на заголовки этого span. Обработчик Kafka пересылает
    их, поэтому Kafka-потребитель на Kora продолжает ту же трассу; `handleBatch` по умолчанию выполняет `handle` в
    контексте Kora, несущем этот span, поэтому клиенты Kora, вызванные из него, тоже продолжают трассу.
@@ -1444,10 +1563,10 @@ Grafana на http://localhost:3000 открывает дашборд **Outbox** 
   `OutboxSerializer`.
 - **Интеграционные тесты** запускают настоящий модуль на Postgres 16 (Testcontainers). Выключите фоновый relay и
   доставляйте синхронно через `OutboxRelay.drain()`: он делает тик, затем обрабатывает каждый шард, пока все шарды не
-  дойдут до этого тика и не останется голов в retry-таблице, срок которых наступил, и возвращает число доставленных
-  сообщений. Он работает независимо от того, запущен ли relay. Он бросает `IllegalStateException`, если ни один шард не
-  продвинулся за 2 × `batchTimeout`, хотя работа осталась (например, шард приостановлен из-за сбойного обработчика),
-  или пока relay остановлен.
+  дойдут до этого тика и не останется голов в retry-таблице и отложенных записей, срок которых наступил, и возвращает
+  число доставленных сообщений. Он работает независимо от того, запущен ли relay. Он бросает
+  `IllegalStateException`, если ни один шард не продвинулся за 2 × `batchTimeout`, хотя работа осталась (например,
+  шард приостановлен из-за сбойного обработчика), или пока relay остановлен.
 
 ```java
 @KoraAppTest(App.class)
@@ -1490,9 +1609,11 @@ class OrdersTest implements KoraAppTestConfigModifier {
 }
 ```
 
-- `drain()` останавливается, когда не осталось голов в retry-таблице, срок которых наступил: запись, чья отправка
-  упала и которая ждёт своего backoff, ещё не доставлена. Создайте топик до теста и дополнительно проверяйте, что
-  `select count(*) from outbox_retry` = 0. С меньшим `batchTimeout` `drain()` быстрее сдаётся при тестовом
+- `drain()` останавливается, когда не осталось голов в retry-таблице и отложенных записей, срок которых наступил:
+  запись, чья отправка упала и которая ждёт своего backoff, ещё не доставлена; запись, отложенная через `requeue` до
+  своего срока, — тоже.
+  Создайте топик до теста и дополнительно проверяйте, что `select count(*) from outbox_retry` = 0 (а с обработчиком,
+  который откладывает записи, — и `outbox_parked`). С меньшим `batchTimeout` `drain()` быстрее сдаётся при тестовом
   обработчике, запоминающем записи; с Kafka значение должно оставаться ≥ `delivery.timeout.ms + 5 s + max.block.ms`.
 - `partitions { xidsPerPartition = 1000000, premake = 4 }` ускоряет bootstrap новой таблицы (6 партиций вместо 66).
 - Чтобы проверять доставленное без Kafka, дайте тестовому графу собственный обработчик: тестовый `@KoraApp`, фабрика
@@ -1647,7 +1768,7 @@ retry и dead пусты. Прогон на более ранней версии
 | Скилл | Когда агент его загружает |
 |---|---|
 | `using-kora-outbox` | Подключение, настройка и отправка; роль в базе, соединения, топики Kafka перед деплоем |
-| `writing-kora-outbox-handlers` | Свой `OutboxHandler`, `byTopic`, `batchSize` и `batchTimeout` под медленную цель, dead letters |
+| `writing-kora-outbox-handlers` | Свой `OutboxHandler`, `byTopic`, `batchSize` и `batchTimeout` под медленную цель, dead letters, `Outcome.requeue` |
 | `consuming-with-kora-outbox-inbox` | Потребитель с `Inbox`: дедупликация, scope, записи без заголовка `outbox-message-id` |
 | `testing-kora-outbox` | Интеграционные тесты с Testcontainers и `OutboxRelay.drain()`, тесты, не проверяющие доставку |
 | `operating-kora-outbox` | Метрики, алерты, dead letters, процедуры восстановления, решардинг, деплои |
