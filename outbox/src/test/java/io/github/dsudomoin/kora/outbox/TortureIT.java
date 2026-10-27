@@ -179,11 +179,13 @@ class TortureIT {
             long unkeyed = order.values().stream().filter(row -> row.key() == null).count();
 
             System.out.printf("TortureIT seed %d: committed %d (unkeyed %d), rolled back %d, delivered %d,"
-                            + " duplicates %d, dead %d, requeued %d, transient failures %d, target-down failures %d,"
-                            + " crashes %d, partitions dropped %d (while relaying %d), writers %.1f s, total %.1f s%n",
+                            + " duplicates %d, dead %d, requeue answers %d (first delivered or dead after parking %d),"
+                            + " transient failures %d, target-down failures %d, crashes %d, partitions dropped %d (while"
+                            + " relaying %d), writers %.1f s, total %.1f s%n",
                     seed, committed.size(), unkeyed, rolledBack.size(), delivered.size(), handler.duplicates(),
-                    dead.size(), handler.requeued.size(), handler.transientFailures.get(), handler.downFailures.get(),
-                    handler.crashes.get(), partitions.dropped(), droppedWhileRunning, (writersDone - started) / 1e9,
+                    dead.size(), handler.requeueAnswers.get(), handler.requeued.size(),
+                    handler.transientFailures.get(), handler.downFailures.get(), handler.crashes.get(),
+                    partitions.dropped(), droppedWhileRunning, (writersDone - started) / 1e9,
                     (System.nanoTime() - started) / 1e9);
 
             // differences, not whole sets: a failure must print only the offending ids
@@ -203,12 +205,15 @@ class TortureIT {
                             + " order), each requeued one after those committed before it, none before a dead"
                             + " never-requeued predecessor was attempted")
                     .isEmpty();
-            // a crash fails its call as a whole, and every record the call delivered is delivered again: a retry-pass
-            // call hands at most batchSize rows, a main-pass call a batchSize chunk with up to batchSize parked rows
-            // merged ahead; nothing else redelivers delivered work (the reliable phase does not crash), so no slack
-            // beyond that: more duplicates mean two steps delivered the same rows
-            assertThat(handler.duplicates()).as("duplicates for %d crashes", handler.crashes.get())
-                    .isLessThanOrEqualTo(handler.crashes.get() * 3L * config.batchSize());
+            // a crash fails only its own call, as a whole: each record it delivered is delivered again, once per
+            // such call; nothing else redelivers delivered work (the reliable phase does not crash), so a message
+            // delivered more often means two steps delivered the same row
+            assertThat(handler.deliveries.entrySet().stream()
+                    .filter(e -> e.getValue() - 1 > handler.crashedDeliveries.getOrDefault(e.getKey(), 0))
+                    .map(e -> e.getKey() + " delivered " + e.getValue() + " times, "
+                            + handler.crashedDeliveries.getOrDefault(e.getKey(), 0) + " in crashed calls")
+                    .toList())
+                    .as("deliveries beyond the first that no crashed call explains").isEmpty();
 
             assertThat(droppedWhileRunning).as("partitions dropped while relaying").isPositive();
             assertThat(queryLong(c, "select count(*) from " + names.retry())).as("retry table").isZero();
@@ -240,8 +245,8 @@ class TortureIT {
      * Per (topic, key): the committed non-dead never-requeued messages in commit order ({@code commit_order.n}) against
      * the order of their first successful deliveries; their outbox ids rise in commit order; each requeued message was
      * first delivered after those committed before it; and none was first delivered before a dead never-requeued
-     * predecessor's first permanent failure (a requeued one may fail after its key went on). One line per diverging
-     * key.
+     * predecessor's first permanent failure (a requeued one may fail after its key went on). {@code requeued}: the
+     * messages that parked before their first delivery or first permanent failure. One line per diverging key.
      */
     private static List<String> orderViolations(Map<UUID, Row> order, Set<UUID> dead, Set<UUID> requeued,
             Map<UUID, Delivery> first, Map<UUID, Long> permanentAt) {
@@ -549,13 +554,15 @@ class TortureIT {
     private record Delivery(long sequence, long outboxId) {}
 
     /**
-     * The default {@code handleBatch} loop (per-key skip included) over a flaky {@code handle}: every record fails
-     * while the target is down, 3% transient failures otherwise, permanent failures decided by the payload token
-     * (0.5%, the same on every redelivery and replay), and about every 200th call crashes with an {@link Error} at a
-     * random point, after delivering the records before it. Outside the reliable phase about 3% of the records the
-     * loop would attempt are requeued instead, and after each requeue the call winds down with even odds
-     * ({@code NotAttempted} for every later record, as a call cut at its soft deadline answers). Each call draws from
-     * its own seeded random. First successes and first permanent failures get numbers from one sequence.
+     * A flaky {@code handle}: every record fails while the target is down, 3% transient failures otherwise, permanent
+     * failures decided by the payload token (0.5%, the same on every redelivery and replay), and about every 200th call
+     * crashes: {@code handle} fails with an {@link Error} at a random point (a Retry for that record, as the default
+     * {@code handleBatch} catches it) and the call throws an {@link Error} once it has handed every record. A quarter
+     * of the calls, and every call of the reliable phase, run the default {@code handleBatch}; the others run its loop
+     * (per-key skip included) with requeues: about 3% of the records it would attempt are requeued instead, and after
+     * each requeue the call winds down with even odds ({@code NotAttempted} for every later record, as a call cut at
+     * its soft deadline answers). Each call draws from its own seeded random. First successes and first permanent
+     * failures get numbers from one sequence.
      */
     private static final class FlakyHandler implements OutboxHandler {
 
@@ -566,9 +573,15 @@ class TortureIT {
         private final List<long[]> down = new CopyOnWriteArrayList<>();
         final Map<UUID, Delivery> first = new ConcurrentHashMap<>();
         final Map<UUID, Integer> deliveries = new ConcurrentHashMap<>();
+        /** Deliveries in calls that then crashed: each is delivered again. */
+        final Map<UUID, Integer> crashedDeliveries = new ConcurrentHashMap<>();
         final Map<UUID, Long> permanentAt = new ConcurrentHashMap<>();
-        /** Every message the handler answered {@code requeue} for at least once. */
+        /**
+         * The messages whose first delivery, or first permanent failure, carried {@code requeues() > 0}: they parked
+         * before it. A requeue answer the relay did not apply (its call crashed or paused the shard) parks nothing.
+         */
         final Set<UUID> requeued = ConcurrentHashMap.newKeySet();
+        final AtomicInteger requeueAnswers = new AtomicInteger();
         final AtomicInteger transientFailures = new AtomicInteger();
         final AtomicInteger downFailures = new AtomicInteger();
         final AtomicInteger crashes = new AtomicInteger();
@@ -597,12 +610,16 @@ class TortureIT {
         @Override
         public List<Outcome> handleBatch(List<OutboxRecord> records) {
             var random = new SplittableRandom(seed ^ (calls.incrementAndGet() * 0x9E3779B97F4A7C15L));
+            boolean reliable = this.reliable;
             var call = new Call(random, !reliable && random.nextInt(200) == 0 ? random.nextInt(records.size() + 1) : -1);
             current.set(call);
             try {
-                var outcomes = attempt(records, call.random);
-                if (call.crashAt >= 0) { // a crash point that handle() reached was caught there as a Retry
-                    throw crash();
+                var outcomes = reliable || random.nextInt(4) == 0
+                        ? OutboxHandler.super.handleBatch(records)
+                        : attempt(records, random);
+                if (call.crashAt >= 0) { // whether or not handle() reached the crash point
+                    crashes.incrementAndGet();
+                    throw new AssertionError("simulated crash mid-batch");
                 }
                 return outcomes;
             } finally {
@@ -610,7 +627,7 @@ class TortureIT {
             }
         }
 
-        /** {@link OutboxHandler#handleBatch}'s default loop, with the requeues and wind-downs. */
+        /** {@link OutboxHandler#handleBatch}'s default loop, with the requeues and wind-downs (not reliable). */
         private List<Outcome> attempt(List<OutboxRecord> records, SplittableRandom random) {
             var outcomes = new ArrayList<Outcome>(records.size());
             var failed = new HashSet<Object>();
@@ -623,8 +640,8 @@ class TortureIT {
                     outcomes.add(Outcome.notAttempted());
                     continue;
                 }
-                if (!reliable && random.nextInt(100) < 3) {
-                    requeued.add(record.messageId());
+                if (random.nextInt(100) < 3) {
+                    requeueAnswers.incrementAndGet();
                     outcomes.add(Outcome.requeue());
                     windDown = random.nextBoolean();
                     continue;
@@ -647,7 +664,7 @@ class TortureIT {
         public void handle(OutboxRecord record) throws Exception {
             var call = current.get();
             if (call.handled++ == call.crashAt) {
-                throw crash();
+                throw new AssertionError("simulated crash point");
             }
             var id = record.messageId();
             if (!reliable && targetDown()) {
@@ -655,15 +672,23 @@ class TortureIT {
                 throw new Exception("target down");
             }
             if (isPermanent(record)) {
-                permanentAt.putIfAbsent(id, sequence.incrementAndGet());
+                if (permanentAt.putIfAbsent(id, sequence.incrementAndGet()) == null && record.requeues() > 0) {
+                    requeued.add(id);
+                }
                 throw new OutboxPermanentException("poison " + id);
             }
             if (!reliable && call.random.nextInt(1000) < 30) {
                 transientFailures.incrementAndGet();
                 throw new Exception("flaky " + id);
             }
-            first.putIfAbsent(id, new Delivery(sequence.incrementAndGet(), record.id()));
+            if (first.putIfAbsent(id, new Delivery(sequence.incrementAndGet(), record.id())) == null
+                    && record.requeues() > 0) {
+                requeued.add(id);
+            }
             deliveries.merge(id, 1, Integer::sum);
+            if (call.crashAt >= 0) {
+                crashedDeliveries.merge(id, 1, Integer::sum);
+            }
         }
 
         private boolean targetDown() {
@@ -674,11 +699,6 @@ class TortureIT {
         private boolean isPermanent(OutboxRecord record) {
             long token = Long.parseLong(new String(record.payload(), UTF_8));
             return new SplittableRandom(seed ^ (token * 0x9E3779B97F4A7C15L)).nextInt(200) == 0;
-        }
-
-        private AssertionError crash() {
-            crashes.incrementAndGet();
-            return new AssertionError("simulated crash mid-batch");
         }
 
         long duplicates() {

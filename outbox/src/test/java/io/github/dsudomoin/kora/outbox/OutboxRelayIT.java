@@ -448,7 +448,11 @@ class OutboxRelayIT {
 
         send(outbox, msg("t", "acc42", "SYNCHRONIZE#2"));
         await(Duration.ofSeconds(1), () -> "SYNCHRONIZE#2".equals(parked()));
-        Thread.sleep(3000); // handed again at each due time, requeued each time
+        Thread.sleep(3000);
+        assertThat(handler.calls).as("handed again at each due time (about 1 s and 2 s later)")
+                .filteredOn(List.of("SYNCHRONIZE#2")::equals).hasSizeGreaterThanOrEqualTo(3);
+        assertThat(handler.delivered()).isEmpty();
+        assertThat(parked()).isEqualTo("SYNCHRONIZE#2");
         send(outbox, msg("t", "acc42", "FEE_RELEASE"));
         await(Duration.ofSeconds(1), () -> handler.delivered().size() == 1); // FEE_RELEASE did not wait
 
@@ -461,7 +465,9 @@ class OutboxRelayIT {
 
         assertThat(handler.delivered()).extracting(OutboxRelayIT::payload)
                 .containsExactly("FEE_RELEASE", "SYNCHRONIZE#2");
-        assertThat(handler.delivered().get(1).requeues()).isPositive();
+        long handed = handler.calls.stream().filter(call -> call.contains("SYNCHRONIZE#2")).count();
+        assertThat(handler.delivered().get(1).requeues()).as("requeued in each call before the last")
+                .isEqualTo(handed - 1);
     }
 
     @Test
@@ -491,30 +497,11 @@ class OutboxRelayIT {
         bootstrap();
         var handler = new RecordingHandler();
         var started = List.of(start(handler), start(handler), start(handler));
-        var writers = Executors.newFixedThreadPool(4);
-        var sent = new ArrayList<Future<List<UUID>>>();
-        for (int w = 0; w < 4; w++) {
-            var outbox = outbox(started.get(w % 3)::wake);
-            sent.add(writers.submit(() -> {
-                var ids = new ArrayList<UUID>();
-                for (int tx = 0; tx < 25; tx++) {
-                    ids.addAll(send(outbox, IntStream.range(0, 50)
-                            .mapToObj(i -> msg("t", "k" + ThreadLocalRandom.current().nextInt(20), "m"))
-                            .toArray(OutboxMessage[]::new)));
-                }
-                return ids;
-            }));
-        }
-        var ids = new ArrayList<UUID>();
-        for (var f : sent) {
-            ids.addAll(f.get(60, TimeUnit.SECONDS));
-        }
-        writers.shutdown();
+        var ids = sendConcurrently(started);
 
         await(Duration.ofSeconds(60), () -> handler.delivered().size() >= 5000);
         assertThat(started.get(0).drain()).isZero(); // everything is committed, nothing left
 
-        assertThat(ids).hasSize(5000);
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(ids);
         assertIdOrderPerKey(handler.delivered());
     }
@@ -526,25 +513,7 @@ class OutboxRelayIT {
         var handler = new Coordinator();
         handler.blocked = r -> r.requeues() == 0 && ThreadLocalRandom.current().nextBoolean();
         var started = List.of(start(handler), start(handler), start(handler));
-        var writers = Executors.newFixedThreadPool(4);
-        var sent = new ArrayList<Future<List<UUID>>>();
-        for (int w = 0; w < 4; w++) {
-            var outbox = outbox(started.get(w % 3)::wake);
-            sent.add(writers.submit(() -> {
-                var ids = new ArrayList<UUID>();
-                for (int tx = 0; tx < 25; tx++) {
-                    ids.addAll(send(outbox, IntStream.range(0, 50)
-                            .mapToObj(i -> msg("t", "k" + ThreadLocalRandom.current().nextInt(20), "m"))
-                            .toArray(OutboxMessage[]::new)));
-                }
-                return ids;
-            }));
-        }
-        var ids = new ArrayList<UUID>();
-        for (var f : sent) {
-            ids.addAll(f.get(60, TimeUnit.SECONDS));
-        }
-        writers.shutdown();
+        var ids = sendConcurrently(started);
 
         await(Duration.ofSeconds(60), () -> handler.delivered().size() >= 5000);
         assertThat(started.get(0).drain()).isZero(); // everything is committed, nothing left
@@ -1298,6 +1267,37 @@ class OutboxRelayIT {
 
     private PgOutbox outbox(Runnable wake) {
         return new PgOutbox(db, schema, config.shards(), wake, new OutboxMetrics(null));
+    }
+
+    /**
+     * 5000 messages over 20 keys from 4 writers, each waking one of {@code relays} in turn: 25 transactions of 50
+     * messages each; returns their ids.
+     */
+    private List<UUID> sendConcurrently(List<OutboxRelay> relays) throws Exception {
+        var writers = Executors.newFixedThreadPool(4);
+        try {
+            var sent = new ArrayList<Future<List<UUID>>>();
+            for (int w = 0; w < 4; w++) {
+                var outbox = outbox(relays.get(w % relays.size())::wake);
+                sent.add(writers.submit(() -> {
+                    var ids = new ArrayList<UUID>();
+                    for (int tx = 0; tx < 25; tx++) {
+                        ids.addAll(send(outbox, IntStream.range(0, 50)
+                                .mapToObj(i -> msg("t", "k" + ThreadLocalRandom.current().nextInt(20), "m"))
+                                .toArray(OutboxMessage[]::new)));
+                    }
+                    return ids;
+                }));
+            }
+            var ids = new ArrayList<UUID>();
+            for (var f : sent) {
+                ids.addAll(f.get(60, TimeUnit.SECONDS));
+            }
+            assertThat(ids).hasSize(5000);
+            return ids;
+        } finally {
+            writers.shutdown();
+        }
     }
 
     /** One committed transaction; Kora runs the wake-up after the commit. */
