@@ -55,6 +55,8 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
   `partitionInterval` on all instances at once.
 - **Rollback to the previous release** (5fc60dd): «Rolling-деплои», item «Обновление с предыдущего релиза (5fc60dd),
   смешанный парк и откат». The old release writes dead letters `kept`: list the window's kept letters afterwards.
-  Once no new instance runs, drop the hot tail's bound check the README gives (`<table>_tail_bounded`).
+  Once no new instance runs, drop the hot tail's bound check the README gives (`<table>_tail_bounded`). The old
+  release refuses to start unless its `outbox.shards` equals the cursors' count: set it after a reshard and for an
+  outbox this release created (256 by default).
 - «Репликация, failover и PITR»: async failover can deliver events whose data is gone; PITR redelivers.
 - `relay.retry.maxAttempts = 0` (default): a key stuck on a broken target shows only as lag.
