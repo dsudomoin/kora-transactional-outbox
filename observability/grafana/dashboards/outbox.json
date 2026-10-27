@@ -1,7 +1,7 @@
 {
   "uid": "outbox",
   "title": "Outbox",
-  "description": "kora-outbox bench: throughput, delivery delay, relay health, Postgres and consumer correctness.",
+  "description": "kora-outbox bench: throughput, delivery delay, relay health, dead letters, Postgres and consumer correctness.",
   "tags": [
     "outbox",
     "bench"
@@ -761,8 +761,8 @@
     {
       "type": "timeseries",
       "id": 9,
-      "title": "Retry and dead tables",
-      "description": "Rows in outbox_retry and outbox_dead (outbox.retry.size, outbox.dead.size).",
+      "title": "Retry table",
+      "description": "Rows in outbox_retry (outbox.retry.size).",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -809,27 +809,12 @@
                 }
               }
             ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "dead"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#d95926"
-                }
-              }
-            ]
           }
         ]
       },
       "options": {
         "legend": {
-          "showLegend": true,
+          "showLegend": false,
           "displayMode": "list",
           "placement": "bottom",
           "calcs": [
@@ -851,16 +836,6 @@
           },
           "expr": "max(outbox_retry_size)",
           "legendFormat": "retry",
-          "range": true
-        },
-        {
-          "refId": "B",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "max(outbox_dead_size)",
-          "legendFormat": "dead",
           "range": true
         }
       ]
@@ -1370,12 +1345,477 @@
     },
     {
       "type": "row",
+      "title": "Dead letters",
+      "collapsed": false,
+      "id": 33,
+      "gridPos": {
+        "x": 0,
+        "y": 46,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 34,
+      "title": "Dead-letter table",
+      "description": "Rows in outbox_dead (outbox.dead.size): kept, pending and scheduled letters. Without a dead-letter hook every letter is kept, and the level falls only when an admin redrive or discard removes letters or outbox.deadLetters.retention (off by default) deletes old kept ones.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 47,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#3987e5"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisPlacement": "auto"
+          },
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dead"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(outbox_dead_size)",
+          "legendFormat": "dead",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 35,
+      "title": "Pending dead letters",
+      "description": "Dead letters waiting for the dead-letter hook (outbox.dead.pending). Stays 0 without a hook; a level that keeps rising means the hook fails or falls behind.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 47,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#3987e5"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisPlacement": "auto"
+          },
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "pending"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(outbox_dead_pending)",
+          "legendFormat": "pending",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 36,
+      "title": "Oldest pending dead letter",
+      "description": "Seconds since the oldest pending dead letter failed (outbox.dead.pending.oldest), 0 when none, refreshed by maintenance every 30 s. Growing steadily means the hook has not answered for it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 47,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#3987e5"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "oldest"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(outbox_dead_pending_oldest)",
+          "legendFormat": "oldest",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 37,
+      "title": "Dead-letter decisions per second",
+      "description": "outbox.dead.decisions by decision, one per letter the hook answered: keep, discard, redrive or redrive_at. Each series appears with the first decision of its kind, so the panel is empty without a hook.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 55,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: msg/s",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#3987e5"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "keep"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "discard"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "redrive"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "redrive_at"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (decision) (rate(outbox_dead_decisions_total[$__rate_interval]))",
+          "legendFormat": "{{decision}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 38,
+      "title": "Dead-letter hook failures per second",
+      "description": "outbox.dead.hook.failures rate: hook calls that threw or exceeded outbox.deadLetters.timeout; their letters stay pending and are handed over again after a backoff. The counter appears on the first failure; the series reads 0 while the app is up and the hook has not failed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 55,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: /s",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#3987e5"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "failures"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(outbox_dead_hook_failures_total[$__rate_interval])) or 0 * sum(kora_up)",
+          "legendFormat": "failures",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "row",
       "title": "Postgres",
       "collapsed": false,
       "id": 14,
       "gridPos": {
         "x": 0,
-        "y": 46,
+        "y": 63,
         "w": 24,
         "h": 1
       },
@@ -1392,7 +1832,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 47,
+        "y": 64,
         "w": 8,
         "h": 8
       },
@@ -1498,7 +1938,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 47,
+        "y": 64,
         "w": 8,
         "h": 8
       },
@@ -1613,7 +2053,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 47,
+        "y": 64,
         "w": 8,
         "h": 8
       },
@@ -1694,7 +2134,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 55,
+        "y": 72,
         "w": 12,
         "h": 8
       },
@@ -1775,7 +2215,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 55,
+        "y": 72,
         "w": 12,
         "h": 8
       },
@@ -1878,7 +2318,7 @@
       "id": 20,
       "gridPos": {
         "x": 0,
-        "y": 63,
+        "y": 80,
         "w": 24,
         "h": 1
       },
@@ -1895,7 +2335,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 64,
+        "y": 81,
         "w": 8,
         "h": 4
       },
@@ -1962,7 +2402,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 64,
+        "y": 81,
         "w": 8,
         "h": 4
       },
@@ -2029,7 +2469,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 64,
+        "y": 81,
         "w": 8,
         "h": 4
       },
@@ -2096,7 +2536,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 68,
+        "y": 85,
         "w": 12,
         "h": 8
       },
@@ -2202,7 +2642,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 68,
+        "y": 85,
         "w": 12,
         "h": 8
       },
@@ -2280,7 +2720,7 @@
       "id": 26,
       "gridPos": {
         "x": 0,
-        "y": 76,
+        "y": 93,
         "w": 24,
         "h": 1
       },
@@ -2297,7 +2737,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 77,
+        "y": 94,
         "w": 6,
         "h": 8
       },
@@ -2403,7 +2843,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 77,
+        "y": 94,
         "w": 6,
         "h": 8
       },
@@ -2509,7 +2949,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 77,
+        "y": 94,
         "w": 6,
         "h": 8
       },
@@ -2641,7 +3081,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 77,
+        "y": 94,
         "w": 6,
         "h": 8
       },
