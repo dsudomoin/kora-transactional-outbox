@@ -115,6 +115,8 @@ class OutboxConfigTest {
     @Test
     void badDeadLettersValuesAreRejected() {
         assertRejected("outbox.deadLetters.batchSize = 0", "outbox.deadLetters.batchSize must be at least 1: 0");
+        assertRejected("outbox.deadLetters.batchSize = 1001",
+                "outbox.deadLetters.batchSize must be at most 1000: 1001");
         assertRejected("outbox.deadLetters.timeout = 0ms", "outbox.deadLetters.timeout must be positive: PT0S");
         assertRejected("outbox.deadLetters.retention = -1ms",
                 "outbox.deadLetters.retention must not be negative: PT-0.001S");

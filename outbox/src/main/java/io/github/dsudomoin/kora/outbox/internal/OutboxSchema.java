@@ -154,6 +154,9 @@ public final class OutboxSchema implements Lifecycle {
                 "outbox.partitions.swapLockTimeout must be positive: " + partitions.swapLockTimeout());
         require(deadLetters.batchSize() >= 1,
                 "outbox.deadLetters.batchSize must be at least 1: " + deadLetters.batchSize());
+        // a batch's redrive holds a key lock per letter in one transaction, as an admin chunk does
+        require(deadLetters.batchSize() <= PgOutboxAdmin.CHUNK,
+                "outbox.deadLetters.batchSize must be at most " + PgOutboxAdmin.CHUNK + ": " + deadLetters.batchSize());
         require(deadLetters.timeout().compareTo(Duration.ZERO) > 0,
                 "outbox.deadLetters.timeout must be positive: " + deadLetters.timeout());
         require(!deadLetters.retention().isNegative(),

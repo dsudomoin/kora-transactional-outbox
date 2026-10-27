@@ -202,7 +202,7 @@ public interface OutboxConfig {
     @ConfigValueExtractor
     interface DeadLettersConfig {
 
-        /** Letters per call of the dead-letter hook. Default 100. */
+        /** Letters per call of the dead-letter hook, 1..1000 (a redrive batch holds a key lock each). Default 100. */
         default int batchSize() {
             return 100;
         }
