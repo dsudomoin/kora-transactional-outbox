@@ -10,7 +10,6 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -135,7 +134,7 @@ public final class Ticks {
      * 1024 shards and 400 ended xids), and appending its cursor row: one capped tick costs one sweep of every shard
      * plus one cursor row per shard, outside the tick lock and spread over the relay workers, however far the shards'
      * effective ticks lie behind it, as a fresh batch starts at the last tick before C that does not mark its shard
-     * ({@link #lastUnmarked}). The rows
+     * ({@link #fresh}). The rows
      * inside the ranges are not read: for a shard at P they are no candidates of the batch (P, C], being visible in P.
      * That the heavy load such ranges need has branch 1 mark nearly every shard anyway is an expectation, not a
      * measurement. At 1024 shards a probe estimated just below the budget took about 5 ms (on a scratch Postgres 16,
@@ -454,40 +453,61 @@ public final class Ticks {
     }
 
     /**
-     * For a fresh batch of each shard from its tick in {@code afterIds}: the last tick before the first one after it,
-     * up to {@code latestId}, that marks the shard, when that is past its tick; absent when none is. A tick marks the
-     * shard when its {@code dirty} has the shard's bit or is null (or of another non-zero length), when it follows a
-     * gap in tick ids, or when it is the latest. The ticks skipped mark nothing of the shard and chain (see the class
-     * comment), so the shard has no row visible in the tick returned and not in {@code afterId}: its batch can start
-     * there, read the same rows and cover its {@code maxTicksPerBatch} ticks from the first that may hold them. The
-     * ticks come without their snapshots ({@link Tick#snapshot()} null), as {@link #between}'s, keyed by shard, from
-     * one statement: per shard an index scan from its tick that stops at the first tick marking it.
+     * What a fresh batch of each shard chooses its target from: {@code skipped}, keyed by shard, and {@code ticks}, the
+     * ticks after each shard's start, each once, keyed by id; all without their snapshots ({@link Tick#snapshot()}
+     * null), as {@link #between}'s.
      */
-    public Map<Integer, Tick> lastUnmarked(Connection c, Map<Integer, Long> afterIds, long latestId)
-            throws SQLException {
-        var result = new HashMap<Integer, Tick>();
+    public record Fresh(Map<Integer, Tick> skipped, NavigableMap<Long, Tick> ticks) {}
+
+    /**
+     * For a fresh batch of each shard from its tick in {@code afterIds}, in one statement: in {@code skipped}, the last
+     * tick before the first one after it, up to {@code latestId}, that marks the shard, when that is past its tick;
+     * absent when none is. A tick marks the shard when its {@code dirty} has the shard's bit or is null (or of another
+     * non-zero length), when it follows a gap in tick ids, or when it is the latest. The ticks skipped mark nothing of
+     * the shard and chain (see the class comment), so the shard has no row visible in the tick returned and not in
+     * {@code afterId}: its batch can start there, read the same rows and cover its {@code maxTicks} ticks from the
+     * first that may hold them. Per shard an index scan from its tick that stops at the first tick marking it. Then,
+     * in {@code ticks}, the ticks {@code start < id <= min(latestId, start + maxTicks)} for each shard's start (the
+     * skipped-to tick, else its own): one index range scan per distinct start.
+     */
+    public Fresh fresh(Connection c, Map<Integer, Long> afterIds, long latestId, int maxTicks) throws SQLException {
+        var skipped = new HashMap<Integer, Tick>();
+        var between = new TreeMap<Long, Tick>();
         if (afterIds.isEmpty()) {
-            return result;
+            return new Fresh(skipped, between);
         }
-        try (var ps = c.prepareStatement("select u.shard, t.id, t.created_at, t.max_id from unnest(?::int[],"
-                + " ?::int8[]) u(shard, after_id) join " + names.tick() + " t on t.id = (select max(m.id) from "
-                + names.tick() + " m where m.id > u.after_id and m.id < (select n.id from " + names.tick()
-                + " n where n.id > u.after_id and n.id <= ? and (n.id = ? or n.dirty is null or not exists (select 1"
-                + " from " + names.tick() + " g where g.id = n.id - 1) or case when length(n.dirty) = 0 then false"
-                + " when length(n.dirty) <> " + shards + " then true else get_bit(n.dirty, u.shard) = 1 end)"
-                + " order by n.id limit 1))")) {
+        // u, materialised, is read twice: its rows with a skip, then its distinct starts
+        try (var ps = c.prepareStatement("with u as materialized (select u.shard, u.after_id, t.id, t.created_at,"
+                + " t.max_id from unnest(?::int[], ?::int8[]) u(shard, after_id) left join " + names.tick()
+                + " t on t.id = (select max(m.id) from " + names.tick() + " m where m.id > u.after_id and m.id <"
+                + " (select n.id from " + names.tick() + " n where n.id > u.after_id and n.id <= ? and (n.id = ?"
+                + " or n.dirty is null or not exists (select 1 from " + names.tick() + " g where g.id = n.id - 1)"
+                + " or case when length(n.dirty) = 0 then false when length(n.dirty) <> " + shards + " then true"
+                + " else get_bit(n.dirty, u.shard) = 1 end) order by n.id limit 1)))"
+                + " select shard, id, created_at, max_id from u where id is not null"
+                + " union all select null, id, created_at, max_id from (select distinct t.id, t.created_at, t.max_id"
+                + " from (select distinct coalesce(id, after_id) lo from u) r cross join lateral (select id,"
+                + " created_at, max_id from " + names.tick() + " where id > r.lo and id <= least(?, r.lo + ?)) t) t")) {
             ps.setArray(1, c.createArrayOf("int4", afterIds.keySet().toArray()));
             ps.setArray(2, c.createArrayOf("int8", afterIds.values().toArray()));
             ps.setLong(3, latestId);
             ps.setLong(4, latestId);
+            ps.setLong(5, latestId);
+            ps.setInt(6, maxTicks);
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    result.put(rs.getInt(1), new Tick(rs.getLong(2), null,
-                            rs.getObject(3, OffsetDateTime.class).toInstant(), rs.getObject(4, Long.class)));
+                    var tick = new Tick(rs.getLong(2), null, rs.getObject(3, OffsetDateTime.class).toInstant(),
+                            rs.getObject(4, Long.class));
+                    var shard = rs.getObject(1, Integer.class);
+                    if (shard != null) {
+                        skipped.put(shard, tick);
+                    } else {
+                        between.put(tick.id(), tick);
+                    }
                 }
             }
         }
-        return result;
+        return new Fresh(skipped, between);
     }
 
     /** The ticks with these ids, keyed by id; an id without a tick is absent. One statement. */
@@ -527,34 +547,6 @@ public final class Ticks {
                 return ticks;
             }
         }
-    }
-
-    /**
-     * The ticks of every range {@code (afterIds[i], upToIds[i]]}, each once, keyed by id, without their snapshots as
-     * {@link #between(Connection, long, long)}'s: one statement, one index range scan per distinct range.
-     */
-    public NavigableMap<Long, Tick> between(Connection c, long[] afterIds, long[] upToIds) throws SQLException {
-        var ranges = new LinkedHashSet<List<Long>>();
-        for (int i = 0; i < afterIds.length; i++) {
-            ranges.add(List.of(afterIds[i], upToIds[i]));
-        }
-        var result = new TreeMap<Long, Tick>();
-        if (ranges.isEmpty()) {
-            return result;
-        }
-        try (var ps = c.prepareStatement("select distinct t.id, t.created_at, t.max_id from unnest(?::int8[],"
-                + " ?::int8[]) r(after_id, up_to_id) cross join lateral (select id, created_at, max_id from "
-                + names.tick() + " where id > r.after_id and id <= r.up_to_id) t")) {
-            ps.setArray(1, c.createArrayOf("int8", ranges.stream().map(r -> r.get(0)).toArray()));
-            ps.setArray(2, c.createArrayOf("int8", ranges.stream().map(r -> r.get(1)).toArray()));
-            try (var rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    result.put(rs.getLong(1), new Tick(rs.getLong(1), null,
-                            rs.getObject(2, OffsetDateTime.class).toInstant(), rs.getObject(3, Long.class)));
-                }
-            }
-        }
-        return result;
     }
 
     /** The oldest tick with {@code id > afterId}: bridges gaps in tick ids. */

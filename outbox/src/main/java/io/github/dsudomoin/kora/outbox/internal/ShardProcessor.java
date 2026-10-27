@@ -61,7 +61,7 @@ import org.slf4j.LoggerFactory;
  * re-read the cursors, deliver each shard's due retry heads and due parked rows, then the next chunk of each batch
  * {@code (tickId, target]} with the parked rows of its keys first in its part of the call, classify each shard and
  * append the new cursors. Each rule below holds per shard. A shard's batch starts from the shard's effective tick
- * ({@link Cursors}); a fresh one skips the leading ticks that do not mark the shard ({@link Ticks#lastUnmarked}),
+ * ({@link Cursors}); a fresh one skips the leading ticks that do not mark the shard ({@link Ticks#fresh}),
  * which hold none of its rows, so its {@code maxTicksPerBatch} ticks start at
  * the first that may: an idle shard far behind the latest tick (an effective tick a maintenance interval old, or a
  * cursor's) reaches its first row, or the latest tick, in one step, not one step per {@code maxTicksPerBatch} ticks. A
@@ -594,7 +594,8 @@ public final class ShardProcessor implements AutoCloseable {
             if (more.isEmpty()) {
                 return;
             }
-            var skipped = ticks.lastUnmarked(c, afterIds, latestTickId);
+            var fresh = ticks.fresh(c, afterIds, latestTickId, relay.maxTicksPerBatch());
+            var skipped = fresh.skipped();
             var from = new long[more.size()];
             var prevs = new Tick[more.size()];
             var lo = new long[more.size()];
@@ -612,7 +613,7 @@ public final class ShardProcessor implements AutoCloseable {
                 lo[i] = from[i];
                 hi[i] = Math.min(latestTickId, from[i] + relay.maxTicksPerBatch());
             }
-            var between = ticks.between(c, lo, hi);
+            var between = fresh.ticks(); // read from the same starts, so it holds each range
             var targets = new Tick[more.size()];
             var targetIds = new long[more.size()];
             for (int i = 0; i < more.size(); i++) {
@@ -695,7 +696,7 @@ public final class ShardProcessor implements AutoCloseable {
     /**
      * The target of each step that has one, from statements shared by all: the batch in progress keeps its target,
      * never re-chosen mid-batch (rows of a long transaction below lastId committing after the old target would be
-     * skipped); a fresh batch skips the leading ticks that do not mark its shard ({@link Ticks#lastUnmarked}), then
+     * skipped); a fresh batch skips the leading ticks that do not mark its shard ({@link Ticks#fresh}), then
      * {@link #chooseTarget} picks among its next {@code maxTicksPerBatch} ticks. The snapshots of the targets and of
      * the skipped-to ticks come in one read; the effective tick's came with the cursor.
      */
@@ -715,7 +716,8 @@ public final class ShardProcessor implements AutoCloseable {
             }
         }
         if (!fresh.isEmpty()) {
-            var skipped = ticks.lastUnmarked(c, afterIds, latestTickId);
+            var starts = ticks.fresh(c, afterIds, latestTickId, relay.maxTicksPerBatch());
+            var skipped = starts.skipped();
             var lo = new long[fresh.size()];
             var hi = new long[fresh.size()];
             for (int i = 0; i < fresh.size(); i++) {
@@ -730,7 +732,7 @@ public final class ShardProcessor implements AutoCloseable {
                 lo[i] = s.cursor.tickId();
                 hi[i] = Math.min(latestTickId, s.cursor.tickId() + relay.maxTicksPerBatch());
             }
-            var between = ticks.between(c, lo, hi);
+            var between = starts.ticks(); // read from the same starts, so it holds each range
             for (int i = 0; i < fresh.size(); i++) {
                 var s = fresh.get(i);
                 var candidates = List.copyOf(between.subMap(lo[i], false, hi[i], true).values());

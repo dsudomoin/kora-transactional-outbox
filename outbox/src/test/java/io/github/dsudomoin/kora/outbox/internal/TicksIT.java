@@ -73,11 +73,34 @@ class TicksIT {
         }
     }
 
-    /** {@link Ticks#lastUnmarked}'s tick id, null for none. */
+    /** {@link Ticks#fresh}'s skipped-to tick id, null for none. */
     @Nullable
     private Long lastUnmarked(Connection c, int shard, long afterId, long latestId) throws Exception {
-        var tick = ticks.lastUnmarked(c, Map.of(shard, afterId), latestId).get(shard);
+        var tick = ticks.fresh(c, Map.of(shard, afterId), latestId, 100).skipped().get(shard);
         return tick == null ? null : tick.id();
+    }
+
+    @Test
+    void freshReadsTheTicksAfterEachShardsSkipUpToItsBound() throws Exception {
+        try (var c = TestDb.connect()) {
+            long p = ticks.latest(c).id(); // the bootstrap tick
+            long a = tick(c, "''");
+            long b = tick(c, "B'01000000'"); // marks shard 1
+            long d = tick(c, "''");
+            long e = tick(c, "''");
+            long latest = tick(c, "''");
+
+            var fresh = ticks.fresh(c, Map.of(0, p, 1, p, 2, a), latest, 2);
+
+            assertThat(fresh.skipped()).extractingFromEntries(entry -> entry.getKey() + "@" + entry.getValue().id())
+                    .as("shards 0 and 2 up to the latest's predecessor, shard 1 to the tick before b")
+                    .containsExactlyInAnyOrder("0@" + e, "1@" + a, "2@" + e);
+            assertThat(fresh.skipped().get(1).snapshot()).as("without snapshots").isNull();
+            // (e, latest] for shards 0 and 2, (a, a + 2] for shard 1: each tick once
+            assertThat(fresh.ticks().keySet()).containsExactly(b, d, latest);
+            assertThat(ticks.fresh(c, Map.of(0, latest), latest, 2).ticks()).as("nothing after the latest").isEmpty();
+            assertThat(ticks.fresh(c, Map.of(), latest, 2).skipped()).isEmpty();
+        }
     }
 
     /** A tick with {@code dirty} (SQL); returns its id. */
