@@ -47,10 +47,12 @@ Kafka producer client metrics of the outbox are not bound to Micrometer (JMX onl
 
 Logs: logger `io.github.dsudomoin.kora.outbox`, repeated lines rate-limited. INFO for start, stop, partition DDL and
 each changing admin call; WARN for diverted keys, shard pauses, deferred partition extensions, tail overflow, stale
-maintenance, dead-letter hook failures and letters the Kafka DLQ kept; ERROR for dead letters, handler errors,
-stranded shards, the xid regression, `premade < 2`, a detached tail, orphans and transaction pooling. WARN «outbox tick
-made without its shard set» (at most once a minute): a partition is held by an `ACCESS EXCLUSIVE` lock (`ALTER TABLE`,
-`VACUUM FULL`, `TRUNCATE`, a manual `LOCK`), so ticks step every shard and lag grows while it lasts.
+maintenance, dead-letter hook failures, letters the Kafka DLQ kept and failed heartbeats («outbox heartbeat of instance
+... failed»); ERROR for dead letters, handler errors, stranded shards, the shard-count mismatch after a reshard («...
+holds cursors for N shards, but this instance runs with outbox.shards = M ...»), the xid regression, `premade < 2`, a
+detached tail, orphans and transaction pooling. WARN «outbox tick made without its shard set» (at most once a minute): a
+partition is held by an `ACCESS EXCLUSIVE` lock (`ALTER TABLE`, `VACUUM FULL`, `TRUNCATE`, a manual `LOCK`), so ticks
+step every shard and lag grows while it lasts.
 
 Tracing (with an OpenTelemetry `Tracer` in the graph): one `PRODUCER` span per delivery attempt,
 `outbox deliver <topic>`, child of the writer's trace, with attributes `messaging.destination.name`,

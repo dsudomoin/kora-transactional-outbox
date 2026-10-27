@@ -29,7 +29,7 @@ letters per call.
 | `DeadLetterDecision.keep()` | Stays for humans (`kept`); the hook never gets it again. |
 | `discard()` | Deleted. |
 | `redrive()` | Right after the decision commits, back to the outbox as a new message after the later messages of its key: same message id, topic, key, payload and headers, `attempts` from zero, shard computed for the current `outbox.shards`. While a transaction that sends its key is open, it waits `scheduled` and tries again after `relay.retry.initialDelay`. |
-| `redriveAt(at)` | Waits `scheduled` and redrives at `at`, without another hook call; `at` within [now, now + 7 days]. |
+| `redriveAt(at)` | Waits `scheduled` and redrives at `at`, without another hook call; `at` is clamped to [now, now + 7 days]. |
 
 A redrive breaks per-key order: the letter is delivered after the key's later records. Inbox consumers deduplicate
 it by message id within their window.

@@ -7,10 +7,9 @@ description: Use when monitoring, alerting on, sizing or troubleshooting kora-tr
 
 ## Overview
 
-Procedures: the library README (https://github.com/dsudomoin/kora-transactional-outbox#readme), Russian section
-names quoted below. Act through the admin API: `OutboxAdmin` in code or `kora-outbox-admin` over HTTP
-([admin-api.md](admin-api.md)). **Never improvise SQL against the library's tables**; run only SQL the README prints,
-as written, on a staging copy first.
+Procedures: the library README (https://github.com/dsudomoin/kora-transactional-outbox#readme). Act through the admin
+API: `OutboxAdmin` in code or `kora-outbox-admin` over HTTP ([admin-api.md](admin-api.md)). **Never improvise SQL
+against the library's tables**; run only SQL the README prints, on a staging copy first.
 
 ## Wake someone: delivery stopped or soon stops
 
@@ -19,8 +18,9 @@ as written, on a staging copy first.
 | `outbox.shard.lag` growing | Target down, slow handler, too few workers; with ERROR «outbox shards [...] start from ticks [...] that no longer exist»: stranded shards | «Обработка сбоев», «Застрявшие шарды» |
 | `outbox.maintenance.since_success` > 5 × `maintenanceInterval` | No maintenance anywhere; `transaction_pooling` = 1: a pooler | «Обслуживание работает там же, где relay» |
 | `outbox.partitions.xids_left` not NaN | Tail detached: inserts fail at 0 | «Партиции» |
-| `outbox.dead.pending.oldest` > X (X > `relay.retry.maxDelay`) and `outbox.dead.hook.failures` growing | Hook failing: letters wait, its alerts are not sent | «Dead letters» |
+| `outbox.dead.pending.oldest` > X (X > `relay.retry.maxDelay`) and `outbox.dead.hook.failures` growing | Hook failing: letters wait, no alerts sent | «Dead letters» |
 | ERROR «outbox xid regression detected» | «recovered»: done; «relay halted»: reason at line end, maybe `POST /recovery/xid-regression` | «Восстановление после регрессии xid (xid regression recovery)» |
+| ERROR «... holds cursors for N shards, but this instance runs with outbox.shards = M ...» or «... refuses this write ...» | Old-count instance after a reshard: restart with the new count or unset | «Решардинг» |
 
 ## Morning: nothing lost, waits for a human
 
@@ -37,22 +37,21 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
 
 - Change rows of `<table>_retry`, `_parked`, `_dead`, `_cursor`, `_instance` or `_halt` by hand; use the admin API.
 - Detach outbox partitions by hand, or drop or truncate library tables while instances run.
-- Disable the relay on every instance: maintenance and the dead-letter pass run only where the relay runs.
+- Disable the relay everywhere: maintenance and the dead-letter pass run only with it.
 
 ## Shards and pool
 
-- **`outbox.shards`: leave it unset.** A new outbox gets 256, an existing one keeps its count: upgrades need no setting.
-  A differing set value is the **emergency reshard**, never routine: stop writers, wait for `outbox.shard.lag` 0, stop
-  all instances (previous-release ones too), start with the new value («Решардинг»). Startup refuses while another
-  instance or relay runs or anything is undelivered; an old-count instance refuses `send` («refuses this write»).
-  Details: [config-reference.md](../using-kora-outbox/config-reference.md).
+- **`outbox.shards`: leave it unset** (256 for a new outbox; an existing one keeps its count). A differing set value
+  is the **emergency reshard**: stop writers, wait for `outbox.shard.lag` 0, stop all instances (old release too), start
+  one with the new value, then the rest; startup refuses while another instance with a different count runs
+  («Решардинг», [config-reference.md](../using-kora-outbox/config-reference.md)).
 - **Pool:** `db.maxPoolSize` ≥ own peak + `relay.workers` + 3, + 1 while `drain()` runs. Profiles:
   [sizing-examples.md](../using-kora-outbox/sizing-examples.md).
 
 ## Deploys and incidents
 
 - «Rolling-деплои»: same schema-qualified `outbox.table` and `outbox.inbox.table` everywhere; inbox `retention` /
-  `partitionInterval` on all instances at once; shutdown redelivers unfinished batches.
+  `partitionInterval` on all instances at once.
 - **Rollback to the previous release** (5fc60dd): «Rolling-деплои», item «Обновление с предыдущего релиза (5fc60dd),
   смешанный парк и откат». The old release writes dead letters `kept`: list the window's kept letters afterwards.
 - «Репликация, failover и PITR»: async failover can deliver events whose data is gone; PITR redelivers.

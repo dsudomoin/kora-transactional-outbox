@@ -104,13 +104,14 @@ The dead-letter hook and the dead table (writing-kora-outbox-handlers, `dead-let
 - Every instance heartbeats into `<table>_instance` (id `<host>/<pid>/<8 hex>`, shard count, whether its dead-letter
   hook is active) every `maintenanceInterval`; `OutboxAdmin.status()` lists them as `instances`.
 - An explicit `shards` that differs from the cursors' count takes the emergency reshard path at bootstrap. It refuses
-  while another instance with a different count has a live heartbeat, and while any relay ticks: the newest tick must
-  be at least 1 min old (more for slow tick rates), which it waits up to 2 min for, so a relay of a release without
-  the heartbeat counts too. An instance of the previous release (5fc60dd) with its relay disabled is invisible to
-  both checks: stop every old instance before an explicit reshard. Under locks it
-  then requires a drained outbox: empty retry and parked tables, no batch in progress, no committed row unrelayed, no
-  standalone range, no xid regression. Each failed check is named with its count, and startup fails. Procedure: stop
-  writers, wait for `outbox.shard.lag` 0, stop all instances, start with the new value (README «Решардинг»).
+  while another instance with a different count has a live heartbeat, and while any relay ticks: the newest tick must be
+  at least 1 min old (more for slow tick rates), which it waits up to 2 min for, so a relay of a release without the
+  heartbeat counts too. An instance of the previous release (5fc60dd) with its relay disabled is invisible to both
+  checks: stop every old instance before an explicit reshard. Under locks it then requires a drained outbox: empty retry
+  and parked tables, no batch in progress, no committed row unrelayed, no standalone range, no xid regression. Each
+  failed check is named with its count, and startup fails. Procedure: stop writers, wait for `outbox.shard.lag` 0, stop
+  all instances, start one instance with the new value, wait for its INFO «outbox resharded ... from N to M shards»,
+  then start the rest with the same value or unset (README «Решардинг»).
 - After a reshard, an instance still running with the old count halts: ERROR «... holds cursors for N shards, but
   this instance runs with outbox.shards = M ...», its relay takes no shards, its maintenance runs no step, `drain()`
   throws, and `send` and redrives are refused within one heartbeat (`IllegalStateException` «... refuses this write

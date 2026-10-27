@@ -9,7 +9,7 @@ A component of `OutboxModule`. Each call runs its own transactions; inside `inTx
 
 | Method | Does |
 |---|---|
-| `status()` | Relay halt, lag, retry and parked sizes, dead letters by topic and status, orphans, tail overflow, `premade`, `xidsLeft`, seconds since maintenance, shards, and `instances`: each running instance's id, shard count, last heartbeat and whether its dead-letter hook is active (a crashed one's row stays until unseen for an hour). |
+| `status()` | Relay halt, lag, retry and parked sizes, dead letters by topic and status, orphans, tail overflow, `premade`, `xidsLeft`, seconds since maintenance, shards, and `instances`: every heartbeat row, expired ones included (id, shard count, `lastSeen`, whether its dead-letter hook is active). A `lastSeen` older than 3 × `maintenanceInterval` means the instance is not running; a crashed instance's row stays about an hour after its heartbeat expires, 3 × `maintenanceInterval` + 1 h after its last beat. |
 | `findDeadLetters(filter, afterId, limit)`, `countDeadLetters(filter)` | Dead letters by `DeadLetterFilter` (topic, key, error substring, `failedFrom` inclusive, `failedTo` exclusive, status), id order, up to 1 000 per page. |
 | `redriveDeadLetters(ids)` / `(filter)` | Back to the outbox as the hook's `redrive`: a new message after the later messages of its key, same message id. Returns the count. |
 | `discardDeadLetters(ids)` / `(filter)` | Delete; returns the count. |

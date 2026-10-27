@@ -58,8 +58,8 @@ Measured with library defaults (one instance, workers 4, `batchSize` 1000), RESU
 | 256 | 0.053 / 0.110 s, 27–28 % | 288–289k, 0.40 s | |
 | 1024 | 0.057 / 0.111 s, 31 % | 261k, 1.6 s | 5.1 |
 
-- The previous release at 32 shards: 0.074 / 0.146 s and 68 % DB CPU at 1 000 msg/s, bulk 299–308k msg/s; 256 shards
-  on this release are within the spread of its bulk runs.
+- The code before the shard work (baseline `574601d`) at 32 shards: 0.074 / 0.146 s and 68 % DB CPU at 1 000 msg/s, bulk
+  299–308k msg/s; 256 shards on this release are within the spread of its bulk runs.
 - Relay steps per second stay about 40 at 1 000 msg/s for any shard count: one step per tick and group, not per
   shard.
 - Bulk at 32 shards delivers as much but its queue grew in most windows (writers got faster, relay capacity did not),
