@@ -1,9 +1,13 @@
 package io.github.dsudomoin.kora.outbox.admin;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.kora.outbox.admin.model.$ModelError_JsonWriter;
 import io.github.dsudomoin.kora.outbox.testing.CapturedStderr;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -19,6 +23,7 @@ import ru.tinkoff.kora.http.common.cookie.Cookie;
 import ru.tinkoff.kora.http.common.header.HttpHeaders;
 import ru.tinkoff.kora.http.server.common.HttpServerRequest;
 import ru.tinkoff.kora.http.server.common.HttpServerResponse;
+import ru.tinkoff.kora.http.server.common.HttpServerResponseException;
 import ru.tinkoff.kora.http.server.common.handler.BlockingRequestExecutor;
 
 class OutboxAdminInterceptorTest {
@@ -46,6 +51,31 @@ class OutboxAdminInterceptorTest {
 
             assertThat(logAtResponse.get()).contains("outbox admin GET \"/kora-outbox/admin/v1/status\" denied: 500");
             assertThat(response.toCompletableFuture().join().code()).isEqualTo(500);
+        }
+    }
+
+    /** As the authorizer's javadoc promises: a thrown 401 is no refusal, it is a failure. */
+    @Test
+    void anAuthorizerThrowing401GetsTheFixed500() {
+        var authorization = new AtomicReference<Runnable>();
+        var interceptor = new OutboxAdminInterceptor(request -> {
+            throw HttpServerResponseException.of(401, "token expired");
+        }, deferred(authorization), new $ModelError_JsonWriter());
+
+        try (var stderr = new CapturedStderr()) {
+            var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"),
+                    (context, request) -> {
+                        throw new AssertionError("the route must not run");
+                    });
+            authorization.get().run();
+
+            var answered = response.toCompletableFuture().join();
+            assertThat(answered.code()).isEqualTo(500);
+            assertThat(body(answered)).isEqualTo("{\"message\":\"authorization failed\"}");
+            assertThat(stderr.text()).contains("WARN").contains("OutboxAdminAuthorizer failed")
+                    .as("the exception, which prints its code, not its text")
+                    .contains("HttpServerResponseException{code=401")
+                    .contains("outbox admin GET \"/kora-outbox/admin/v1/status\" denied: 500");
         }
     }
 
@@ -85,6 +115,16 @@ class OutboxAdminInterceptorTest {
                     .singleElement(InstanceOfAssertFactories.STRING)
                     .endsWith("outbox admin GET \"/kora-outbox/admin/v1/status\" by \"x\\\": 200 \\\\\": 409");
         }
+    }
+
+    private static String body(HttpServerResponse response) {
+        var out = new ByteArrayOutputStream();
+        try {
+            response.body().write(out);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return out.toString(UTF_8);
     }
 
     /** Runs the handler only when the test runs what it leaves in {@code run}. */

@@ -28,6 +28,20 @@ sourceSets.main {
     java.srcDir(tasks.openApiGenerate.map { it.outputDir }) // compileJava and sourcesJar depend on the generation
 }
 
+// The test app's own API, contract-first as a service's is, with its own security scheme, models and mappers
+val openApiGenerateTestApp by tasks.registering(org.openapitools.generator.gradle.plugin.tasks.GenerateTask::class) {
+    generatorName = "kora"
+    inputSpec = "$projectDir/src/test/resources/openapi/test-app.yaml"
+    outputDir = layout.buildDirectory.dir("generated/openapi-test-app").get().asFile.path
+    apiPackage = "io.github.dsudomoin.kora.outbox.admin.testapp.api"
+    modelPackage = "io.github.dsudomoin.kora.outbox.admin.testapp.model"
+    configOptions = mapOf("mode" to "java-server")
+}
+
+sourceSets.test {
+    java.srcDir(openApiGenerateTestApp.map { it.outputDir }) // compileTestJava depends on the generation
+}
+
 tasks.sourcesJar {
     exclude(".openapi-generator*", ".openapi-generator/**") // the generator's bookkeeping, not sources
 }

@@ -8,48 +8,65 @@ import java.lang.reflect.Proxy;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import ru.tinkoff.kora.application.graph.GraphInterceptor;
-import ru.tinkoff.kora.common.Component;
+import io.github.dsudomoin.kora.outbox.admin.testapp.api.ApiSecurity;
+import io.github.dsudomoin.kora.outbox.admin.testapp.api.AppApiDelegate;
+import io.github.dsudomoin.kora.outbox.admin.testapp.api.AppApiResponses.AppDeadLettersApiResponse;
+import io.github.dsudomoin.kora.outbox.admin.testapp.api.AppApiResponses.AppStatusApiResponse;
+import io.github.dsudomoin.kora.outbox.admin.testapp.api.AppApiResponses.HelloApiResponse;
+import java.util.concurrent.CompletableFuture;
 import ru.tinkoff.kora.common.KoraApp;
+import ru.tinkoff.kora.common.Principal;
 import ru.tinkoff.kora.common.Tag;
 import ru.tinkoff.kora.config.hocon.HoconConfigModule;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabaseModule;
-import ru.tinkoff.kora.http.common.HttpMethod;
-import ru.tinkoff.kora.http.common.annotation.HttpRoute;
 import ru.tinkoff.kora.http.server.common.HttpServerInterceptor;
 import ru.tinkoff.kora.http.server.common.HttpServerModule;
 import ru.tinkoff.kora.http.server.common.HttpServerRequest;
-import ru.tinkoff.kora.http.server.common.annotation.HttpController;
+import ru.tinkoff.kora.http.server.common.HttpServerResponseException;
+import ru.tinkoff.kora.http.server.common.auth.HttpServerPrincipalExtractor;
 import ru.tinkoff.kora.http.server.undertow.UndertowHttpServerModule;
 import ru.tinkoff.kora.json.module.JsonModule;
 import ru.tinkoff.kora.openapi.management.OpenApiManagementModule;
 
 /**
- * An app with its own routes, two of them at the admin API's own names without its prefix, and a global interceptor,
- * that gets the admin API by extending one module. It records every call that reaches the admin delegate.
+ * A contract-first app, its own API generated from {@code openapi/test-app.yaml} with a security scheme, models and
+ * mappers of its own, two of its routes at the admin API's names without its prefix, and a global interceptor, that
+ * gets the admin API by extending one module. It records every call that reaches the admin delegate.
  */
 @KoraApp
 public interface AdminTestApp extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, UndertowHttpServerModule,
         JsonModule, OpenApiManagementModule, OutboxAdminHttpModule {
 
-    @Component
-    @HttpController
-    final class HelloController {
+    String APP_KEY = "app-secret";
 
-        @HttpRoute(method = HttpMethod.GET, path = "/hello")
-        public String hello() {
-            return "hello";
-        }
+    /** The app's own API: {@code /hello} open, {@code /status} and {@code /dead-letters} behind its {@code appKey}. */
+    default AppApiDelegate appApiDelegate() {
+        return new AppApiDelegate() {
+            @Override
+            public HelloApiResponse hello() {
+                return new HelloApiResponse("hello");
+            }
 
-        @HttpRoute(method = HttpMethod.GET, path = "/status")
-        public String status() {
-            return "app status";
-        }
+            @Override
+            public AppStatusApiResponse appStatus() {
+                return new AppStatusApiResponse.AppStatus200ApiResponse("app status");
+            }
 
-        @HttpRoute(method = HttpMethod.GET, path = "/dead-letters")
-        public String deadLetters() {
-            return "app dead letters";
-        }
+            @Override
+            public AppDeadLettersApiResponse appDeadLetters() {
+                return new AppDeadLettersApiResponse.AppDeadLetters200ApiResponse("app dead letters");
+            }
+        };
     }
+
+    /** The app's {@code X-App-Key}, which knows nothing of the admin API's {@code X-Api-Key}. */
+    @Tag(ApiSecurity.AppKey.class)
+    default HttpServerPrincipalExtractor<Principal> appKeyExtractor() {
+        return (request, key) -> APP_KEY.equals(key) ? CompletableFuture.completedFuture(new AppUser("app-user"))
+                : CompletableFuture.failedFuture(HttpServerResponseException.of(401, "X-App-Key required"));
+    }
+
+    record AppUser(String name) implements Principal {}
 
     default DelegateCalls delegateCalls() {
         return new DelegateCalls();

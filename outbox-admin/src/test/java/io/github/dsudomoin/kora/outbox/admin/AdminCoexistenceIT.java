@@ -99,7 +99,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         return ROUTES.stream();
     }
 
-    @ParameterizedTest(name = "{0}")
+    @ParameterizedTest(name = "{0} answers 401 and 403")
     @MethodSource("routes")
     void everyAdminRouteAnswers401And403(Route route) throws Exception {
         seed();
@@ -141,11 +141,12 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
                 .containsExactlyElementsOf(ROUTES.stream().map(Route::operation).toList());
     }
 
+    /** The app's generated API, its {@code appKey} scheme and extractor, beside ours: neither guards the other. */
     @Test
     void ownRoutesStillWork() throws Exception {
-        var hello = get("/hello", null);
-        var status = get("/status", null);
-        var deadLetters = get("/dead-letters", null);
+        var hello = send("/hello");
+        var status = send("/status", "X-App-Key", AdminTestApp.APP_KEY);
+        var deadLetters = send("/dead-letters", "X-App-Key", AdminTestApp.APP_KEY);
 
         for (var response : List.of(hello, status, deadLetters)) {
             assertThat(response.statusCode()).isEqualTo(200);
@@ -154,13 +155,18 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         assertThat(hello.body()).isEqualTo("hello");
         assertThat(status.body()).isEqualTo("app status");
         assertThat(deadLetters.body()).isEqualTo("app dead letters");
-        assertThat(authorizer.threads).as("the authorizer guards the admin routes alone").isEmpty();
+        for (var path : List.of("/status", "/dead-letters")) {
+            assertThat(send(path).statusCode()).as("the app's own extractor runs on " + path).isEqualTo(401);
+            assertThat(send(path, "X-Api-Key", "secret").statusCode()).as("the admin key opens no app route")
+                    .isEqualTo(401);
+        }
+        assertThat(authorizer.threads).as("the admin authorizer guards the admin routes alone").isEmpty();
         assertThat(delegate.operations).isEmpty();
 
         var adminStatus = get(STATUS, "secret");
         var adminLetters = get(API + "/dead-letters", "secret");
 
-        assertThat(adminStatus.statusCode()).isEqualTo(200);
+        assertThat(adminStatus.statusCode()).as("no app key needed").isEqualTo(200);
         assertThat(adminStatus.body()).startsWith("{\"halted\":false,");
         assertThat(adminLetters.statusCode()).isEqualTo(200);
         assertThat(adminLetters.body()).isEqualTo("{\"items\":[]}");
@@ -175,7 +181,8 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         var swaggerUi = get("/swagger-ui", null);
 
         assertThat(app.statusCode()).isEqualTo(200);
-        assertThat(app.body()).contains("title: admin wiring test app").contains("operationId: appStatus");
+        assertThat(app.body()).contains("title: admin wiring test app").contains("operationId: appStatus")
+                .contains("securitySchemes");
         assertThat(admin.statusCode()).isEqualTo(200);
         String contract;
         try (var in = Objects.requireNonNull(getClass().getResourceAsStream("/openapi/kora-outbox-admin.yaml"))) {
@@ -225,6 +232,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         }
 
         assertError(failed, 500, "authorization failed");
+        assertThat(failed.headers().firstValue("X-Test-Global")).hasValue("1");
         assertThat(log).contains("WARN").contains("OutboxAdminAuthorizer failed").contains("key store down")
                 .contains("outbox admin GET \"" + STATUS + "\" denied: 500");
         assertThat(delegate.operations).isEmpty();
@@ -343,6 +351,15 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
             assertThat(client.send(request, BodyHandlers.ofString()).statusCode()).isEqualTo(401);
             return stderr.text();
         }
+    }
+
+    /** A GET of {@code path} with these header names and values. */
+    private HttpResponse<String> send(String path, String... headers) throws Exception {
+        var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path));
+        if (headers.length > 0) {
+            request.headers(headers);
+        }
+        return client.send(request.build(), BodyHandlers.ofString());
     }
 
     private HttpResponse<String> get(String path, String apiKey) throws Exception {

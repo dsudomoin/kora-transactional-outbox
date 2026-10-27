@@ -2,10 +2,17 @@ openapi: 3.0.3
 info:
   title: admin wiring test app
   version: '1'
+  description: >-
+    A service's own contract-first API, with an api-key scheme of its own, beside the kora-outbox admin API. Two of its
+    routes have the admin API's names without its prefix.
+security:
+  - appKey: []
 paths:
   /hello:
     get:
       operationId: hello
+      tags: [App]
+      security: []
       responses:
         '200':
           description: Greeting
@@ -16,6 +23,7 @@ paths:
   /status:
     get:
       operationId: appStatus
+      tags: [App]
       responses:
         '200':
           description: The app's own status, not the outbox's
@@ -23,9 +31,12 @@ paths:
             text/plain:
               schema:
                 type: string
+        '401':
+          $ref: '#/components/responses/AppUnauthorized'
   /dead-letters:
     get:
       operationId: appDeadLetters
+      tags: [App]
       responses:
         '200':
           description: The app's own dead letters, not the outbox's
@@ -33,3 +44,25 @@ paths:
             text/plain:
               schema:
                 type: string
+        '401':
+          $ref: '#/components/responses/AppUnauthorized'
+components:
+  securitySchemes:
+    appKey:
+      type: apiKey
+      in: header
+      name: X-App-Key
+  responses:
+    AppUnauthorized:
+      description: No app key, or a wrong one
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AppError'
+  schemas:
+    AppError:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
