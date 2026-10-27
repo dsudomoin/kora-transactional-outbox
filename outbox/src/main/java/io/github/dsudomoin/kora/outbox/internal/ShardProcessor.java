@@ -62,8 +62,9 @@ import org.slf4j.LoggerFactory;
  * step reads and a delivery doubles them (up to {@code batchSize}), so a record that fails its whole call deep in a
  * chunk is soon read alone; a requeue is neither. After {@code headFailuresBeforeDivert} failed attempts in a row the
  * shard probes: it reads the head row alone and merges no parked row into its call, so a slow or poison head is
- * diverted as a single failing key, and a down target loses at most one row to the retry table per (backed-off) probe. Handler calls run on this processor's own
- * bounded pool of daemon threads, each bounded by {@code batchTimeout}. A call that throws (an Error included) or
+ * diverted as a single failing key, and a down target loses at most one row to the retry table per (backed-off)
+ * probe. Handler calls run on this processor's own bounded pool of daemon threads, each bounded by
+ * {@code batchTimeout}. A call that throws (an Error included) or
  * returns an invalid outcome list fails each of its records transiently, so a poison record takes that same path and
  * no handler failure reaches the caller. The caller commits on return and rolls back on an exception (SQL), so a
  * failed step is redelivered, and a record it parked stays where it was.
