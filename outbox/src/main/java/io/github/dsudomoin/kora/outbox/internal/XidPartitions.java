@@ -91,7 +91,10 @@ public final class XidPartitions {
               and exists (select 1 from {table} o where o.shard = s.shard and o.xid >= ?::text::xid8)
             limit 1""";
 
-    /** A standalone range {@link #dropOrphans} kept; {@code ours} when maintenance detached it as relayed. */
+    /**
+     * A standalone range {@link #dropOrphans} kept; {@code ours} when maintenance detached it as relayed, and then
+     * {@link Maintenance} moves its rows back ({@link OrphanRestore}) unless {@code restoreOrphans} is off.
+     */
     record Orphan(String table, boolean ours) {}
 
     private final TableNames names;
@@ -246,7 +249,8 @@ public final class XidPartitions {
      * passes U. A check already there is replaced once the current xid comes within half a range of its U, even while
      * a blocker defers the swap, and kept otherwise, for the next attempt after a failed swap.
      * Ranges a failed empty-tail swap pre-created below U are dropped: {@code [H, U)} covers them, and the first would
-     * take its name. A swap that finds the current xid at U drops the check, and the next run adds one higher up.
+     * take its name. A swap that finds the current xid at or above U drops the check with an ERROR, as inserts routed
+     * to the tail at or above U may have failed, and the next run adds one higher up.
      */
     private void convert(Connection c, State s, long bound, Duration quiesceTimeout) throws SQLException {
         long lower = s.tailLower;
@@ -277,9 +281,11 @@ public final class XidPartitions {
                 return true;
             }
             PartitionDdl.execute(c, swapLockTimeout, "alter table " + names.tail() + " drop constraint " + bounded);
-            log.warn("outbox partition tail {} was not swapped: the current xid reached {}, the upper bound of its"
-                    + " check {}, so inserts routed to it with an xid at or above that failed meanwhile. The check is"
-                    + " dropped; the next run adds one higher up", names.tail(), from, bounded);
+            // the next xid reached U; one at U may not have been assigned yet, so "may"
+            log.error("outbox partition tail {} was not swapped: the current xid reached {}, the upper bound of its"
+                    + " check {}, so inserts routed to it with an xid at or above that may have failed meanwhile"
+                    + " (SQLState 23514). The check is dropped; the next run adds one higher up", names.tail(), from,
+                    bounded);
             return false;
         });
         if (swapped) {

@@ -37,6 +37,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
+import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 class MaintenanceIT {
 
@@ -599,8 +600,8 @@ class MaintenanceIT {
     }
 
     @Test
-    void rangeDetachedByHandIsKeptWithAnError() throws Exception {
-        bootstrap();
+    void foreignOrphanIsKeptAndNamesTheAdminCall() throws Exception {
+        bootstrap(); // restoreOrphans on: it covers only the ranges maintenance detached
         var relay = relay(new RecordingHandler(), maintenance());
         var orphan = ranges().stream() // a range with rows, detached before the relay got to them
                 .filter(b -> b.to() != null)
@@ -624,10 +625,14 @@ class MaintenanceIT {
             assertThat(new Maintenance(db, names, config, new OutboxMetrics(registry)).runOnce()).isTrue();
 
             assertThat(err.text()).contains("ERROR").contains(orphan.name()).contains("not by this library")
-                    .contains("insert into " + names.base() + " (shard, message_id, topic, key, payload, headers)"
-                            + " select shard, message_id, topic, key, payload, headers from " + orphan.name());
+                    .contains("OutboxAdmin.restoreOrphan(\"" + orphan.name() + "\", fromXid)")
+                    .contains("POST /kora-outbox/admin/v1/orphans/" + orphan.name() + "/restore?fromXid=")
+                    .doesNotContain("insert into");
         }
         assertThat(exists(orphan.name())).isTrue();
+        try (var c = TestDb.connect()) {
+            assertThat(queryLong(c, "select count(*) from " + orphan.name())).as("nothing moved").isOne();
+        }
         assertThat(gauge(registry, "outbox.partitions.orphaned")).isEqualTo(1);
     }
 
@@ -728,32 +733,98 @@ class MaintenanceIT {
     }
 
     @Test
-    void orphanedRangeWithRowsAtTheHorizonIsKeptWithAnError() throws Exception {
+    void oursOrphanWithRowsAboveTheHorizonIsRestored() throws Exception {
         bootstrap();
-        var relay = relay(new RecordingHandler(), maintenance());
-        send(msg("t", "k", "a"));
-        TestDb.burnXids(3000);
-        relay.drain();
-        long xmin = minCursorXmin();
-        var orphan = ranges().stream()
-                .filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin)
-                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
-                .orElseThrow();
-        try (var c = TestDb.connect()) { // ours, detached without its range check, then a row the relay never saw
-            markDropping(c, orphan.name());
-            execute(c, "alter table " + names.base() + " detach partition " + orphan.name());
-            execute(c, "insert into " + orphan.name() + " (id, shard, xid, message_id, topic) values (1000000, 0,"
-                    + " '" + (Long.parseLong(orphan.from()) + 1) + "', gen_random_uuid(), 't'),"
-                    + " (1000001, 3, '" + xmin + "', gen_random_uuid(), 't')");
-        }
+        var handler = new RecordingHandler();
+        var relay = relay(handler, maintenance());
+        var orphan = oursOrphan(relay, 2500);
         var registry = new SimpleMeterRegistry();
 
         try (var err = new CapturedStderr()) {
             assertThat(new Maintenance(db, names, config, new OutboxMetrics(registry)).runOnce()).isTrue();
 
-            assertThat(err.text()).contains("ERROR").contains(orphan.name()).contains("cannot deliver");
+            assertThat(err.text()).contains("INFO").contains("outbox table " + orphan.table())
+                    .contains("moved 2500 rows at or above xid " + orphan.horizon())
+                    .contains("they are new messages, delivered after later messages of their keys")
+                    .contains("rows below it went with the table").doesNotContain("cannot deliver");
         }
-        assertThat(exists(orphan.name())).isTrue();
+        assertThat(exists(orphan.table())).isFalse();
+        assertThat(droppingMarkers()).isEmpty();
+        assertThat(gauge(registry, "outbox.partitions.orphaned")).isZero();
+        relay.drain(); // their shards recomputed: the stale one would be on no worker's list
+        var delivered = new ArrayList<>(orphan.sent());
+        delivered.addAll(orphan.above());
+        assertThat(handler.delivered()).extracting(OutboxRecord::messageId).as("each once, none below the horizon")
+                .containsExactlyInAnyOrderElementsOf(delivered);
+    }
+
+    @Test
+    void restoreIsChunkedAndResumable() throws Exception {
+        bootstrap();
+        var orphan = oursOrphan(relay(new RecordingHandler(), maintenance()), 2500);
+        var killed = maintenance();
+        killed.orphanRestore.afterChunk = c -> { // the session dies right after its first chunk committed
+            long pid = queryLong(c, "select pg_backend_pid()");
+            try (var other = TestDb.connect()) {
+                execute(other, "select pg_terminate_backend(" + pid + ", 10000)");
+            }
+        };
+
+        assertThatThrownBy(killed::runOnce).as("its session is gone").isInstanceOf(RuntimeSqlException.class);
+
+        assertThat(exists(orphan.table())).isTrue();
+        assertThat(count(orphan.table(), orphan.above())).isEqualTo(2500 - OrphanRestore.CHUNK);
+        assertThat(count(names.base(), orphan.above())).as("one chunk, committed").isEqualTo(OrphanRestore.CHUNK);
+
+        assertThat(maintenance().runOnce()).isTrue();
+
+        assertThat(exists(orphan.table())).isFalse();
+        assertThat(droppingMarkers()).isEmpty();
+        try (var c = TestDb.connect(); var ps = c.prepareStatement("select count(*), count(distinct message_id) from "
+                + names.base() + " where message_id = any(?)")) {
+            ps.setArray(1, c.createArrayOf("uuid", orphan.above().toArray()));
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                assertThat(List.of(rs.getLong(1), rs.getLong(2))).as("each once").containsExactly(2500L, 2500L);
+            }
+        }
+    }
+
+    @Test
+    void restoreRefusesAnythingButAStandaloneRangeOfTheOutbox() throws Exception {
+        bootstrap();
+        var attached = ranges().stream().filter(b -> b.to() != null).findFirst().orElseThrow().name();
+        var restore = new OrphanRestore(names, new Resender(names, config.shards()));
+        try (var c = TestDb.connect()) {
+            execute(c, "create schema if not exists other");
+            execute(c, "create table other." + names.unqualified(names.partitionPrefix()) + "5 (id bigint)");
+            for (var table : List.of(names.base(), names.tail(), attached, names.partitionPrefix() + "5",
+                    "other." + names.unqualified(names.partitionPrefix()) + "5", attached + "; drop table x",
+                    attached + " (id)", names.partitionPrefix())) {
+                assertThatThrownBy(() -> restore.restore(c, table, 0, Duration.ofSeconds(1))).as(table)
+                        .isInstanceOf(IllegalArgumentException.class);
+            }
+            assertThat(queryString(c, "select (to_regclass(?) is null)::text", attached + "_id"))
+                    .as("nothing run on the attached range").isEqualTo("true");
+        }
+        assertThat(ranges()).extracting(Bound::name).contains(attached);
+    }
+
+    @Test
+    void restoreOrphansOffKeepsTheError() throws Exception {
+        config.restoreOrphans(false);
+        bootstrap();
+        var orphan = oursOrphan(relay(new RecordingHandler(), maintenance()), 2);
+        var registry = new SimpleMeterRegistry();
+
+        try (var err = new CapturedStderr()) {
+            assertThat(new Maintenance(db, names, config, new OutboxMetrics(registry)).runOnce()).isTrue();
+
+            assertThat(err.text()).contains("ERROR").contains(orphan.table()).contains("cannot deliver")
+                    .contains("move them back with insert into " + names.base());
+        }
+        assertThat(exists(orphan.table())).isTrue();
+        assertThat(count(orphan.table(), orphan.above())).isEqualTo(2);
         assertThat(gauge(registry, "outbox.partitions.orphaned")).isEqualTo(1);
     }
 
@@ -1016,6 +1087,55 @@ class MaintenanceIT {
     private static boolean exists(String table) throws SQLException {
         try (var c = TestDb.connect()) {
             return queryString(c, "select (to_regclass(?) is not null)::text", table).equals("true");
+        }
+    }
+
+    /** An orphan {@link #oursOrphan} made: the slowest shard's horizon, and the message ids sent and kept apart. */
+    private record Detached(String table, long horizon, List<UUID> sent, List<UUID> above) {}
+
+    /**
+     * The lowest range once relayed, marked and detached as {@code dropProcessed} does and left by a run killed before
+     * its drop (detached without its range check), then given {@code rows} rows at or above the horizon, which the
+     * relay never saw, on a stale shard, over 50 keys and some unkeyed, and one row below the horizon.
+     */
+    private Detached oursOrphan(OutboxRelay relay, int rows) throws Exception {
+        var sent = send(msg("t", "k", "a"));
+        TestDb.burnXids(3000);
+        relay.drain();
+        long horizon = minCursorXmin();
+        var range = ranges().stream()
+                .filter(b -> b.to() != null && Long.parseLong(b.to()) <= horizon)
+                .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
+                .orElseThrow();
+        var above = new ArrayList<UUID>();
+        try (var c = TestDb.connect()) {
+            markDropping(c, range.name());
+            execute(c, "alter table " + names.base() + " detach partition " + range.name());
+            execute(c, "insert into " + range.name() + " (id, shard, xid, message_id, topic) values (999999, 0, '"
+                    + (Long.parseLong(range.from()) + 1) + "', gen_random_uuid(), 't')");
+            execute(c, "insert into " + range.name() + " (id, shard, xid, message_id, topic, key, payload)"
+                    + " select 1000000 + s, 999, (" + horizon + " + s % 7)::text::xid8, gen_random_uuid(), 't',"
+                    + " case when s % 10 > 0 then convert_to('k' || s % 50, 'UTF8') end, convert_to('p' || s, 'UTF8')"
+                    + " from generate_series(1, " + rows + ") s");
+            try (var st = c.createStatement(); var rs = st.executeQuery("select message_id from " + range.name()
+                    + " where xid >= '" + horizon + "'::xid8")) {
+                while (rs.next()) {
+                    above.add(rs.getObject(1, UUID.class));
+                }
+            }
+        }
+        assertThat(above).hasSize(rows);
+        return new Detached(range.name(), horizon, sent, above);
+    }
+
+    private static long count(String table, List<UUID> messageIds) throws SQLException {
+        try (var c = TestDb.connect();
+                var ps = c.prepareStatement("select count(*) from " + table + " where message_id = any(?)")) {
+            ps.setArray(1, c.createArrayOf("uuid", messageIds.toArray()));
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getLong(1);
+            }
         }
     }
 

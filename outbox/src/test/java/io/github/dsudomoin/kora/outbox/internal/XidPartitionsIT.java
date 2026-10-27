@@ -393,6 +393,73 @@ class XidPartitionsIT {
     }
 
     @Test
+    void hotTailOfASchemaQualifiedOutboxIsConverted() throws Exception {
+        var config = new TestOutboxConfig().table("public." + TestDb.uniqueTable()).xidsPerPartition(1000).premake(4)
+                .swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+
+        try (var c = TestDb.connect()) {
+            long lower = overflowTail(c, names, 10);
+
+            partitions.ensurePremade(c);
+
+            var former = formerTail(c, names, lower);
+            assertThat(queryLong(c, "select count(*) from " + former.name())).isEqualTo(10);
+            // a constraint name takes no schema: "public.<tail>_bounded" would fail to parse
+            assertThat(boundCheck(c, names, former.name())).as("the check, by its unqualified name").isNotNull();
+            assertThat(partitions.overflow()).isFalse();
+            assertTailAboveLastRange(c, names);
+        }
+    }
+
+    @Test
+    void swapThatFindsTheXidAtTheBoundDropsTheCheckWithAnError() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(Duration.ofSeconds(10));
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+
+        try (var holder = TestDb.connect(); var c = TestDb.connect()) {
+            long lower = overflowTail(c, names, 10);
+            holder.setAutoCommit(false); // a young lock on the parent alone: the swap waits for it, the check goes on
+            execute(holder, "lock table only " + names.base() + " in access share mode");
+            var errors = new ConcurrentLinkedQueue<Throwable>();
+            var meanwhile = new Thread(() -> { // while the swap waits, the xid passes U, 2 ranges above the current one
+                try (var w = TestDb.connect()) {
+                    while (queryLong(w, "select count(*) from pg_locks where relation = to_regclass('" + names.base()
+                            + "') and mode = 'AccessExclusiveLock' and not granted") == 0) {
+                        Thread.sleep(5);
+                    }
+                    TestDb.burnXids(2000);
+                    holder.commit();
+                } catch (Throwable e) {
+                    errors.add(e);
+                }
+            });
+            meanwhile.start();
+
+            String log;
+            try (var err = new CapturedStderr()) {
+                partitions.ensurePremade(c);
+                log = err.text();
+            }
+
+            meanwhile.join();
+            assertThat(errors).isEmpty();
+            assertThat(log).contains("ERROR").contains("was not swapped").contains("may have failed");
+            assertThat(boundCheck(c, names, names.tail())).as("dropped").isNull();
+            assertThat(tail(c, names)).isEqualTo(lower);
+            assertThat(partitions.overflow()).isTrue();
+            assertThat(swapLocks(c, names)).as("the quiesce lock released").isZero();
+
+            partitions.ensurePremade(c); // a check higher up, then the swap
+
+            assertThat(queryLong(c, "select count(*) from " + formerTail(c, names, lower).name())).isEqualTo(10);
+            assertTailAboveLastRange(c, names);
+        }
+    }
+
+    @Test
     void convertedTailRowsAreDelivered() throws Exception {
         var config = new TestOutboxConfig().relayEnabled(false).xidsPerPartition(1000).premake(4);
         var schema = new OutboxSchema(db, config);
@@ -1143,7 +1210,7 @@ class XidPartitionsIT {
     /** The former tail, attached as the range from {@code lower}. */
     private static Bound formerTail(Connection c, TableNames names, long lower) throws SQLException {
         return PartitionDdl.listRanges(c, names.base()).stream()
-                .filter(b -> b.name().equals(names.partitionPrefix() + lower))
+                .filter(b -> names.unqualified(b.name()).equals(names.unqualified(names.partitionPrefix()) + lower))
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("no range " + names.partitionPrefix() + lower));
     }
@@ -1247,6 +1314,7 @@ class XidPartitionsIT {
                 .orElseThrow();
         assertThat(tail(c, names)).isEqualTo(lastUpper);
         assertThat(ranges).filteredOn(b -> b.to() == null).singleElement()
-                .satisfies(tail -> assertThat(tail.name()).isEqualTo(names.tail()));
+                .satisfies(tail ->
+                        assertThat(names.unqualified(tail.name())).isEqualTo(names.unqualified(names.tail())));
     }
 }
