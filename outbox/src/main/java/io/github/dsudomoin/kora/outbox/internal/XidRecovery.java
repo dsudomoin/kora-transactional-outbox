@@ -248,11 +248,11 @@ public final class XidRecovery {
      * Recovers in one read-committed transaction ({@code lock_timeout} 5 s, one deadline of
      * {@code outbox.recovery.timeout} for it, each statement's {@code statement_timeout} what is left of it; the
      * partition DDL of the new ranges is not held to it: each such statement runs under {@link PartitionDdl#execute}'s
-     * own (its lock timeout + 60 s), which, rarely needed, can carry the transaction past the deadline, {@code idle_in_transaction_session_timeout} 5 s, so Postgres ends the session of a frozen holder and writers
-     * go on; no {@code transaction_timeout}), for a caller holding {@code LOCK_MAINTENANCE}; returns the rows
-     * re-sent, or 0 with no change when there is neither a regression nor a halt row. First, outside it, a detach left
-     * pending is finished ({@link XidPartitions#finishPendingDetach}), so its wait for older snapshots stalls no
-     * writer. Then:
+     * own (its lock timeout + 60 s), which, rarely needed, can carry the transaction past the deadline,
+     * {@code idle_in_transaction_session_timeout} 5 s, so Postgres ends the session of a frozen holder and writers go
+     * on; no {@code transaction_timeout}), for a caller holding {@code LOCK_MAINTENANCE}; returns the rows re-sent, or
+     * 0 with no change when there is neither a regression nor a halt row. First, outside it, a detach left pending is
+     * finished ({@link XidPartitions#finishPendingDetach}), so its wait for older snapshots stalls no writer. Then:
      * ACCESS EXCLUSIVE on the cursor, checkpoint and tick tables, in the order every relay statement opens them, so no
      * relay transaction holds one of them while waiting for an earlier one (a step that read its cursor ends first, one
      * that reads it later sees the new one), then on the outbox, which writers wait for, not fail; a detach found

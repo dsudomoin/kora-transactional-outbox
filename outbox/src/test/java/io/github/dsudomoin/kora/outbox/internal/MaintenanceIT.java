@@ -1186,7 +1186,8 @@ class MaintenanceIT {
 
     /**
      * A key held by an open send: its rows stay, in every chunk, without a wait, so they go back behind that send; the
-     * other keys' rows go on, and the call fails with 55P03 for the next one to finish.
+     * other keys' rows go on, then the held key is waited for once, at most swapLockTimeout, and the call fails with
+     * 55P03 for the next one to finish.
      */
     @Test
     void restoreLeavesABusyKeysRowsWithoutWaitingForIt() throws Exception {
@@ -1209,9 +1210,10 @@ class MaintenanceIT {
             try (var c = TestDb.connect()) {
                 assertThatThrownBy(() -> restore.restore(c, orphan.table(), orphan.horizon(), Duration.ofSeconds(30)))
                         .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("55P03"))
-                        .hasMessageContaining(busyRows + " rows of 1 keys another transaction held");
+                        .hasMessageContaining(busyRows + " rows of keys another transaction held");
             }
             var took = Duration.ofNanos(System.nanoTime() - start);
+            assertThat(took).as("one wait for the held key").isLessThan(config.swapLockTimeout().plusSeconds(1));
 
             assertThat(count(orphan.table(), orphan.above())).as("the busy key's rows stay").isEqualTo(busyRows);
             assertThat(count(names.base(), orphan.above())).as("the others moved").isEqualTo(2500 - busyRows);
@@ -1228,6 +1230,61 @@ class MaintenanceIT {
                     + "', 'UTF8') and id < (select id from " + names.base() + " where payload = convert_to('busy',"
                     + " 'UTF8'))")).as("the busy key's restored rows after its send").isZero();
         }
+    }
+
+    /**
+     * A key sent all the time, by two writers whose transactions overlap, is never free for a try-lock; the restore's
+     * bounded wait for it gets in between them, so the orphan is restored within a few calls, not never.
+     */
+    @Test
+    void restoreGetsAKeyThatIsAlmostAlwaysHeld() throws Exception {
+        bootstrap();
+        var orphan = oursOrphan(relay(new RecordingHandler(), maintenance()), 2500);
+        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
+        var restore = maintenance().orphanRestore;
+        var stop = new AtomicBoolean();
+        var errors = new ConcurrentLinkedQueue<Throwable>();
+        var writers = new ArrayList<Thread>();
+        for (int i = 0; i < 2; i++) {
+            var writer = new Thread(() -> {
+                while (!stop.get()) {
+                    try {
+                        db.inTx((SqlFunction0<UUID>) () -> {
+                            var id = outbox.send(msg("t", "k7", "hot"));
+                            try {
+                                Thread.sleep(5); // the other one queues for the key meanwhile
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                            return id;
+                        });
+                    } catch (Throwable e) {
+                        errors.add(e);
+                    }
+                }
+            });
+            writer.start();
+            writers.add(writer);
+        }
+        int calls = 0;
+        try (var c = TestDb.connect()) {
+            Thread.sleep(200);
+            while (exists(orphan.table())) {
+                assertThat(++calls).as("calls to restore it").isLessThanOrEqualTo(5);
+                try {
+                    restore.restore(c, orphan.table(), orphan.horizon(), Duration.ofSeconds(30));
+                } catch (SQLException e) {
+                    assertThat(e.getSQLState()).isEqualTo("55P03");
+                }
+            }
+        } finally {
+            stop.set(true);
+            for (var w : writers) {
+                w.join();
+            }
+        }
+        assertThat(errors).isEmpty();
+        assertThat(count(names.base(), orphan.above())).isEqualTo(orphan.above().size());
     }
 
     @Test

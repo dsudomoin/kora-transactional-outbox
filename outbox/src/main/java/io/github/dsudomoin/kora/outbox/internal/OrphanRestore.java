@@ -6,6 +6,7 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlConsumer;
@@ -19,6 +20,8 @@ public final class OrphanRestore {
 
     /** Rows, so key locks, per chunk transaction: far below {@code max_locks_per_transaction} × connections. */
     public static final int CHUNK = 1000;
+    /** Keys held through a whole call whose lock the call then waits for, one transaction each. */
+    static final int HELD_KEYS_WAITED = 8;
 
     private final TableNames names;
     private final Resender resender;
@@ -60,9 +63,13 @@ public final class OrphanRestore {
      * transaction holds (an open {@code send} of it) stay, and so do that key's rows in the later chunks of the call,
      * so its rows still go back in id order, behind that send; the other rows of the chunk go on. Any other lock the
      * insert waits for is waited for at most {@code keyLockTimeout}. The chunk that finds fewer rows, the last, also
-     * drops {@code table} and deletes its {@code <base>_dropping} marker, unless rows stayed: the call then fails with
-     * SQLState 55P03 after its last chunk, and the next run or call moves them. A lock timeout (55P03) rolls back the
-     * chunk it hits, rows and locks. Returns the rows moved.
+     * drops {@code table} and deletes its {@code <base>_dropping} marker, unless rows stayed. Then, so that a key held
+     * almost all the time still gets through, the first {@link #HELD_KEYS_WAITED} keys that stayed are waited for,
+     * one transaction each: its key lock waited for at most {@code keyLockTimeout} (only that key's writers wait
+     * meanwhile, at most one such wait), then up to {@link #CHUNK} of its rows moved, and the table dropped with the
+     * last of them. Rows still left fail the call with SQLState 55P03, and the next run or call moves them. A lock
+     * timeout (55P03) on the table or on another lock rolls back the chunk it hits, rows and locks. Returns the rows
+     * moved.
      *
      * @throws IllegalArgumentException before any SQL that names it, unless {@code table} is {@code <base>_x<digits>}
      *     or {@code <base>_o<digits>}, unqualified or qualified as the outbox is named, and a table in the outbox's
@@ -82,6 +89,7 @@ public final class OrphanRestore {
         long after = Long.MIN_VALUE;
         boolean last = false;
         var busy = new HashSet<Integer>(); // key hashes another transaction held: theirs stay, in every later chunk
+        var held = new LinkedHashMap<Integer, Resender.Row>(); // a row of each busy hash, in the order first met
         long left = 0;
         var c = autocommit;
         while (!last) {
@@ -120,6 +128,11 @@ public final class OrphanRestore {
                         .toList();
                 busy.addAll(resender.tryKeyLocks(c,
                         hashes.stream().filter(h -> h != null && !busy.contains(h)).toList()));
+                for (int i = 0; i < rows.size(); i++) {
+                    if (hashes.get(i) != null && busy.contains(hashes.get(i))) {
+                        held.putIfAbsent(hashes.get(i), rows.get(i));
+                    }
+                }
                 for (int i = rows.size() - 1; i >= 0; i--) {
                     if (hashes.get(i) != null && busy.contains(hashes.get(i))) {
                         rows.remove(i);
@@ -157,13 +170,104 @@ public final class OrphanRestore {
                 afterChunk.accept(c);
             }
         }
-        if (left > 0) {
-            throw new SQLException("moved " + moved + " rows of " + table + " back into the outbox; " + left
-                    + " rows of " + busy.size() + " keys another transaction held (an open send of the key) stay in it, so"
-                    + " that each key's rows go back in order behind that send: the next run or call moves them",
-                    "55P03");
+        int waited = 0;
+        boolean dropped = left == 0;
+        for (var row : held.values()) {
+            if (dropped || waited++ == HELD_KEYS_WAITED) {
+                break;
+            }
+            var m = moveHeld(c, table, fromXid, lockTimeout, row);
+            moved += m.rows();
+            left -= m.rows();
+            dropped = m.dropped();
+        }
+        if (!dropped) {
+            throw new SQLException("moved " + moved + " rows of " + table + " back into the outbox; "
+                    + Math.max(left, 1) + " rows of keys another transaction held (an open send of the key) stay in"
+                    + " it, so that each key's rows go back in order behind that send: the next run or call moves"
+                    + " them", "55P03");
         }
         return moved;
+    }
+
+    /** What {@link #moveHeld} did: the rows it moved, and whether it dropped the table, none being left. */
+    private record Moved(long rows, boolean dropped) {}
+
+    /**
+     * Up to {@link #CHUNK} rows of {@code row}'s key from {@code fromXid}, in id order, in one transaction as a
+     * chunk's, once its key lock is had within {@code keyLockTimeout}; none when it is not. Drops the table when no row at or
+     * above {@code fromXid} is left.
+     */
+    private Moved moveHeld(Connection c, String table, long fromXid, Duration lockTimeout, Resender.Row row)
+            throws SQLException {
+        c.setAutoCommit(false);
+        try (var st = c.createStatement()) {
+            st.execute("set transaction isolation level read committed");
+            st.execute("set local lock_timeout = " + lockTimeout.toMillis());
+            st.execute("set local idle_in_transaction_session_timeout = " + lockTimeout.plusSeconds(30).toMillis());
+            st.execute("set local statement_timeout = " + lockTimeout.plus(PartitionDdl.DDL_MARGIN).toMillis());
+            st.execute("lock table " + table + " in access exclusive mode");
+            st.execute("set local lock_timeout = " + keyLockTimeout.toMillis());
+            try (var ps = c.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
+                ps.setInt(1, names.keyNamespace());
+                ps.setInt(2, Hashing.keyHash(row.topic(), row.key()));
+                ps.execute();
+            } catch (SQLException e) {
+                if (!"55P03".equals(e.getSQLState())) {
+                    throw e;
+                }
+                c.rollback();
+                c.setAutoCommit(true);
+                return new Moved(0, false);
+            }
+            var ids = new ArrayList<Long>();
+            var rows = new ArrayList<Resender.Row>();
+            try (var ps = c.prepareStatement("select id, message_id, topic, key, payload, headers from " + table
+                    + " where xid >= ?::text::xid8 and topic = ? and key = ? order by id limit " + CHUNK)) {
+                ps.setString(1, Long.toString(fromXid));
+                ps.setString(2, row.topic());
+                ps.setBytes(3, row.key());
+                try (var rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        ids.add(rs.getLong(1));
+                        rows.add(new Resender.Row(rs.getObject(2, UUID.class), rs.getString(3), rs.getBytes(4),
+                                rs.getBytes(5), rs.getBytes(6)));
+                    }
+                }
+            }
+            resender.insertAll(c, rows); // the key's lock is ours: taken again without waiting
+            try (var ps = c.prepareStatement("delete from " + table + " where id = any(?)")) {
+                ps.setArray(1, c.createArrayOf("int8", ids.toArray()));
+                ps.executeUpdate();
+            }
+            boolean empty;
+            try (var ps = c.prepareStatement("select not exists (select 1 from " + table
+                    + " where xid >= ?::text::xid8)")) {
+                ps.setString(1, Long.toString(fromXid));
+                try (var rs = ps.executeQuery()) {
+                    rs.next();
+                    empty = rs.getBoolean(1);
+                }
+            }
+            if (empty) {
+                st.execute("drop table " + table);
+                try (var ps = c.prepareStatement(unmarkDropping)) {
+                    ps.setString(1, names.unqualified(table));
+                    ps.executeUpdate();
+                }
+            }
+            c.commit();
+            c.setAutoCommit(true);
+            return new Moved(rows.size(), empty);
+        } catch (Throwable e) { // an Error too: setAutoCommit(true) would commit the work so far
+            try {
+                c.rollback();
+                c.setAutoCommit(true);
+            } catch (SQLException cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            throw e;
+        }
     }
 
     private boolean standalone(Connection c, String table) throws SQLException {
