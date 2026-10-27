@@ -810,7 +810,7 @@ flowchart TD
     pause -->|нет| outcome{"outcome записи"}
     outcome -->|Delivered| ok(["доставлена"])
     outcome -->|Permanent| dead(["outbox_dead: ERROR в логе,<br/>ключ идёт дальше"])
-    outcome -->|Requeue| parked(["outbox_parked: не сбой, ключ идёт дальше;<br/>запись вернётся перед следующей<br/>записью ключа или по сроку"])
+    outcome -->|Requeue| parked(["outbox_parked: не сбой, ключ идёт дальше,<br/>запись вернётся перед следующей<br/>записью ключа или по сроку"])
     outcome -->|"Retry / NotAttempted"| head["ключ отведён в outbox_retry:<br/>запись — голова с next_attempt_at,<br/>следующие записи ключа — последователи"]
     head -.-> others(["остальные ключи идут дальше,<br/>новые записи этого ключа<br/>встают в последователи"])
     head --> due{{"срок головы наступил:<br/>голова и последователи<br/>снова у обработчика"}}
