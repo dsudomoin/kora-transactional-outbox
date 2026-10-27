@@ -32,8 +32,9 @@ public final class PartitionDdl {
     static final Duration VALIDATE_TIMEOUT = Duration.ofHours(1);
     /** The two timeouts as this session set them, null where it did not (the role, database or server default). */
     private static final String SESSION_TIMEOUTS = "select max(setting) filter (where name = 'lock_timeout'),"
-            + " max(setting) filter (where name = 'statement_timeout') from pg_settings"
-            + " where name in ('lock_timeout', 'statement_timeout') and source = 'session'";
+            + " max(setting) filter (where name = 'statement_timeout'),"
+            + " max(setting) filter (where name = 'transaction_timeout') from pg_settings"
+            + " where name in ('lock_timeout', 'statement_timeout', 'transaction_timeout') and source = 'session'";
     /** What bootstrap and maintenance need of their connection, see {@link #backendChanges}. */
     static final String SESSION_POOLING_REQUIRED =
             "needs a direct or session-pooled connection (transaction-pooling proxy detected)";
@@ -328,8 +329,10 @@ public final class PartitionDdl {
     }
 
     /**
-     * Runs {@code sql} under the class's per-statement timeouts, then gives the session's own back. Inside a
-     * transaction (autocommit off) both are {@code SET LOCAL}: a plain SET there would outlive the commit, carrying the
+     * Runs {@code sql} under the class's per-statement timeouts, then gives the session's own back. On Postgres 17+
+     * also with {@code transaction_timeout} off, which a role or database default would otherwise apply to the
+     * statement's implicit transaction too (a concurrent index build or detach included). Inside a transaction
+     * (autocommit off) all are {@code SET LOCAL}: a plain SET there would outlive the commit, carrying the
      * transaction's own {@code SET LOCAL} values (which {@code pg_settings} reports as the session's) into the session.
      */
     static void execute(Connection c, Duration lockTimeout, String sql) throws SQLException {
@@ -341,27 +344,40 @@ public final class PartitionDdl {
             throws SQLException {
         String lock;
         String statement;
+        String transaction;
         try (var st = c.createStatement(); var rs = st.executeQuery(SESSION_TIMEOUTS)) {
             rs.next();
             lock = rs.getString(1);
             statement = rs.getString(2);
+            transaction = rs.getString(3);
         }
         boolean local = !c.getAutoCommit();
+        boolean pg17 = c.getMetaData().getDatabaseMajorVersion() >= 17; // before it, no such setting
         try (var st = c.createStatement()) {
             st.execute((local ? "set local" : "set") + " lock_timeout = " + lockTimeout.toMillis());
             st.execute((local ? "set local" : "set") + " statement_timeout = " + statementTimeout.toMillis());
+            if (pg17) {
+                st.execute((local ? "set local" : "set") + " transaction_timeout = 0");
+            }
             st.execute(sql);
         } catch (SQLException | RuntimeException e) {
             try {
-                restore(c, "lock_timeout", lock, local);
-                restore(c, "statement_timeout", statement, local);
+                restore(c, lock, statement, transaction, local, pg17);
             } catch (SQLException cleanup) { // a terminated session: keep its cause on top
                 e.addSuppressed(cleanup);
             }
             throw e;
         }
+        restore(c, lock, statement, transaction, local, pg17);
+    }
+
+    private static void restore(Connection c, @Nullable String lock, @Nullable String statement,
+            @Nullable String transaction, boolean local, boolean pg17) throws SQLException {
         restore(c, "lock_timeout", lock, local);
         restore(c, "statement_timeout", statement, local);
+        if (pg17) {
+            restore(c, "transaction_timeout", transaction, local);
+        }
     }
 
     private static void restore(Connection c, String setting, @Nullable String sessionValue, boolean local)

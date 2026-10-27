@@ -17,6 +17,7 @@ import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
+import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -29,6 +30,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 
 class XidPartitionsIT {
@@ -1009,6 +1011,25 @@ class XidPartitionsIT {
             assertThat(log).as("said at startup").contains("WARN").contains(role).contains("pg_read_all_stats");
         } finally {
             app.release();
+        }
+    }
+
+    /**
+     * On Postgres 17+ a role or database {@code transaction_timeout} applies to a DDL statement's implicit transaction
+     * too: a concurrent build of {@code <dead>_due} outlasting it would be ended and leave the index INVALID, every
+     * try. Postgres 16, which every other test runs, has no such setting, so they pin that none is issued there.
+     */
+    @Test
+    void ddlOutlivesARoleTransactionTimeoutOnPostgres17() throws Exception {
+        try (var pg17 = new PostgreSQLContainer("postgres:17-alpine")) {
+            pg17.start();
+            try (var c = DriverManager.getConnection(pg17.getJdbcUrl(), pg17.getUsername(), pg17.getPassword())) {
+                execute(c, "set transaction_timeout = '200ms'"); // as a role or database default would
+
+                PartitionDdl.execute(c, Duration.ofSeconds(5), Duration.ZERO, "select pg_sleep(0.5)");
+
+                assertThat(queryString(c, "show transaction_timeout")).as("the session value again").isEqualTo("200ms");
+            }
         }
     }
 
