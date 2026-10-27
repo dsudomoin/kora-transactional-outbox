@@ -77,7 +77,11 @@ chaos_for "$WINDOW"
 stop_inst 2
 chaos_for "$LOAD_S"
 
-errors() { grep -h ' ERROR ' "$LOGS"/chaos-rollback-"$1".log 2> /dev/null | sed 's/^.* ERROR //' | cut -c1-160 | sort | uniq -c; }
+# errors I: instance I's distinct ERROR lines, counted; empty when none (no failure under pipefail)
+errors() {
+  { grep -h ' ERROR ' "$LOGS"/chaos-rollback-"$1".log 2> /dev/null || true; } | sed 's/^.* ERROR //' | cut -c1-160 |
+    sort | uniq -c
+}
 chaos_checks() {
   check "$([ "$CURSOR_TICKS" = "$SHARDS_N" ] && [ "${CURSOR_AGE:-x}" -le "$BOUND" ] 2> /dev/null &&
     [ "$TICK_AGE" -le "$BOUND" ] && echo 0 || echo 1)" \
