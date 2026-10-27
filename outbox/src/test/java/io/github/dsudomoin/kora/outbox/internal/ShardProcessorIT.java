@@ -1980,19 +1980,35 @@ class ShardProcessorIT {
 
     @Test
     void aCallOfReParkedRowsAndAnUnattemptedChunkFailsAsAWhole() throws Exception {
+        // k#1 is parked again on every call and the rest is never attempted, e.g. the call is cut right after it
+        failsAsAWholeWhileItsParkedRowStays(Outcome::requeue, 2);
+    }
+
+    @Test
+    void aCallOfKeptParkedRowsAndAnUnattemptedChunkFailsAsAWhole() throws Exception {
+        // k#1 is not attempted with a notBefore of its own (it counts as attempted), the rest not attempted at all
+        failsAsAWholeWhileItsParkedRowStays(Outcome::notAttempted, 1);
+    }
+
+    /**
+     * {@code k#1} parked until {@code later}, then answered {@code answer(later)} in every call while {@code k#2} and
+     * {@code j#1} are never attempted; {@code requeues}: k#1's after the probe step applied that answer.
+     */
+    private void failsAsAWholeWhileItsParkedRowStays(Function<Instant, Outcome> answer, int requeues)
+            throws Exception {
         bootstrap();
         var later = now.plus(Duration.ofHours(1)); // k#1 is due long after this test
         script = answering(Map.of("k#1", Outcome.requeue(later)));
         send(msg("t", "k", "k#1"));
         tick();
         process();
-        // k#1 is parked again on every call and the rest is never attempted, e.g. the call is cut right after it
-        script = answering(Map.of("k#1", Outcome.requeue(later), "k#2", Outcome.notAttempted(),
+        script = answering(Map.of("k#1", answer.apply(later), "k#2", Outcome.notAttempted(),
                 "j#1", Outcome.notAttempted()));
         send(msg("t", "k", "k#2"), msg("t", "j", "j#1"));
         tick();
 
-        // nothing attempted but a requeue: two keys fail, the call pauses and its requeue is not applied
+        // k#1 stays parked and no chunk row is attempted: two keys fail, the call pauses and k#1's answer is not
+        // applied
         for (int failures = 1; failures <= config.headFailuresBeforeDivert(); failures++) {
             assertThat(process().status()).isEqualTo(PAUSED);
             assertThat(cursor().failures()).isEqualTo(failures);
@@ -2004,7 +2020,7 @@ class ShardProcessorIT {
         assertThat(process().status()).isEqualTo(PAUSED);
         assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1", "k#2"));
         assertThat(retryRows()).containsExactly("k#2:0:" + now.plus(INITIAL));
-        assertThat(parkedRows()).containsExactly("k#1:2:" + later);
+        assertThat(parkedRows()).containsExactly("k#1:" + requeues + ":" + later);
 
         // k blocked in the retry table hands no record, so k#1 is no longer merged, and the shard goes on with j#1
         script = answering(Map.of("k#2", Outcome.notAttempted()));
@@ -2013,7 +2029,7 @@ class ShardProcessorIT {
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, false));
         assertThat(calls).extracting(call -> payloads(call)).containsExactly(List.of("k#2"), List.of("j#1"));
         assertThat(delivered()).containsExactly("j#1");
-        assertThat(parkedRows()).containsExactly("k#1:2:" + later);
+        assertThat(parkedRows()).containsExactly("k#1:" + requeues + ":" + later);
     }
 
     @Test
@@ -2181,6 +2197,331 @@ class ShardProcessorIT {
                 assertThat(span.getStatus().getStatusCode()).isEqualTo(StatusCode.UNSET);
             });
         }
+    }
+
+    @Test
+    void aParkedRecordComesBackAtItsDueTime() throws Exception {
+        bootstrap();
+        script = answering(Map.of("k#1", Outcome.requeue()));
+        send(msg("t", "k", "k#1"));
+        tick();
+        process();
+        var due = now.plus(REQUEUE_DELAY);
+        script = answering(Map.of());
+        calls.clear();
+
+        now = due.minus(1, ChronoUnit.MICROS);
+        assertThat(process()).isEqualTo(new ShardResult(NO_WORK, 0, true));
+        assertThat(calls).isEmpty();
+
+        now = due; // nothing else of k arrives: the retry pass hands it
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(calls).singleElement().satisfies(call -> {
+            assertThat(payloads(call)).containsExactly("k#1");
+            assertThat(call.get(0).requeues()).isEqualTo(1);
+        });
+        assertThat(delivered()).containsExactly("k#1");
+        assertThat(parkedRows()).isEmpty();
+        assertThat(cursor().parkedDueAt()).isNull();
+        assertThat(process().status()).isEqualTo(NO_WORK);
+    }
+
+    @Test
+    void requeueWithNotBefore() throws Exception {
+        bootstrap();
+        script = answering(Map.of("k#1", Outcome.requeue()));
+        send(msg("t", "k", "k#1"));
+        tick();
+        process();
+
+        now = now.plus(REQUEUE_DELAY);
+        var notBefore = now.plusSeconds(10);
+        script = answering(Map.of("k#1", Outcome.requeue(notBefore)));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+        assertThat(parkedRows()).containsExactly("k#1:2:" + notBefore);
+
+        now = notBefore; // a notBefore in the past is due after the requeue delay, not at once
+        script = answering(Map.of("k#1", Outcome.requeue(now.minusSeconds(1))));
+        process();
+        assertThat(parkedRows()).containsExactly("k#1:3:" + now.plus(REQUEUE_DELAY));
+
+        now = now.plus(REQUEUE_DELAY); // one beyond 24 h is cut to 24 h
+        script = answering(Map.of("k#1", Outcome.requeue(now.plus(Duration.ofHours(48)))));
+        process();
+        assertThat(parkedRows()).containsExactly("k#1:4:" + now.plus(Duration.ofHours(24)));
+        assertThat(cursor().parkedDueAt()).isEqualTo(now.plus(Duration.ofHours(24)));
+    }
+
+    @Test
+    void anUnkeyedRecordIsRequeuedAndComesBackOnlyAtItsDueTime() throws Exception {
+        bootstrap();
+        script = answering(Map.of("u", Outcome.requeue()));
+        send(msg("t", null, "u"));
+        tick();
+        process();
+        var due = now.plus(REQUEUE_DELAY);
+        send(msg("t", null, "v"));
+        tick();
+        calls.clear();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("v"));
+        assertThat(parkedRows()).containsExactly("u:1:" + due);
+
+        script = answering(Map.of());
+        now = due;
+        calls.clear();
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("u"));
+        assertThat(delivered()).containsExactly("v", "u");
+        assertThat(parkedRows()).isEmpty();
+    }
+
+    @Test
+    void requeueOfARetryHeadParksItAndItsFollowersGoOn() throws Exception {
+        bootstrap();
+        script = answering(Map.of("k#1", Outcome.retry(new RuntimeException("k busy")), "k#2", Outcome.notAttempted(),
+                "k#3", Outcome.notAttempted()));
+        send(msg("t", "k", "k#1"), msg("t", "k", "k#2"), msg("t", "k", "k#3"), msg("t", "j", "j#1"));
+        tick();
+        process(); // j#1 delivered, so k#1 is diverted at once, k#2 and k#3 behind it
+        var due = now.plus(INITIAL);
+        assertThat(retryRows()).containsExactly("k#1:1:" + due, "k#2:0:-", "k#3:0:-");
+        script = answering(Map.of("k#1", Outcome.requeue()));
+        now = due;
+        calls.clear();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
+
+        assertThat(calls).singleElement()
+                .satisfies(call -> assertThat(payloads(call)).containsExactly("k#1", "k#2", "k#3"));
+        assertThat(retryRows()).isEmpty();
+        assertThat(parkedRows()).containsExactly("k#1:1:" + now.plus(REQUEUE_DELAY));
+        assertThat(delivered()).containsExactly("j#1", "k#2", "k#3");
+        assertThat(cursor().retryDueAt()).isNull();
+        assertThat(cursor().parkedDueAt()).isEqualTo(now.plus(REQUEUE_DELAY));
+        assertThat(counter("outbox.messages.requeued", "topic", "t")).isEqualTo(1);
+
+        script = answering(Map.of()); // back at its due with the attempt it was charged
+        now = now.plus(REQUEUE_DELAY);
+        calls.clear();
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(calls).singleElement().satisfies(call -> {
+            assertThat(payloads(call)).containsExactly("k#1");
+            assertThat(call.get(0).attempts()).isEqualTo(1);
+            assertThat(call.get(0).requeues()).isEqualTo(1);
+        });
+        assertThat(parkedRows()).isEmpty();
+    }
+
+    @Test
+    void aDueParkedRowFailingTransientlyBecomesTheHeadAndDemotesANewerHead() throws Exception {
+        now = parkedBelowARetryHeadOfItsKey(); // k#2's head is due as well
+        script = answering(Map.of("k#1", Outcome.retry(new RuntimeException("k#1 down")),
+                "k#2", Outcome.retry(new RuntimeException("k#2 down"))));
+        calls.clear();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1", "k#2"));
+        var due = now.plus(INITIAL);
+        assertThat(retryRows()).as("one head: k#1").containsExactly("k#1:1:" + due, "k#2:2:-");
+        assertThat(parkedRows()).isEmpty();
+        assertThat(cursor().retryDueAt()).isEqualTo(due);
+        assertThat(cursor().parkedDueAt()).isNull();
+
+        script = answering(Map.of());
+        now = due;
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
+        assertThat(delivered()).containsExactly("j#1", "k#1", "k#2");
+        assertThat(retryRows()).isEmpty();
+    }
+
+    @Test
+    void aDueParkedRowFailingAfterTheRetryHeadOfItsKeyWasDeliveredKeepsItsBackoff() throws Exception {
+        now = parkedBelowARetryHeadOfItsKey();
+        script = answering(Map.of("k#1", Outcome.retry(new RuntimeException("k#1 down")))); // k#2 is delivered
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+
+        // k goes on after k#2 (its next retry row is promoted) before k#1 becomes its head: a promote after it would
+        // make k#1, then the lowest retry row of k, due at once
+        assertThat(retryRows()).containsExactly("k#1:1:" + now.plus(INITIAL));
+        assertThat(parkedRows()).isEmpty();
+        assertThat(delivered()).containsExactly("j#1", "k#2");
+    }
+
+    /**
+     * {@code k#1} parked, then {@code k#2} failing in the call that merges {@code k#1}, which is parked again: k#1
+     * parked below the retry head k#2; returns k#1's due, by which k#2 is due too.
+     */
+    private Instant parkedBelowARetryHeadOfItsKey() throws Exception {
+        bootstrap();
+        script = answering(Map.of("k#1", Outcome.requeue()));
+        send(msg("t", "k", "k#1"));
+        tick();
+        process();
+        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.retry(new RuntimeException("k#2 down"))));
+        send(msg("t", "k", "k#2"), msg("t", "j", "j#1"));
+        tick();
+        process();
+        var due = now.plus(REQUEUE_DELAY);
+        assertThat(parkedRows()).containsExactly("k#1:2:" + due);
+        assertThat(retryRows()).containsExactly("k#2:1:" + now.plus(INITIAL));
+        return due;
+    }
+
+    @Test
+    void aKeyGoingOnInARetryCallFailingAsAWholeIsPromotedBeforeItsParkedRowBecomesTheHead() throws Exception {
+        config.batchSize(3).retry(INITIAL, Duration.ofMillis(500), 2);
+        bootstrap();
+        // as the relay leaves them (no parked row has a lower-id retry row of its key): k#2 a head out of attempts,
+        // k#3 its follower, k#1 and x#1 parked; all due
+        var due = "'" + now + "'::timestamptz";
+        try (var c = TestDb.connect()) {
+            execute(c, "insert into " + names.retry() + " (id, shard, message_id, topic, key, payload, created_at,"
+                    + " attempts, next_attempt_at, last_error) values (2, 0, gen_random_uuid(), 't', 'k'::bytea,"
+                    + " 'k#2'::bytea, now(), 2, " + due + ", 'k#2 down'), (3, 0, gen_random_uuid(), 't', 'k'::bytea,"
+                    + " 'k#3'::bytea, now(), 0, null, null)");
+            execute(c, "insert into " + names.parked() + " (id, shard, message_id, topic, key, payload, created_at,"
+                    + " requeues, due_at) values (1, 0, gen_random_uuid(), 't', 'k'::bytea, 'k#1'::bytea, now(), 1, "
+                    + due + "), (4, 0, gen_random_uuid(), 't', 'x'::bytea, 'x#1'::bytea, now(), 1, " + due + ")");
+        }
+        // k#2 goes to dead before the call and the budget leaves k#3 out: k goes on without a call of its own; the
+        // call of k#1 and x#1 fails as a whole, then k#1 alone fails transiently
+        script = records -> {
+            if (records.stream().anyMatch(payload("x#1"))) {
+                throw new IllegalStateException("handleBatch cannot take x#1");
+            }
+            return records.stream().map(r -> Outcome.retry(new RuntimeException("k#1 down"))).toList();
+        };
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+
+        assertThat(calls).extracting(call -> payloads(call))
+                .containsExactly(List.of("k#1", "x#1"), List.of("k#1"), List.of("x#1"));
+        assertThat(deadRows()).containsExactly("k#2:2");
+        var next = now.plus(INITIAL);
+        assertThat(retryRows()).as("k#3 promoted, then demoted under k#1")
+                .containsExactly("k#1:1:" + next, "k#3:0:-", "x#1:1:" + next);
+        assertThat(parkedRows()).isEmpty();
+    }
+
+    @Test
+    void aParkedRowFailingInTheRetryPassBlocksTheNewerRecordsOfItsKeyInTheSameStep() throws Exception {
+        bootstrap();
+        script = answering(Map.of("k#1", Outcome.requeue()));
+        send(msg("t", "k", "k#1"));
+        tick();
+        process();
+        assertThat(cursor().retryDueAt()).isNull();
+        script = answering(Map.of("k#1", Outcome.retry(new RuntimeException("k#1 down"))));
+        send(msg("t", "k", "k#2"));
+        tick();
+        now = now.plus(REQUEUE_DELAY);
+        calls.clear();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+
+        assertThat(calls).as("k#2 is read blocked behind k#1, which the main pass no longer merges")
+                .singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1"));
+        assertThat(retryRows()).containsExactly("k#1:1:" + now.plus(INITIAL), "k#2:0:-");
+        assertThat(delivered()).isEmpty();
+    }
+
+    @Test
+    void requeueLimitInTheRetryPass() throws Exception {
+        config.maxRequeues(1);
+        bootstrap();
+        script = answering(Map.of("k#1", Outcome.requeue(), "j#1", Outcome.requeue()));
+        send(msg("t", "k", "k#1"), msg("t", "j", "j#1"));
+        tick();
+        process();
+        assertThat(parkedRows()).hasSize(2);
+
+        now = now.plus(REQUEUE_DELAY); // j#1 is requeued past the limit, k#1 fails and becomes a retry head
+        script = answering(Map.of("k#1", Outcome.retry(new RuntimeException("k#1 down")), "j#1", Outcome.requeue()));
+        try (var err = new CapturedStderr()) {
+            assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+            assertThat(err.text()).contains("moved to the dead table").contains("requeue limit reached");
+        }
+        assertThat(deadRows()).containsExactly("j#1:0");
+        assertThat(retryRows()).containsExactly("k#1:1:" + now.plus(INITIAL));
+        assertThat(parkedRows()).isEmpty();
+
+        now = now.plus(INITIAL); // k#1 is requeued as a retry head, past the limit too
+        script = answering(Map.of("k#1", Outcome.requeue()));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+
+        assertThat(deadRows()).containsExactly("k#1:1", "j#1:0");
+        assertThat(rows("select error from " + names.dead() + " order by id", rs -> rs.getString(1)))
+                .containsExactly("requeue limit reached", "requeue limit reached");
+        assertThat(retryRows()).isEmpty();
+        assertThat(parkedRows()).isEmpty();
+        assertThat(cursor().retryDueAt()).isNull();
+        assertThat(cursor().parkedDueAt()).isNull();
+        assertThat(counter("outbox.messages.failed", "topic", "t", "outcome", "dead")).isEqualTo(2);
+    }
+
+    @Test
+    void parkedRowsAreFoundWithinMaintenanceIntervalWhenTheCursorLostTheSignal() throws Exception {
+        config.maintenanceInterval(Duration.ofMillis(100));
+        bootstrap();
+        script = answering(Map.of("k#1", Outcome.requeue()));
+        send(msg("t", "k", "k#1"));
+        tick();
+        process();
+        var due = now.plus(REQUEUE_DELAY);
+        assertThat(cursor().parkedDueAt()).isEqualTo(due);
+        try (var c = TestDb.connect()) { // an instance of the previous version appends a cursor without the column
+            cursors.append(c, cursor().withParkedDueAt(null));
+        }
+        calls.clear();
+
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (cursor().parkedDueAt() == null && System.nanoTime() < deadline) { // not due yet: the signal comes back
+            assertThat(process().status()).isEqualTo(NO_WORK);
+            Thread.sleep(10);
+        }
+        assertThat(cursor().parkedDueAt()).isEqualTo(due);
+        assertThat(calls).isEmpty();
+
+        try (var c = TestDb.connect()) {
+            cursors.append(c, cursor().withParkedDueAt(null));
+        }
+        now = due; // due: the full check hands it, and it is parked once more
+        while (calls.isEmpty() && System.nanoTime() < deadline) {
+            process();
+            Thread.sleep(10);
+        }
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1"));
+        assertThat(parkedRows()).containsExactly("k#1:2:" + now.plus(REQUEUE_DELAY));
+        assertThat(cursor().parkedDueAt()).isEqualTo(now.plus(REQUEUE_DELAY));
+    }
+
+    @Test
+    void aParkedGroupFailingAsAWholeIsIsolated() throws Exception {
+        bootstrap();
+        script = answering(Map.of("p1", Outcome.requeue(), "p2", Outcome.requeue()));
+        send(msg("t", "a", "p1"), msg("t", "b", "p2"));
+        tick();
+        process();
+        script = records -> {
+            if (records.stream().anyMatch(payload("p1"))) {
+                throw new IllegalStateException("handleBatch cannot take p1");
+            }
+            return handler.handleBatch(records);
+        };
+        now = now.plus(REQUEUE_DELAY);
+        calls.clear();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+
+        assertThat(calls).extracting(call -> payloads(call))
+                .containsExactly(List.of("p1", "p2"), List.of("p1"), List.of("p2"));
+        assertThat(delivered()).containsExactly("p2");
+        assertThat(retryRows()).containsExactly("p1:1:" + now.plus(INITIAL));
+        assertThat(parkedRows()).isEmpty();
     }
 
     @Test

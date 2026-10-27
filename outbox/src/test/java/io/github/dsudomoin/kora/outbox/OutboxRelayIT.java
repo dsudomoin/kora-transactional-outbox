@@ -2,6 +2,7 @@ package io.github.dsudomoin.kora.outbox;
 
 import static io.github.dsudomoin.kora.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryLong;
+import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryString;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -28,6 +29,7 @@ import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -35,6 +37,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -363,6 +366,66 @@ class OutboxRelayIT {
                 .cause()
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("no progress");
+    }
+
+    @Test
+    void drainHandsDueParkedRowsAndDoesNotWaitForTheRest() throws Exception {
+        config.relayEnabled(false).requeueDelay(Duration.ofSeconds(1));
+        bootstrap();
+        var relay = relay(new OutboxHandler() { // k: requeued for an hour every time; j: requeued once
+            @Override
+            public void handle(OutboxRecord record) {
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                return records.stream().map(r -> "k".equals(key(r))
+                        ? Outcome.requeue(Instant.now().plus(Duration.ofHours(1)))
+                        : r.requeues() == 0 ? Outcome.requeue() : Outcome.delivered()).toList();
+            }
+        });
+        send(outbox(relay::wake), msg("t", "k", "k#1"), msg("t", "j", "j#1"));
+
+        long started = System.nanoTime();
+        assertThat(relay.drain()).isZero();
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(1));
+        assertThat(parked()).isEqualTo("k#1,j#1");
+
+        Thread.sleep(1100); // j#1 is due
+        started = System.nanoTime();
+        assertThat(relay.drain()).isEqualTo(1);
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(1));
+        assertThat(parked()).isEqualTo("k#1");
+    }
+
+    @Test
+    void aShardWhoseParkedRowIsDueIsSteppedWithoutNewRows() throws Exception {
+        bootstrap();
+        var delivered = new CopyOnWriteArrayList<OutboxRecord>();
+        var relay = start(new OutboxHandler() { // requeues each record once, then delivers it
+            @Override
+            public void handle(OutboxRecord record) {
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                return records.stream().map(r -> {
+                    if (r.requeues() == 0) {
+                        return Outcome.requeue();
+                    }
+                    delivered.add(r);
+                    return Outcome.delivered();
+                }).toList();
+            }
+        });
+        var outbox = outbox(relay::wake);
+        awaitParked();
+
+        send(outbox, msg("t", "k", "k#1")); // parked at once, due 100 ms later; nothing else is written
+
+        // well before the shard's idle append (5 s), which would step it as well
+        await(Duration.ofSeconds(2), () -> delivered.size() == 1 && parked() == null);
+        assertThat(delivered.get(0).requeues()).isEqualTo(1);
     }
 
     @Test
@@ -1166,6 +1229,14 @@ class OutboxRelayIT {
             }
         }
         return IntStream.range(0, n).mapToObj(i -> msg("t", keys.get(i % keys.size()), first + "/" + i)).toList();
+    }
+
+    /** Payloads of the parked table in id order, comma-separated; null when it is empty. */
+    private String parked() throws Exception {
+        try (var c = TestDb.connect()) {
+            return queryString(c, "select string_agg(convert_from(payload, 'UTF8'), ',' order by id) from "
+                    + schema.names().parked());
+        }
     }
 
     /** Rows of {@code key} in the retry table. */

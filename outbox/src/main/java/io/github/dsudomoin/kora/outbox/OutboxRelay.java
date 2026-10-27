@@ -42,12 +42,12 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * made by this relay, or the next tick attempt is due, so an idle relay does not spin; an idle attempt makes a tick
  * only when the newest tick of any instance is about {@code idlePollInterval} old, so an idle cluster makes about one
  * tick per {@code idlePollInterval}. A shard is a candidate only when a tick after its cursor holds its rows (each tick
- * records the shards that gained rows, see {@link Ticks}), its batch is in progress or a retry head is due, so a shard
- * without new rows costs a step only when its cursor turns 5 s old, and that step's append keeps tick cleanup and
- * partition drops going. Every tick this relay makes wakes all its workers, which spread the tick's shards with new
- * rows between them. A wake-up that cannot make a tick yet ({@code minTickInterval}) only brings the tick forward, so
- * under a high commit rate the workers read cursors per tick, not per commit. While {@link Maintenance#halted()} the
- * workers take no shards.
+ * records the shards that gained rows, see {@link Ticks}), its batch is in progress or a retry head or parked row is
+ * due, so a shard without new rows costs a step only when its cursor turns 5 s old, and that step's append keeps tick
+ * cleanup and partition drops going. Every tick this relay makes wakes all its workers, which spread the tick's shards
+ * with new rows between them. A wake-up that cannot make a tick yet ({@code minTickInterval}) only brings the tick
+ * forward, so under a high commit rate the workers read cursors per tick, not per commit. While
+ * {@link Maintenance#halted()} the workers take no shards.
  */
 public final class OutboxRelay implements Lifecycle {
 
@@ -204,9 +204,9 @@ public final class OutboxRelay implements Lifecycle {
 
     /**
      * Makes a tick D, then processes every shard until each cursor has reached D, no batch is in progress
-     * and no retry head is due; returns the number of messages this call delivered. Works whether or not the relay
-     * runs: it contends with the workers for shard locks. Handler failures are outcomes (see {@link OutboxHandler}); a
-     * database failure of a step propagates.
+     * and no retry head or parked row is due (one due later does not hold it up); returns the number of messages this
+     * call delivered. Works whether or not the relay runs: it contends with the workers for shard locks. Handler
+     * failures are outcomes (see {@link OutboxHandler}); a database failure of a step propagates.
      *
      * @throws IllegalStateException when no shard advanced for {@code 2 × batchTimeout} while work remains (e.g. a
      *     shard paused by a down target), or while maintenance has halted the relay (xid regression)
@@ -236,9 +236,11 @@ public final class OutboxRelay implements Lifecycle {
                 if (pending.isEmpty()) {
                     return delivered;
                 }
-                // a position change of a pending shard, by this call or a worker; a pause alone is no progress, and
-                // drained shards moving under live traffic must not hide a stuck one
-                var current = pending.stream().map(cursor -> cursor.cleared().withRetryDueAt(null)).toList();
+                // a position change of a pending shard, by this call or a worker; a pause or due time alone is no
+                // progress (a requeue moves parked_due_at on every step), and drained shards moving under live traffic
+                // must not hide a stuck one
+                var current = pending.stream()
+                        .map(cursor -> cursor.cleared().withRetryDueAt(null).withParkedDueAt(null)).toList();
                 if (!current.equals(positions)) {
                     positions = current;
                     progressed = System.nanoTime();
@@ -276,8 +278,12 @@ public final class OutboxRelay implements Lifecycle {
     }
 
     private static boolean drained(Cursor c, long target, Instant now) {
-        return c.tickId() >= target && c.targetTickId() == null
-                && (c.retryDueAt() == null || c.retryDueAt().isAfter(now));
+        return c.tickId() >= target && c.targetTickId() == null && !due(c.retryDueAt(), now)
+                && !due(c.parkedDueAt(), now);
+    }
+
+    private static boolean due(@Nullable Instant at, Instant now) {
+        return at != null && !at.isAfter(now);
     }
 
     /** One shard step in its own transaction on {@code c}; leaves {@code c} in autocommit, rolled back on failure. */
@@ -447,14 +453,15 @@ public final class OutboxRelay implements Lifecycle {
 
         /**
          * {@link Position#behind() Behind} the latest tick (a tick after its cursor holds its rows, or its cursor is
-         * due an idle append), mid-batch or with a due retry head, and not paused; most behind first. All of it comes
-         * from the database, so every instance sees the same candidates, whichever instance made the ticks.
+         * due an idle append), mid-batch or with a due retry head or parked row, and not paused; most behind first.
+         * All of it comes from the database, so every instance sees the same candidates, whichever instance made the
+         * ticks.
          */
         private List<Integer> candidates(List<Position> all, Instant now) {
             int shards = config.shards();
             return all.stream()
                     .filter(p -> p.behind() || p.cursor().targetTickId() != null
-                            || (p.cursor().retryDueAt() != null && !p.cursor().retryDueAt().isAfter(now)))
+                            || due(p.cursor().retryDueAt(), now) || due(p.cursor().parkedDueAt(), now))
                     .map(Position::cursor)
                     .filter(c -> c.pausedUntil() == null || !c.pausedUntil().isAfter(now))
                     .sorted(Comparator.comparingLong(Cursor::tickId)
