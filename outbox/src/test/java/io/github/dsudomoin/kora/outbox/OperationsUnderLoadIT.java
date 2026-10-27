@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.github.dsudomoin.kora.outbox.internal.Cursors;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
+import io.github.dsudomoin.kora.outbox.internal.OrphanRestore;
 import io.github.dsudomoin.kora.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.kora.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.kora.outbox.internal.PartitionDdl;
@@ -38,11 +39,16 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
@@ -56,14 +62,19 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * writers run for the whole test: outbox writers send one keyed message per transaction through {@link Outbox#send}
  * in {@code inTx}, keys over {@value #KEYS} values that every restored and redriven row shares, while a running relay
  * delivers and its maintenance runs every 50 ms; inbox writers record new ids and redeliver recorded ones through
- * {@link Inbox#tryAccept}, its maintenance running every 50 ms.
+ * {@link Inbox#tryAccept}, its maintenance running every 50 ms. In the outbox tests a business transaction sends
+ * {@value #HELD} and stays open across the operation ({@link #holdKey}), so the operation meets a key held for longer
+ * than {@code swapLockTimeout}.
  */
 class OperationsUnderLoadIT {
 
     private static final int WRITERS = 8;
     private static final int KEYS = 200;
-    /** Three restore chunks. */
+    /** The key the holder keeps; no row of a restore's first chunk has it. */
+    private static final String HELD = "k7";
+    /** Three restore chunks, the first without {@link #HELD}. */
     private static final int ORPHAN_ROWS = 2500;
+    private static final int CHUNK = OrphanRestore.CHUNK;
     private static final long ORPHAN_IDS = 1_000_000_000L;
     private static final Duration SWAP_LOCK_TIMEOUT = Duration.ofMillis(200);
     /**
@@ -72,16 +83,20 @@ class OperationsUnderLoadIT {
      * machine, as in {@link TailSwapIT}.
      */
     private static final Duration WRITER_BOUND = SWAP_LOCK_TIMEOUT.plusMillis(500);
-    /** For every wait on the library, and every loop of calls. */
+    /** The first chunk that meets {@link #HELD} gives up within this: its key lock waits {@code swapLockTimeout}. */
+    private static final Duration FIRST_FAILURE_CAP = Duration.ofSeconds(1);
+    /** For every other wait on the library, and every loop of calls. */
     private static final Duration BOUND = Duration.ofSeconds(60);
     private static final long HOUR = Duration.ofHours(1).toMillis();
     private static final String LOCK_NOT_AVAILABLE = "55P03";
+    private static final String NO_PARTITION = "23514";
 
     private final JdbcDatabase db = TestDb.newDatabase(30);
-    // premake 16 ranges of 10 000 xids: the extension is due with 8 left, over 80 000 xids, so the seconds maintenance
-    // is paused to make an orphan never let rows reach the tail
+    // ranges of 30 000 xids: the relay lags the counter by far less, so the range an orphan is made of is the only one
+    // relayed below the pinned horizon (relayedRange); premake 16: the extension is due with 8 left, 240 000 xids, so
+    // the seconds maintenance is paused never let rows reach the tail
     private final TestOutboxConfig config = new TestOutboxConfig()
-            .xidsPerPartition(10_000)
+            .xidsPerPartition(30_000)
             .premake(16)
             .swapLockTimeout(SWAP_LOCK_TIMEOUT)
             .maintenanceInterval(Duration.ofMillis(50))
@@ -97,7 +112,13 @@ class OperationsUnderLoadIT {
     private final Queue<Sent> sent = new ConcurrentLinkedQueue<>();
     private final AtomicLong commits = new AtomicLong();
     private final AtomicLong maxLatency = new AtomicLong();
+    /** Ends the holder's transaction. */
+    private final CountDownLatch release = new CountDownLatch(1);
+    private final AtomicReference<Sent> holderSent = new AtomicReference<>();
+    /** Writers do not send {@link #HELD} meanwhile: they would queue behind the holder. */
+    private volatile boolean skipHeld;
     private TableNames names;
+    private PgOutbox outbox;
     private OutboxRelay relay;
     private Maintenance maintenance;
     private PgInbox inbox;
@@ -113,6 +134,7 @@ class OperationsUnderLoadIT {
 
     @AfterEach
     void release() throws InterruptedException {
+        release.countDown();
         stopLoad();
         if (relay != null) {
             relay.release();
@@ -129,28 +151,48 @@ class OperationsUnderLoadIT {
         start();
         Orphan orphan;
         long restoreStarted;
-        try (var pause = TestDb.connect(); var c = TestDb.connect()) {
+        long firstFailure;
+        try (var pause = TestDb.connect(); var c = TestDb.connect(); var pin = TestDb.connect()) {
             maintenanceLock(pause, "pg_advisory_lock"); // after the run in progress, if any
-            var range = relayedRange(c);
+            var range = relayedRange(c, pin);
             // as dropProcessed marks and detaches a range, by a run killed before its drop
             execute(c, "insert into " + names.dropping() + " (table_name) values ('" + names.unqualified(range.name())
                     + "')");
             execute(c, "alter table " + names.base() + " detach partition " + range.name() + " concurrently");
-            // far above the counter: the horizon, which the relay moves on meanwhile, stays below them
+            // far above the counter: the horizon stays below them
             orphan = fill(c, range, queryLong(c, "select pg_current_xact_id()::text::bigint") + 100_000_000L);
+            var holder = holdKey();
             restoreStarted = System.nanoTime();
             maintenanceLock(pause, "pg_advisory_unlock");
+
+            var failed = failedRuns(orphan);
+            await(FIRST_FAILURE_CAP, "a maintenance run giving up on " + HELD, () -> failed.matcher(log.text()).find());
+            firstFailure = System.nanoTime() - restoreStarted;
+            assertThat(remaining(orphan)).as("the first chunk stayed moved: the next run resumes, not restarts")
+                    .isEqualTo(ORPHAN_ROWS - CHUNK);
+            release.countDown();
+            holder.join(BOUND.toMillis());
+            skipHeld = false;
+            await(BOUND, "the orphan restored", () -> !exists(orphan.table()));
+            assertEachOnceInTheOutbox(orphan);
+        }
+        var failed = failedRuns(orphan).matcher(log.text()).results().map(m -> m.group(1)).toList();
+        assertThat(failed).as("the runs that gave up").isNotEmpty().containsOnly(LOCK_NOT_AVAILABLE);
+        assertThat(occurrences(log.text(), "could not move the rows of " + orphan.table())).as("every failed run")
+                .isEqualTo(failed.size());
+        await(BOUND, "the orphan gauge back to 0", () -> gauge("outbox.partitions.orphaned") == 0);
+        try (var c = TestDb.connect()) {
+            assertThat(queryLong(c, "select count(*) from " + names.dropping() + " where table_name = '"
+                    + names.unqualified(orphan.table()) + "'")).as("its <base>_dropping marker").isZero();
         }
 
-        await(BOUND, () -> !exists(orphan.table()));
-        // a chunk that met a key a writer held rolled back, and the next run went on
-        int failedRuns = occurrences(log.text(), "could not move the rows of " + orphan.table());
-
-        var delivered = finish("oursOrphanIsRestoredUnderLoad", (failedRuns + 1) + " maintenance runs restored "
-                + orphan.rows().size() + " rows");
+        var delivered = finish("oursOrphanIsRestoredUnderLoad", failed.size() + " maintenance runs gave up on " + HELD
+                + ", the first after " + TimeUnit.NANOSECONDS.toMillis(firstFailure) + " ms, then one restored the rest"
+                + " of " + orphan.rows().size() + " rows");
 
         assertThat(Duration.ofNanos(maxLatency.get())).as("the slowest writer transaction").isLessThan(WRITER_BOUND);
         assertPutBackInOrder(delivered, orphan.rows().stream().collect(Collectors.toMap(r -> r, r -> restoreStarted)));
+        assertHeldRowsAfterTheHolder(delivered, orphan);
         assertThat(delivered).as("below the horizon: gone with the table").doesNotContainKey(orphan.below());
     }
 
@@ -159,35 +201,63 @@ class OperationsUnderLoadIT {
         start();
         var admin = new PgOutboxAdmin(db, names, config, maintenance, relay::wake);
         Orphan orphan;
-        try (var pause = TestDb.connect(); var c = TestDb.connect()) {
+        long restoreStarted;
+        long firstFailure;
+        int calls = 1;
+        int failedCalls = 1;
+        try (var pause = TestDb.connect(); var c = TestDb.connect(); var pin = TestDb.connect()) {
             maintenanceLock(pause, "pg_advisory_lock");
-            var range = relayedRange(c);
+            var range = relayedRange(c, pin);
             execute(c, "alter table " + names.base() + " detach partition " + range.name() + " concurrently");
-            // undelivered rows from its upper bound on, the cut the call is given; its own rows lie below it
+            // its own rows fill its bounds and were delivered, so no cut inside them parts delivered from undelivered:
+            // the undelivered rows sit from its upper bound on, the fromXid the call is given, and the cut re-sends
+            // exactly them; an operator with a real foreign orphan finds the cut by comparing with what was delivered
             orphan = fill(c, range, Long.parseLong(range.to()));
             maintenanceLock(pause, "pg_advisory_unlock");
-        }
-        await(Duration.ofSeconds(10), () -> gauge("outbox.partitions.orphaned") == 1); // kept, left to the admin
+            await(BOUND, "maintenance keeping it", () -> gauge("outbox.partitions.orphaned") == 1);
 
-        long restoreStarted = System.nanoTime();
-        int calls = 0;
-        long deadline = restoreStarted + BOUND.toNanos();
-        while (exists(orphan.table())) {
-            assertThat(System.nanoTime()).as("restored within %s, %d calls", BOUND, calls).isLessThan(deadline);
-            calls++;
+            var holder = holdKey();
+            restoreStarted = System.nanoTime();
+            var first = CompletableFuture.supplyAsync(() -> admin.restoreOrphan(orphan.table(), orphan.from()));
+            Throwable failure = null;
             try {
-                admin.restoreOrphan(orphan.table(), orphan.from());
-            } catch (RuntimeSqlException e) { // a chunk met a key a writer held: rolled back, the next call goes on
-                assertThat(e.getCause()).isInstanceOfSatisfying(SQLException.class,
-                        s -> assertThat(s.getSQLState()).as(s.toString()).isEqualTo(LOCK_NOT_AVAILABLE));
+                first.get(FIRST_FAILURE_CAP.toMillis(), TimeUnit.MILLISECONDS);
+            } catch (ExecutionException e) {
+                failure = e.getCause();
+            } catch (TimeoutException e) {
+                throw new AssertionError("the first restoreOrphan call did not give up on " + HELD + " within "
+                        + FIRST_FAILURE_CAP, e);
             }
+            firstFailure = System.nanoTime() - restoreStarted;
+            assertThat(failure).as("the first call, past a chunk, meets " + HELD)
+                    .isInstanceOfSatisfying(RuntimeSqlException.class, OperationsUnderLoadIT::assertLockNotAvailable);
+            assertThat(remaining(orphan)).as("the first chunk stayed moved: the next call resumes, not restarts")
+                    .isEqualTo(ORPHAN_ROWS - CHUNK);
+            release.countDown();
+            holder.join(BOUND.toMillis());
+            skipHeld = false;
+            long deadline = System.nanoTime() + BOUND.toNanos();
+            while (exists(orphan.table())) {
+                assertThat(System.nanoTime()).as("restored within %s, %d calls", BOUND, calls).isLessThan(deadline);
+                calls++;
+                try {
+                    admin.restoreOrphan(orphan.table(), orphan.from());
+                } catch (RuntimeSqlException e) { // a chunk met a key a writer held: rolled back, the next call goes on
+                    assertLockNotAvailable(e);
+                    failedCalls++;
+                }
+            }
+            assertEachOnceInTheOutbox(orphan);
         }
+        await(BOUND, "the orphan gauge back to 0", () -> gauge("outbox.partitions.orphaned") == 0);
 
-        var delivered = finish("foreignOrphanIsRestoredByTheAdminUnderLoad", calls + " restoreOrphan calls restored "
-                + orphan.rows().size() + " rows");
+        var delivered = finish("foreignOrphanIsRestoredByTheAdminUnderLoad", calls + " restoreOrphan calls, "
+                + failedCalls + " gave up (the first after " + TimeUnit.NANOSECONDS.toMillis(firstFailure) + " ms),"
+                + " restored " + orphan.rows().size() + " rows");
 
         assertThat(Duration.ofNanos(maxLatency.get())).as("the slowest writer transaction").isLessThan(WRITER_BOUND);
         assertPutBackInOrder(delivered, orphan.rows().stream().collect(Collectors.toMap(r -> r, r -> restoreStarted)));
+        assertHeldRowsAfterTheHolder(delivered, orphan);
         assertThat(delivered).as("below the cut: gone with the table").doesNotContainKey(orphan.below());
     }
 
@@ -208,19 +278,19 @@ class OperationsUnderLoadIT {
         }
         assertThat(db.inTx((SqlFunction0<Set<UUID>>) () -> inbox.tryAcceptAll(before))).hasSize(before.size());
         pools.get(1).addAll(before);
-        var reattached = new AtomicBoolean(); // until then no writer reaches the detached range: its inserts would fail
+        var attachedSeen = new AtomicLong(Long.MAX_VALUE); // when the test saw it attached again
+        var tolerated = new AtomicLong();
         for (int i = 0; i < WRITERS; i++) {
             run("inbox-writer-" + i, () -> {
                 var random = ThreadLocalRandom.current();
                 while (!stopping.get()) {
-                    int range = reattached.get() && random.nextBoolean() ? 1 : 0;
+                    int range = random.nextInt(2);
                     var pool = pools.get(range);
                     boolean redelivered = random.nextBoolean() && !pool.isEmpty();
                     var id = redelivered ? pool.get(random.nextInt(pool.size())) : v7(range == 0 ? current : detached);
                     long started = System.nanoTime();
                     try {
                         boolean accepted = db.inTx((SqlFunction0<Boolean>) () -> inbox.tryAccept(id));
-                        maxLatency.accumulateAndGet(System.nanoTime() - started, Math::max);
                         commits.incrementAndGet();
                         if (accepted == redelivered) {
                             errors.add(new AssertionError((redelivered ? "a recorded id accepted again: "
@@ -228,13 +298,23 @@ class OperationsUnderLoadIT {
                         } else if (accepted) {
                             pool.add(id);
                         }
+                    } catch (RuntimeSqlException e) {
+                        // no partition takes an id of the detached range (documented) until the attach
+                        if (range == 1 && started < attachedSeen.get() && e.getCause() instanceof SQLException s
+                                && NO_PARTITION.equals(s.getSQLState())) {
+                            tolerated.incrementAndGet();
+                        } else {
+                            errors.add(e);
+                        }
                     } catch (RuntimeException e) {
                         errors.add(e);
+                    } finally {
+                        maxLatency.accumulateAndGet(System.nanoTime() - started, Math::max);
                     }
                 }
             });
         }
-        await(BOUND, () -> commits.get() >= 1000);
+        await(BOUND, "inbox load", () -> commits.get() >= 1000);
 
         try (var pause = TestDb.connect(); var c = TestDb.connect()) {
             var lock = "(" + TableNames.of(table).resolve(c).internalNamespace() + ", "
@@ -243,19 +323,21 @@ class OperationsUnderLoadIT {
             execute(c, "alter table " + table + " detach partition " + detached.name() + " concurrently");
             assertThat(PartitionDdl.listRanges(c, table)).doesNotContain(detached);
             long during = commits.get();
-            await(BOUND, () -> commits.get() >= during + 1000); // ids recorded while it is detached
+            await(BOUND, "ids recorded while it is detached", () -> commits.get() >= during + 1000);
             execute(pause, "select pg_advisory_unlock" + lock);
         }
-        await(BOUND, () -> inboxRanges(table).contains(detached));
-        reattached.set(true);
+        await(BOUND, "the range attached back", () -> inboxRanges(table).contains(detached));
+        attachedSeen.set(System.nanoTime());
         long attached = commits.get();
-        await(BOUND, () -> commits.get() >= attached + 1000); // its ids recorded before, and new ones, under load
+        await(BOUND, "load after the attach", () -> commits.get() >= attached + 1000);
         stopLoad();
-        System.out.printf("OperationsUnderLoadIT inboxOrphanIsAttachedBackUnderLoad: %d writer transactions, %d ids"
-                + " recorded, the slowest %.1f ms%n", commits.get(), pools.get(0).size() + pools.get(1).size(),
+        System.out.printf("OperationsUnderLoadIT inboxOrphanIsAttachedBackUnderLoad: %d writer commits, %d ids"
+                + " recorded, %d inserts into the detached range failed (23514) before the attach, the slowest %.1f"
+                + " ms%n", commits.get(), pools.get(0).size() + pools.get(1).size(), tolerated.get(),
                 maxLatency.get() / 1e6);
 
         assertThat(errors).as("writer failures").isEmpty();
+        assertThat(tolerated).as("writers that met the detached range").hasPositiveValue();
         assertThat(log.text()).contains(detached.name() + ", a range of " + table + " detached inside the dedup window,"
                 + " is attached back");
         try (var c = TestDb.connect()) {
@@ -287,32 +369,51 @@ class OperationsUnderLoadIT {
                 }
             }
         }
+        long heldLetter = letters.entrySet().stream().filter(e -> e.getValue().key().equals(HELD)).findFirst()
+                .orElseThrow().getKey();
         var filter = new DeadLetterFilter("t", null, null, null, null, null);
         var redriven = new HashMap<Row, Long>(); // when the call that redrove it began
-        int calls = 0;
+        var returned = new ArrayList<Long>();
+
+        var holder = holdKey();
+        // writers hold keys for their own sends too, so a call skips those as well: the next call takes them
         long deadline = System.nanoTime() + BOUND.toNanos();
-        while (redriven.size() < letters.size()) {
-            assertThat(System.nanoTime()).as("redriven within %s, %d calls", BOUND, calls).isLessThan(deadline);
-            calls++;
-            var dead = deadIds();
-            long started = System.nanoTime();
-            long done;
-            try {
-                done = admin.redriveDeadLetters(filter); // skips letters whose key an open send holds
-            } catch (RuntimeSqlException e) { // its insert waited for a tail swap: rolled back, the next call goes on
-                assertThat(e.getCause()).isInstanceOfSatisfying(SQLException.class,
-                        s -> assertThat(s.getSQLState()).as(s.toString()).isEqualTo(LOCK_NOT_AVAILABLE));
-                done = 0;
-            }
-            dead.removeAll(deadIds());
-            assertThat(dead).as("the letters call %d says it redrove", calls).hasSize((int) done);
-            dead.forEach(id -> redriven.put(letters.get(id), started));
+        while (deadIds().size() > 1) {
+            assertThat(System.nanoTime()).as("redriven within %s: %s", BOUND, returned).isLessThan(deadline);
+            returned.add(redrive(admin, filter, letters, redriven));
         }
+        assertThat(deadIds()).as("the letter of the held key, skipped").containsExactly(heldLetter);
+        assertThat(redriven).as("redriven while " + HELD + " is held, never waiting for it").hasSize(KEYS - 1);
+        release.countDown();
+        holder.join(BOUND.toMillis());
+        assertThat(redrive(admin, filter, letters, redriven)).as("once the holder committed").isOne();
+        skipHeld = false;
 
-        var delivered = finish("adminRedriveByFilterUnderLoad", calls + " redriveDeadLetters calls redrove "
-                + redriven.size() + " letters");
+        var delivered = finish("adminRedriveByFilterUnderLoad", "redriveDeadLetters returned " + returned + " while "
+                + HELD + " was held, then 1");
 
-        assertPutBackInOrder(delivered, redriven);
+        assertPutBackInOrder(delivered, redriven); // the held letter: after the holder's message
+    }
+
+    /**
+     * One {@code redriveDeadLetters(filter)} call; records when it began for each letter it redrove, checked against
+     * the dead table. Returns what it returned, 0 when its insert waited for a tail swap and rolled back (55P03).
+     */
+    private long redrive(PgOutboxAdmin admin, DeadLetterFilter filter, Map<Long, Row> letters,
+            Map<Row, Long> redriven) throws SQLException {
+        var dead = deadIds();
+        long started = System.nanoTime();
+        long done;
+        try {
+            done = admin.redriveDeadLetters(filter);
+        } catch (RuntimeSqlException e) {
+            assertLockNotAvailable(e);
+            done = 0;
+        }
+        dead.removeAll(deadIds());
+        assertThat(dead).as("the letters the call says it redrove").hasSize((int) done);
+        dead.forEach(id -> redriven.put(letters.get(id), started));
+        return done;
     }
 
     /** Bootstraps the outbox, starts the relay with its maintenance and the writers, and waits for 1000 commits. */
@@ -322,12 +423,15 @@ class OperationsUnderLoadIT {
         names = schema.names();
         maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
         relay = new OutboxRelay(db, config, schema, recording, new OutboxMetrics(null), null, maintenance);
-        var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new OutboxMetrics(null));
+        outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new OutboxMetrics(null));
         relay.init();
         for (int i = 0; i < WRITERS; i++) {
             run("writer-" + i, () -> {
                 while (!stopping.get()) {
                     var key = "k" + ThreadLocalRandom.current().nextInt(KEYS);
+                    if (skipHeld && key.equals(HELD)) {
+                        continue;
+                    }
                     long started = System.nanoTime();
                     try {
                         var id = db.inTx((SqlFunction0<UUID>) () ->
@@ -342,12 +446,41 @@ class OperationsUnderLoadIT {
                 }
             });
         }
-        await(BOUND, () -> commits.get() >= 1000);
+        await(BOUND, "outbox load", () -> commits.get() >= 1000);
     }
 
     /**
-     * Stops the writers, checks that none failed and that a drain delivers every committed message; prints the slowest
-     * writer transaction. Returns each delivered message id's first position in delivery order.
+     * Sends {@link #HELD} in a transaction that stays open until {@link #release}, as a business transaction that sent
+     * the key and goes on working; writers skip the key from now on. Returns once it holds the key lock. Its
+     * {@link Sent} is recorded after its commit; its wait is no writer's latency.
+     */
+    private Thread holdKey() throws InterruptedException {
+        skipHeld = true;
+        var holding = new CountDownLatch(1);
+        var holder = run("key-holder", () -> {
+            var id = db.inTx((SqlFunction0<UUID>) () -> {
+                var sentId = outbox.send(OutboxMessage.of("t", HELD, HELD.getBytes(UTF_8)));
+                holding.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(e);
+                }
+                return sentId;
+            });
+            var held = new Sent(id, HELD, System.nanoTime());
+            holderSent.set(held);
+            sent.add(held);
+        });
+        assertThat(holding.await(BOUND.toMillis(), TimeUnit.MILLISECONDS)).as("the holder sent " + HELD).isTrue();
+        return holder;
+    }
+
+    /**
+     * Stops the writers, checks that none failed and that a drain delivers every committed message, per key first
+     * deliveries in rising outbox id (writers' and put-back rows together); prints the slowest writer transaction.
+     * Returns each delivered message id's first position in delivery order.
      */
     private Map<UUID, Integer> finish(String test, String operation) throws Exception {
         stopLoad();
@@ -357,12 +490,22 @@ class OperationsUnderLoadIT {
         assertThat(errors).as("writer failures").isEmpty();
         relay.drain();
         var delivered = new HashMap<UUID, Integer>();
+        var lastId = new HashMap<String, Long>();
+        var unordered = new ArrayList<String>();
         var records = recording.delivered();
         for (int i = 0; i < records.size(); i++) {
-            delivered.putIfAbsent(records.get(i).messageId(), i);
+            var r = records.get(i);
+            if (delivered.putIfAbsent(r.messageId(), i) == null && r.key() != null) {
+                var key = new String(r.key(), UTF_8);
+                var last = lastId.put(key, r.id());
+                if (last != null && last >= r.id()) {
+                    unordered.add(key + ": id " + last + ", then id " + r.id() + " at " + i);
+                }
+            }
         }
         assertThat(sent.stream().map(Sent::id).filter(id -> !delivered.containsKey(id)).toList())
                 .as("committed, never delivered").isEmpty();
+        assertThat(unordered).as("per key, first deliveries in rising outbox id").isEmpty();
         return delivered;
     }
 
@@ -396,8 +539,22 @@ class OperationsUnderLoadIT {
         assertThat(early).as("delivered before a message of its key committed earlier").isEmpty();
     }
 
-    /** The lowest range at or below the slowest shard's horizon, once there is one: maintenance must be paused. */
-    private Bound relayedRange(Connection c) throws Exception {
+    /** The restored rows of {@link #HELD}, all in later chunks, waited for the holder: delivered after its message. */
+    private void assertHeldRowsAfterTheHolder(Map<UUID, Integer> delivered, Orphan orphan) {
+        int holder = delivered.get(holderSent.get().id());
+        assertThat(orphan.rows().stream().filter(r -> HELD.equals(r.key())).toList()).as("restored rows of " + HELD)
+                .isNotEmpty()
+                .allSatisfy(r -> assertThat(delivered.get(r.id())).as("after the holder's message")
+                        .isGreaterThan(holder));
+    }
+
+    /**
+     * The lowest range at or below the slowest shard's horizon, once there is one; maintenance must be paused. Then
+     * {@code pin} opens a transaction with an xid, which holds every later tick's xmin, so the horizon, at or below
+     * it: maintenance drops no range the restored rows go to until the test counted them, nor any other range, whose
+     * detach would wait for the key holder's open transaction.
+     */
+    private Bound relayedRange(Connection c, Connection pin) throws Exception {
         long deadline = System.nanoTime() + BOUND.toNanos();
         while (true) {
             long tick = new Cursors(names).latestAll(c, config.shards()).stream().mapToLong(Cursor::tickId).min()
@@ -407,6 +564,11 @@ class OperationsUnderLoadIT {
                     .filter(b -> b.to() != null && Long.parseLong(b.to()) <= horizon)
                     .min(Comparator.comparingLong(b -> Long.parseLong(b.from())));
             if (range.isPresent()) {
+                pin.setAutoCommit(false);
+                long pinned = queryLong(pin, "select pg_current_xact_id()::text::bigint");
+                assertThat(PartitionDdl.listRanges(c, names.base())).as("relayed by the pinned horizon %d", pinned)
+                        .filteredOn(b -> b.to() != null && Long.parseLong(b.to()) <= pinned)
+                        .containsExactly(range.get());
                 return range.get();
             }
             assertThat(System.nanoTime()).as("the relay passed a range within %s", BOUND).isLessThan(deadline);
@@ -416,7 +578,8 @@ class OperationsUnderLoadIT {
 
     /**
      * Gives the standalone {@code range} one row below {@code from} and {@value #ORPHAN_ROWS} from it on, which the
-     * relay never saw: on a stale shard, over the writers' keys and some unkeyed, as {@code MaintenanceIT} makes them.
+     * relay never saw: on a stale shard, over the writers' keys and some unkeyed, as {@code MaintenanceIT} makes them,
+     * but none of {@link #HELD} in the first chunk.
      */
     private Orphan fill(Connection c, Bound range, long from) throws SQLException {
         // DETACH CONCURRENTLY keeps the bounds as a CHECK; the plain DETACH of MaintenanceIT's orphans leaves none
@@ -435,10 +598,12 @@ class OperationsUnderLoadIT {
         }
         execute(c, "insert into " + range.name() + " (id, shard, xid, message_id, topic) values (" + ORPHAN_IDS + ", 0,"
                 + " '" + (Long.parseLong(range.from()) + 1) + "', gen_random_uuid(), 't')");
+        int held = Integer.parseInt(HELD.substring(1));
         execute(c, "insert into " + range.name() + " (id, shard, xid, message_id, topic, key, payload)"
                 + " select " + ORPHAN_IDS + " + s, 999, (" + from + " + s % 7)::text::xid8, gen_random_uuid(), 't',"
-                + " case when s % 10 > 0 then convert_to('k' || s % " + KEYS + ", 'UTF8') end, convert_to('p' || s,"
-                + " 'UTF8') from generate_series(1, " + ORPHAN_ROWS + ") s");
+                + " case when s % 10 = 0 or (s <= " + CHUNK + " and s % " + KEYS + " = " + held + ") then null"
+                + " else convert_to('k' || s % " + KEYS + ", 'UTF8') end, convert_to('p' || s, 'UTF8')"
+                + " from generate_series(1, " + ORPHAN_ROWS + ") s");
         var rows = new ArrayList<Row>();
         UUID below = null;
         try (var st = c.createStatement(); var rs = st.executeQuery("select message_id, convert_from(key, 'UTF8'),"
@@ -455,6 +620,38 @@ class OperationsUnderLoadIT {
         return new Orphan(range.name(), from, rows, below);
     }
 
+    /** The rows from {@code from} on still in the orphan; waits for a chunk in progress, which locks it. */
+    private static long remaining(Orphan orphan) throws SQLException {
+        try (var c = TestDb.connect()) {
+            return queryLong(c, "select count(*) from " + orphan.table() + " where xid >= '" + orphan.from()
+                    + "'::xid8");
+        }
+    }
+
+    /** Each restored message is in the outbox once: no chunk moved twice, none lost (the pin keeps every range). */
+    private void assertEachOnceInTheOutbox(Orphan orphan) throws SQLException {
+        try (var c = TestDb.connect(); var ps = c.prepareStatement("select count(*), count(distinct message_id) from "
+                + names.base() + " where message_id = any(?)")) {
+            ps.setArray(1, c.createArrayOf("uuid", orphan.rows().stream().map(Row::id).toArray()));
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                assertThat(List.of(rs.getLong(1), rs.getLong(2))).as("rows, distinct message ids")
+                        .containsExactly((long) ORPHAN_ROWS, (long) ORPHAN_ROWS);
+            }
+        }
+    }
+
+    /** The WARN of a maintenance run that could not move the rows of {@code orphan}, its SQLState captured. */
+    private static Pattern failedRuns(Orphan orphan) {
+        return Pattern.compile("could not move the rows of " + Pattern.quote(orphan.table())
+                + ", .*?\\(SQLState (\\w+)\\)");
+    }
+
+    private static void assertLockNotAvailable(RuntimeSqlException e) {
+        assertThat(e.getCause()).isInstanceOfSatisfying(SQLException.class,
+                s -> assertThat(s.getSQLState()).as(s.toString()).isEqualTo(LOCK_NOT_AVAILABLE));
+    }
+
     private void stopLoad() throws InterruptedException {
         stopping.set(true);
         for (var t : threads) {
@@ -466,7 +663,7 @@ class OperationsUnderLoadIT {
         void run() throws Exception;
     }
 
-    private void run(String name, Body body) {
+    private Thread run(String name, Body body) {
         var t = new Thread(() -> {
             try {
                 body.run();
@@ -477,6 +674,7 @@ class OperationsUnderLoadIT {
         t.setDaemon(true);
         threads.add(t);
         t.start();
+        return t;
     }
 
     /** {@code function(internalNs, LOCK_MAINTENANCE)}: maintenance runs skip while this session holds it. */
@@ -539,11 +737,11 @@ class OperationsUnderLoadIT {
         boolean holds() throws Exception;
     }
 
-    private static void await(Duration timeout, Condition condition) throws Exception {
+    private static void await(Duration timeout, String what, Condition condition) throws Exception {
         long deadline = System.nanoTime() + timeout.toNanos();
         while (!condition.holds()) {
             if (System.nanoTime() > deadline) {
-                throw new AssertionError("condition not met within " + timeout);
+                throw new AssertionError(what + ": not within " + timeout);
             }
             Thread.sleep(5);
         }
