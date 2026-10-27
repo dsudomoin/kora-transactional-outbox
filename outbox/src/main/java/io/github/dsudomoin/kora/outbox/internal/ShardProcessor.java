@@ -389,8 +389,15 @@ public final class ShardProcessor implements AutoCloseable {
             var shared = new ArrayList<Step>(reads.size());
             var alone = new ArrayList<Step>();
             for (var s : reads) {
-                s.rows = batch.rows().get(s.shard);
+                s.rows = new ArrayList<>(batch.rows().get(s.shard));
                 s.cut = cut;
+                s.segments.add(new Segment(s.cursor.tickId(), s.target, 0, s.rows.size(),
+                        !cut && s.rows.size() < s.limit));
+            }
+            if (!cut) {
+                chain(inTx, reads, latestTickId, started);
+            }
+            for (var s : reads) {
                 if (s.cut && s.rows.isEmpty()) {
                     s.untouched = true; // maybe unread: the shards after the cut have no rows they would have had
                     continue;
@@ -512,7 +519,10 @@ public final class ShardProcessor implements AutoCloseable {
         boolean called;
         boolean probe;
         int limit;
+        /** Its chunk's rows, batch by batch ({@link #segments}), id order inside each. */
         List<BatchRow> rows = List.of();
+        /** The batches its read covers: the first, then the ones {@link #chain} went on into. */
+        final List<Segment> segments = new ArrayList<>();
         /** The read was cut at {@code batchSize} rows. */
         boolean cut;
         List<OutboxRecord> parkedRows = List.of();
@@ -540,6 +550,141 @@ public final class ShardProcessor implements AutoCloseable {
         boolean attempted() {
             return items.stream().anyMatch(ShardProcessor::attempted);
         }
+    }
+
+    /**
+     * One batch of a step's read: from the tick {@code fromTickId} (the cursor's, or where the previous batch of the
+     * step ended or skipped to) up to {@code target}, its rows at {@code from} in the step's rows, {@code count} of
+     * them; {@code finished}: all of the batch was read (fewer rows than asked for, and the read was not cut).
+     */
+    private record Segment(long fromTickId, Tick target, int from, int count, boolean finished) {}
+
+    /** Batches one step may cover; the chain stops after them. */
+    private static final int MAX_SEGMENTS = 16;
+
+    /**
+     * Goes on, for each shard whose read finished its batch below its limit while the latest tick is newer, into the
+     * next fresh batch of the same step: chosen as {@link #chooseTargets} chooses a fresh one (the leading ticks that
+     * do not mark the shard skipped, then {@link #chooseTarget} within {@code batchIds}), read for what is left of its
+     * limit and of the step's {@code batchSize}, its rows after the previous batch's in the step's one call. Under a
+     * steady load a shard is stepped about once per tick, and a batch is bounded by {@code batchIds}, about a tick's
+     * rows of the shard: without this a lagging shard would catch up a tick per step, and a relay that falls behind
+     * could never take more than a tick per step to catch up. Statements are shared by the shards of each round; the
+     * chain stops at a shard's limit, the latest tick, a cut read, {@link #MAX_SEGMENTS} batches or a quarter of
+     * {@code batchTimeout} spent.
+     */
+    private void chain(Connection c, List<Step> reads, long latestTickId, long started) throws SQLException {
+        long budget = relay.batchSize() - reads.stream().mapToLong(s -> s.rows.size()).sum();
+        while (budget > 0 && System.nanoTime() - started < relay.batchTimeout().toNanos() / 4) {
+            var more = new ArrayList<Step>();
+            var afterIds = new HashMap<Integer, Long>();
+            for (var s : reads) {
+                var last = s.segments.get(s.segments.size() - 1);
+                if (!s.probe && last.finished() && last.target().id() < latestTickId && s.rows.size() < s.limit
+                        && s.segments.size() < MAX_SEGMENTS) {
+                    more.add(s);
+                    afterIds.put(s.shard, last.target().id());
+                }
+            }
+            if (more.isEmpty()) {
+                return;
+            }
+            var skipped = ticks.lastUnmarked(c, afterIds, latestTickId);
+            var from = new long[more.size()];
+            var prevs = new Tick[more.size()];
+            var lo = new long[more.size()];
+            var hi = new long[more.size()];
+            var wanted = new HashSet<Long>();
+            for (int i = 0; i < more.size(); i++) {
+                var s = more.get(i);
+                var last = s.segments.get(s.segments.size() - 1);
+                var skip = skipped.get(s.shard);
+                prevs[i] = skip != null ? skip : last.target(); // a skipped-to tick's snapshot is read below
+                if (skip != null) {
+                    wanted.add(skip.id());
+                }
+                from[i] = prevs[i].id();
+                lo[i] = from[i];
+                hi[i] = Math.min(latestTickId, from[i] + relay.maxTicksPerBatch());
+            }
+            var between = ticks.between(c, lo, hi);
+            var targets = new Tick[more.size()];
+            var targetIds = new long[more.size()];
+            for (int i = 0; i < more.size(); i++) {
+                var candidates = List.copyOf(between.subMap(lo[i], false, hi[i], true).values());
+                if (candidates.isEmpty()) { // a gap in tick ids, as in chooseTargets
+                    targets[i] = ticks.oldestAfter(c, from[i]);
+                } else {
+                    targetIds[i] = chooseTarget(prevs[i].maxId(), candidates, batchIds).id();
+                    wanted.add(targetIds[i]);
+                }
+            }
+            var read = ticks.get(c, wanted);
+            var shardReads = new ArrayList<BatchReader.ShardRead>(more.size());
+            var chained = new ArrayList<Step>(more.size());
+            var segmentTargets = new ArrayList<Tick>(more.size());
+            var segmentFrom = new ArrayList<Long>(more.size());
+            long asked = 0;
+            for (int i = 0; i < more.size(); i++) {
+                var s = more.get(i);
+                var target = targets[i] != null || targetIds[i] == 0 ? targets[i] : tick(read, targetIds[i]);
+                if (target == null) {
+                    continue; // no tick after it: nothing to go on into
+                }
+                var prev = prevs[i].snapshot() != null ? prevs[i] : tick(read, prevs[i].id());
+                int left = s.limit - s.rows.size();
+                asked += left;
+                shardReads.add(new BatchReader.ShardRead(s.shard, prev.snapshot(), target.snapshot(), 0, left,
+                        s.full ? hasRetryRows(c, s.shard) : s.retryDue != null || s.wroteRetry));
+                chained.add(s);
+                segmentTargets.add(target);
+                segmentFrom.add(from[i]);
+            }
+            if (chained.isEmpty()) {
+                return;
+            }
+            var batch = reader.readMany(c, shardReads, (int) budget);
+            boolean cut = batch.cut() && asked > budget;
+            for (int i = 0; i < chained.size(); i++) {
+                var s = chained.get(i);
+                var rows = batch.rows().get(s.shard);
+                if (cut && rows.isEmpty()) {
+                    continue; // maybe unread: its chain ends at the batch before
+                }
+                int left = shardReads.get(i).limit();
+                s.segments.add(new Segment(segmentFrom.get(i), segmentTargets.get(i), s.rows.size(), rows.size(),
+                        !cut && rows.size() < left));
+                s.rows.addAll(rows);
+                budget -= rows.size();
+            }
+            if (cut) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * Where the shard stands once the first {@code read} rows of its step are settled, batch by batch: past a batch
+     * read in full and finished, at its target; inside a batch, mid-batch from the tick it started at, at the last row
+     * read; with nothing of a batch read, where the batch before it left it (the step's cursor for the first).
+     */
+    private static Cursor position(Step s, int read) {
+        var next = s.cursor;
+        int left = read;
+        for (var segment : s.segments) {
+            if (left >= segment.count() && segment.finished()) {
+                left -= segment.count();
+                next = next.withProgress(segment.target().id(), null, 0);
+                continue;
+            }
+            int taken = Math.min(left, segment.count());
+            if (taken > 0) {
+                next = next.withProgress(segment.fromTickId(), segment.target().id(),
+                        s.rows.get(segment.from() + taken - 1).record().id());
+            }
+            break;
+        }
+        return next;
     }
 
     /**
@@ -639,12 +784,9 @@ public final class ShardProcessor implements AutoCloseable {
                     .anyMatch(action -> action instanceof Head || action instanceof Follower);
             s.deadLettered |= decision.actions().stream().anyMatch(action -> action instanceof Dead);
             s.delivered += recordOutcomes(items, decision.actions(), shard, now);
-            var rows = s.rows;
-            if (read == rows.size() && rows.size() < s.limit && !s.cut) {
-                next = cursor.withProgress(s.target.id(), null, 0);
-            } else if (read > 0) { // a cut read: what the shard has read so far, maybe all
-                next = cursor.withProgress(cursor.tickId(), s.target.id(), rows.get(read - 1).record().id());
-            } // else only parked rows read: the position stays, as on a pause
+            // past the batches read in full, else mid-batch at the last row read (a cut read: maybe all of its rows);
+            // only parked rows read: the position stays, as on a pause
+            next = position(s, read);
         } // else no progress: a batch in progress keeps its target, a fresh one is not stored (lastId is still 0)
         if (failedAttempt(items)) { // paused, or a single failing key diverted: either way back off
             limits.set(shard, Math.max(1, s.limit / 2));

@@ -182,19 +182,9 @@ class ShardProcessorIT {
 
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(ids);
         assertThat(handler.delivered()).extracting(OutboxRecord::id).isSorted();
-        // each call with a batch reads one chunk; a batch ends with the call that finishes it
-        var chunksPerBatch = new ArrayList<Integer>();
-        int chunks = 0;
-        for (var result : results) {
-            chunks++;
-            if (result.batchFinished()) {
-                chunksPerBatch.add(chunks);
-                chunks = 0;
-            }
-        }
-        assertThat(chunks).isZero();
-        assertThat(chunksPerBatch).as("one tick per batch, 2000 rows in chunks of 1000").hasSize(40)
-                .allMatch(n -> n <= 3);
+        // a batch is one tick (2000 rows, past its id bound); a step reads at most batchSize rows, going on into the
+        // next batch when one ends below it, so 80 000 rows take about 80 steps, never one huge read
+        assertThat(results).as("steps").allMatch(r -> r.delivered() <= 1000).hasSizeBetween(80, 82);
     }
 
     @Test
@@ -1530,16 +1520,14 @@ class ShardProcessorIT {
         assertThat(cursor().tickId()).isEqualTo(t3);
         assertThat(cursorRows()).isEqualTo(appends + 2);
 
-        // ticks that mark it: maxTicksPerBatch (1) a step, each appended
+        // ticks that mark it: maxTicksPerBatch (1) a batch, and the step goes on into the next batch, one append
         send(msg("t", "a", "a#1"));
-        long t4 = tick();
+        tick();
         send(msg("t", "b", "b#1"));
         long t5 = tick();
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
-        assertThat(cursor().tickId()).isEqualTo(t4);
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
         assertThat(cursor().tickId()).isEqualTo(t5);
-        assertThat(cursorRows()).isEqualTo(appends + 4);
+        assertThat(cursorRows()).isEqualTo(appends + 3);
     }
 
     @Test
@@ -3156,6 +3144,127 @@ class ShardProcessorIT {
         send(msg("t", keyOnShard(3), "d#1"));
         processGroup(3);
         assertThat(lastCaughtUp).as("rows after the step's latest tick are no work yet").containsExactly(true);
+    }
+
+    @Test
+    void aLaggingShardIsDeliveredInOneStepAcrossItsTicks() throws Exception {
+        config.shards(2).batchSize(1000); // a batch spans at most 2000 ids: one tick of the filler below
+        bootstrap();
+        var keys = keysOnShard(0, 3);
+        long last = 0;
+        for (int t = 1; t <= 10; t++) { // 10 ticks of 90 rows of shard 0, each past the batch's id bound
+            lagTick(keys, "t" + t + "#", 30, 2100);
+            last = tick();
+        }
+
+        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 900, true));
+
+        assertThat(calls).as("one call, batch by batch").hasSize(1);
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, last, null, 0, null, 0, null, null));
+        assertThat(lastCaughtUp).containsExactly(true);
+        assertIdOrderPerKey(handler.delivered());
+    }
+
+    @Test
+    void aKeyFailingInTheFirstBatchHoldsItsRowsOfTheNextOne() throws Exception {
+        config.shards(2).batchSize(1000);
+        bootstrap();
+        var keys = keysOnShard(0, 3);
+        handler.failNext(payload("t1#" + keys.get(0) + "#0"), () -> new RuntimeException("once"));
+        lagTick(keys, "t1#", 30, 2100);
+        tick();
+        lagTick(keys, "t2#", 30, 2100);
+        long last = tick();
+
+        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 120, true));
+
+        // the failing key's 29 more rows of the first batch and its 30 of the second follow its head
+        assertThat(retryRows()).hasSize(60).first().asString().startsWith("t1#" + keys.get(0) + "#0:1:");
+        assertThat(retryRows().subList(1, 60)).allSatisfy(row -> assertThat(row).endsWith(":0:-"));
+        assertThat(delivered()).noneMatch(payload -> payload.contains("#" + keys.get(0) + "#"));
+        assertThat(cursor(0).tickId()).isEqualTo(last);
+        assertIdOrderPerKey(handler.delivered());
+    }
+
+    @Test
+    void aChainCutByTheLimitInsideTheNextBatchGoesOnFromItsLastRow() throws Exception {
+        config.shards(2).batchSize(150); // a batch spans at most 300 ids
+        bootstrap();
+        var keys = keysOnShard(0, 2);
+        lagTick(keys, "t1#", 50, 400);
+        long t1 = tick();
+        lagTick(keys, "t2#", 50, 400);
+        long t2 = tick();
+
+        // 100 rows of the first batch, then 50 of the second: the limit
+        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 150, false));
+        var ids = handler.delivered().stream().map(OutboxRecord::id).toList();
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, t1, t2, ids.get(149), null, 0, null, null));
+
+        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 50, true));
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, t2, null, 0, null, 0, null, null));
+        assertThat(handler.delivered()).hasSize(200).extracting(OutboxRecord::messageId).doesNotHaveDuplicates();
+        assertIdOrderPerKey(handler.delivered());
+    }
+
+    @Test
+    void aGroupStepChainsEachShard() throws Exception {
+        config.shards(3).batchSize(1000); // a batch spans at most 3000 ids
+        bootstrap();
+        var a = keysOnShard(0, 2);
+        var b = keysOnShard(1, 2);
+        long last = 0;
+        for (int t = 1; t <= 5; t++) {
+            var messages = new ArrayList<OutboxMessage>();
+            for (var key : List.of(a.get(0), a.get(1), b.get(0), b.get(1))) {
+                for (int i = 0; i < 25; i++) {
+                    messages.add(msg("t", key, "t" + t + "#" + key + "#" + i));
+                }
+            }
+            var filler = keyOnShard(2);
+            for (int i = 0; i < 3100; i++) {
+                messages.add(msg("t", filler, "f"));
+            }
+            send(messages.toArray(OutboxMessage[]::new));
+            last = tick();
+        }
+
+        assertThat(processGroup(0, 1)).containsExactly(new ShardResult(PROGRESS, 250, true),
+                new ShardResult(PROGRESS, 250, true));
+
+        assertThat(calls).as("one call for both shards, each over its 5 batches").hasSize(1);
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, last, null, 0, null, 0, null, null));
+        assertThat(cursor(1)).isEqualTo(new Cursor(1, last, null, 0, null, 0, null, null));
+        assertIdOrderPerKey(handler.delivered());
+    }
+
+    /**
+     * One transaction: {@code perKey} rows on each of {@code keys} (payload prefix + key + # + n), then {@code filler}
+     * rows on shard 1, which push the tick past a batch's id bound so the next batch starts at the next tick.
+     */
+    private void lagTick(List<String> keys, String prefix, int perKey, int filler) throws SQLException {
+        var messages = new ArrayList<OutboxMessage>();
+        for (var key : keys) {
+            for (int i = 0; i < perKey; i++) {
+                messages.add(msg("t", key, prefix + key + "#" + i));
+            }
+        }
+        var other = keyOnShard(1);
+        for (int i = 0; i < filler; i++) {
+            messages.add(msg("t", other, "f"));
+        }
+        send(messages.toArray(OutboxMessage[]::new));
+    }
+
+    /** Per key, delivery order is id (= commit) order. */
+    private static void assertIdOrderPerKey(List<OutboxRecord> delivered) {
+        var perKey = new java.util.LinkedHashMap<String, List<Long>>();
+        for (var r : delivered) {
+            if (r.key() != null) {
+                perKey.computeIfAbsent(new String(r.key(), UTF_8), k -> new ArrayList<>()).add(r.id());
+            }
+        }
+        perKey.forEach((key, ids) -> assertThat(ids).as("ids of key %s", key).isSorted());
     }
 
     @Test
