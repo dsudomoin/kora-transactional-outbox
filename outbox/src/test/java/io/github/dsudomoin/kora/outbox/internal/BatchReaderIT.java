@@ -301,6 +301,32 @@ class BatchReaderIT {
     }
 
     @Test
+    void readManyOfOneShardIsItsRead() throws Exception {
+        config.shards(4);
+        bootstrap();
+        var random = new Random(11);
+        var p = tick();
+        sendRandom(random, 30);
+        var c = tick();
+        int shard = 2;
+        var all = read(shard, p, c, 0, 1000, true);
+        assertThat(all).hasSizeGreaterThan(4);
+        var one = List.of(new ShardRead(shard, p, c, 0, 1000, true));
+
+        var whole = readMany(one, 1000);
+        assertThat(rowKeys(whole.rows().get(shard))).isEqualTo(rowKeys(all));
+        assertThat(whole.cut()).isFalse();
+        assertThat(readMany(one, all.size()).cut()).as("exactly the limit counts as cut").isTrue();
+        var cut = readMany(one, 3);
+        assertThat(cut.cut()).isTrue();
+        assertThat(rowKeys(cut.rows().get(shard))).isEqualTo(rowKeys(all.subList(0, 3)));
+        var own = readMany(List.of(new ShardRead(shard, p, c, all.get(1).record().id(), 2, true)), 1000);
+        assertThat(rowKeys(own.rows().get(shard))).as("its own limit, after lastId")
+                .isEqualTo(rowKeys(all.subList(2, 4)));
+        assertThat(own.cut()).as("its own limit is no cut").isFalse();
+    }
+
+    @Test
     void cutKeepsEachShardsRowsAPrefix() throws Exception {
         config.shards(16);
         bootstrap();
