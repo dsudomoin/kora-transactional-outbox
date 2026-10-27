@@ -105,6 +105,8 @@ A `requeue` of a retry-table head parks it and lets the next record of its key g
 
 - A call carries the chunk plus up to the chunk limit (≤ `batchSize`) of parked records of the chunk's keys, oldest
   first: up to 2 × `batchSize` records. Keep the blocked check cheap, or size the batch budget in SKILL.md for 2 ×.
+  A probing shard merges none: the probe call is the head row alone, which may go out ahead of its key's parked
+  records.
 - A call in which the handler only requeued (or left not attempted) the merged parked records and attempted none of
   the new ones fails as a whole, like a call with nothing attempted: shard pause, halved chunk, probe, divert. A
   handler that winds down right after requeuing costs a pause, never a spinning shard.

@@ -1982,21 +1982,20 @@ class ShardProcessorIT {
     @Test
     void aCallOfReParkedRowsAndAnUnattemptedChunkFailsAsAWhole() throws Exception {
         // k#1 is parked again on every call and the rest is never attempted, e.g. the call is cut right after it
-        failsAsAWholeWhileItsParkedRowStays(Outcome::requeue, 2);
+        failsAsAWholeWhileItsParkedRowStays(Outcome::requeue);
     }
 
     @Test
     void aCallOfKeptParkedRowsAndAnUnattemptedChunkFailsAsAWhole() throws Exception {
         // k#1 is not attempted with a notBefore of its own (it counts as attempted), the rest not attempted at all
-        failsAsAWholeWhileItsParkedRowStays(Outcome::notAttempted, 1);
+        failsAsAWholeWhileItsParkedRowStays(Outcome::notAttempted);
     }
 
     /**
      * {@code k#1} parked until {@code later}, then answered {@code answer(later)} in every call while {@code k#2} and
-     * {@code j#1} are never attempted; {@code requeues}: k#1's after the probe step applied that answer.
+     * {@code j#1} are never attempted.
      */
-    private void failsAsAWholeWhileItsParkedRowStays(Function<Instant, Outcome> answer, int requeues)
-            throws Exception {
+    private void failsAsAWholeWhileItsParkedRowStays(Function<Instant, Outcome> answer) throws Exception {
         bootstrap();
         var later = now.plus(Duration.ofHours(1)); // k#1 is due long after this test
         script = answering(Map.of("k#1", Outcome.requeue(later)));
@@ -2016,12 +2015,12 @@ class ShardProcessorIT {
             assertThat(parkedRows()).containsExactly("k#1:1:" + later);
             now = cursor().pausedUntil();
         }
-        // the probe reads k#2 alone, merged with k#1: a single failing key, diverted
+        // the probe reads k#2 alone and merges no parked row: a single failing key, diverted
         calls.clear();
         assertThat(process().status()).isEqualTo(PAUSED);
-        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#1", "k#2"));
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#2"));
         assertThat(retryRows()).containsExactly("k#2:0:" + now.plus(INITIAL));
-        assertThat(parkedRows()).containsExactly("k#1:" + requeues + ":" + later);
+        assertThat(parkedRows()).containsExactly("k#1:1:" + later);
 
         // k blocked in the retry table hands no record, so k#1 is no longer merged, and the shard goes on with j#1
         script = answering(Map.of("k#2", Outcome.notAttempted()));
@@ -2030,7 +2029,38 @@ class ShardProcessorIT {
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, false));
         assertThat(calls).extracting(call -> payloads(call)).containsExactly(List.of("k#2"), List.of("j#1"));
         assertThat(delivered()).containsExactly("j#1");
-        assertThat(parkedRows()).containsExactly("k#1:" + requeues + ":" + later);
+        assertThat(parkedRows()).containsExactly("k#1:1:" + later);
+    }
+
+    @Test
+    void theProbeCallHoldsTheHeadAloneWithoutTheParkedRowsOfItsKey() throws Exception {
+        bootstrap();
+        var later = now.plus(Duration.ofHours(1)); // k#1 is due long after this test
+        script = answering(Map.of("k#1", Outcome.requeue(later)));
+        send(msg("t", "k", "k#1"));
+        tick();
+        process();
+        script = records -> {
+            if (records.stream().anyMatch(payload("k#2"))) {
+                throw new IllegalStateException("cannot handle k#2");
+            }
+            return handler.handleBatch(records);
+        };
+        send(msg("t", "k", "k#2"), msg("t", "j", "j#1"));
+        tick();
+
+        // k#1, k#2 and j#1 fail as a whole: two keys, so the shard pauses until it probes
+        for (int failures = 1; failures <= config.headFailuresBeforeDivert(); failures++) {
+            assertThat(process().status()).isEqualTo(PAUSED);
+            now = cursor().pausedUntil();
+        }
+        // the probe hands the poison alone: it is diverted and charged, k#1 stays parked as it was
+        calls.clear();
+        assertThat(process().status()).isEqualTo(PAUSED);
+        assertThat(calls).singleElement().satisfies(call -> assertThat(payloads(call)).containsExactly("k#2"));
+        assertThat(retryRows()).containsExactly("k#2:3:" + now.plus(Backoff.delay(2, INITIAL, config.maxDelay())));
+        assertThat(parkedRows()).containsExactly("k#1:1:" + later);
+        assertThat(rows("select attempts from " + names.parked(), rs -> rs.getString(1))).containsExactly("0");
     }
 
     @Test

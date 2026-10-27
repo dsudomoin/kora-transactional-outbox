@@ -61,8 +61,8 @@ import org.slf4j.LoggerFactory;
  * of its keys first in its call, classify and append the new cursor. A failed attempt halves the rows the shard's next
  * step reads and a delivery doubles them (up to {@code batchSize}), so a record that fails its whole call deep in a
  * chunk is soon read alone; a requeue is neither. After {@code headFailuresBeforeDivert} failed attempts in a row the
- * shard probes: it reads the head row alone, so a slow or poison head is diverted as a single failing key, and a down
- * target loses at most one row to the retry table per (backed-off) probe. Handler calls run on this processor's own
+ * shard probes: it reads the head row alone and merges no parked row into its call, so a slow or poison head is
+ * diverted as a single failing key, and a down target loses at most one row to the retry table per (backed-off) probe. Handler calls run on this processor's own
  * bounded pool of daemon threads, each bounded by {@code batchTimeout}. A call that throws (an Error included) or
  * returns an invalid outcome list fails each of its records transiently, so a poison record takes that same path and
  * no handler failure reaches the caller. The caller commits on return and rolls back on an exception (SQL), so a
@@ -283,7 +283,8 @@ public final class ShardProcessor implements AutoCloseable {
         boolean idle = false;
         if (target != null && !busy) {
             // probe mode: after headFailuresBeforeDivert failed attempts in a row, the head row alone
-            int limit = cursor.failures() >= relay.headFailuresBeforeDivert() ? 1 : limits.get(shard);
+            boolean probe = cursor.failures() >= relay.headFailuresBeforeDivert();
+            int limit = probe ? 1 : limits.get(shard);
             if (prev == null) {
                 prev = ticks.get(inTx, cursor.tickId());
             }
@@ -294,9 +295,11 @@ public final class ShardProcessor implements AutoCloseable {
             // when the target is below the latest tick, or maxTicksPerBatch ticks within IDLE_APPEND_AFTER keep it on P
             idle = !draining && rows.isEmpty() && target.id() == latestTickId && young(prev, target);
             // a parked record comes back right before the next record of its key: the oldest limit parked rows of
-            // the chunk's keys go first in its call (a key blocked in the retry table hands no record, so none)
-            var parkedRows = parkedDue == null && !wroteParked ? List.<OutboxRecord>of() : parked.ofKeys(inTx, shard,
-                    rows.stream().filter(row -> !row.blocked() && row.record().key() != null).map(BatchRow::record)
+            // the chunk's keys go first in its call (a key blocked in the retry table hands no record, so none); a
+            // probe merges none, so the head it isolates is the only record of its call
+            var parkedRows = probe || parkedDue == null && !wroteParked ? List.<OutboxRecord>of()
+                    : parked.ofKeys(inTx, shard, rows.stream()
+                            .filter(row -> !row.blocked() && row.record().key() != null).map(BatchRow::record)
                             .toList(), limit);
             var items = deliverBatch(parkedRows, rows, now);
             busy = items.stream().anyMatch(item -> item.outcome() == BUSY); // nothing handed: nothing read, no items
