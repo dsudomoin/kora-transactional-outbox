@@ -1251,6 +1251,9 @@ class OutboxRelayIT {
 
     @Test
     void aCheckpointFromAnotherHistoryIsIgnoredAndReplaced() throws Exception {
+        // only the wake-up ticks: an idle tick before the run at start would let its cleanup delete the cursors' tick,
+        // which the restore this stands for keeps
+        config.idlePollInterval(Duration.ofSeconds(30));
         bootstrap(); // 4 shards; maintenance runs at start, then not for an hour
         var handler = new RecordingHandler();
         var relay = start(handler);
@@ -1270,6 +1273,40 @@ class OutboxRelayIT {
         assertThat(maintenance(db).runOnce()).isTrue();
 
         assertThat(checkpointTick()).as("replaced").isLessThanOrEqualTo(ticksMade());
+        assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(ids);
+    }
+
+    @Test
+    void aCheckpointMadeBeforeItsOwnTickIsIgnoredAndReplaced() throws Exception {
+        config.idlePollInterval(Duration.ofSeconds(30)); // only the wake-up steps
+        bootstrap(); // 4 shards; maintenance runs at start, then not for an hour
+        var handler = new RecordingHandler();
+        var relay = start(handler);
+        awaitParked();
+        var names = schema.names();
+        long next = ticksMade() + 1;
+        try (var c = TestDb.connect()) { // as a partial restore leaves it once new ticks pass its id: every shard idle
+            execute(c, "delete from " + names.checkpoint());
+            execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + next
+                    + ", B'0000', " + next + ")");
+        }
+        var ids = send(outbox(() -> {}), msg("t", keyOnShard(2, "k"), "m"));
+        try (var c = TestDb.connect()) { // the tick it names, made after it, holds shard 2's row: its 0 bit hides it
+            assertThat(new Ticks(names, config.shards()).make(c, Duration.ZERO)).isTrue();
+        }
+        assertThat(ticksMade()).as("the tick the checkpoint names").isEqualTo(next);
+
+        relay.wake();
+        await(Duration.ofSeconds(5), () -> handler.delivered().size() == ids.size()); // the relay alone delivers
+        assertThat(checkpointTick()).as("no maintenance ran meanwhile").isEqualTo(next);
+
+        assertThat(maintenance(db).runOnce()).isTrue();
+
+        try (var c = TestDb.connect()) {
+            assertThat(queryLong(c, "select count(*) from " + names.checkpoint() + " k join " + names.tick()
+                    + " t on t.id = k.tick_id and t.created_at <= k.created_at")).as("replaced").isOne();
+            assertThat(queryLong(c, "select count(*) from " + names.checkpoint())).isOne();
+        }
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(ids);
     }
 

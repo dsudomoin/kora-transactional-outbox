@@ -174,15 +174,15 @@ group_lag() {
 psql_q() { docker exec -e PGOPTIONS='-c client_min_messages=warning' "$PG" psql -U outbox -d outbox -Atq -c "$1"; }
 
 # effective_ticks BASE: a derived table (shard, tick_id) of each shard's effective tick: its cursor's tick, or the
-# tick of maintenance's checkpoint when newer, unless that checkpoint is above the newest tick (Cursors; the README
-# queries use the same SQL). Use it in a FROM clause.
+# tick of maintenance's checkpoint when newer, unless that checkpoint's tick is gone or was made after it (Cursors; the
+# README queries use the same SQL). Use it in a FROM clause.
 effective_ticks() {
   echo "(select c.shard, case when length(k.busy) = count(*) over ()
       then greatest(c.tick_id, case when get_bit(k.busy, c.shard) = 0 then k.tick_id else k.busy_tick_id end)
       else c.tick_id end tick_id
     from (select distinct on (shard) shard, tick_id from ${1}_cursor order by shard, seq desc) c
-    left join (select * from (select tick_id, busy, busy_tick_id from ${1}_checkpoint order by seq desc limit 1) n
-      where tick_id <= (select max(id) from ${1}_tick)) k on true)"
+    left join (select n.* from (select tick_id, busy, busy_tick_id, created_at from ${1}_checkpoint
+      order by seq desc limit 1) n join ${1}_tick v on v.id = n.tick_id and v.created_at <= n.created_at) k on true)"
 }
 
 # drop_outbox BASE: the outbox tables of one run (partitions go with the parent).

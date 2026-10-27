@@ -22,8 +22,10 @@ import java.util.List;
  * effective tick of the busy shards (L when none). A shard's <em>effective tick</em> is
  * {@code greatest(cursor.tick_id, ckpt.tick_id)} when the newest checkpoint has {@code outbox.shards} bits and the
  * shard's bit is 0, {@code greatest(cursor.tick_id, ckpt.busy_tick_id)} when it is 1, else {@code cursor.tick_id}; a
- * checkpoint on a tick above the newest belongs to another history (tick ids went backwards under it, as in a partial
- * restore) and counts for nothing, and the next maintenance run replaces it.
+ * checkpoint counts only while the tick at its {@code tick_id} exists and was made no later than the checkpoint (both
+ * {@code created_at} on the database clock): one whose tick is gone, or newer than itself, belongs to another history
+ * (tick ids went backwards under it, as in a partial restore, and new ticks may since have passed its id) and counts for
+ * nothing, and the next maintenance run replaces it.
  * Every step starts from it, and tick cleanup, the partition drop horizon and {@code outbox.shard.lag} go by it.
  * Writing E for a shard's effective tick, every committed row of the shard visible in E is visible in its cursor's
  * tick, so relayed (a batch in progress: up to {@code lastId}, rows past it lie above E). By induction over the
@@ -152,13 +154,15 @@ public final class Cursors {
     }
 
     /**
-     * A subquery of the newest checkpoint's {@code tick_id, busy, busy_tick_id}, for {@link #effective}; none when its
-     * tick is above the newest tick (an index probe): it then belongs to another history, as tick ids went backwards
-     * under it in a partial restore, and maintenance replaces it.
+     * A subquery of the newest checkpoint's {@code tick_id, busy, busy_tick_id}, for {@link #effective}; none unless
+     * the tick at its {@code tick_id} exists and was made no later than the checkpoint (a primary key probe): otherwise
+     * it belongs to another history, as tick ids went backwards under it in a partial restore, and maintenance replaces
+     * it ({@link #ignoredCheckpointTick}).
      */
     static String newestCheckpoint(TableNames names) {
-        return "(select tick_id, busy, busy_tick_id from (select tick_id, busy, busy_tick_id from " + names.checkpoint()
-                + " order by seq desc limit 1) n where tick_id <= (select max(id) from " + names.tick() + "))";
+        return "(select n.tick_id, n.busy, n.busy_tick_id from (select tick_id, busy, busy_tick_id, created_at from "
+                + names.checkpoint() + " order by seq desc limit 1) n join " + names.tick()
+                + " v on v.id = n.tick_id and v.created_at <= n.created_at)";
     }
 
     /**
@@ -191,11 +195,15 @@ public final class Cursors {
         }
     }
 
-    /** The newest checkpoint's tick, valid or not, null without one. */
+    /**
+     * The newest checkpoint's tick when that checkpoint counts for nothing as from another history (its tick gone or
+     * made after it, see {@link #newestCheckpoint}); null when it counts, or there is none.
+     */
     @Nullable
-    public Long checkpointTick(Connection c) throws SQLException {
-        try (var st = c.createStatement(); var rs = st.executeQuery("select tick_id from " + names.checkpoint()
-                + " order by seq desc limit 1")) {
+    public Long ignoredCheckpointTick(Connection c) throws SQLException {
+        try (var st = c.createStatement(); var rs = st.executeQuery("select n.tick_id from (select tick_id, created_at"
+                + " from " + names.checkpoint() + " order by seq desc limit 1) n where not exists (select 1 from "
+                + names.tick() + " v where v.id = n.tick_id and v.created_at <= n.created_at)")) {
             return rs.next() ? rs.getLong(1) : null;
         }
     }

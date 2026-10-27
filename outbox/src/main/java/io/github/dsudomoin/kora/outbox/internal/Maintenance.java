@@ -36,8 +36,8 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * every shard; a step running longer, as one may, defers the swap to the next run), the checkpoint ({@link Cursors}:
  * the latest tick and the shards busy at it, by which a shard without new rows moves on without a cursor row; the
  * drops and the tick cleanup go by its effective ticks, and a run that fails to write it does neither; a checkpoint
- * above the newest tick, as tick ids going backwards in a partial restore leave it, counts for nothing and is replaced,
- * with an ERROR at most once a minute), drop of
+ * whose tick is gone or was made after it, as tick ids going backwards in a partial restore leave it, counts for
+ * nothing and is replaced, with an ERROR at most once a minute), drop of
  * processed partitions, drop of ranges left detached but not dropped: by a crash of this library's maintenance once
  * relayed (one still holding rows at or above the horizon first has those moved back into the outbox as new messages,
  * {@link OrphanRestore}, unless {@code outbox.partitions.restoreOrphans} is off), by anyone else only when empty
@@ -257,16 +257,10 @@ public final class Maintenance {
     /**
      * One read of every shard's position at the latest tick L. {@code slowest}: the tick of the lowest effective tick
      * of the shards busy at L ({@link Cursors#busyTick}), L when none: the lag gauge's, and the lowest effective tick
-     * of all once the checkpoint of this read is written. {@code checkpointTick}: the newest checkpoint's tick before
-     * this run's, null without one.
+     * of all once the checkpoint of this read is written. {@code ignoredCheckpointTick}: the newest checkpoint's tick
+     * before this run's when that checkpoint counts for nothing ({@link Cursors#ignoredCheckpointTick}), else null.
      */
-    private record Read(Tick latest, List<Position> positions, Tick slowest, @Nullable Long checkpointTick) {
-
-        /** The checkpoint is on a tick above L: from another history, ignored by the read and replaced by the run. */
-        boolean checkpointAhead() {
-            return checkpointTick != null && checkpointTick > latest.id();
-        }
-
+    private record Read(Tick latest, List<Position> positions, Tick slowest, @Nullable Long ignoredCheckpointTick) {
 
         /** {@code outbox.shard.lag}: from the slowest busy shard's effective tick to L, 0 when no shard is busy. */
         double lagSeconds() {
@@ -279,7 +273,7 @@ public final class Maintenance {
         var positions = cursors.positions(c, latest.id());
         long slowest = Cursors.busyTick(positions, latest.id());
         return new Read(latest, positions, slowest == latest.id() ? latest : ticks.get(c, slowest),
-                cursors.checkpointTick(c));
+                cursors.ignoredCheckpointTick(c));
     }
 
     private boolean sessionStable(Connection c) throws SQLException {
@@ -353,12 +347,13 @@ public final class Maintenance {
             return null;
         });
         var read = step("cursor read", () -> read(c));
-        if (read != null && read.checkpointAhead() && due(checkpointLogged)) {
+        if (read != null && read.ignoredCheckpointTick() != null && due(checkpointLogged)) {
             // the read went by the cursors alone (Cursors ignores such a checkpoint); the checkpoint below replaces it
-            log.error("outbox checkpoint of {} was on tick {}, above the newest tick {}: it belongs to another"
-                    + " history, as tick ids went backwards under it (restoring {} without {}?). It counted for"
-                    + " nothing and is replaced by this run's; this ERROR repeats at most once a minute", names.base(),
-                    read.checkpointTick(), read.latest().id(), names.tick(), names.checkpoint());
+            log.error("outbox checkpoint of {} was on tick {}, which is gone or was made after the checkpoint (the"
+                    + " newest tick is {}): it belongs to another history, as tick ids went backwards under it"
+                    + " (restoring {} without {}?). It counted for nothing and is replaced by this run's; this ERROR"
+                    + " repeats at most once a minute", names.base(), read.ignoredCheckpointTick(), read.latest().id(),
+                    names.tick(), names.checkpoint());
         }
         // the drops and tick cleanup go by the effective ticks of this run's checkpoint: without it, none this run
         var slowest = read == null ? null : step("checkpoint", () -> {

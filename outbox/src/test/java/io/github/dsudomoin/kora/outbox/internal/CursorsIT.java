@@ -228,7 +228,8 @@ class CursorsIT {
             assertThat(cursors.positions(c, latest)).extracting(Cursors.Position::effectiveTickId).containsOnly(b);
             assertThat(behind(cursors.positions(c, latest))).containsExactly(false, false, true, false);
             assertThat(cursors.latest(c, 2).effectiveTickId()).isEqualTo(b);
-            assertThat(cursors.checkpointTick(c)).as("still there for maintenance to see").isEqualTo(latest + 1);
+            assertThat(cursors.ignoredCheckpointTick(c)).as("still there for maintenance to see")
+                    .isEqualTo(latest + 1);
         }
     }
 
@@ -258,13 +259,13 @@ class CursorsIT {
     }
 
     /**
-     * A tick with {@code dirty} (SQL), made {@code millis} after the bootstrap tick by the database clock; returns its
-     * id.
+     * A tick with {@code dirty} (SQL), made {@code millis} after the bootstrap tick by the database clock, but never
+     * after now (a checkpoint counts only on a tick made before it); returns its id.
      */
     private static long tick(Connection c, TableNames names, String dirty, long millis) throws Exception {
         return queryLong(c, "insert into " + names.tick() + " (snapshot, max_id, dirty, created_at)"
-                + " select pg_current_snapshot(), 0, " + dirty + "::varbit, min(created_at) + interval '"
-                + millis + " milliseconds' from " + names.tick() + " returning id");
+                + " select pg_current_snapshot(), 0, " + dirty + "::varbit, least(min(created_at) + interval '"
+                + millis + " milliseconds', clock_timestamp()) from " + names.tick() + " returning id");
     }
 
     /** Every shard's latest cursor, from {@link Cursors#positions}. */

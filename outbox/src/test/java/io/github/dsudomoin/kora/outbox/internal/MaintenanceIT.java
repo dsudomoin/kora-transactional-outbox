@@ -498,7 +498,8 @@ class MaintenanceIT {
         try (var err = new CapturedStderr()) {
             assertThat(maintenance.runOnce()).isTrue();
 
-            assertThat(err.text()).contains("ERROR").contains("above the newest tick").contains("another history");
+            assertThat(err.text()).contains("ERROR").contains("gone or was made after the checkpoint")
+                    .contains("another history");
         }
         try (var c = TestDb.connect()) {
             assertThat(queryString(c, "select string_agg(tick_id::text, ',') from " + names.checkpoint()))
