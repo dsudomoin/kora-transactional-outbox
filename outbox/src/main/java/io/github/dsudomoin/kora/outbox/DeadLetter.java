@@ -35,7 +35,7 @@ public record DeadLetter(
     public enum Status {
         /** Waiting for the dead-letter hook's decision. */
         PENDING,
-        /** Kept for humans: decided {@code keep}, or dead while no hook was set. */
+        /** Kept for humans: decided {@code keep}, or dead while no active hook was set. */
         KEPT,
         /** Decided {@code redrive} or {@code redriveAt}: redriven automatically at {@code dueAt}. */
         SCHEDULED

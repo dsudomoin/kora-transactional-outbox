@@ -599,6 +599,35 @@ class DeadLetterPassIT {
     }
 
     @Test
+    void anInactiveHookIsNeverCalledAndReadOnce() throws Exception {
+        long pending = letter("t", "a", "p", List.of());
+        var calls = new AtomicInteger();
+        var reads = new AtomicInteger();
+        var inactive = new OutboxDeadLetterHandler() {
+            @Override
+            public List<DeadLetterDecision> handle(List<DeadLetter> letters) {
+                calls.incrementAndGet();
+                return all(letters, keep());
+            }
+
+            @Override
+            public boolean active() {
+                reads.incrementAndGet();
+                return false;
+            }
+        };
+
+        var pass = pass(inactive);
+        assertThat(pass.active()).isFalse();
+        assertThat(pass.runOnce()).isZero();
+        assertThat(pass.active()).isFalse();
+
+        assertThat(status(pending)).isEqualTo("kept");
+        assertThat(calls).hasValue(0);
+        assertThat(reads).as("read once, when the pass is built").hasValue(1);
+    }
+
+    @Test
     void twoPassesNeverHandTheSameLetterAtOnce() throws Exception {
         config.deadLettersBatchSize(10);
         for (int i = 0; i < 200; i++) {

@@ -396,6 +396,33 @@ class OutboxRelayIT {
     }
 
     @Test
+    void anInactiveHookIsNeverCalledAndTheRelayWritesKept() throws Exception {
+        bootstrap();
+        var handed = new CopyOnWriteArrayList<DeadLetter>();
+        var keeping = keeping(handed);
+        var relay = relay(poisonous(), new OutboxDeadLetterHandler() {
+            @Override
+            public List<DeadLetterDecision> handle(List<DeadLetter> letters) throws Exception {
+                return keeping.handle(letters);
+            }
+
+            @Override
+            public boolean active() {
+                return false;
+            }
+        });
+        relay.init();
+        awaitParked();
+
+        var ids = send(outbox(relay::wake), msg("t", "poison", "p"));
+
+        await(Duration.ofSeconds(2), () -> deadStatus(ids.get(0)) != null);
+        assertThat(deadStatus(ids.get(0))).as("written kept by the step").isEqualTo("kept");
+        relay.drain(); // runs the dead-letter pass once more
+        assertThat(handed).isEmpty();
+    }
+
+    @Test
     void aHangingHookDoesNotDelayDelivery() throws Exception {
         config.deadLettersTimeout(Duration.ofMinutes(1)); // the call is never cut while the test runs
         bootstrap();

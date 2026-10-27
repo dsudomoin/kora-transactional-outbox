@@ -60,6 +60,7 @@ public final class DeadLetterPass {
     private final JdbcConnectionFactory db;
     @Nullable
     private final OutboxDeadLetterHandler hook;
+    private final boolean active;
     private final OutboxMetrics metrics;
     private final DeadLetters rows;
     private final String dead;
@@ -89,6 +90,7 @@ public final class DeadLetterPass {
         OutboxSchema.validate(config);
         this.db = db;
         this.hook = hook;
+        this.active = hook != null && hook.active(); // read once: the relay's steps write by it
         this.metrics = metrics;
         this.rows = new DeadLetters(names, config);
         this.dead = names.dead();
@@ -118,14 +120,17 @@ public final class DeadLetterPass {
         });
     }
 
-    /** A hook is set: not null and not {@link OutboxDeadLetterHandler#NONE}. */
+    /**
+     * A hook is set and {@link OutboxDeadLetterHandler#active()}, as read once when this pass was built; otherwise
+     * dead letters are written kept, with no call.
+     */
     public boolean active() {
-        return hook != null && hook != OutboxDeadLetterHandler.NONE;
+        return active;
     }
 
     /**
-     * With a hook, hands due pending letters to it batch after batch, until a batch is not full or a call fails (its
-     * backoff then holds the hook back, not just its letters); without one, makes every pending letter kept. Then
+     * With an active hook, hands due pending letters to it batch after batch, until a batch is not full or a call fails
+     * (its backoff then holds the hook back, not just its letters); without one, makes every pending letter kept. Then
      * redrives the due scheduled letters, those just decided {@code redrive} included. Returns the letters this run
      * redrove: the caller wakes the relay when there are any. One run at a time per pass, so a second caller's hook
      * call never waits for the first one's inside its own timeout; the wait for it is interruptible. A run that starts

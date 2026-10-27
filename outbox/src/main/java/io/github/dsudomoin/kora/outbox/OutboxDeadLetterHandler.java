@@ -4,7 +4,7 @@ import java.util.List;
 
 /**
  * Decides the fate of dead letters (records that failed permanently or ran out of retry attempts). Optional: without
- * one, or with {@link #NONE}, every dead letter is kept for humans.
+ * one, with {@link #NONE} or with one that is not {@link #active()}, every dead letter is kept for humans.
  */
 public interface OutboxDeadLetterHandler {
 
@@ -26,8 +26,24 @@ public interface OutboxDeadLetterHandler {
      */
     List<DeadLetterDecision> handle(List<DeadLetter> letters) throws Exception;
 
-    /** No hook: every dead letter is kept for humans, without a call (the Kafka module's default, its DLQ off). */
-    OutboxDeadLetterHandler NONE = letters -> {
-        throw new UnsupportedOperationException("NONE is never called");
+    /**
+     * False when this hook would keep every letter: they are then written {@link DeadLetter.Status#KEPT} at once and
+     * it is never called. Read once, when the dead-letter pass is built at startup. Default true.
+     */
+    default boolean active() {
+        return true;
+    }
+
+    /** No hook: every dead letter is kept for humans, without a call. */
+    OutboxDeadLetterHandler NONE = new OutboxDeadLetterHandler() {
+        @Override
+        public List<DeadLetterDecision> handle(List<DeadLetter> letters) {
+            throw new UnsupportedOperationException("NONE is never called");
+        }
+
+        @Override
+        public boolean active() {
+            return false;
+        }
     };
 }
