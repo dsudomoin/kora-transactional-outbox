@@ -25,14 +25,20 @@ import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
  * rows in 100 transactions over every shard. Per ended count E and round: E open transactions each take an xid (variant
  * {@code withRows}: and insert one row into a random shard), one later transaction ends (so P.xip lists the E), tick P
  * is made, the E commit, and tick C is timed twice: its probe alone, then the whole {@link Ticks#make}. The probe's
- * second branch scans each cluster of P.xip \ C.xip (here one) in each shard where the first found nothing. The probe
- * alone is the statement the tick runs, bound as it binds it, under the tick lock with the tick's settings, then rolled
- * back: read-only, so its time (one round trip included) does not depend on the WAL flush, unlike the whole make
+ * second branch scans each cluster of P.xip \ C.xip in each shard where the first found nothing. In {@code noRows} and
+ * {@code withRows} the E xids are consecutive, so they make one cluster and no committed row lies in its range: the
+ * clustered probe's best case. Its bad case is variant {@code interleaved}: the E open one after another, and between
+ * consecutive E xids a transaction of K rows (spread over every shard, the next rotated by K) commits before P, so
+ * those rows sit inside the cluster's range; the E write nothing, so every shard scans its whole slice of it unless
+ * the cluster splits (the rows stay, so the lines after it run on a larger table). The probe alone is the statement
+ * the tick runs, bound as it binds it, under the tick lock with the tick's settings, then rolled back: read-only, so
+ * its time (one round trip included) does not depend on the WAL flush, unlike the whole make
  * (about 7 round trips and a commit). Prints p50 and p99 of both per (shards, E, variant), after 10 untimed rounds.
  *
  * <p>Not part of the build: {@code ./gradlew :outbox:test -Pbenchmark --tests '*TickCostBenchmark'}. Properties:
  * {@code bench.jdbcUrl}, {@code bench.user}, {@code bench.password} (default: the test container), {@code bench.shards}
- * (default 32,256,1024), {@code bench.ended} (default 0,100,400), {@code bench.rounds} (default 200). The E
+ * (default 32,256,1024), {@code bench.ended} (default 0,100,400), {@code bench.rounds} (default 200),
+ * {@code bench.interleavedRows} (the K of variant {@code interleaved}, a line per K; default 1,1000). The E
  * transactions hold one connection each, opened once and kept: on a database with fewer free connection slots than the
  * largest E (the bench stand allows 300), every larger E is cut to the free slots less 10, and the line says so.
  */
@@ -42,6 +48,9 @@ class TickCostBenchmark {
     private static final int SEED_TRANSACTIONS = 100;
     private static final int SEED_ROWS_PER_TRANSACTION = 10_000;
     private static final int WARMUP_ROUNDS = 10;
+
+    /** {@code interleaved}: the K rows committed between consecutive E xids, 0 for none. */
+    private record Variant(String name, boolean withRows, int interleaved) {}
 
     @Test
     void tickDuration() throws Exception {
@@ -54,6 +63,10 @@ class TickCostBenchmark {
         int[] shardCounts = ints("bench.shards", "32,256,1024");
         int[] endedCounts = ints("bench.ended", "0,100,400");
         int rounds = Integer.getInteger("bench.rounds", 200);
+        var variants = new ArrayList<>(List.of(new Variant("noRows", false, 0), new Variant("withRows", true, 0)));
+        for (int k : ints("bench.interleavedRows", "1,1000")) {
+            variants.add(new Variant("interleaved K " + k, false, k));
+        }
 
         var db = TestDb.newDatabase(url, user, password, 2);
         var open = new ArrayList<Connection>();
@@ -71,7 +84,7 @@ class TickCostBenchmark {
             System.out.printf("TickCostBenchmark on %s: %d rounds per line, %d connections for the ended"
                     + " transactions (%d free slots)%n", url, rounds, open.size(), free);
             for (int shards : shardCounts) {
-                run(db, tick, open, shards, endedCounts, rounds);
+                run(db, tick, open, shards, endedCounts, variants, rounds);
             }
         } finally {
             for (var c : open) {
@@ -82,7 +95,7 @@ class TickCostBenchmark {
     }
 
     private static void run(JdbcDatabase db, Connection tick, List<Connection> open, int shards, int[] endedCounts,
-            int rounds) throws SQLException {
+            List<Variant> variants, int rounds) throws SQLException {
         var partitions = new OutboxConfig.PartitionsConfig() {};
         var schema = new OutboxSchema(db, new TestOutboxConfig().shards(shards)
                 .xidsPerPartition(partitions.xidsPerPartition()).premake(partitions.premake()));
@@ -98,13 +111,29 @@ class TickCostBenchmark {
             String takeXid = "select pg_current_xact_id()";
             String withRow = takeXid + "; insert into " + names.base() + " (shard, message_id, topic)"
                     + " values (floor(random() * " + shards + ")::int, gen_random_uuid(), 't')";
+            int spread = 0;
             for (int ended : endedCounts) {
                 var held = open.subList(0, Math.min(ended, open.size()));
-                for (boolean withRows : new boolean[] {false, true}) {
+                for (var v : variants) {
+                    if (v.interleaved() > 0 && held.size() < 2) {
+                        continue; // no gap to commit into: noRows
+                    }
                     long[] probe = new long[rounds];
                     long[] make = new long[rounds];
                     for (int r = -WARMUP_ROUNDS; r < rounds; r++) {
-                        each(held, c -> execute(c, withRows ? withRow : takeXid));
+                        if (v.interleaved() > 0) {
+                            for (int i = 0; i < held.size(); i++) { // one by one: the xids must alternate
+                                execute(held.get(i), takeXid);
+                                if (i < held.size() - 1) {
+                                    execute(tick, "insert into " + names.base() + " (shard, message_id, topic)"
+                                            + " select (" + spread + " + g) % " + shards + ", gen_random_uuid(), 't'"
+                                            + " from generate_series(1, " + v.interleaved() + ") g");
+                                    spread = (spread + v.interleaved()) % shards;
+                                }
+                            }
+                        } else {
+                            each(held, c -> execute(c, v.withRows() ? withRow : takeXid));
+                        }
                         // a later xid ends first, so P's xmax passes the E and P.xip lists them, as among concurrent
                         // writers: xids at or above xmax are in no xip, and the first probe alone would cover them
                         execute(tick, takeXid);
@@ -122,11 +151,10 @@ class TickCostBenchmark {
                     }
                     Arrays.sort(probe);
                     Arrays.sort(make);
-                    System.out.printf(Locale.ROOT, "tick C | shards %5d | ended %4d%-22s | %-8s"
+                    System.out.printf(Locale.ROOT, "tick C | shards %5d | ended %4d%-22s | %-18s"
                                     + " | probe p50 %8.3f ms, p99 %8.3f ms | make p50 %8.3f ms, p99 %8.3f ms%n",
                             shards, ended, held.size() < ended ? " (only " + held.size() + " opened)" : "",
-                            withRows ? "withRows" : "noRows", ms(probe, 0.50), ms(probe, 0.99), ms(make, 0.50),
-                            ms(make, 0.99));
+                            v.name(), ms(probe, 0.50), ms(probe, 0.99), ms(make, 0.50), ms(make, 0.99));
                 }
             }
         } finally {

@@ -402,23 +402,32 @@ class TicksIT {
 
             // the plan Ticks.make runs: generic (see Ticks.lock), where an exists per shard may become one hashed pass
             // over all 20 000 rows
-            c.setAutoCommit(false);
-            execute(c, "set local plan_cache_mode = force_generic_plan");
-            execute(c, "prepare tick_probe(int, bigint) as " + ticks.probe(c).replaceFirst("\\?", "\\$1")
-                    .replaceFirst("\\?", "\\$2"));
-            long buffers = 0;
-            try (var st = c.createStatement();
-                    var rs = st.executeQuery("explain (analyze, buffers) execute tick_probe(" + SHARDS + ", 0)")) {
-                while (rs.next() && buffers == 0) { // the first Buffers line: the whole statement's
-                    var m = Pattern.compile("(hit|read)=(\\d+)").matcher(rs.getString(1));
-                    while (m.find()) {
-                        buffers += Long.parseLong(m.group(2));
-                    }
-                }
-            }
-            c.rollback();
+            assertThat(probeBuffers(c)).as("buffers of a tick over 20 000 new rows on %d shards", SHARDS)
+                    .isLessThan(200);
+        }
+    }
 
-            assertThat(buffers).as("buffers of a tick over 20 000 new rows on %d shards", SHARDS).isLessThan(200);
+    @Test
+    void aClusterSplitsWhereManyRowsCommittedBetweenItsXids() throws Exception {
+        try (var first = TestDb.connect(); var last = TestDb.connect(); var c = TestDb.connect()) {
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue(); // the tick before P: the rows per xid up to P
+            first.setAutoCommit(false);
+            xid(first); // ends with no row
+            // committed before P between the two: inside their cluster's range, 2 500 rows per shard
+            execute(c, "insert into " + names.base() + " (shard, message_id, topic) select g % " + SHARDS
+                    + ", gen_random_uuid(), 't' from generate_series(1, 20000) g");
+            last.setAutoCommit(false);
+            insertRow(last, 2);
+            xid(c); // a later xid completes: P's xmax passes the two
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue(); // P
+            assertThat(xid(last) - xid(first)).as("within the cluster gap").isLessThanOrEqualTo(Ticks.CLUSTER_GAP);
+            first.commit();
+            last.commit();
+
+            assertThat(probeBuffers(c)).as("buffers of a tick whose ended xids have 20 000 rows between them")
+                    .isLessThan(200);
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue(); // C
+            assertThat(shards(c)).containsExactly(2);
         }
     }
 
@@ -488,6 +497,31 @@ class TicksIT {
             assertSessionRestored(asRole);
             assertThat(err.text()).contains("42501").containsOnlyOnce("WARN " + Ticks.class.getName());
         }
+    }
+
+    /**
+     * The shared buffers the probe of a tick made now touches, in the plan {@link Ticks#make} runs (generic, see
+     * {@code Ticks.lock}); rolled back, so no tick is made.
+     */
+    private long probeBuffers(Connection c) throws Exception {
+        c.setAutoCommit(false);
+        execute(c, "set local plan_cache_mode = force_generic_plan");
+        execute(c, "prepare tick_probe(int, bigint) as " + ticks.probe(c).replaceFirst("\\?", "\\$1")
+                .replaceFirst("\\?", "\\$2"));
+        long buffers = 0;
+        try (var st = c.createStatement();
+                var rs = st.executeQuery("explain (analyze, buffers) execute tick_probe(" + SHARDS + ", 0)")) {
+            while (rs.next() && buffers == 0) { // the first Buffers line: the whole statement's
+                var m = Pattern.compile("(hit|read)=(\\d+)").matcher(rs.getString(1));
+                while (m.find()) {
+                    buffers += Long.parseLong(m.group(2));
+                }
+            }
+        }
+        c.rollback();
+        execute(c, "deallocate tick_probe");
+        c.setAutoCommit(true);
+        return buffers;
     }
 
     /** One row of {@code shard} in the caller's transaction (its own one in autocommit). */

@@ -35,13 +35,15 @@ import org.slf4j.LoggerFactory;
  *       and not in C.xip (branch 1), or in P.xip and not in C.xip (branch 2): exactly the two candidate sets of the
  *       batch query ({@link BatchReader}).</li>
  *   <li>The probe scans both sets per shard. Branch 1 scans {@code [P.xmax, C.xmax)} less C.xip. Branch 2 scans, per
- *       cluster of E = P.xip \ C.xip (its xids sorted, a new cluster where the gap to the previous xid exceeds
- *       {@link #CLUSTER_GAP}), the range {@code [lo, hi]} from the cluster's first xid to its last, keeping the rows
- *       not visible in P. Every xid of E lies in its cluster's range, so every row of E is scanned. And a row this
- *       branch returns has its xid in {@code [lo, hi]}, within {@code [P.xmin, P.xmax)}, and not visible in P, so in
- *       P.xip; the scan sees it, so it committed before C (next item): its xid is in E. So branch 2 finds the same
- *       shards as a probe per xid of E would; the ranges add only rows of transactions committed before P, of at most
- *       {@code CLUSTER_GAP - 1} xids per gap between consecutive xids of a cluster.</li>
+ *       cluster of E = P.xip \ C.xip (its xids sorted, a new cluster where the gap to the previous xid exceeds a
+ *       bound of at most {@link #CLUSTER_GAP}, smaller when the newest ticks show many outbox rows per xid:
+ *       {@link #SPLIT_ROWS}), the range {@code [lo, hi]} from the cluster's first xid to its last, keeping the rows
+ *       not visible in P. Every xid of E lies in its cluster's range, however E is cut into clusters, so every row of
+ *       E is scanned. And a row this branch returns has its xid in {@code [lo, hi]}, within {@code [P.xmin, P.xmax)},
+ *       and not visible in P, so in P.xip; the scan sees it, so it committed before C (next item): its xid is in E.
+ *       So branch 2 finds the same shards as a probe per xid of E would; the ranges add only rows of transactions
+ *       committed before P, of at most {@code CLUSTER_GAP - 1} xids per gap between consecutive xids of a
+ *       cluster.</li>
  *   <li>The shard set is computed by the very statement that takes C (the probe, whose row the tick is then written
  *       from under the same lock): {@code pg_current_snapshot()} is that statement's snapshot, which is also the one
  *       its scans read with. T committed before C was taken, so the scans see T's rows, and every shard holding one of
@@ -80,6 +82,16 @@ public final class Ticks {
      * makes its own.
      */
     static final int CLUSTER_GAP = 1024;
+    /**
+     * A cluster splits where the rows committed between two of its xids would cost more than probing every shard once
+     * more: consecutive ended xids a &lt; b go to different clusters when the {@code b - a - 1} xids between them are
+     * estimated to hold more than {@code SPLIT_ROWS} rows per shard, at the rows per xid between the two newest ticks
+     * (the outbox ids handed out over the xids drawn; while unknown, no split), so when
+     * {@code b - a > 1 + shards * SPLIT_ROWS / (rows per xid)}, and whenever {@code b - a > CLUSTER_GAP}. Measured
+     * ({@code TickCostBenchmark}, variant {@code interleaved}): a range spends about 0.26 µs on each such row (a heap
+     * fetch, as they are too fresh to be all-visible), one more range probe about 0.8 µs per shard.
+     */
+    static final int SPLIT_ROWS = 3;
 
     private final TableNames names;
     private final int shards;
@@ -146,16 +158,23 @@ public final class Ticks {
                     + " and o.xid < pg_snapshot_xmax(c.snapshot) and not pg_visible_in_snapshot(o.xid, p.snapshot)"
                     + " limit 1) o limit 1) limit 1) d on true) end"
                     + " from (select pg_current_snapshot() snapshot) c"
-                    + " left join lateral (select snapshot from " + names.tick() + " order by id desc limit 1) p"
-                    + " on true"
+                    // through text once: a snapshot of a few hundred xids is stored compressed, and each function
+                    // given the stored value would decompress it again, for every row a range scans
+                    + " left join lateral (select snapshot::text::pg_snapshot snapshot from " + names.tick()
+                    + " order by id desc limit 1) p on true"
                     // the clusters of E = P.xip \ C.xip: lo[k] and hi[k] are the first and the last xid of cluster
                     // k. E is the xids of P.xip visible in C (they are below P.xmax <= C.xmax), and P.xip lists them
                     // ascending (pg_snapshot rejects any other order), so ordinality is xid order and nothing is sorted
                     + " cross join lateral (select array(select pg_snapshot_xip(c.snapshot)) running,"
-                    + " array_agg(xid order by i) filter (where first) lo,"
-                    + " array_agg(xid order by i) filter (where last) hi"
-                    + " from (select xid, i, n - lag(n) over w > " + CLUSTER_GAP + " is not false first,"
-                    + " lead(n) over w - n > " + CLUSTER_GAP + " is not false last"
+                    + " array_agg(xid order by i) filter (where n - b > gap is not false) lo,"
+                    + " array_agg(xid order by i) filter (where a - n > gap is not false) hi"
+                    // b and a: the xids before and after; gap: see SPLIT_ROWS, an uncorrelated subquery, so
+                    // computed once (and only when E is not empty)
+                    + " from (select xid, i, n, lag(n) over w b, lead(n) over w a, (select least(" + CLUSTER_GAP
+                    + ", 1 + " + (long) shards * SPLIT_ROWS + " * (max(t.xmax) - min(t.xmax))"
+                    + " / nullif(max(t.max_id) - min(t.max_id), 0)) from (select"
+                    + " pg_snapshot_xmax(snapshot)::text::float8 xmax, max_id from " + names.tick()
+                    + " order by id desc limit 2) t) gap"
                     + " from (select xid, i, xid::text::bigint n"
                     + " from pg_snapshot_xip(p.snapshot) with ordinality e(xid, i)"
                     + " where pg_visible_in_snapshot(xid, c.snapshot)) e window w as (order by i)) e) x"
