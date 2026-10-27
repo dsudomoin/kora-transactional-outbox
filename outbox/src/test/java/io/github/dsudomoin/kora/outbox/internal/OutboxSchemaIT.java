@@ -222,6 +222,9 @@ class OutboxSchemaIT {
         String letters = "select string_agg(concat_ws(':', id, status, coalesce(due_at::text, 'null'),"
                 + " handler_attempts, coalesce(last_handler_error, 'null'), redrives), ',' order by id)"
                 + " from " + n.dead();
+        String check = "select string_agg(convalidated::text, ',') from pg_constraint where conrelid = to_regclass(?)"
+                + " and conname = ?";
+        String checkName = n.unqualified(n.dead()) + "_status";
         try (var c = TestDb.connect()) {
             execute(c, "create table " + n.dead() + """
                      (
@@ -244,6 +247,8 @@ class OutboxSchemaIT {
             new OutboxSchema(db, config).init();
 
             assertThat(queryString(c, letters)).isEqualTo("1:kept:null:0:null:0,2:kept:null:0:null:0");
+            assertThat(queryString(c, check, n.dead(), checkName)).as("not valid: the old letters are not scanned")
+                    .isEqualTo("false");
             assertThat(queryString(c, "select (to_regclass(?) is not null)::text", n.dead() + "_due"))
                     .isEqualTo("true");
             assertThatThrownBy(() -> execute(c, "update " + n.dead() + " set status = 'gone' where id = 1"))
@@ -258,6 +263,7 @@ class OutboxSchemaIT {
                 writer.rollback();
             }
             assertThat(queryString(c, letters)).isEqualTo("1:kept:null:0:null:0,2:kept:null:0:null:0");
+            assertThat(queryString(c, check, n.dead(), checkName)).isEqualTo("false");
         }
     }
 

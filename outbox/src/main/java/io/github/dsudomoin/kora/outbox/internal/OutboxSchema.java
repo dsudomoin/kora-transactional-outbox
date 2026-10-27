@@ -6,6 +6,7 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
+import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.tinkoff.kora.application.graph.Lifecycle;
@@ -35,8 +36,8 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * made before {@code requeues} and a dead table made before the dead-letter hook's columns get each column once, and a
  * tick table's {@code shards} (the shard sets {@code dirty} replaces) is dropped once; that ALTER waits for running
  * relay transactions and fails startup on timeout. Ticks without {@code dirty} (null) count as holding rows of every
- * shard; dead letters older than {@code status} are kept, the hook sees new ones only, and adding its check scans the
- * dead table once under the ALTER's lock.
+ * shard; dead letters older than {@code status} are kept and the hook sees new ones only: one ALTER adds the hook's
+ * columns, and their check is not validated, so it scans no row of the dead table under that ALTER's lock.
  */
 public final class OutboxSchema implements Lifecycle {
 
@@ -288,13 +289,23 @@ public final class OutboxSchema implements Lifecycle {
                       failed_at  timestamptz not null default now(),
                       error      text
                     )""");
-            // the dead-letter hook's columns, on a fresh table too; letters of a table made before them become kept
-            addColumn(c, n.dead(), "status", "text not null default 'kept' constraint " + n.unqualified(n.dead())
-                    + "_status check (status in ('pending', 'kept', 'scheduled'))");
-            addColumn(c, n.dead(), "due_at", "timestamptz"); // pending: next hook call; scheduled: redrive time
-            addColumn(c, n.dead(), "handler_attempts", "int not null default 0");
-            addColumn(c, n.dead(), "last_handler_error", "text");
-            addColumn(c, n.dead(), "redrives", "int not null default 0");
+            // the dead-letter hook's columns, on a fresh table too, in one ALTER while any is missing (due_at: the next
+            // hook call of a pending letter, the redrive of a scheduled one); letters of a table made before them
+            // become kept, so the status check, added with its column, skips them (not valid)
+            boolean noStatus = !columnExists(c, n.dead(), "status");
+            boolean missing = noStatus;
+            for (var column : List.of("due_at", "handler_attempts", "last_handler_error", "redrives")) {
+                missing |= !columnExists(c, n.dead(), column);
+            }
+            if (missing) {
+                st.execute("alter table " + n.dead() + " add column if not exists status text not null default 'kept',"
+                        + " add column if not exists due_at timestamptz,"
+                        + " add column if not exists handler_attempts int not null default 0,"
+                        + " add column if not exists last_handler_error text,"
+                        + " add column if not exists redrives int not null default 0"
+                        + (noStatus ? ", add constraint " + n.unqualified(n.dead()) + "_status"
+                                + " check (status in ('pending', 'kept', 'scheduled')) not valid" : ""));
+            }
             createIndex(c, n.dead() + "_due", n.dead() + " (due_at) where due_at is not null");
             // how many times a message was redriven, read by its next dead row
             st.execute("create table if not exists " + n.redriven() + """
@@ -394,10 +405,7 @@ public final class OutboxSchema implements Lifecycle {
         }
     }
 
-    /**
-     * Once per table: ACCESS EXCLUSIVE for a metadata-only change (a constant default), plus one scan of the table for
-     * a CHECK constraint on the new column.
-     */
+    /** Once per table: ACCESS EXCLUSIVE for a metadata-only change (a constant default or none). */
     private static void addColumn(Connection c, String table, String column, String definition) throws SQLException {
         if (!columnExists(c, table, column)) {
             try (var st = c.createStatement()) {

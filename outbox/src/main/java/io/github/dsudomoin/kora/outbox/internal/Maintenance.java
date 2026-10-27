@@ -101,8 +101,8 @@ public final class Maintenance {
         this.partitions = new XidPartitions(names, config.partitions());
         this.ticks = new Ticks(names, config.shards());
         this.cursors = new Cursors(names);
-        this.retries = new RetryStore(names);
-        this.parked = new ParkedStore(names);
+        this.retries = new RetryStore(names, false); // counts rows only, writes no dead row
+        this.parked = new ParkedStore(names, retries);
         this.orphanRestore = new OrphanRestore(
                 names, new Resender(names, config.shards()), config.partitions().swapLockTimeout());
         this.restoreOrphans = config.partitions().restoreOrphans();

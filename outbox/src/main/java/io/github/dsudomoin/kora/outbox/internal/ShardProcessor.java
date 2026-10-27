@@ -164,8 +164,8 @@ public final class ShardProcessor implements AutoCloseable {
         this.ticks = new Ticks(names, config.shards());
         this.cursors = new Cursors(names);
         this.reader = new BatchReader(names);
-        this.retries = new RetryStore(names);
-        this.parked = new ParkedStore(names);
+        this.retries = new RetryStore(names, false); // no dead-letter hook wired in yet: every dead row is kept
+        this.parked = new ParkedStore(names, retries);
         this.hasRetryRows = "select exists (select 1 from " + names.retry() + " where shard = ?)";
         this.divertAt = retry.maxAttempts() > 0
                 ? Math.min(relay.headFailuresBeforeDivert(), retry.maxAttempts())

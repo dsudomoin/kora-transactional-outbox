@@ -1068,7 +1068,8 @@ class MaintenanceIT {
                     + " where id = " + minCursorTickId());
             var parked =
                     new OutboxRecord(1_000_000, UUID.randomUUID(), "t", null, null, List.of(), Instant.now(), 0, 0);
-            new ParkedStore(names).apply(c, 0, List.of(new Park(parked, 1, Instant.now())), Set.of());
+            new ParkedStore(names, new RetryStore(names, false))
+                    .apply(c, 0, List.of(new Park(parked, 1, Instant.now())), Set.of());
         }
 
         assertThat(maintenance.runOnce()).isTrue();

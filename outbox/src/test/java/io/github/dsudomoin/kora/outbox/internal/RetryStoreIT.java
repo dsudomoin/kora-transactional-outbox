@@ -20,7 +20,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -45,7 +47,7 @@ class RetryStoreIT {
         var schema = new OutboxSchema(db, new TestOutboxConfig().shards(2));
         schema.init();
         names = schema.names();
-        store = new RetryStore(names);
+        store = new RetryStore(names, false);
         c = TestDb.connect();
     }
 
@@ -268,6 +270,65 @@ class RetryStoreIT {
 
         assertThatThrownBy(() -> store.apply(c, 0, List.of(head, park))).isInstanceOf(IllegalStateException.class);
         assertThat(store.size(c)).as("nothing written").isZero();
+    }
+
+    @Test
+    void deadRowsArePendingWithAHook() throws SQLException {
+        c.setAutoCommit(false); // one transaction, so its now() is the inserts' now()
+
+        deadThroughEveryPath(new RetryStore(names, true), record("t", "a"), record("t", "b"), record("t", "c"));
+
+        assertThat(deadStates()).containsExactly("pending|now|0", "pending|now|0", "pending|now|0");
+    }
+
+    @Test
+    void deadRowsAreKeptWithoutAHook() throws SQLException {
+        deadThroughEveryPath(store, record("t", "a"), record("t", "b"), record("t", "c"));
+
+        assertThat(deadStates()).containsExactly("kept|null|0", "kept|null|0", "kept|null|0");
+    }
+
+    @Test
+    void redrivesComeFromTheRedrivenTable() throws SQLException {
+        var fromApply = record("t", "a");
+        var fromRetry = record("t", "b");
+        var fromParked = record("t", "c");
+        var neverRedriven = record("t", "d");
+        try (var ps = c.prepareStatement("insert into " + names.redriven() + " (message_id, redrives)"
+                + " values (?, 2), (?, 5), (?, 7), (gen_random_uuid(), 9)")) {
+            ps.setObject(1, fromApply.messageId());
+            ps.setObject(2, fromRetry.messageId());
+            ps.setObject(3, fromParked.messageId());
+            ps.executeUpdate();
+        }
+
+        deadThroughEveryPath(store, fromApply, fromRetry, fromParked);
+        store.apply(c, 0, List.of(new Dead(neverRedriven, 1, "boom")));
+
+        assertThat(deadStates()).containsExactly("kept|null|2", "kept|null|5", "kept|null|7", "kept|null|0");
+    }
+
+    /** One dead row through each statement that writes one: apply's batch, deadFromRetry, ParkedStore#toDead. */
+    private void deadThroughEveryPath(RetryStore retries, OutboxRecord fromApply, OutboxRecord fromRetry,
+            OutboxRecord fromParked) throws SQLException {
+        retries.apply(c, 0, List.of(new Dead(fromApply, 1, "boom"), new Head(fromRetry, 1, NOW, "e")));
+        retries.deadFromRetry(c, fromRetry, 2, "gave up");
+        var parked = new ParkedStore(names, retries);
+        parked.apply(c, 0, List.of(new Park(fromParked, 1, NOW)), Set.of());
+        parked.toDead(c, fromParked, 3, "requeue limit reached");
+    }
+
+    /** {@code status|due_at|redrives} of every dead row in id order, due_at {@code now} when it is now(). */
+    private List<String> deadStates() throws SQLException {
+        try (var st = c.createStatement(); var rs = st.executeQuery("select status, case when due_at is null then"
+                + " 'null' when due_at = now() then 'now' else due_at::text end, redrives from " + names.dead()
+                + " order by id")) {
+            var states = new ArrayList<String>();
+            while (rs.next()) {
+                states.add(rs.getString(1) + "|" + rs.getString(2) + "|" + rs.getInt(3));
+            }
+            return states;
+        }
     }
 
     private String lastError(long id) throws SQLException {

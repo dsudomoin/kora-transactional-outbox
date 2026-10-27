@@ -24,7 +24,9 @@ import java.util.UUID;
 /**
  * The rare path: blocked (topic, key) streams in {@code <base>_retry} (a head with
  * {@code next_attempt_at}, followers with null) and permanently failed rows in {@code <base>_dead}. Error texts are
- * cut to 2000 chars, NUL characters (rejected by Postgres text) replaced by {@code ?}.
+ * cut to 2000 chars, NUL characters (rejected by Postgres text) replaced by {@code ?}. Every dead row, here and in
+ * {@link ParkedStore}, is written by {@link #toDead} or {@link #apply}: pending and due at once while a dead-letter
+ * hook is active, kept otherwise, with the redrives {@code <base>_redriven} counts for its message.
  */
 public final class RetryStore {
 
@@ -33,6 +35,9 @@ public final class RetryStore {
     /** What {@link #record} reads. */
     static final String RECORD_COLUMNS = "id, message_id, topic, key, payload, headers, created_at, attempts, requeues";
 
+    private final String deadTable;
+    private final String redriven;
+    private final boolean hookActive;
     private final String insertRetry;
     private final String insertDead;
     private final String selectDue;
@@ -45,13 +50,14 @@ public final class RetryStore {
     private final String size;
     private final String deadSize;
 
-    public RetryStore(TableNames names) {
+    public RetryStore(TableNames names, boolean hookActive) {
         var retry = names.retry();
-        var dead = names.dead();
+        this.deadTable = names.dead();
+        this.redriven = names.redriven();
+        this.hookActive = hookActive;
         insertRetry = "insert into " + retry + " (" + COLUMNS + ", attempts, next_attempt_at, last_error, requeues)"
                 + " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        insertDead = "insert into " + dead + " (" + COLUMNS + ", attempts, error)"
-                + " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        insertDead = "insert into " + deadColumns() + " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, " + deadState("?") + ")";
         selectDue = "select " + RECORD_COLUMNS + " from " + retry
                 + " where shard = ? and next_attempt_at <= ? order by id limit ?";
         selectFollowers = "select h.id, f.id, f.message_id, f.topic, f.key, f.payload, f.headers, f.created_at,"
@@ -63,12 +69,31 @@ public final class RetryStore {
                 + " where shard = ? and topic = ? and key = ? order by id limit 1)";
         reschedule = "update " + retry
                 + " set attempts = ?, next_attempt_at = ?, last_error = coalesce(?, last_error) where id = ?";
-        moveToDead = "with moved as (delete from " + retry + " where id = ? returning " + COLUMNS + ", last_error)"
-                + " insert into " + dead + " (" + COLUMNS + ", attempts, error)"
-                + " select " + COLUMNS + ", ?, coalesce(?, last_error) from moved";
+        moveToDead = toDead("delete from " + retry + " where id = ? returning " + COLUMNS + ", last_error",
+                "coalesce(?, last_error)");
         minDue = "select min(next_attempt_at) from " + retry + " where shard = ? and next_attempt_at is not null";
         size = "select count(*) from " + retry;
-        deadSize = "select count(*) from " + dead;
+        deadSize = "select count(*) from " + deadTable;
+    }
+
+    /**
+     * Moves the row {@code delete} removes ({@code delete ... where id = ? returning} {@link #COLUMNS} and more) to the
+     * dead table: parameter 2 its attempts, {@code error} its error text, an expression over parameter 3 and the
+     * returned columns.
+     */
+    String toDead(String delete, String error) {
+        return "with moved as (" + delete + ") insert into " + deadColumns() + " select " + COLUMNS + ", ?, " + error
+                + ", " + deadState("moved.message_id") + " from moved";
+    }
+
+    private String deadColumns() {
+        return deadTable + " (" + COLUMNS + ", attempts, error, status, due_at, redrives)";
+    }
+
+    /** Status, due_at and redrives of a new dead row whose message id is the SQL expression {@code messageId}. */
+    private String deadState(String messageId) {
+        return (hookActive ? "'pending', now()" : "'kept', null") + ", coalesce((select r.redrives from " + redriven
+                + " r where r.message_id = " + messageId + "), 0)";
     }
 
     /**
@@ -87,6 +112,7 @@ public final class RetryStore {
                     bindRow(dead, shard, d.r());
                     dead.setInt(9, d.attempts());
                     dead.setString(10, errorText(d.error()));
+                    dead.setObject(11, d.r().messageId()); // its redrives
                     dead.addBatch();
                     deads++;
                 } else if (action instanceof Head || action instanceof Follower) {

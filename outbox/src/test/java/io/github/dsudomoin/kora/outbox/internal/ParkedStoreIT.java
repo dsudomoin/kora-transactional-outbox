@@ -50,8 +50,8 @@ class ParkedStoreIT {
         var schema = new OutboxSchema(db, new TestOutboxConfig().shards(2));
         schema.init();
         names = schema.names();
-        store = new ParkedStore(names);
-        retries = new RetryStore(names);
+        retries = new RetryStore(names, false);
+        store = new ParkedStore(names, retries);
         c = TestDb.connect();
     }
 

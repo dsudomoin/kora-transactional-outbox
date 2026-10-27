@@ -43,7 +43,7 @@ public final class ParkedStore {
     private final String minDue;
     private final String size;
 
-    public ParkedStore(TableNames names) {
+    public ParkedStore(TableNames names, RetryStore retries) {
         var parked = names.parked();
         var retry = names.retry();
         insert = "insert into " + parked + " (" + COLUMNS + ", attempts, requeues, due_at)"
@@ -61,9 +61,7 @@ public final class ParkedStore {
                 + " followers as (insert into " + retry + " (" + COLUMNS + ", attempts, requeues)"
                 + " select " + COLUMNS + ", attempts, requeues from moved where id <> ?)"
                 + " select count(*) from head";
-        toDead = "with moved as (delete from " + parked + " where id = ? returning " + COLUMNS + ")"
-                + " insert into " + names.dead() + " (" + COLUMNS + ", attempts, error)"
-                + " select " + COLUMNS + ", ?, ? from moved";
+        toDead = retries.toDead("delete from " + parked + " where id = ? returning " + COLUMNS, "?");
         fromRetry = "with moved as (delete from " + retry + " where id = ? returning " + COLUMNS + ", attempts)"
                 + " insert into " + parked + " (" + COLUMNS + ", attempts, requeues, due_at)"
                 + " select " + COLUMNS + ", attempts, ?, ? from moved";
@@ -189,7 +187,7 @@ public final class ParkedStore {
         }
     }
 
-    /** Moves a parked row to the dead table. */
+    /** Moves a parked row to the dead table, as {@link RetryStore#toDead} writes every dead row. */
     public void toDead(Connection c, OutboxRecord row, int attempts, String error) throws SQLException {
         try (var ps = c.prepareStatement(toDead)) {
             ps.setLong(1, row.id());

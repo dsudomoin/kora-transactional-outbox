@@ -84,8 +84,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         this.wakeRelay = wakeRelay;
         this.rows = new DeadLetters(names, config);
         this.partitions = new XidPartitions(names, config.partitions());
-        this.retries = new RetryStore(names);
-        this.parked = new ParkedStore(names);
+        this.retries = new RetryStore(names, false); // counts rows only, writes no dead row
+        this.parked = new ParkedStore(names, retries);
         this.recovery = new XidRecovery(names, config);
         this.orphanRestore = new OrphanRestore(
                 names, new Resender(names, config.shards()), config.partitions().swapLockTimeout());
