@@ -97,8 +97,9 @@ class TableSpellingIT {
             assertThat(release.await(10, SECONDS)).isTrue();
         };
         OutboxHandler idle = r -> {};
-        try (var a = new ShardProcessor(plain.names(), plainConfig, blocking, new OutboxMetrics(null), null);
-                var b = new ShardProcessor(qualified.names(), qualifiedConfig, idle, new OutboxMetrics(null), null)) {
+        try (var a = new ShardProcessor(plain.names(), plainConfig, blocking, new OutboxMetrics(null), null, false);
+                var b = new ShardProcessor(qualified.names(), qualifiedConfig, idle, new OutboxMetrics(null), null,
+                        false)) {
             var first = pool.submit(() -> step(a, latest));
             assertThat(inHandler.await(10, SECONDS)).as("A holds shard 0").isTrue();
 

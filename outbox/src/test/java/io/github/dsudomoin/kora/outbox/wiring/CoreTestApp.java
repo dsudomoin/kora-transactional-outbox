@@ -1,11 +1,17 @@
 package io.github.dsudomoin.kora.outbox.wiring;
 
+import io.github.dsudomoin.kora.outbox.DeadLetter;
+import io.github.dsudomoin.kora.outbox.DeadLetterDecision;
 import io.github.dsudomoin.kora.outbox.Inbox;
 import io.github.dsudomoin.kora.outbox.InboxModule;
 import io.github.dsudomoin.kora.outbox.Outbox;
 import io.github.dsudomoin.kora.outbox.OutboxAdmin;
+import io.github.dsudomoin.kora.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.kora.outbox.OutboxModule;
 import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import ru.tinkoff.kora.common.Component;
 import ru.tinkoff.kora.common.KoraApp;
 import ru.tinkoff.kora.common.annotation.Root;
 import ru.tinkoff.kora.config.hocon.HoconConfigModule;
@@ -16,6 +22,19 @@ public interface CoreTestApp extends HoconConfigModule, JdbcDatabaseModule, Outb
 
     default RecordingHandler outboxHandler() {
         return new RecordingHandler();
+    }
+
+    /** The app's own dead-letter hook, a component as an app writes one: keeps every letter, recording it. */
+    @Component
+    final class RecordingHook implements OutboxDeadLetterHandler {
+
+        final List<DeadLetter> handed = new CopyOnWriteArrayList<>();
+
+        @Override
+        public List<DeadLetterDecision> handle(List<DeadLetter> letters) {
+            handed.addAll(letters);
+            return letters.stream().map(l -> DeadLetterDecision.keep()).toList();
+        }
     }
 
     /** Application code: Kora leaves components that no root depends on out of the graph. */

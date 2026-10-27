@@ -37,9 +37,13 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * {@link OrphanRestore}, unless {@code outbox.partitions.restoreOrphans} is off), by anyone else only when empty
  * (and ranges the xid-regression recovery set aside, {@code <base>_o<digits>}, likewise:
  * {@code outbox.partitions.orphaned} counts the ones kept, with an ERROR each run, as their rows lie outside the
- * outbox), tick cleanup, cursor cleanup, gauges; when none failed, the run is recorded as the last success. One
- * long-lived instance per outbox table: it registers the gauges {@code outbox.shard.lag},
- * {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.parked.size}, {@code outbox.partitions.premade},
+ * outbox), tick cleanup, cursor cleanup, deletion of kept dead letters older than
+ * {@code outbox.deadLetters.retention} (by {@code failed_at}; none when it is 0, pending or scheduled ones never) and
+ * of redrive counts older than {@code outbox.deadLetters.redriveHistory}, gauges; when none failed, the run is recorded
+ * as the last success. One long-lived instance per outbox table: it registers the gauges {@code outbox.shard.lag},
+ * {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.dead.pending} (letters waiting for the hook),
+ * {@code outbox.dead.pending.oldest} (seconds since the oldest of them failed, 0 when none),
+ * {@code outbox.parked.size}, {@code outbox.partitions.premade},
  * {@code outbox.partitions.overflow}, {@code outbox.partitions.xids_left} (xids before inserts fail while the tail is
  * not attached, with an ERROR each run; NaN while it is), {@code outbox.maintenance.transaction_pooling} and
  * {@code outbox.maintenance.since_success} (NaN until the first run).
@@ -68,6 +72,11 @@ public final class Maintenance {
     private final boolean autoRecovery;
     private final String sinceSuccess;
     private final String succeeded;
+    private final Duration deadRetention;
+    private final Duration redriveHistory;
+    private final String deleteOldKept;
+    private final String deleteOldRedrives;
+    private final String deadPending;
     private final Duration staleAfter;
     private final AtomicLong poolingLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong staleLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
@@ -78,6 +87,8 @@ public final class Maintenance {
     private volatile double lag = Double.NaN;
     private volatile double retrySize = Double.NaN;
     private volatile double deadSize = Double.NaN;
+    private volatile double deadPendingCount = Double.NaN;
+    private volatile double deadPendingOldest = Double.NaN;
     private volatile double parkedSize = Double.NaN;
     private volatile double premade = Double.NaN;
     private volatile double xidsLeft = Double.NaN;
@@ -114,9 +125,20 @@ public final class Maintenance {
         this.succeeded = "insert into " + names.maintenance() + " (succeeded_at) values (clock_timestamp())"
                 + " on conflict (id) do update set succeeded_at = excluded.succeeded_at";
         this.staleAfter = config.partitions().maintenanceInterval().multipliedBy(STALE_INTERVALS);
+        this.deadRetention = config.deadLetters().retention();
+        this.redriveHistory = config.deadLetters().redriveHistory();
+        // ponytail: one statement per run, a scan of the dead table; chunk it if a first retention ever meets millions
+        this.deleteOldKept = "delete from " + names.dead() + " where status = 'kept'"
+                + " and failed_at < now() - make_interval(secs => ?)";
+        this.deleteOldRedrives = "delete from " + names.redriven() + " where at < now() - make_interval(secs => ?)";
+        // due_at is set on every pending letter: the partial index finds them, not a scan of all the kept ones
+        this.deadPending = "select count(*), coalesce(extract(epoch from now() - min(failed_at)), 0)::float8 from "
+                + names.dead() + " where status = 'pending' and due_at is not null";
         metrics.gauge("outbox.shard.lag", () -> lag);
         metrics.gauge("outbox.retry.size", () -> retrySize);
         metrics.gauge("outbox.dead.size", () -> deadSize);
+        metrics.gauge("outbox.dead.pending", () -> deadPendingCount);
+        metrics.gauge("outbox.dead.pending.oldest", () -> deadPendingOldest);
         metrics.gauge("outbox.parked.size", () -> parkedSize);
         metrics.gauge("outbox.partitions.premade", () -> premade);
         metrics.gauge("outbox.partitions.overflow", () -> partitions.overflow() ? 1 : 0);
@@ -340,6 +362,10 @@ public final class Maintenance {
             step("tick cleanup", () -> ticks.deleteBelow(c, slowest.id()));
         }
         step("cursor cleanup", () -> cursors.deleteSuperseded(c));
+        if (!deadRetention.isZero()) {
+            step("dead-letter retention", () -> deleteOlder(c, deleteOldKept, deadRetention));
+        }
+        step("redrive history cleanup", () -> deleteOlder(c, deleteOldRedrives, redriveHistory));
         step("gauges", () -> {
             refreshGauges(c, slowest);
             return null;
@@ -372,6 +398,14 @@ public final class Maintenance {
         return false;
     }
 
+    /** {@code delete} with the one parameter: {@code age} in seconds; returns the rows deleted. */
+    private static int deleteOlder(Connection c, String delete, Duration age) throws SQLException {
+        try (var ps = c.prepareStatement(delete)) {
+            ps.setDouble(1, age.getSeconds() + age.getNano() / 1e9); // no overflow, whatever the config says
+            return ps.executeUpdate();
+        }
+    }
+
     /** The tick of the slowest shard; shards mid-batch count by tick id, as their target is not processed yet. */
     private Tick slowestTick(Connection c) throws SQLException {
         long minTickId = cursors.latestAll(c, shards).stream().mapToLong(Cursor::tickId).min()
@@ -383,6 +417,11 @@ public final class Maintenance {
         lag = slowest == null ? Double.NaN : lagSeconds(slowest, ticks.latest(c));
         retrySize = retries.size(c);
         deadSize = retries.deadSize(c);
+        try (var st = c.createStatement(); var rs = st.executeQuery(deadPending)) {
+            rs.next();
+            deadPendingCount = rs.getLong(1);
+            deadPendingOldest = rs.getDouble(2);
+        }
         parkedSize = parked.size(c);
         int ahead = partitions.premadeAhead(c);
         premade = ahead;

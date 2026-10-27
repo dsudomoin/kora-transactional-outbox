@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.kora.outbox.internal.Cursors;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
+import io.github.dsudomoin.kora.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.kora.outbox.internal.Hashing;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
 import io.github.dsudomoin.kora.outbox.internal.OutboxMetrics;
@@ -375,6 +376,139 @@ class OutboxRelayIT {
                 .cause()
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("no progress");
+    }
+
+    @Test
+    void hookReceivesTheRelaysDeadLetters() throws Exception {
+        bootstrap(); // maintenanceInterval is 1 h: only the wake-up of the step that wrote the letter is in time
+        var handed = new CopyOnWriteArrayList<DeadLetter>();
+        var relay = relay(poisonous(), keeping(handed));
+        relay.init();
+        awaitParked();
+
+        var ids = send(outbox(relay::wake), msg("t", "poison", "p"));
+
+        await(Duration.ofSeconds(2), () -> handed.size() == 1);
+        assertThat(handed.get(0).messageId()).isEqualTo(ids.get(0));
+        assertThat(handed.get(0).error()).contains("bad payload");
+        await(Duration.ofSeconds(2), () -> "kept".equals(deadStatus(ids.get(0))));
+    }
+
+    @Test
+    void aHangingHookDoesNotDelayDelivery() throws Exception {
+        config.deadLettersTimeout(Duration.ofMinutes(1)); // the call is never cut while the test runs
+        bootstrap();
+        var withoutHook = new ConcurrentHashMap<String, Long>();
+        var plain = relay(record -> withoutHook.put(payload(record), System.nanoTime()));
+        plain.init();
+        awaitParked();
+        var baseline = p99(deliveryDelays(outbox(plain::wake), withoutHook));
+        plain.release();
+
+        var entered = new CountDownLatch(1);
+        var never = new CountDownLatch(1);
+        var withHook = new ConcurrentHashMap<String, Long>();
+        pendingLetter("dead");
+        var relay = relay(record -> withHook.put(payload(record), System.nanoTime()), letters -> {
+            entered.countDown();
+            never.await(); // until release() interrupts it
+            return List.of();
+        });
+        relay.init();
+        assertThat(entered.await(5, TimeUnit.SECONDS)).as("the hook hangs").isTrue();
+        awaitParked();
+        var hanging = p99(deliveryDelays(outbox(relay::wake), withHook));
+
+        // 20 ms on top of 2×: scheduler noise of a run of a few seconds on a shared machine
+        assertThat(hanging).as("p99 with a hanging hook, %s without", baseline)
+                .isLessThanOrEqualTo(baseline.multipliedBy(2).plusMillis(20));
+    }
+
+    @Test
+    void drainRunsTheHook() throws Exception {
+        config.relayEnabled(false);
+        bootstrap();
+        var handed = new CopyOnWriteArrayList<DeadLetter>();
+        var relay = relay(poisonous(), keeping(handed));
+        relay.init();
+        var ids = send(outbox(relay::wake), msg("t", "poison", "p"), msg("t", "ok", "q"));
+
+        assertThat(relay.drain()).isOne();
+
+        assertThat(handed).extracting(DeadLetter::messageId).containsExactly(ids.get(0));
+        assertThat(deadStatus(ids.get(0))).isEqualTo("kept");
+        assertThat(deadLetterThreads()).as("no thread of its own while the relay is disabled").isEmpty();
+    }
+
+    @Test
+    void theDeadLetterThreadBacksOffWhileAPassFailsAndResetsOnSuccess() throws Exception {
+        config.maintenanceInterval(Duration.ofSeconds(5)); // the backoff's cap
+        bootstrap();
+        var dead = schema.names().dead();
+        try (var c = TestDb.connect()) { // the hook's decisions cannot be written: each pass fails after its call
+            execute(c, "create function " + dead + "_fail() returns trigger language plpgsql as"
+                    + " $$ begin raise exception 'decisions cannot be written (test)'; end $$");
+            execute(c, "create trigger fail before update on " + dead + " for each row when (new.status = 'kept')"
+                    + " execute function " + dead + "_fail()");
+        }
+        pendingLetter("a");
+        var calls = new AtomicInteger();
+        var keeping = keeping(new CopyOnWriteArrayList<>());
+        var relay = relay(poisonous(), letters -> {
+            calls.incrementAndGet();
+            return keeping.handle(letters);
+        });
+        relay.init();
+
+        Thread.sleep(3000);
+        // initialDelay is 50 ms: about 60 calls in 3 s without a growing backoff, 7 with one doubling from it
+        assertThat(calls.get()).isBetween(2, 12);
+
+        try (var c = TestDb.connect()) {
+            execute(c, "alter table " + dead + " disable trigger fail");
+        }
+        await(Duration.ofSeconds(10), () -> rows(dead + " where status = 'kept'") == 1); // the next run, by 5 s
+        try (var c = TestDb.connect()) {
+            execute(c, "alter table " + dead + " enable trigger fail");
+        }
+        int before = calls.get();
+
+        send(outbox(relay::wake), msg("t", "poison", "p")); // its step wakes the thread
+
+        // the success reset the backoff: the failure of that call is retried after initialDelay, not 5 s
+        await(Duration.ofSeconds(2), () -> calls.get() >= before + 2);
+    }
+
+    @Test
+    void releaseStopsTheDeadLetterThreadWhileTheHookIgnoresInterrupts() throws Exception {
+        config.deadLettersTimeout(Duration.ofMinutes(1)).shutdownTimeout(Duration.ofMillis(300));
+        bootstrap();
+        pendingLetter("a");
+        var entered = new CountDownLatch(1);
+        var relay = relay(new RecordingHandler(), letters -> {
+            entered.countDown();
+            long until = System.nanoTime() + TimeUnit.MINUTES.toNanos(1);
+            while (System.nanoTime() < until) {
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException ignored) {
+                    // a hook that will not stop
+                }
+            }
+            return List.of();
+        });
+        relay.init();
+        assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+
+        long releasing = System.nanoTime();
+        relay.release();
+
+        assertThat(Duration.ofNanos(System.nanoTime() - releasing)).isLessThan(Duration.ofSeconds(2));
+        assertThat(deadLetterThreads()).isEmpty();
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select status || '/' || handler_attempts from " + schema.names().dead()))
+                    .as("no attempt spent").isEqualTo("pending/0");
+        }
     }
 
     @Test
@@ -1186,6 +1320,81 @@ class OutboxRelayIT {
         var relay = new OutboxRelay(factory, config, schema, handler, new OutboxMetrics(null), null, maintenance(db));
         relays.add(relay);
         return relay;
+    }
+
+    private OutboxRelay relay(OutboxHandler handler, OutboxDeadLetterHandler hook) {
+        var metrics = new OutboxMetrics(null);
+        var relay = new OutboxRelay(db, config, schema, handler, metrics, null, maintenance(db),
+                new DeadLetterPass(db, schema.names(), config, hook, metrics));
+        relays.add(relay);
+        return relay;
+    }
+
+    /** A handler failing every record of key {@code poison} permanently. */
+    private static RecordingHandler poisonous() {
+        return new RecordingHandler()
+                .failAlways(r -> "poison".equals(key(r)), () -> new OutboxPermanentException("bad payload"));
+    }
+
+    /** A hook keeping every letter, which it records. */
+    private static OutboxDeadLetterHandler keeping(List<DeadLetter> handed) {
+        return letters -> {
+            handed.addAll(letters);
+            return letters.stream().map(l -> DeadLetterDecision.keep()).toList();
+        };
+    }
+
+    /** The status of the dead letter of {@code messageId}, null without one. */
+    private String deadStatus(UUID messageId) throws Exception {
+        try (var c = TestDb.connect()) {
+            return queryString(c, "select status from " + schema.names().dead() + " where message_id = '"
+                    + messageId + "'");
+        }
+    }
+
+    /** A pending dead letter as the relay writes one with a hook, due now; its id is above any outbox row's. */
+    private void pendingLetter(String key) throws Exception {
+        try (var c = TestDb.connect()) {
+            execute(c, "insert into " + schema.names().dead() + " (id, shard, message_id, topic, key, payload,"
+                    + " created_at, attempts, error, status, due_at) values ((select greatest(max(id), 1000000000)"
+                    + " + 1 from " + schema.names().dead() + "), 0, gen_random_uuid(), 't', '" + key + "', 'p', now(),"
+                    + " 1, 'boom', 'pending', now())");
+        }
+    }
+
+    private static List<Thread> deadLetterThreads() {
+        return Thread.getAllStackTraces().keySet().stream()
+                .filter(t -> t.getName().equals("outbox-dead-letters") && t.isAlive())
+                .toList();
+    }
+
+    /** {@code delays} sorted: the 99th percentile. */
+    private static Duration p99(List<Duration> delays) {
+        var sorted = delays.stream().sorted().toList();
+        return sorted.get((int) Math.ceil(sorted.size() * 0.99) - 1);
+    }
+
+    /**
+     * 1000 messages over 50 keys in 100 transactions, 5 ms apart; returns how long after its commit each one reached
+     * {@code delivered}, keyed by payload.
+     */
+    private List<Duration> deliveryDelays(PgOutbox outbox, Map<String, Long> delivered) throws Exception {
+        var committed = new ConcurrentHashMap<String, Long>();
+        for (int tx = 0; tx < 100; tx++) {
+            int t = tx;
+            var messages = IntStream.range(0, 10).mapToObj(i -> msg("t", "k" + (t * 10 + i) % 50, t + "/" + i))
+                    .toArray(OutboxMessage[]::new);
+            send(outbox, messages);
+            long now = System.nanoTime();
+            for (var m : messages) {
+                committed.put(new String(m.payload(), UTF_8), now);
+            }
+            Thread.sleep(5);
+        }
+        await(Duration.ofSeconds(30), () -> delivered.size() == 1000);
+        return committed.entrySet().stream()
+                .map(e -> Duration.ofNanos(Math.max(0, delivered.get(e.getKey()) - e.getValue())))
+                .toList();
     }
 
     /** Real maintenance; with the 1 h {@code maintenanceInterval} it runs once, right after the relay starts. */

@@ -9,6 +9,7 @@ import io.github.dsudomoin.kora.outbox.Inbox;
 import io.github.dsudomoin.kora.outbox.Outbox;
 import io.github.dsudomoin.kora.outbox.OutboxAdmin;
 import io.github.dsudomoin.kora.outbox.OutboxMessage;
+import io.github.dsudomoin.kora.outbox.OutboxPermanentException;
 import io.github.dsudomoin.kora.outbox.OutboxRecord;
 import io.github.dsudomoin.kora.outbox.OutboxRelay;
 import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
@@ -99,6 +100,18 @@ class OutboxModuleIT implements KoraAppTestConfigModifier {
         assertThat(admin.redriveDeadLetters(List.of(1L))).isOne();
 
         await(() -> handler.delivered().size() == 2); // the idle poll is 30 s: the wake-up delivers
+    }
+
+    @Test
+    void hookComponentIsUsed(@TestComponent CoreTestApp.RecordingHook hook) throws Exception {
+        handler.failAlways(r -> "poison".equals(new String(r.key(), UTF_8)),
+                () -> new OutboxPermanentException("bad payload"));
+
+        var id = db.inTx((SqlFunction0<UUID>) () -> outbox.send(
+                OutboxMessage.of("orders", "poison", "p".getBytes(UTF_8))));
+
+        await(() -> hook.handed.size() == 1); // maintenanceInterval is 30 s: the step's wake-up hands it
+        assertThat(hook.handed.get(0).messageId()).isEqualTo(id);
     }
 
     @Nested

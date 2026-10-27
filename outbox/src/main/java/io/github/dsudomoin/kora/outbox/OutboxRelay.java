@@ -1,8 +1,10 @@
 package io.github.dsudomoin.kora.outbox;
 
+import io.github.dsudomoin.kora.outbox.internal.Backoff;
 import io.github.dsudomoin.kora.outbox.internal.Cursors;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Position;
+import io.github.dsudomoin.kora.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
 import io.github.dsudomoin.kora.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.kora.outbox.internal.OutboxSchema;
@@ -27,6 +29,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.BooleanSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.tinkoff.kora.application.graph.Lifecycle;
@@ -47,7 +50,11 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * cleanup and partition drops going. Every tick this relay makes wakes all its workers, which spread the tick's shards
  * with new rows between them. A wake-up that cannot make a tick yet ({@code minTickInterval}) only brings the tick
  * forward, so under a high commit rate the workers read cursors per tick, not per commit. While
- * {@link Maintenance#halted()} the workers take no shards.
+ * {@link Maintenance#halted()} the workers take no shards. Dead letters go to the {@link DeadLetterPass} on the daemon
+ * thread {@code outbox-dead-letters} (also not started when the relay is disabled; {@link #drain()} ends with one run
+ * of it): a run right after start, then after each committed step that moved a row to the dead table, when the
+ * earliest letter is due, and at least every {@code maintenanceInterval}; so a slow or failing hook never holds up a
+ * shard step.
  */
 public final class OutboxRelay implements Lifecycle {
 
@@ -64,6 +71,7 @@ public final class OutboxRelay implements Lifecycle {
     private final Ticks ticks;
     private final Cursors cursors;
     private final ShardProcessor processor;
+    private final DeadLetterPass deadLetters;
     private final long idleNanos;
     private final long minTickNanos;
     /**
@@ -79,6 +87,8 @@ public final class OutboxRelay implements Lifecycle {
     private final AtomicLong wakeups = new AtomicLong();
     /** Incremented by every tick this relay inserts; parked workers wake on it. */
     private final AtomicLong ticksMade = new AtomicLong();
+    /** Incremented by every committed step that dead-lettered a row; the dead-letter thread wakes on it. */
+    private final AtomicLong deadLettered = new AtomicLong();
     /** Per shard, when a worker of this relay last started a step on it ({@code nanoTime}). */
     private final AtomicLongArray stepStarted;
 
@@ -92,12 +102,27 @@ public final class OutboxRelay implements Lifecycle {
 
     private volatile Thread[] workers = new Thread[0];
     @Nullable
+    private volatile Thread deadLetterThread;
+    @Nullable
     private volatile ScheduledExecutorService scheduler;
     private volatile boolean started;
     private volatile boolean stopping;
 
+    /** Without a dead-letter hook: every dead letter is kept. */
     public OutboxRelay(JdbcConnectionFactory db, OutboxConfig config, OutboxSchema schema, OutboxHandler handler,
             OutboxMetrics metrics, @Nullable Tracer tracer, Maintenance maintenance) {
+        this(db, config, schema, handler, metrics, tracer, maintenance, withoutHook(db, config, schema, metrics));
+    }
+
+    private static DeadLetterPass withoutHook(JdbcConnectionFactory db, OutboxConfig config, OutboxSchema schema,
+            OutboxMetrics metrics) {
+        OutboxSchema.validate(config); // a bad config fails as such, before the schema is asked for its names
+        return new DeadLetterPass(db, schema.names(), config, null, metrics);
+    }
+
+    /** {@code deadLetters}: the pass this relay runs, and closes on {@link #release()}. */
+    public OutboxRelay(JdbcConnectionFactory db, OutboxConfig config, OutboxSchema schema, OutboxHandler handler,
+            OutboxMetrics metrics, @Nullable Tracer tracer, Maintenance maintenance, DeadLetterPass deadLetters) {
         OutboxSchema.validate(config);
         this.db = db;
         this.config = config;
@@ -105,7 +130,8 @@ public final class OutboxRelay implements Lifecycle {
         this.maintenance = maintenance;
         this.ticks = new Ticks(schema.names(), config.shards());
         this.cursors = new Cursors(schema.names());
-        this.processor = new ShardProcessor(schema.names(), config, handler, metrics, tracer);
+        this.deadLetters = deadLetters;
+        this.processor = new ShardProcessor(schema.names(), config, handler, metrics, tracer, deadLetters.active());
         this.idleNanos = relay.idlePollInterval().toNanos();
         this.minTickNanos = relay.minTickInterval().toNanos();
         this.idleTickAge = Duration.ofNanos(Math.max(minTickNanos, idleNanos - idleNanos / 4));
@@ -117,7 +143,7 @@ public final class OutboxRelay implements Lifecycle {
         }
     }
 
-    /** Starts the workers and the maintenance schedule, unless {@code relay.enabled} is false. */
+    /** Starts the workers, the dead-letter thread and maintenance, unless {@code relay.enabled} is false. */
     @Override
     public void init() {
         if (!relay.enabled()) {
@@ -135,6 +161,10 @@ public final class OutboxRelay implements Lifecycle {
         for (var t : threads) {
             t.start();
         }
+        var dead = new Thread(this::runDeadLetters, "outbox-dead-letters");
+        dead.setDaemon(true);
+        deadLetterThread = dead;
+        dead.start();
         var maintenanceInterval = config.partitions().maintenanceInterval().toNanos();
         var s = Executors.newSingleThreadScheduledExecutor(r -> {
             var t = new Thread(r, "outbox-maintenance");
@@ -148,12 +178,19 @@ public final class OutboxRelay implements Lifecycle {
 
     /**
      * Graceful shutdown: workers take no further shards, in-flight batches get {@code shutdownTimeout} to
-     * finish, then the workers are interrupted and their uncommitted batches are redelivered later.
+     * finish, then the workers are interrupted and their uncommitted batches are redelivered later. A dead-letter hook
+     * call in flight is interrupted at once ({@link DeadLetterPass#close()}): its letters roll back, costing no
+     * attempt, and are handed again later.
      */
     @Override
     public void release() {
         stopping = true;
         wakeAll();
+        deadLetters.close();
+        var dead = deadLetterThread;
+        if (dead != null) {
+            dead.interrupt(); // also stops it waiting for a hook that ignores the interrupt
+        }
         var s = scheduler;
         if (s != null) {
             s.shutdown();
@@ -168,6 +205,13 @@ public final class OutboxRelay implements Lifecycle {
                     t.interrupt();
                 }
                 awaitWorkers(System.nanoTime() + INTERRUPT_GRACE);
+            }
+            if (dead != null) {
+                TimeUnit.NANOSECONDS.timedJoin(dead, deadline - System.nanoTime());
+                if (dead.isAlive()) {
+                    log.warn("outbox dead-letter thread still busy after shutdownTimeout {}; it ends with its current"
+                            + " statement, its letters are handed again later", relay.shutdownTimeout());
+                }
             }
             if (s != null && !s.awaitTermination(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
                 s.shutdownNow();
@@ -206,7 +250,9 @@ public final class OutboxRelay implements Lifecycle {
      * Makes a tick D, then processes every shard until each cursor has reached D, no batch is in progress
      * and no retry head or parked row is due (one due later does not hold it up); returns the number of messages this
      * call delivered. Works whether or not the relay runs: it contends with the workers for shard locks. Handler
-     * failures are outcomes (see {@link OutboxHandler}); a database failure of a step propagates.
+     * failures are outcomes (see {@link OutboxHandler}); a database failure of a step propagates. Ends with one run of
+     * the dead-letter pass, so the hook has had the letters this call made, whether or not the relay runs; letters it
+     * redrives are new messages, after D.
      *
      * @throws IllegalStateException when no shard advanced for {@code 2 × (batchTimeout + 5 s)}, twice the longest a
      *     tail swap waits for relay steps in flight, while work remains (e.g. a shard paused by a down target), or
@@ -236,6 +282,9 @@ public final class OutboxRelay implements Lifecycle {
                 var all = cursors.latestAll(c, config.shards());
                 var pending = all.stream().filter(cursor -> !drained(cursor, target, now)).toList();
                 if (pending.isEmpty()) {
+                    if (deadLetters.runOnce() > 0) {
+                        wake();
+                    }
                     return delivered;
                 }
                 // a position change of a pending shard, by this call or a worker; a pause or due time alone is no
@@ -287,7 +336,10 @@ public final class OutboxRelay implements Lifecycle {
         return at != null && !at.isAfter(now);
     }
 
-    /** One shard step in its own transaction on {@code c}; leaves {@code c} in autocommit, rolled back on failure. */
+    /**
+     * One shard step in its own transaction on {@code c}; leaves {@code c} in autocommit, rolled back on failure. A
+     * step that moved a row to the dead table wakes the dead-letter thread once committed.
+     */
     private ShardResult processInOwnTransaction(Connection c, int shard, long latest, Instant now, boolean draining)
             throws SQLException, InterruptedException {
         try {
@@ -295,6 +347,13 @@ public final class OutboxRelay implements Lifecycle {
             var result = processor.tryProcess(c, shard, latest, now, draining);
             c.commit();
             c.setAutoCommit(true);
+            if (result.deadLettered()) {
+                deadLettered.incrementAndGet();
+                var dead = deadLetterThread;
+                if (dead != null) {
+                    LockSupport.unpark(dead);
+                }
+            }
             return result;
         } catch (Throwable t) {
             rollback(c, t);
@@ -316,6 +375,42 @@ public final class OutboxRelay implements Lifecycle {
             finished &= !t.isAlive();
         }
         return finished;
+    }
+
+    /**
+     * The dead-letter thread: a {@link DeadLetterPass#runOnce} (a run that redrove letters wakes the workers, so they
+     * are ticked at once), then a park until the earliest letter is due, {@code maintenanceInterval} passes or a step
+     * dead-letters a row. A failed run is retried after {@code relay.retry.initialDelay}, doubled after each failure
+     * in a row up to {@code maintenanceInterval} and reset by a run that succeeds; wake-ups do not cut it short: a run
+     * that fails after its hook call (its decisions could not be written) calls the hook again each time.
+     */
+    private void runDeadLetters() {
+        var interval = config.partitions().maintenanceInterval();
+        int failures = 0;
+        while (!stopping) {
+            long seen = deadLettered.get();
+            try {
+                if (deadLetters.runOnce() > 0) {
+                    wake();
+                }
+                var due = deadLetters.untilNextDue();
+                failures = 0;
+                var wait = due == null || due.compareTo(interval) > 0 ? interval : due;
+                park(System.nanoTime() + wait.toNanos(), () -> deadLettered.get() != seen);
+            } catch (VirtualMachineError e) {
+                log.error("outbox dead-letter thread stopped by a fatal error", e);
+                throw e;
+            } catch (Throwable t) {
+                if (stopping) { // e.g. the pass closed under it
+                    log.debug("outbox dead-letter pass failed while stopping", t);
+                    return;
+                }
+                Thread.interrupted(); // not stopping: a stray interrupt is one more failure
+                var backoff = Backoff.delay(failures++, relay.retry().initialDelay(), interval);
+                log.warn("outbox dead-letter pass failed, retrying in {}", backoff, t);
+                park(System.nanoTime() + backoff.toNanos(), () -> false);
+            }
+        }
     }
 
     private void runMaintenance() {
@@ -342,7 +437,12 @@ public final class OutboxRelay implements Lifecycle {
      * relay after {@code seenTicks}.
      */
     private void park(long deadline, boolean wakeable, long seen, long seenTicks) {
-        while (!stopping && !(wakeable && (wakeups.get() != seen || ticksMade.get() != seenTicks))) {
+        park(deadline, () -> wakeable && (wakeups.get() != seen || ticksMade.get() != seenTicks));
+    }
+
+    /** Parks until {@code deadline}, release, or {@code woken}, which a waker makes true before it unparks. */
+    private void park(long deadline, BooleanSupplier woken) {
+        while (!stopping && !woken.getAsBoolean()) {
             long left = deadline - System.nanoTime();
             if (left <= 0) {
                 return;

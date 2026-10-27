@@ -254,7 +254,7 @@ class ShardProcessorIT {
                 msg("t", "k", "k#3"));
         tick();
 
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true, true));
         assertThat(delivered()).containsExactly("k#2", "k#3");
         assertThat(deadRows()).containsExactly("k#1:1");
         assertThat(retryRows()).containsExactly("j#1:1:" + now.plus(INITIAL), "j#2:0:-");
@@ -262,7 +262,7 @@ class ShardProcessorIT {
         // in the retry pass a permanent failure moves the head to dead and its follower goes on in the same pass
         handler.failNext(payload("j#1"), () -> new OutboxPermanentException("bad j#1"));
         now = now.plus(INITIAL);
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true, true));
 
         assertThat(delivered()).containsExactly("k#2", "k#3", "j#2");
         assertThat(deadRows()).containsExactly("k#1:1", "j#1:2");
@@ -358,7 +358,7 @@ class ShardProcessorIT {
 
         script = null;
         now = notBefore;
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true, true));
         assertThat(attempts).as("maxAttempts = 2: two delivery attempts in all").hasValue(2);
         assertThat(deadRows()).containsExactly("k#1:2");
         // k#2 was handed with k#1 and skipped after its failure: the next head, not attempted, attempts 0
@@ -544,7 +544,7 @@ class ShardProcessorIT {
         int calls = handler.batches().size();
 
         now = now.plus(INITIAL);
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 4, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 4, true, true));
 
         assertThat(handler.batches()).as("the head and its followers in one call").hasSize(calls + 1);
         assertThat(delivered()).containsExactly("a#1", "k#1", "k#2", "k#4", "k#5");
@@ -715,7 +715,7 @@ class ShardProcessorIT {
         };
 
         long started = System.nanoTime();
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true, true));
 
         assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(timeout.multipliedBy(3));
         assertThat(calls).as("[b#1, a#2, c#1], then b#1 alone").hasValue(2);
@@ -1166,7 +1166,7 @@ class ShardProcessorIT {
             throw new OutboxPermanentException("bad k#1");
         };
 
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true, true));
         assertThat(deadRows()).containsExactly("k#1:1");
     }
 
@@ -1276,7 +1276,7 @@ class ShardProcessorIT {
                 .containsExactly("k#1:2:" + now.plus(Backoff.delay(1, INITIAL, config.maxDelay())));
         now = cursor().pausedUntil(); // the head is due by then
 
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true, true));
         assertThat(attempts).as("dead-lettered without a third attempt").hasValue(2);
         assertThat(deadRows()).containsExactly("k#1:2");
         assertThat(rows("select error from " + names.dead(), rs -> rs.getString(1)))
@@ -1736,7 +1736,7 @@ class ShardProcessorIT {
                     // a handler that ignores cancellation keeps its thread
                 }
             }
-        }, new OutboxMetrics(null), null);
+        }, new OutboxMetrics(null), null, false);
         try {
             send(msg("t", "a", "a#1"));
             tick();
@@ -1796,7 +1796,7 @@ class ShardProcessorIT {
                     // a handler that ignores cancellation keeps its thread
                 }
             }
-        }, new OutboxMetrics(null), null);
+        }, new OutboxMetrics(null), null, false);
         try {
             send(msg("t", "a", "a#1"), msg("t", "b", "b#1"));
             tick();
@@ -2022,7 +2022,7 @@ class ShardProcessorIT {
         tick();
         calls.clear();
 
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true, true));
 
         var requeueDue = now.plus(REQUEUE_DELAY);
         var retryDue = now.plus(INITIAL);
@@ -2282,7 +2282,7 @@ class ShardProcessorIT {
         try (var err = new CapturedStderr()) {
             send(msg("t", "k", "k#3"));
             tick();
-            assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+            assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true, true));
             assertThat(err.text()).contains("ERROR " + ShardProcessor.class.getName())
                     .contains("moved to the dead table").contains("requeue limit reached");
         }
@@ -2514,7 +2514,7 @@ class ShardProcessorIT {
             return records.stream().map(r -> Outcome.retry(new RuntimeException("k#1 down"))).toList();
         };
 
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true, true));
 
         assertThat(calls).extracting(call -> payloads(call))
                 .containsExactly(List.of("k#1", "x#1"), List.of("k#1"), List.of("x#1"));
@@ -2560,7 +2560,7 @@ class ShardProcessorIT {
         now = now.plus(REQUEUE_DELAY); // j#1 is requeued past the limit, k#1 fails and becomes a retry head
         script = answering(Map.of("k#1", Outcome.retry(new RuntimeException("k#1 down")), "j#1", Outcome.requeue()));
         try (var err = new CapturedStderr()) {
-            assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+            assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true, true));
             assertThat(err.text()).contains("moved to the dead table").contains("requeue limit reached");
         }
         assertThat(deadRows()).containsExactly("j#1:0");
@@ -2569,7 +2569,7 @@ class ShardProcessorIT {
 
         now = now.plus(INITIAL); // k#1 is requeued as a retry head, past the limit too
         script = answering(Map.of("k#1", Outcome.requeue()));
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true, true));
 
         assertThat(deadRows()).containsExactly("k#1:1", "j#1:0");
         assertThat(rows("select error from " + names.dead() + " order by id", rs -> rs.getString(1)))
@@ -2682,7 +2682,7 @@ class ShardProcessorIT {
             var invalid = new TestOutboxConfig();
             cases.get(i).accept(invalid);
             assertThatThrownBy(() -> new ShardProcessor(TableNames.of("outbox"), invalid, handler,
-                    new OutboxMetrics(null), null))
+                    new OutboxMetrics(null), null, false))
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageStartingWith(keys.get(i) + " ");
         }
@@ -2708,7 +2708,7 @@ class ShardProcessorIT {
                 return s == null ? handler.handleBatch(records) : s.apply(records);
             }
         };
-        processor = new ShardProcessor(names, config, scripted, new OutboxMetrics(meters), tracer);
+        processor = new ShardProcessor(names, config, scripted, new OutboxMetrics(meters), tracer, false);
     }
 
     /** One worker {@code tryProcess} of shard 0 at the test clock in its own transaction, rolled back on failure. */

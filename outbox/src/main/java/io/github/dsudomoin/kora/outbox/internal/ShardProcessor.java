@@ -80,9 +80,15 @@ public final class ShardProcessor implements AutoCloseable {
     /**
      * {@code batchFinished}: no batch is in progress on the shard after the call (false when not locked or paused), as
      * the cursor stands: a step that handed only parked rows and left the chunk of a fresh batch unread stores no
-     * target, so it reports true.
+     * target, so it reports true. {@code deadLettered}: the step moved a row to the dead table, from any of its passes;
+     * once it commits, the dead-letter pass has a new letter.
      */
-    public record ShardResult(ShardStatus status, int delivered, boolean batchFinished) {}
+    public record ShardResult(ShardStatus status, int delivered, boolean batchFinished, boolean deadLettered) {
+
+        public ShardResult(ShardStatus status, int delivered, boolean batchFinished) {
+            this(status, delivered, batchFinished, false);
+        }
+    }
 
     private static final Logger log = LoggerFactory.getLogger(ShardProcessor.class);
     private static final AtomicInteger THREADS = new AtomicInteger();
@@ -151,8 +157,9 @@ public final class ShardProcessor implements AutoCloseable {
     private final AtomicLong bugReported = new AtomicLong(System.nanoTime() - BUG_REPORT_INTERVAL);
     private final AtomicInteger bugsSuppressed = new AtomicInteger();
 
+    /** {@code deadLetterHook}: a dead-letter hook is active, so every dead row is written pending for it. */
     public ShardProcessor(TableNames names, OutboxConfig config, OutboxHandler handler, OutboxMetrics metrics,
-            @Nullable Tracer tracer) {
+            @Nullable Tracer tracer, boolean deadLetterHook) {
         OutboxSchema.validate(config);
         this.relay = config.relay();
         this.retry = relay.retry();
@@ -164,7 +171,7 @@ public final class ShardProcessor implements AutoCloseable {
         this.ticks = new Ticks(names, config.shards());
         this.cursors = new Cursors(names);
         this.reader = new BatchReader(names);
-        this.retries = new RetryStore(names, false); // no dead-letter hook wired in yet: every dead row is kept
+        this.retries = new RetryStore(names, deadLetterHook);
         this.parked = new ParkedStore(names, retries);
         this.hasRetryRows = "select exists (select 1 from " + names.retry() + " where shard = ?)";
         this.divertAt = retry.maxAttempts() > 0
@@ -274,6 +281,7 @@ public final class ShardProcessor implements AutoCloseable {
 
         var pass = retryPass(inTx, shard, heads, dueParked, now);
         int delivered = pass.delivered;
+        boolean deadLettered = pass.deadLettered;
         // the retry pass writes to the table of the rows it hands, and moves rows between the two
         boolean wroteRetry = !heads.isEmpty() || pass.toRetry;
         boolean wroteParked = !dueParked.isEmpty() || pass.fromRetry;
@@ -318,6 +326,7 @@ public final class ShardProcessor implements AutoCloseable {
                 wroteParked |= apply(inTx, shard, decision.actions(), parkedIds);
                 wroteRetry |= decision.actions().stream()
                         .anyMatch(action -> action instanceof Head || action instanceof Follower);
+                deadLettered |= decision.actions().stream().anyMatch(action -> action instanceof Dead);
                 delivered += recordOutcomes(items, decision.actions(), shard, now);
                 if (read == rows.size() && rows.size() < limit) {
                     next = cursor.withProgress(target.id(), null, 0);
@@ -371,7 +380,8 @@ public final class ShardProcessor implements AutoCloseable {
         }
         cursors.append(inTx, next);
         metrics.batch(Duration.ofNanos(System.nanoTime() - started));
-        return new ShardResult(status, delivered, status == ShardStatus.PROGRESS && next.targetTickId() == null);
+        return new ShardResult(status, delivered, status == ShardStatus.PROGRESS && next.targetTickId() == null,
+                deadLettered);
     }
 
     /** {@code target} made less than {@link #IDLE_APPEND_AFTER} after {@code prev} (both database clock). */
@@ -488,7 +498,7 @@ public final class ShardProcessor implements AutoCloseable {
                 }
                 var rows = new ArrayList<OutboxRecord>();
                 if (exhausted(head.attempts())) {
-                    dead(c, head, head.attempts(), null);
+                    dead(c, pass, head, head.attempts(), null);
                 } else {
                     rows.add(head);
                 }
@@ -551,6 +561,8 @@ public final class ShardProcessor implements AutoCloseable {
         boolean toRetry;
         /** A retry row was parked. */
         boolean fromRetry;
+        /** A row went to the dead table. */
+        boolean deadLettered;
         /** Re-parks, keeps and unparks of handed parked rows, written as JDBC batches when the pass ends. */
         final List<Action> parkedWrites = new ArrayList<>();
 
@@ -702,17 +714,17 @@ public final class ShardProcessor implements AutoCloseable {
                 done.add(row);
             } else if (outcome instanceof Outcome.Requeue q) { // the rows of its key before it have all left the table
                 if (BatchClassifier.requeueLimitReached(row, requeue.maxRequeues())) {
-                    dead(c, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT);
+                    dead(c, pass, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT);
                 } else {
                     parked.fromRetry(c, row, row.requeues() + 1, requeueDue(q.notBefore(), now));
                     metrics.requeued(row.topic());
                     pass.fromRetry = true;
                 }
             } else if (outcome instanceof Outcome.Permanent p) {
-                dead(c, row, attempts, p.error().toString());
+                dead(c, pass, row, attempts, p.error().toString());
             } else if (outcome instanceof Outcome.Retry r) {
                 if (exhausted(attempts)) {
-                    dead(c, row, attempts, r.error().toString());
+                    dead(c, pass, row, attempts, r.error().toString());
                     continue;
                 }
                 var due = now.plus(Backoff.delay(row.attempts(), retry.initialDelay(), retry.maxDelay()));
@@ -754,16 +766,16 @@ public final class ShardProcessor implements AutoCloseable {
                 pass.parkedWrites.add(new Unpark(row));
             } else if (outcome instanceof Outcome.Requeue q) {
                 if (BatchClassifier.requeueLimitReached(row, requeue.maxRequeues())) {
-                    deadFromParked(c, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT);
+                    deadFromParked(c, pass, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT);
                 } else {
                     pass.parkedWrites.add(new Park(row, row.requeues() + 1, requeueDue(q.notBefore(), now)));
                     metrics.requeued(row.topic());
                 }
             } else if (outcome instanceof Outcome.Permanent p) {
-                deadFromParked(c, row, attempts, p.error().toString());
+                deadFromParked(c, pass, row, attempts, p.error().toString());
             } else if (outcome instanceof Outcome.Retry r) {
                 if (exhausted(attempts)) {
-                    deadFromParked(c, row, attempts, r.error().toString());
+                    deadFromParked(c, pass, row, attempts, r.error().toString());
                     continue;
                 }
                 var due = now.plus(Backoff.delay(row.attempts(), retry.initialDelay(), retry.maxDelay()));
@@ -788,14 +800,18 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /** A null {@code error}: maxAttempts used up, the stored last error stays. */
-    private void dead(Connection c, OutboxRecord row, int attempts, @Nullable String error) throws SQLException {
+    private void dead(Connection c, Pass pass, OutboxRecord row, int attempts, @Nullable String error)
+            throws SQLException {
         retries.deadFromRetry(c, row, attempts, error);
+        pass.deadLettered = true;
         metrics.failed(row.topic(), "dead");
         logDead(row, attempts, error != null ? error : "maxAttempts reached");
     }
 
-    private void deadFromParked(Connection c, OutboxRecord row, int attempts, String error) throws SQLException {
+    private void deadFromParked(Connection c, Pass pass, OutboxRecord row, int attempts, String error)
+            throws SQLException {
         parked.toDead(c, row, attempts, error);
+        pass.deadLettered = true;
         metrics.failed(row.topic(), "dead");
         logDead(row, attempts, error);
     }

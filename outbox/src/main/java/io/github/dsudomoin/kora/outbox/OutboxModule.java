@@ -1,5 +1,6 @@
 package io.github.dsudomoin.kora.outbox;
 
+import io.github.dsudomoin.kora.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
 import io.github.dsudomoin.kora.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.kora.outbox.internal.OutboxSchema;
@@ -21,8 +22,9 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * interface App extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, InboxModule {}
  * }</pre>
  * Config at {@code outbox}. The relay is a root: with {@code outbox.relay.enabled = false} it only serves
- * {@link OutboxRelay#drain()}. Tracing is on when the app has a {@link Tracer}. An app that only deduplicates uses
- * {@link InboxModule} alone.
+ * {@link OutboxRelay#drain()}. Tracing is on when the app has a {@link Tracer}. Dead letters go to the app's
+ * {@link OutboxDeadLetterHandler} component when it has one, and are kept for humans otherwise. An app that only
+ * deduplicates uses {@link InboxModule} alone.
  */
 public interface OutboxModule extends OutboxCommonModule {
 
@@ -35,10 +37,18 @@ public interface OutboxModule extends OutboxCommonModule {
         return new Maintenance(db, schema.names(), config, metrics);
     }
 
+    /** The relay runs it and closes it; without a hook component every dead letter is kept. */
+    default DeadLetterPass outboxDeadLetterPass(JdbcConnectionFactory db, OutboxSchema schema, OutboxConfig config,
+            @Nullable OutboxDeadLetterHandler hook, OutboxMetrics metrics) {
+        return new DeadLetterPass(db, schema.names(), config, hook == null ? OutboxDeadLetterHandler.NONE : hook,
+                metrics);
+    }
+
     @Root
     default OutboxRelay outboxRelay(JdbcConnectionFactory db, OutboxConfig config, OutboxSchema schema,
-            OutboxHandler handler, OutboxMetrics metrics, @Nullable Tracer tracer, Maintenance maintenance) {
-        return new OutboxRelay(db, config, schema, handler, metrics, tracer, maintenance);
+            OutboxHandler handler, OutboxMetrics metrics, @Nullable Tracer tracer, Maintenance maintenance,
+            DeadLetterPass deadLetters) {
+        return new OutboxRelay(db, config, schema, handler, metrics, tracer, maintenance, deadLetters);
     }
 
     default Outbox outbox(JdbcConnectionFactory db, OutboxSchema schema, OutboxConfig config, OutboxRelay relay,

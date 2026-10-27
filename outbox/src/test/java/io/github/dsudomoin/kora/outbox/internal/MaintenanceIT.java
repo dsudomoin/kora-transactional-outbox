@@ -1052,8 +1052,8 @@ class MaintenanceIT {
         var registry = new SimpleMeterRegistry();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
         assertThat(registry.getMeters()).extracting(m -> m.getId().getName()).containsExactlyInAnyOrder(
-                "outbox.shard.lag", "outbox.retry.size", "outbox.dead.size", "outbox.parked.size",
-                "outbox.partitions.premade", "outbox.partitions.overflow", "outbox.partitions.xids_left",
+                "outbox.shard.lag", "outbox.retry.size", "outbox.dead.size", "outbox.dead.pending",
+                "outbox.dead.pending.oldest", "outbox.parked.size", "outbox.partitions.premade", "outbox.partitions.overflow", "outbox.partitions.xids_left",
                 "outbox.partitions.orphaned", "outbox.maintenance.transaction_pooling",
                 "outbox.maintenance.since_success");
         var handler = new RecordingHandler()
@@ -1089,6 +1089,84 @@ class MaintenanceIT {
         }
         assertThat(gauge(registry, "outbox.partitions.overflow")).isZero();
         assertThat(registry.get("outbox.shard.lag").gauge().value()).isBetween(10.0, 20.0);
+    }
+
+    @Test
+    void deadLetterGaugesCountThePendingOnes() throws Exception {
+        bootstrap();
+        var registry = new SimpleMeterRegistry();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
+
+        assertThat(maintenance.runOnce()).isTrue();
+        assertThat(gauge(registry, "outbox.dead.pending")).isZero();
+        assertThat(gauge(registry, "outbox.dead.pending.oldest")).as("none").isZero();
+
+        deadLetter(1, "pending", "1 hour");
+        deadLetter(2, "pending", "1 minute");
+        deadLetter(3, "kept", "2 hours");
+        deadLetter(4, "scheduled", "3 hours");
+        assertThat(maintenance.runOnce()).isTrue();
+
+        assertThat(gauge(registry, "outbox.dead.pending")).isEqualTo(2);
+        assertThat(gauge(registry, "outbox.dead.pending.oldest")).as("seconds since its failed_at")
+                .isBetween(3600.0, 3700.0);
+        assertThat(gauge(registry, "outbox.dead.size")).isEqualTo(4);
+    }
+
+    @Test
+    void retentionDeletesOnlyOldKeptLetters() throws Exception {
+        bootstrap();
+        deadLetter(1, "kept", "2 days");
+        deadLetter(2, "kept", "1 hour");
+        deadLetter(3, "pending", "2 days");
+        deadLetter(4, "scheduled", "2 days");
+
+        assertThat(maintenance().runOnce()).isTrue();
+        assertThat(deadIds()).as("retention 0: kept forever").containsExactly(1L, 2L, 3L, 4L);
+
+        config.deadLettersRetention(Duration.ofDays(1));
+        assertThat(maintenance().runOnce()).isTrue();
+
+        assertThat(deadIds()).as("a letter the hook has not decided on is never deleted").containsExactly(2L, 3L, 4L);
+    }
+
+    @Test
+    void redriveHistoryIsCleaned() throws Exception {
+        config.deadLettersRedriveHistory(Duration.ofDays(30));
+        bootstrap();
+        var old = UUID.randomUUID();
+        var recent = UUID.randomUUID();
+        try (var c = TestDb.connect()) {
+            execute(c, "insert into " + names.redriven() + " (message_id, redrives, at) values ('" + old
+                    + "', 2, now() - interval '31 days'), ('" + recent + "', 1, now() - interval '29 days')");
+        }
+
+        assertThat(maintenance().runOnce()).isTrue();
+
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select string_agg(message_id::text, ',') from " + names.redriven()))
+                    .isEqualTo(recent.toString());
+        }
+    }
+
+    /** A dead letter of {@code status} that failed {@code age} ago (an interval), due now unless kept. */
+    private void deadLetter(long id, String status, String age) throws SQLException {
+        try (var c = TestDb.connect()) {
+            execute(c, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts,"
+                    + " failed_at, status, due_at) values (" + id + ", 0, gen_random_uuid(), 't', now(), 1, now() -"
+                    + " interval '" + age + "', '" + status + "', " + (status.equals("kept") ? "null" : "now()") + ")");
+        }
+    }
+
+    private List<Long> deadIds() throws SQLException {
+        try (var c = TestDb.connect(); var st = c.createStatement();
+                var rs = st.executeQuery("select id from " + names.dead() + " order by id")) {
+            var ids = new ArrayList<Long>();
+            while (rs.next()) {
+                ids.add(rs.getLong(1));
+            }
+            return ids;
+        }
     }
 
     private void bootstrap() throws Exception {
