@@ -33,7 +33,9 @@ import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
  * the cluster splits (the rows stay, so the lines after it run on a larger table). The probe alone is the statement
  * the tick runs, bound as it binds it, under the tick lock with the tick's settings, then rolled back: read-only, so
  * its time (one round trip included) does not depend on the WAL flush, unlike the whole make
- * (about 7 round trips and a commit). Prints p50 and p99 of both per (shards, E, variant), after 10 untimed rounds.
+ * (about 7 round trips and a commit). Prints p50 and p99 of both per (shards, E, variant), after 10 untimed rounds,
+ * and in how many rounds C marked every shard ({@code dirty} null: the probe's estimate went over its budget,
+ * {@link Ticks#PROBE_BUDGET_MICROS}).
  *
  * <p>Not part of the build: {@code ./gradlew :outbox:test -Pbenchmark --tests '*TickCostBenchmark'}. Properties:
  * {@code bench.jdbcUrl}, {@code bench.user}, {@code bench.password} (default: the test container), {@code bench.shards}
@@ -120,6 +122,7 @@ class TickCostBenchmark {
                     }
                     long[] probe = new long[rounds];
                     long[] make = new long[rounds];
+                    int everyShard = 0;
                     for (int r = -WARMUP_ROUNDS; r < rounds; r++) {
                         if (v.interleaved() > 0) {
                             for (int i = 0; i < held.size(); i++) { // one by one: the xids must alternate
@@ -147,14 +150,18 @@ class TickCostBenchmark {
                         if (r >= 0) {
                             probe[r] = probed;
                             make[r] = took;
+                            everyShard += (int) queryLong(tick, "select count(*) from " + names.tick()
+                                    + " where id = (select max(id) from " + names.tick() + ") and dirty is null");
                         }
                     }
                     Arrays.sort(probe);
                     Arrays.sort(make);
                     System.out.printf(Locale.ROOT, "tick C | shards %5d | ended %4d%-22s | %-18s"
-                                    + " | probe p50 %8.3f ms, p99 %8.3f ms | make p50 %8.3f ms, p99 %8.3f ms%n",
+                                    + " | probe p50 %8.3f ms, p99 %8.3f ms | make p50 %8.3f ms, p99 %8.3f ms"
+                                    + " | every shard %d/%d%n",
                             shards, ended, held.size() < ended ? " (only " + held.size() + " opened)" : "",
-                            v.name(), ms(probe, 0.50), ms(probe, 0.99), ms(make, 0.50), ms(make, 0.99));
+                            v.name(), ms(probe, 0.50), ms(probe, 0.99), ms(make, 0.50), ms(make, 0.99), everyShard,
+                            rounds);
                 }
             }
         } finally {
@@ -163,7 +170,7 @@ class TickCostBenchmark {
             }
             execute(tick, "drop table if exists " + String.join(", ", names.base(), names.tick(), names.cursor(),
                     names.retry(), names.dead(), names.halt(), names.maintenance(), names.dropping(),
-                    names.redriven()) + " cascade");
+                    names.redriven(), names.base() + "_parked") + " cascade"); // _parked: requeue's, where it exists
         }
     }
 

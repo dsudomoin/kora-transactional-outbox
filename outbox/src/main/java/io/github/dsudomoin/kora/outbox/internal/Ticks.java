@@ -58,7 +58,9 @@ import org.slf4j.LoggerFactory;
  *       {@code dirty} on) one of those ticks.</li>
  * </ol>
  * A tick deleted by hand from above a cursor breaks the chain: the shards of its rows are then found only by the idle
- * append ({@link ShardProcessor#IDLE_APPEND_AFTER}), not lost.
+ * append ({@link ShardProcessor#IDLE_APPEND_AFTER}), not lost. When the probe estimates its branch 2 to cost more than
+ * {@link #PROBE_BUDGET_MICROS}, it scans neither branch and C gets a null {@code dirty}, every shard: a superset of any
+ * set the scans could find, so none of the above depends on the estimate being right.
  *
  * <p>The shard set is an optimisation, the tick is not: when the probing insert fails, the tick is made without it
  * ({@code dirty} null, every shard), so a lock on any partition (an ALTER TABLE, VACUUM FULL or LOCK by hand, even on
@@ -92,6 +94,20 @@ public final class Ticks {
      * fetch, as they are too fresh to be all-visible), one more range probe about 0.8 µs per shard.
      */
     static final int SPLIT_ROWS = 3;
+    /** The estimated cost of one range probe of one shard, in µs (see {@link #SPLIT_ROWS}). */
+    static final double PROBE_MICROS = 0.8;
+    /** The estimated cost of one row of a transaction committed before P that a range scans past, in µs. */
+    static final double ROW_MICROS = 0.26;
+    /**
+     * The estimated cost of the probe's branch 2 above which a tick skips both branches and marks every shard: a range
+     * probe per shard and cluster ({@link #PROBE_MICROS}) plus, inside the clusters' ranges, the estimated rows of
+     * transactions committed before P ({@link #ROW_MICROS} each, at the rows per xid of {@link #SPLIT_ROWS}); with
+     * those rows per xid unknown, no estimate and no cap. The cost moves to the relays, which then step every shard
+     * once, in parallel and outside the tick lock; such ranges need a heavy load, under which branch 1 marks nearly
+     * every shard anyway. At 1024 shards a probe estimated just below the budget took about 5 ms (on a scratch
+     * Postgres 16, rows too fresh to be all-visible), a capped one 0.3 – 0.5 ms ({@code TickCostBenchmark}).
+     */
+    static final int PROBE_BUDGET_MICROS = 4000;
 
     private final TableNames names;
     private final int shards;
@@ -139,13 +155,15 @@ public final class Ticks {
      * slow). Every {@code c.snapshot} is {@code pg_current_snapshot()}, stable, so the same snapshot in the whole
      * statement; as such it prunes the premade partitions above C.xmax when the executor starts (the redundant bound
      * in branch 2 is there for that), and the probes' lower bounds (P.xmax, a cluster's first xid) prune the rest as
-     * the probes run.
+     * the probes run. When the estimate of branch 2 goes over {@link #PROBE_BUDGET_MICROS}, the bitmap is null and the
+     * statement probes no shard (a CASE that skips the subquery).
      */
     String probe(Connection c) throws SQLException {
         var sql = probe;
         if (sql == null) {
             // a future created_at (the clock stepped back) counts as stale, so a wrong clock cannot stop ticks
-            probe = sql = "select c.snapshot::text, " + maxIdQuery(c, names) + ", case when p.snapshot is not null then"
+            probe = sql = "select c.snapshot::text, " + maxIdQuery(c, names) + ", case when p.snapshot is not null"
+                    + " and not x.capped then"
                     // ordinality: the rows come in shard order, and the planner knows it, so the aggregate sorts
                     // nothing
                     + " (select string_agg(case when d.found is null then '0' else '1' end, '' order by g.i)::varbit"
@@ -160,28 +178,37 @@ public final class Ticks {
                     + " from (select pg_current_snapshot() snapshot) c"
                     // through text once: a snapshot of a few hundred xids is stored compressed, and each function
                     // given the stored value would decompress it again, for every row a range scans
-                    + " left join lateral (select snapshot::text::pg_snapshot snapshot from " + names.tick()
-                    + " order by id desc limit 1) p on true"
+                    + " left join lateral (select snapshot::text::pg_snapshot snapshot, created_at from "
+                    + names.tick() + " order by id desc limit 1) p on true"
                     // the clusters of E = P.xip \ C.xip: lo[k] and hi[k] are the first and the last xid of cluster
                     // k. E is the xids of P.xip visible in C (they are below P.xmax <= C.xmax), and P.xip lists them
                     // ascending (pg_snapshot rejects any other order), so ordinality is xid order and nothing is sorted
                     + " cross join lateral (select array(select pg_snapshot_xip(c.snapshot)) running,"
-                    + " array_agg(xid order by i) filter (where n - b > gap is not false) lo,"
-                    + " array_agg(xid order by i) filter (where a - n > gap is not false) hi"
-                    // b and a: the xids before and after; gap: see SPLIT_ROWS, an uncorrelated subquery, so
-                    // computed once (and only when E is not empty)
-                    + " from (select xid, i, n, lag(n) over w b, lead(n) over w a, (select least(" + CLUSTER_GAP
-                    + ", 1 + " + (long) shards * SPLIT_ROWS + " * (max(t.xmax) - min(t.xmax))"
-                    + " / nullif(max(t.max_id) - min(t.max_id), 0)) from (select"
+                    + " array_agg(xid order by i) filter (where first) lo,"
+                    + " array_agg(xid order by i) filter (where last) hi,"
+                    // the estimate of PROBE_BUDGET_MICROS: a range probe per shard for each cluster, the rows per xid
+                    // for each xid inside a range that is not in E; one aggregate, as each costs even when E is empty
+                    + " coalesce(sum(case when rho is null then null when first then " + PROBE_MICROS * shards
+                    + " else " + ROW_MICROS + " * rho * (n - b - 1) end) > " + PROBE_BUDGET_MICROS + ", false) capped"
+                    // a cluster starts after a gap wider than SPLIT_ROWS allows, and ends before one
+                    + " from (select xid, i, n, b, rho, n - b > least(" + CLUSTER_GAP + ", 1 + "
+                    + (long) shards * SPLIT_ROWS + " / nullif(rho, 0)) is not false first,"
+                    + " a - n > least(" + CLUSTER_GAP + ", 1 + " + (long) shards * SPLIT_ROWS
+                    + " / nullif(rho, 0)) is not false last"
+                    // b and a: the xids before and after; rho: the rows per xid between the two newest ticks (null
+                    // unless both have max_id), an uncorrelated subquery, so computed once (and only when E is not
+                    // empty)
+                    + " from (select xid, i, n, lag(n) over w b, lead(n) over w a, (select case"
+                    + " when count(t.max_id) = 2 then (max(t.max_id) - min(t.max_id))"
+                    + " / nullif(max(t.xmax) - min(t.xmax), 0) end from (select"
                     + " pg_snapshot_xmax(snapshot)::text::float8 xmax, max_id from " + names.tick()
-                    + " order by id desc limit 2) t) gap"
+                    + " order by id desc limit 2) t) rho"
                     + " from (select xid, i, xid::text::bigint n"
                     + " from pg_snapshot_xip(p.snapshot) with ordinality e(xid, i)"
-                    + " where pg_visible_in_snapshot(xid, c.snapshot)) e window w as (order by i)) e) x"
-                    + " where not exists (select 1 from (select created_at from " + names.tick()
-                    + " order by id desc limit 1) t"
-                    + " where t.created_at > clock_timestamp() - ? * interval '1 microsecond'"
-                    + " and t.created_at <= clock_timestamp())";
+                    + " where pg_visible_in_snapshot(xid, c.snapshot)) e window w as (order by i)) e) e) x"
+                    // P younger than the bound: no row (P's own row, so the tick table is read once for it)
+                    + " where not (p.created_at > clock_timestamp() - ? * interval '1 microsecond'"
+                    + " and p.created_at <= clock_timestamp()) is true";
         }
         return sql;
     }

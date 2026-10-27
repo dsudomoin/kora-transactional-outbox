@@ -402,7 +402,7 @@ class TicksIT {
 
             // the plan Ticks.make runs: generic (see Ticks.lock), where an exists per shard may become one hashed pass
             // over all 20 000 rows
-            assertThat(probeBuffers(c)).as("buffers of a tick over 20 000 new rows on %d shards", SHARDS)
+            assertThat(probeBuffers(c, ticks, SHARDS)).as("buffers of a tick over 20 000 new rows on %d shards", SHARDS)
                     .isLessThan(200);
         }
     }
@@ -424,10 +424,43 @@ class TicksIT {
             first.commit();
             last.commit();
 
-            assertThat(probeBuffers(c)).as("buffers of a tick whose ended xids have 20 000 rows between them")
-                    .isLessThan(200);
+            assertThat(probeBuffers(c, ticks, SHARDS))
+                    .as("buffers of a tick whose ended xids have 20 000 rows between them").isLessThan(200);
             assertThat(ticks.make(c, Duration.ZERO)).isTrue(); // C
             assertThat(shards(c)).containsExactly(2);
+        }
+    }
+
+    @Test
+    void aTickWhoseEstimatedRangeRowsExceedTheBudgetMarksEveryShardUnprobed() throws Exception {
+        var wide = new Ticks(names, 1024); // where a gap of a few rows per xid stays inside a cluster
+        var ended = new ArrayList<Connection>();
+        try (var c = TestDb.connect()) {
+            assertThat(wide.make(c, Duration.ZERO)).isTrue(); // the tick before P: the rows per xid up to P
+            for (int i = 0; i < 16; i++) {
+                var tx = TestDb.connect();
+                ended.add(tx);
+                tx.setAutoCommit(false);
+                xid(tx); // ends with no row
+                if (i < 15) { // committed before P between two ended xids: about 2 000 rows per xid, no split
+                    execute(c, "insert into " + names.base() + " (shard, message_id, topic) select g % " + SHARDS
+                            + ", gen_random_uuid(), 't' from generate_series(1, 4400) g");
+                }
+            }
+            xid(c); // a later xid completes: P's xmax passes the 16
+            assertThat(wide.make(c, Duration.ZERO)).isTrue(); // P
+            for (var tx : ended) {
+                tx.commit();
+            }
+
+            assertThat(probeBuffers(c, wide, 1024)).as("buffers of a probe that scans neither branch")
+                    .isLessThan(100);
+            assertThat(wide.make(c, Duration.ZERO)).isTrue(); // C
+            assertThat(dirty(c)).as("about 30 000 rows estimated inside the cluster's range: every shard").isNull();
+        } finally {
+            for (var tx : ended) {
+                tx.close();
+            }
         }
     }
 
@@ -503,14 +536,14 @@ class TicksIT {
      * The shared buffers the probe of a tick made now touches, in the plan {@link Ticks#make} runs (generic, see
      * {@code Ticks.lock}); rolled back, so no tick is made.
      */
-    private long probeBuffers(Connection c) throws Exception {
+    private static long probeBuffers(Connection c, Ticks ticks, int shards) throws Exception {
         c.setAutoCommit(false);
         execute(c, "set local plan_cache_mode = force_generic_plan");
         execute(c, "prepare tick_probe(int, bigint) as " + ticks.probe(c).replaceFirst("\\?", "\\$1")
                 .replaceFirst("\\?", "\\$2"));
         long buffers = 0;
         try (var st = c.createStatement();
-                var rs = st.executeQuery("explain (analyze, buffers) execute tick_probe(" + SHARDS + ", 0)")) {
+                var rs = st.executeQuery("explain (analyze, buffers) execute tick_probe(" + shards + ", 0)")) {
             while (rs.next() && buffers == 0) { // the first Buffers line: the whole statement's
                 var m = Pattern.compile("(hit|read)=(\\d+)").matcher(rs.getString(1));
                 while (m.find()) {
