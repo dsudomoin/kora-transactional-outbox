@@ -69,6 +69,8 @@ class TailSwapIT {
     private static final Pattern SWAPPED = Pattern.compile("swapped the partition tail of (\\S+): (attached it with"
             + " its rows as )?.*?held ACCESS EXCLUSIVE on \\S+ for ([\\d.]+) ms, after waiting ([\\d.]+) ms for it");
     private static final Duration SLOW_CALL = Duration.ofSeconds(3);
+    /** Business transactions open 1 s after their send, at once: about this many a second. */
+    private static final int LONG_WRITERS = 24;
 
     private final JdbcDatabase db = TestDb.newDatabase(30);
     private final TestOutboxConfig config = new TestOutboxConfig()
@@ -203,6 +205,68 @@ class TailSwapIT {
         }
 
         finish("swapWaitsBehindASlowHandlerWithoutBlockingWriters");
+    }
+
+    /**
+     * Business transactions that stay open 1 s after their send, 24 at a time, so they overlap all the time: the swap
+     * never gets swapLockTimeout without one of them, and fails on every due run. Not a promise of a swap: the signals
+     * (each 55P03 WARN naming the holders and their age, then the ERROR naming the cause and the remedies) and that
+     * nothing is lost.
+     */
+    @Test
+    void writersHoldingTheLockPastTheSendGetTheSwapAnError() throws Exception {
+        writerPause = Duration.ofMillis(20);
+        bootstrap();
+        start();
+        var longDb = TestDb.newDatabase(LONG_WRITERS + 2);
+        try {
+            var longOutbox = new PgOutbox(longDb, schema, config.shards(), relay::wake, new OutboxMetrics(null));
+            try (var pause = TestDb.connect(); var c = TestDb.connect()) {
+                maintenanceLock(pause, "pg_advisory_lock");
+                var partitions = new XidPartitions(names, config.partitions());
+                burnUntil(() -> partitions.premadeAhead(c) <= config.premake() / 2); // the extension is due
+                for (int i = 0; i < LONG_WRITERS; i++) {
+                    run("long-writer-" + i, () -> {
+                        while (!stopping.get()) {
+                            var key = "long" + ThreadLocalRandom.current().nextInt(KEYS);
+                            try {
+                                committed.add(longDb.inTx((SqlFunction0<UUID>) () -> {
+                                    var id = longOutbox.send(OutboxMessage.of("t", key, key.getBytes(UTF_8)));
+                                    try {
+                                        Thread.sleep(1000); // a downstream call inside the business transaction
+                                    } catch (InterruptedException e) {
+                                        Thread.currentThread().interrupt();
+                                        throw new IllegalStateException(e);
+                                    }
+                                    return id;
+                                }));
+                            } catch (RuntimeException e) {
+                                errors.add(e);
+                            }
+                        }
+                    });
+                    Thread.sleep(1000 / LONG_WRITERS); // spread over the second, so they always overlap
+                }
+                maintenanceLock(pause, "pg_advisory_unlock");
+            }
+            await(Duration.ofSeconds(60), () -> log.text().contains("outbox partition tail swap of " + names.base()
+                    + " timed out waiting for writers on"));
+
+            var text = log.text();
+            assertThat(text).contains("failed (SQLState 55P03)").contains("transactions hold a lock on "
+                    + names.base() + " right after, the oldest: pid ").contains("in a transaction open ");
+            assertThat(text).contains("ERROR").contains("due runs in a row")
+                    .contains("Send last in the transaction, or raise swapLockTimeout");
+            stopLoad();
+            assertThat(errors).as("writer failures").isEmpty();
+            relay.drain();
+            var missing = new HashSet<>(committed);
+            missing.removeAll(recording.delivered().stream().map(OutboxRecord::messageId).collect(Collectors.toSet()));
+            assertThat(missing).as("committed, never delivered").isEmpty();
+        } finally {
+            stopLoad();
+            longDb.release();
+        }
     }
 
     /**

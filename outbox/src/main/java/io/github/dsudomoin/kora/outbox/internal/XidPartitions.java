@@ -83,6 +83,24 @@ public final class XidPartitions {
     /** One {@link #SWAP_BLOCKERS} read: who defers at once, and the lock holders whose age is hidden. */
     private record Sample(@Nullable String blocker, List<String> hidden, List<String> holders) {}
     private static final long LOG_INTERVAL = TimeUnit.MINUTES.toNanos(1);
+    private static final String LOCK_NOT_AVAILABLE = "55P03";
+    private static final long STUCK_LOG_INTERVAL = TimeUnit.HOURS.toNanos(1);
+    /** Due extensions in a row whose swap timed out waiting for writers, after which the ERROR says so. */
+    static final int STUCK_SWAPS = 10;
+    /**
+     * The transactions holding a lock on a table, oldest first: how many, and the first five with their age. The
+     * holders seen right after a lock wait timed out, so the ones it waited for and some that came since.
+     */
+    private static final String LOCK_HOLDERS = """
+            with h as (select a.pid, a.application_name, a.xact_start from pg_stat_activity a
+                        where a.pid in (select l.pid from pg_locks l where l.locktype = 'relation'
+                                          and l.relation = to_regclass(?) and l.granted)
+                          and a.pid <> pg_backend_pid())
+            select (select count(*) from h),
+                   (select string_agg(format('pid %s (%s) in a transaction open %s', pid, application_name,
+                                             coalesce(round(extract(epoch from now() - xact_start)::numeric, 1)
+                                                      || ' s', 'for a time hidden from this role')), ', ')
+                      from (select * from h order by xact_start nulls last limit 5) o)""";
     /** The tail's bound check as Postgres prints it, its bounds [H, U) captured; any other form is not ours. */
     private static final String BOUND = "^\\(\\(xid >= '(\\d+)'::xid8\\) AND \\(xid < '(\\d+)'::xid8\\)\\)$";
     /** A row of a standalone range at or above the bound, shard by shard through the (shard, xid) index it keeps. */
@@ -119,6 +137,9 @@ public final class XidPartitions {
     private final AtomicLong deferLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong overflowLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong strangersLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    private final AtomicLong stuckLogged = new AtomicLong(System.nanoTime() - STUCK_LOG_INTERVAL);
+    /** Due extensions in a row whose swap (or bound check) timed out waiting for writers; 0 after a swap. */
+    private volatile int swapTimeouts;
     private volatile boolean overflow;
     /** For tests: runs inside the swap transaction right after the tail's detach, to fail the swap there. */
     @Nullable
@@ -208,11 +229,15 @@ public final class XidPartitions {
             } else {
                 overflow = false;
             }
-            if (!rows && s.current + size <= s.tailLower) {
-                extend(c, s, target, quiesceTimeout);
-            } else if (!bootstrap) { // rows may reach the tail any moment: it becomes a range, holding them
-                convert(c, s, floor + Math.max(2, premake / 2) * size, quiesceTimeout);
-            } // bootstrap leaves that to maintenance: the validate's scan would hold the schema lock and other startups
+            try {
+                if (!rows && s.current + size <= s.tailLower) {
+                    extend(c, s, target, quiesceTimeout);
+                } else if (!bootstrap) { // rows may reach the tail any moment: it becomes a range, holding them
+                    convert(c, s, floor + Math.max(2, premake / 2) * size, quiesceTimeout);
+                } // bootstrap leaves that to maintenance: the validate's scan would hold the schema lock and others
+            } catch (WritersHeldTheLock e) {
+                throw writersHeldTheLock(c, s, e);
+            }
             return;
         }
         if (s.tail != Attachment.MISSING && !dropOrAttachBack(c, s, lockTimeout)) {
@@ -332,14 +357,61 @@ public final class XidPartitions {
     private void addBound(Connection c, long lower, long u, boolean replace, Duration quiesceTimeout)
             throws SQLException {
         quiesced(c, quiesceTimeout, () -> {
-            PartitionDdl.execute(c, swapLockTimeout, "alter table " + names.tail()
-                    + (replace ? " drop constraint " + bounded + "," : "") + " add constraint " + bounded
-                    + " check (xid >= '" + lower + "' and xid < '" + u + "') not valid");
+            try {
+                PartitionDdl.execute(c, swapLockTimeout, "alter table " + names.tail()
+                        + (replace ? " drop constraint " + bounded + "," : "") + " add constraint " + bounded
+                        + " check (xid >= '" + lower + "' and xid < '" + u + "') not valid");
+            } catch (SQLException e) {
+                throw LOCK_NOT_AVAILABLE.equals(e.getSQLState()) ? new WritersHeldTheLock(names.tail(), e) : e;
+            }
             return null;
         });
         log.info("{} check {} (xid >= {} and xid < {}) on the partition tail {}, so that the swap attaches it as a"
                 + " range without a scan; inserts routed to it at or above {} fail until then",
                 replace ? "replaced" : "added", bounded, lower, u, names.tail(), u);
+    }
+
+    /**
+     * The swap (or the hot tail's bound check) timed out waiting for writers' locks: the 55P03 again, naming the
+     * transactions holding a lock on {@code e}'s table and their age. Once {@link #STUCK_SWAPS} due runs in a row did,
+     * or the ranges ahead fell below {@code premake / 2} (one used up since the extension was due), an ERROR at most
+     * once an hour names the cause and the remedies: transactions that hold the outbox's lock longer than
+     * {@code swapLockTimeout} after their send, overlapping all the time, never leave the swap that gap.
+     */
+    private SQLException writersHeldTheLock(Connection c, State s, WritersHeldTheLock e) {
+        int failed = ++swapTimeouts;
+        String holders;
+        try (var ps = c.prepareStatement(LOCK_HOLDERS)) {
+            ps.setString(1, e.table);
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                holders = rs.getLong(1) + " transactions hold a lock on " + e.table + " right after, the oldest: "
+                        + rs.getString(2);
+            }
+        } catch (SQLException | RuntimeException read) {
+            holders = "who held it could not be read: " + read;
+        }
+        if ((failed >= STUCK_SWAPS || s.ahead < premake / 2) && due(stuckLogged, STUCK_LOG_INTERVAL)) {
+            log.error("outbox partition tail swap of {} timed out waiting for writers on {} due runs in a row, {} ranges"
+                    + " ahead of the current xid: writer transactions hold their lock on the outbox longer than"
+                    + " outbox.partitions.swapLockTimeout {} ms after their send, and overlap, so the swap never gets"
+                    + " its gap ({}). Each attempt stalls writers for swapLockTimeout; once the ranges run out, rows go"
+                    + " to the tail and it is not turned into a range either. Send last in the transaction, or raise"
+                    + " swapLockTimeout to those transactions' p99 duration, or find them by the pids above. This ERROR"
+                    + " repeats at most once an hour", names.base(), e.table, failed, s.ahead,
+                    swapLockTimeout.toMillis(), holders);
+        }
+        return new SQLException(e.getMessage() + "; " + holders, e.getSQLState(), e);
+    }
+
+    /** A lock wait of the swap or of the bound check on writers' locks timed out (55P03) on {@code table}. */
+    private static final class WritersHeldTheLock extends SQLException {
+        final String table;
+
+        WritersHeldTheLock(String table, SQLException e) {
+            super(e.getMessage(), e.getSQLState(), e);
+            this.table = table;
+        }
     }
 
     /** Creates the ranges from {@code from} until {@code target} standalone, each skipped when it exists; their top. */
@@ -425,7 +497,11 @@ public final class XidPartitions {
             st.execute("set local statement_timeout = " + swapLockTimeout.plus(SWAP_MARGIN).toMillis());
             asked = System.nanoTime();
             // as the detach would take it, but its own statement: the wait and the hold are timed apart
-            st.execute("lock table only " + base + " in access exclusive mode");
+            try {
+                st.execute("lock table only " + base + " in access exclusive mode");
+            } catch (SQLException e) {
+                throw LOCK_NOT_AVAILABLE.equals(e.getSQLState()) ? new WritersHeldTheLock(base, e) : e;
+            }
             locked = System.nanoTime();
             if (bound != null) { // at or above the bound, the check has been refusing rows routed to the tail
                 try (var rs = st.executeQuery(
@@ -465,6 +541,7 @@ public final class XidPartitions {
             st.execute("alter table " + base + " attach partition " + names.tail() + " "
                     + PartitionDdl.bounds(Long.toString(top), null));
             c.commit();
+            swapTimeouts = 0;
         } catch (Throwable e) { // an Error too: setAutoCommit(true) below would commit the DDL run so far
             try {
                 c.rollback();
@@ -784,9 +861,13 @@ public final class XidPartitions {
 
     /** True at most once per {@link #LOG_INTERVAL} for {@code logged}. */
     private static boolean due(AtomicLong logged) {
+        return due(logged, LOG_INTERVAL);
+    }
+
+    private static boolean due(AtomicLong logged, long interval) {
         long now = System.nanoTime();
         long last = logged.get();
-        return now - last >= LOG_INTERVAL && logged.compareAndSet(last, now);
+        return now - last >= interval && logged.compareAndSet(last, now);
     }
 
     private State state(Connection c) throws SQLException {
