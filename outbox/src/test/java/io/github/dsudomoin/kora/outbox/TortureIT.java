@@ -16,12 +16,14 @@ import io.github.dsudomoin.kora.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.kora.outbox.internal.PartitionDdl;
 import io.github.dsudomoin.kora.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.kora.outbox.internal.PgOutbox;
+import io.github.dsudomoin.kora.outbox.internal.TableNames;
 import io.github.dsudomoin.kora.outbox.internal.Ticks;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -42,6 +44,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -52,9 +56,11 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
  * Torture test: concurrent writers over a small key space and three topics with random rollbacks, each
  * sending its outbox rows before touching the entity row, some unkeyed and some through {@code sendAll} over several
  * keys; three relay instances with maintenance every second; a flaky handler (transient and permanent failures,
- * requeues, simulated crashes mid-batch, two windows with the target down); a long transaction open for the first
+ * requeues, simulated crashes mid-batch, two windows with the target down) whose permanent failures reach a
+ * dead-letter hook that keeps, discards, redrives or redrives later at random; a long transaction open for the first
  * 20 s that sends on every shard right after taking its xid and again near its end. Replay a failure with the logged
- * seed: environment variable {@code TORTURE_SEED} (the writes and the permanent failures replay exactly).
+ * seed: environment variable {@code TORTURE_SEED} (the writes, the permanent failures and the hook's decisions replay
+ * exactly).
  */
 @Tag("slow")
 class TortureIT {
@@ -127,7 +133,8 @@ class TortureIT {
         partitions = new PartitionMonitor(names.base());
         partitions.start();
 
-        var handler = new FlakyHandler(seed);
+        var hook = new DecidingHook(seed);
+        var handler = new FlakyHandler(seed, hook.redrives);
         Set<UUID> committed = ConcurrentHashMap.newKeySet();
         Set<UUID> rolledBack = ConcurrentHashMap.newKeySet();
         var holdsXid = new CompletableFuture<Long>();
@@ -142,7 +149,7 @@ class TortureIT {
         for (int i = 0; i < 3; i++) {
             var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null,
                     new Maintenance(db, names, config, new OutboxMetrics(null)),
-                    new DeadLetterPass(db, names, config, null, new OutboxMetrics(null)));
+                    new DeadLetterPass(db, names, config, hook, new OutboxMetrics(null)));
             relays.add(relay);
             relay.init();
         }
@@ -167,7 +174,7 @@ class TortureIT {
         longTransaction.get(LONG_TRANSACTION.toSeconds() + 10, TimeUnit.SECONDS);
 
         handler.reliable = true;
-        drainEverything(names.retry(), names.parked());
+        drainEverything(names, hook);
         int droppedWhileRunning = partitions.dropped();
         relays.forEach(OutboxRelay::release);
         assertThat(new Maintenance(db, names, config, new OutboxMetrics(null)).runOnce()).isTrue();
@@ -178,14 +185,22 @@ class TortureIT {
             var order = commitOrder(c, commitOrder);
             Set<UUID> dead = dead(c, names.dead());
             var delivered = handler.first.keySet();
+            var failed = handler.permanentAt.keySet(); // dead, kept, discarded or redriven
+            var kept = hook.lastDecided(d -> d instanceof DeadLetterDecision.Keep);
+            var discarded = hook.lastDecided(d -> d instanceof DeadLetterDecision.Discard);
+            var redriven = minus(minus(hook.last.keySet(), kept), discarded); // last decided redrive or redriveAt
+            var dropped = new HashSet<>(kept);
+            dropped.addAll(discarded);
             long unkeyed = order.values().stream().filter(row -> row.key() == null).count();
 
             System.out.printf("TortureIT seed %d: committed %d (unkeyed %d), rolled back %d, delivered %d,"
-                            + " duplicates %d, dead %d, requeue answers %d (first delivered or dead after parking %d),"
+                            + " duplicates %d, failed permanently %d, dead letters handed %d (last kept %d, discarded"
+                            + " %d, redriven %d), requeue answers %d (first delivered or dead after parking %d),"
                             + " transient failures %d, target-down failures %d, crashes %d, partitions dropped %d (while"
                             + " relaying %d), writers %.1f s, total %.1f s%n",
                     seed, committed.size(), unkeyed, rolledBack.size(), delivered.size(), handler.duplicates(),
-                    dead.size(), handler.requeueAnswers.get(), handler.requeued.size(),
+                    failed.size(), hook.handed.get(), kept.size(), discarded.size(), redriven.size(),
+                    handler.requeueAnswers.get(), handler.requeued.size(),
                     handler.transientFailures.get(), handler.downFailures.get(), handler.crashes.get(),
                     partitions.dropped(), droppedWhileRunning, (writersDone - started) / 1e9,
                     (System.nanoTime() - started) / 1e9);
@@ -195,17 +210,24 @@ class TortureIT {
                     .isEmpty();
             assertThat(minus(committed, order.keySet())).as("committed without commit_order rows").isEmpty();
             assertThat(both(committed, rolledBack)).as("both committed and rolled back").isEmpty();
-            assertThat(minus(minus(committed, delivered), dead)).as("committed but neither delivered nor dead")
-                    .isEmpty();
+            assertThat(minus(minus(committed, delivered), dropped))
+                    .as("committed but neither delivered nor last decided keep or discard").isEmpty();
             assertThat(both(delivered, rolledBack)).as("rolled back but delivered").isEmpty();
             assertThat(minus(delivered, committed)).as("delivered but never committed").isEmpty();
-            assertThat(minus(dead, handler.permanentAt.keySet())).as("dead but never failed permanently").isEmpty();
-            assertThat(minus(handler.permanentAt.keySet(), dead)).as("failed permanently but not dead").isEmpty();
-            assertThat(both(dead, delivered)).as("dead but delivered").isEmpty();
-            assertThat(orderViolations(order, dead, handler.requeued, handler.passedRequeue, handler.first,
+            assertThat(minus(failed, hook.last.keySet())).as("failed permanently but never handed to the hook")
+                    .isEmpty();
+            assertThat(minus(hook.last.keySet(), failed)).as("handed to the hook but never failed permanently")
+                    .isEmpty();
+            assertThat(minus(dead, kept)).as("dead but not last decided keep").isEmpty();
+            assertThat(minus(kept, dead)).as("last decided keep but not dead").isEmpty();
+            assertThat(both(dropped, delivered)).as("last decided keep or discard but delivered").isEmpty();
+            assertThat(minus(redriven, delivered)).as("last decided redrive but not delivered").isEmpty();
+            // a redriven message is a new row after the later messages of its key: out of the order check, as the dead
+            assertThat(orderViolations(order, failed, handler.requeued, handler.passedRequeue, handler.first,
                     handler.permanentAt))
                     .as("per (topic, key) each message first delivered after every never-requeued one committed"
-                            + " before it was first delivered or failed permanently; outbox ids in commit order")
+                            + " before it was first delivered or failed permanently; outbox ids in commit order of the"
+                            + " never-failed")
                     .isEmpty();
             // a crash fails only its own call, as a whole: each record it delivered is delivered again, once per
             // such call; nothing else redelivers delivered work (the reliable phase does not crash), so a message
@@ -244,12 +266,13 @@ class TortureIT {
     }
 
     /**
-     * Per (topic, key), in commit order ({@code commit_order.n}): the outbox ids of the non-dead never-requeued
-     * messages rise; and for each pair A committed before B, A never requeued and B not dead, B was first delivered
-     * after A's first delivery, or after A's first permanent failure when A is dead. {@code requeued}: the messages
-     * that parked before their first delivery or first permanent failure, which their key may pass. {@code passed}:
-     * pairs [A, B] where the handler itself first delivered B after answering requeue for A in a call that then
-     * crashed, which discards the answer, so A never parked. One line per diverging key.
+     * Per (topic, key), in commit order ({@code commit_order.n}): the outbox ids of the never-dead never-requeued
+     * messages rise; and for each pair A committed before B, A never requeued and B never dead, B was first delivered
+     * after A's first delivery, or after A's first permanent failure when A ever died. {@code dead}: the messages that
+     * ever failed permanently, redriven ones included (their redriven row is delivered after later ones).
+     * {@code requeued}: the messages that parked before their first delivery or first permanent failure, which their
+     * key may pass. {@code passed}: pairs [A, B] where the handler itself first delivered B after answering requeue
+     * for A in a call that then crashed, which discards the answer, so A never parked. One line per diverging key.
      */
     private static List<String> orderViolations(Map<UUID, Row> order, Set<UUID> dead, Set<UUID> requeued,
             Set<List<UUID>> passed, Map<UUID, Delivery> first, Map<UUID, Long> permanentAt) {
@@ -448,18 +471,29 @@ class TortureIT {
     }
 
     /**
-     * Drains until the retry and parked tables are empty: a drain stops at heads and parked rows not yet due. A drain
-     * that finds a shard stuck (a pause left by the flaky phase) is retried within {@link #FINAL_DRAIN}.
+     * Drains until the retry and parked tables are empty (a drain stops at heads and parked rows not yet due) and the
+     * dead letters are settled: none pending or scheduled before the drain, so every redriven row was there for its
+     * tick, none handed to the hook during it (a redriven row that died again and was redriven anew comes after its
+     * tick), none pending or scheduled after it. A drain that finds a shard stuck (a pause left by the flaky phase)
+     * is retried within {@link #FINAL_DRAIN}.
      */
-    private void drainEverything(String retryTable, String parkedTable) throws Exception {
+    private void drainEverything(TableNames names, DecidingHook hook) throws Exception {
         long deadline = System.nanoTime() + FINAL_DRAIN.toNanos();
         String reported = null;
+        var undecided = "select count(*) from " + names.dead() + " where status in ('pending', 'scheduled')";
         while (true) {
             try {
+                long handed = hook.handed.get(); // before the count: a letter handed after it counts as handed
+                boolean settled;
+                try (var c = TestDb.connect()) {
+                    settled = queryLong(c, undecided) == 0;
+                }
                 relays.get(0).drain();
                 try (var c = TestDb.connect()) {
-                    if (queryLong(c, "select count(*) from " + retryTable) == 0
-                            && queryLong(c, "select count(*) from " + parkedTable) == 0) {
+                    if (settled && hook.handed.get() == handed
+                            && queryLong(c, "select count(*) from " + names.retry()) == 0
+                            && queryLong(c, "select count(*) from " + names.parked()) == 0
+                            && queryLong(c, undecided) == 0) {
                         return;
                     }
                 }
@@ -533,7 +567,8 @@ class TortureIT {
 
     /**
      * A flaky {@code handle}: every record fails while the target is down, 3% transient failures otherwise, permanent
-     * failures decided by the payload token (0.5%, the same on every redelivery and replay), and about every 200th call
+     * failures decided by the payload token (0.5%, the same on every redelivery and replay; a redriven message's by its
+     * token and its redrive decisions so far, 25%, so some die again), and about every 200th call
      * crashes: {@code handle} fails with an {@link Error} at a random point (a Retry for that record, as the default
      * {@code handleBatch} catches it) and the call throws an {@link Error} once it has handed every record. A quarter
      * of the calls, and every call of the reliable phase, run the default {@code handleBatch}; the others run its loop
@@ -545,6 +580,8 @@ class TortureIT {
     private static final class FlakyHandler implements OutboxHandler {
 
         private final long seed;
+        /** The hook's redrive decisions per message. */
+        private final Map<UUID, Integer> redrives;
         private final AtomicLong calls = new AtomicLong();
         private final AtomicLong sequence = new AtomicLong();
         private final ThreadLocal<Call> current = new ThreadLocal<>();
@@ -567,8 +604,9 @@ class TortureIT {
         final AtomicInteger crashes = new AtomicInteger();
         volatile boolean reliable;
 
-        FlakyHandler(long seed) {
+        FlakyHandler(long seed, Map<UUID, Integer> redrives) {
             this.seed = seed;
+            this.redrives = redrives;
         }
 
         private static final class Call {
@@ -687,12 +725,64 @@ class TortureIT {
         }
 
         private boolean isPermanent(OutboxRecord record) {
-            long token = Long.parseLong(new String(record.payload(), UTF_8));
-            return new SplittableRandom(seed ^ (token * 0x9E3779B97F4A7C15L)).nextInt(200) == 0;
+            int redriven = redrives.getOrDefault(record.messageId(), 0);
+            return new SplittableRandom(mix(seed, record.payload(), redriven)).nextInt(redriven == 0 ? 200 : 4) == 0;
         }
 
         long duplicates() {
             return deliveries.values().stream().mapToLong(n -> n - 1).sum();
+        }
+    }
+
+    /** A seed from the test's seed, a payload token and a generation (0: the token's seed from before redrives). */
+    private static long mix(long seed, byte[] payload, int generation) {
+        long token = Long.parseLong(new String(payload, UTF_8));
+        return seed ^ (token * 0x9E3779B97F4A7C15L) ^ (generation * 0xBF58476D1CE4E5B9L);
+    }
+
+    /**
+     * The dead-letter hook: per letter, drawn from its payload token and {@code redrives()} (so a replay decides the
+     * same), keep, discard, redrive or redrive at now + 100 ms, a quarter each. {@link #last} holds each message's last
+     * decision (a letter may be handed again); {@link #redrives} its redrive decisions, by which {@link FlakyHandler}
+     * decides whether a redriven message fails permanently again.
+     */
+    private static final class DecidingHook implements OutboxDeadLetterHandler {
+
+        private final long seed;
+        final Map<UUID, DeadLetterDecision> last = new ConcurrentHashMap<>();
+        final Map<UUID, Integer> redrives = new ConcurrentHashMap<>();
+        /** Letters handed, counted before deciding: one handed while a drain ran shows as a change. */
+        final AtomicLong handed = new AtomicLong();
+
+        DecidingHook(long seed) {
+            this.seed = seed;
+        }
+
+        @Override
+        public List<DeadLetterDecision> handle(List<DeadLetter> letters) {
+            var decisions = new ArrayList<DeadLetterDecision>(letters.size());
+            for (var letter : letters) {
+                handed.incrementAndGet();
+                // ~seed: a stream of its own, not the permanent failure's of the same token and generation
+                var random = new SplittableRandom(mix(~seed, letter.payload(), letter.redrives()));
+                var decision = switch (random.nextInt(4)) {
+                    case 0 -> DeadLetterDecision.keep();
+                    case 1 -> DeadLetterDecision.discard();
+                    case 2 -> DeadLetterDecision.redrive();
+                    default -> DeadLetterDecision.redriveAt(Instant.now().plusMillis(100));
+                };
+                if (!(decision instanceof DeadLetterDecision.Keep || decision instanceof DeadLetterDecision.Discard)) {
+                    redrives.merge(letter.messageId(), 1, Integer::sum);
+                }
+                last.put(letter.messageId(), decision);
+                decisions.add(decision);
+            }
+            return decisions;
+        }
+
+        Set<UUID> lastDecided(Predicate<DeadLetterDecision> which) {
+            return last.entrySet().stream().filter(e -> which.test(e.getValue())).map(Map.Entry::getKey)
+                    .collect(Collectors.toSet());
         }
     }
 
