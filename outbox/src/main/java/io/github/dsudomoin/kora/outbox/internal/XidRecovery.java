@@ -69,7 +69,10 @@ public final class XidRecovery {
     /** The last count above {@code maxRows} and its {@code nanoTime}, or null: a run within the interval reuses it. */
     @Nullable
     private long[] overMaxRows;
-    /** Whether the last {@link #recover} took the outbox's lock: a failure after it stalled writers. */
+    /**
+     * Whether the last {@link #recover} began its copy under the outbox's lock: a failure from there on stalled
+     * writers for as long. One before it (a lock wait, a check) held them for milliseconds and is tried again.
+     */
     private boolean outboxLocked;
     /** For tests: runs once the pending detach is finished, before the transaction. */
     @Nullable
@@ -157,10 +160,10 @@ public final class XidRecovery {
      * recovered meanwhile), then recovers when at most {@code outbox.recovery.maxRows} rows are to be re-sent, with an
      * ERROR saying how many were. Returns null when nothing is halted any more, else why the relay stays halted. Above
      * {@code maxRows} the count stands for 5 min, so a halted outbox is not scanned every run. A failed recovery rolls
-     * back; it is tried again by the next run only when it failed before it locked the outbox. One that failed after
-     * stalled writers for its run, as each try would again (a statement timeout on large rows or a cold cache), so its
-     * cause goes into {@code <base>_halt.recovery_failed}, and no instance tries again by itself: like above
-     * {@code maxRows}, the relay stays halted until the admin call, which may run with a longer
+     * back; it is tried again by the next run only when it failed before its copy under the outbox's lock began. One
+     * that failed after stalled writers for its run, as each try would again (a statement timeout on large rows or a
+     * cold cache), so its cause goes into {@code <base>_halt.recovery_failed}, and no instance tries again by itself:
+     * like above {@code maxRows}, the relay stays halted until the admin call, which may run with a longer
      * {@code outbox.recovery.timeout}.
      */
     @Nullable
@@ -284,7 +287,6 @@ public final class XidRecovery {
                     + " in access exclusive mode");
             timeLeft(st, deadline);
             st.execute("lock table " + names.base() + " in access exclusive mode");
-            outboxLocked = true;
             timeLeft(st, deadline);
             st.execute("lock table " + names.dropping() + ", " + names.halt() + " in exclusive mode");
             timeLeft(st, deadline);
@@ -311,6 +313,7 @@ public final class XidRecovery {
                         + " re-sends, so set outbox.shards back to " + shardsPresent);
             }
             timeLeft(st, deadline);
+            outboxLocked = true; // from the copy on, writers have waited for it
             st.execute("create unlogged table " + holding + " as " + saved);
             setAside(c, st, deadline);
             timeLeft(st, deadline);
