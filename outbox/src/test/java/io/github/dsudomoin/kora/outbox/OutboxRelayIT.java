@@ -31,9 +31,11 @@ import java.sql.PreparedStatement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -47,6 +49,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -57,6 +60,12 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 class OutboxRelayIT {
+
+    /** The owner's priorities: the event types of an account that a running process of that account blocks. */
+    private static final Map<String, Set<String>> BLOCKS = Map.of(
+            "WITHDRAW", Set.of("FEE_RELEASE", "SYNCHRONIZE"),
+            "FEE_RELEASE", Set.of("FEE_RELEASE", "SYNCHRONIZE"),
+            "SYNCHRONIZE", Set.of("SYNCHRONIZE"));
 
     private final JdbcDatabase db = TestDb.newDatabase(30);
     private final TestOutboxConfig config = new TestOutboxConfig();
@@ -429,6 +438,54 @@ class OutboxRelayIT {
     }
 
     @Test
+    void activeSynchronizeLetsFeeThroughAndTheSecondSynchronizeWaits() throws Exception {
+        config.requeueDelay(Duration.ofSeconds(1));
+        bootstrap();
+        var handler = new Coordinator();
+        var relay = start(handler);
+        var outbox = outbox(relay::wake);
+        handler.blocked = whileRunning("SYNCHRONIZE");
+
+        send(outbox, msg("t", "acc42", "SYNCHRONIZE#2"));
+        await(Duration.ofSeconds(1), () -> "SYNCHRONIZE#2".equals(parked()));
+        Thread.sleep(3000); // handed again at each due time, requeued each time
+        send(outbox, msg("t", "acc42", "FEE_RELEASE"));
+        await(Duration.ofSeconds(1), () -> handler.delivered().size() == 1); // FEE_RELEASE did not wait
+
+        assertThat(handler.calls)
+                .anyMatch(call -> Collections.indexOfSubList(call, List.of("SYNCHRONIZE#2", "FEE_RELEASE")) >= 0);
+        assertThat(parked()).isEqualTo("SYNCHRONIZE#2");
+
+        handler.blocked = r -> false; // the running SYNCHRONIZE ends
+        await(Duration.ofSeconds(2), () -> handler.delivered().size() == 2); // its due time at the latest
+
+        assertThat(handler.delivered()).extracting(OutboxRelayIT::payload)
+                .containsExactly("FEE_RELEASE", "SYNCHRONIZE#2");
+        assertThat(handler.delivered().get(1).requeues()).isPositive();
+    }
+
+    @Test
+    void sameTypeOrderIsKeptWhenTheBlockLifts() throws Exception {
+        config.requeueDelay(Duration.ofMinutes(1)); // only the next record of the key brings FEE_RELEASE#1 back
+        bootstrap();
+        var handler = new Coordinator();
+        var relay = start(handler);
+        var outbox = outbox(relay::wake);
+        handler.blocked = whileRunning("FEE_RELEASE");
+
+        send(outbox, msg("t", "acc42", "FEE_RELEASE#1"));
+        await(Duration.ofSeconds(1), () -> "FEE_RELEASE#1".equals(parked()));
+        handler.blocked = r -> false; // the running FEE_RELEASE ends
+        send(outbox, msg("t", "acc42", "FEE_RELEASE#2"));
+        await(Duration.ofSeconds(1), () -> handler.delivered().size() == 2 && parked() == null);
+
+        assertThat(handler.calls)
+                .containsExactly(List.of("FEE_RELEASE#1"), List.of("FEE_RELEASE#1", "FEE_RELEASE#2"));
+        assertThat(handler.delivered()).extracting(OutboxRelayIT::payload)
+                .containsExactly("FEE_RELEASE#1", "FEE_RELEASE#2");
+    }
+
+    @Test
     void multipleRelaysDeliverEachMessageOnceInSteadyState() throws Exception {
         config.shards(4).workers(2);
         bootstrap();
@@ -460,6 +517,59 @@ class OutboxRelayIT {
         assertThat(ids).hasSize(5000);
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(ids);
         assertIdOrderPerKey(handler.delivered());
+    }
+
+    @Test
+    void severalInstancesRequeueAndDeliverEveryMessage() throws Exception {
+        config.shards(4).workers(2);
+        bootstrap();
+        var handler = new Coordinator();
+        handler.blocked = r -> r.requeues() == 0 && ThreadLocalRandom.current().nextBoolean();
+        var started = List.of(start(handler), start(handler), start(handler));
+        var writers = Executors.newFixedThreadPool(4);
+        var sent = new ArrayList<Future<List<UUID>>>();
+        for (int w = 0; w < 4; w++) {
+            var outbox = outbox(started.get(w % 3)::wake);
+            sent.add(writers.submit(() -> {
+                var ids = new ArrayList<UUID>();
+                for (int tx = 0; tx < 25; tx++) {
+                    ids.addAll(send(outbox, IntStream.range(0, 50)
+                            .mapToObj(i -> msg("t", "k" + ThreadLocalRandom.current().nextInt(20), "m"))
+                            .toArray(OutboxMessage[]::new)));
+                }
+                return ids;
+            }));
+        }
+        var ids = new ArrayList<UUID>();
+        for (var f : sent) {
+            ids.addAll(f.get(60, TimeUnit.SECONDS));
+        }
+        writers.shutdown();
+
+        await(Duration.ofSeconds(60), () -> handler.delivered().size() >= 5000);
+        assertThat(started.get(0).drain()).isZero(); // everything is committed, nothing left
+        await(Duration.ofSeconds(5), () -> rows(schema.names().parked()) == 0 && rows(schema.names().retry()) == 0);
+
+        var delivered = handler.delivered();
+        assertThat(delivered).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(ids);
+        assertThat(delivered).filteredOn(r -> r.requeues() > 0).hasSizeGreaterThan(1000); // about half
+        assertThat(delivered).allMatch(r -> r.requeues() <= 1, "requeued at most once");
+        var perKey = new LinkedHashMap<String, List<OutboxRecord>>();
+        delivered.forEach(r -> perKey.computeIfAbsent(key(r), k -> new ArrayList<>()).add(r));
+        perKey.forEach((key, records) -> {
+            assertThat(records).filteredOn(r -> r.requeues() == 0).extracting(OutboxRecord::id)
+                    .as("never-requeued ids of key %s in delivery order", key).isSorted();
+            long laterNeverRequeued = Long.MAX_VALUE; // lowest id of a never-requeued record delivered after r
+            for (int i = records.size() - 1; i >= 0; i--) {
+                var r = records.get(i);
+                if (r.requeues() == 0) {
+                    laterNeverRequeued = Math.min(laterNeverRequeued, r.id());
+                } else {
+                    assertThat(laterNeverRequeued).as("key %s: never-requeued id delivered after requeued id %d",
+                            key, r.id()).isGreaterThan(r.id());
+                }
+            }
+        });
     }
 
     @Test
@@ -1205,6 +1315,56 @@ class OutboxRelayIT {
         return r.key() == null ? null : new String(r.key(), UTF_8);
     }
 
+    private static String payload(OutboxRecord r) {
+        return new String(r.payload(), UTF_8);
+    }
+
+    /** The records a running {@code process} of their account blocks; the event type is the payload up to '#'. */
+    private static Predicate<OutboxRecord> whileRunning(String process) {
+        return r -> BLOCKS.get(process).contains(payload(r).split("#")[0]);
+    }
+
+    /**
+     * The owner's coordinator over {@code handleBatch} (key = account id): requeues each record {@link #blocked}
+     * matches, delivers the rest; logs each call's payloads and the delivered records. The library knows none of the
+     * priorities behind {@code blocked}.
+     */
+    private static final class Coordinator implements OutboxHandler {
+
+        volatile Predicate<OutboxRecord> blocked = r -> false;
+        final List<List<String>> calls = new CopyOnWriteArrayList<>();
+        private final List<OutboxRecord> delivered = new ArrayList<>();
+
+        @Override
+        public void handle(OutboxRecord record) {
+            throw new UnsupportedOperationException("handleBatch only");
+        }
+
+        @Override
+        public List<Outcome> handleBatch(List<OutboxRecord> records) {
+            calls.add(records.stream().map(OutboxRelayIT::payload).toList());
+            var outcomes = new ArrayList<Outcome>(records.size());
+            for (var r : records) {
+                if (blocked.test(r)) {
+                    outcomes.add(Outcome.requeue());
+                } else {
+                    synchronized (delivered) {
+                        delivered.add(r);
+                    }
+                    outcomes.add(Outcome.delivered());
+                }
+            }
+            return outcomes;
+        }
+
+        /** Delivered records in handling order. */
+        List<OutboxRecord> delivered() {
+            synchronized (delivered) {
+                return List.copyOf(delivered);
+            }
+        }
+    }
+
     private String keyOnShard(int shard, String prefix) {
         return keyOnShard(shard, "t", prefix);
     }
@@ -1236,6 +1396,12 @@ class OutboxRelayIT {
         try (var c = TestDb.connect()) {
             return queryString(c, "select string_agg(convert_from(payload, 'UTF8'), ',' order by id) from "
                     + schema.names().parked());
+        }
+    }
+
+    private static long rows(String table) throws Exception {
+        try (var c = TestDb.connect()) {
+            return queryLong(c, "select count(*) from " + table);
         }
     }
 

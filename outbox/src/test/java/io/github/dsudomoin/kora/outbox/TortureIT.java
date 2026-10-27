@@ -5,6 +5,7 @@ import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryLong;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.dsudomoin.kora.outbox.internal.BatchClassifier;
 import io.github.dsudomoin.kora.outbox.internal.Cursors;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.kora.outbox.internal.Hashing;
@@ -50,9 +51,9 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
  * Torture test: concurrent writers over a small key space and three topics with random rollbacks, each
  * sending its outbox rows before touching the entity row, some unkeyed and some through {@code sendAll} over several
  * keys; three relay instances with maintenance every second; a flaky handler (transient and permanent failures,
- * simulated crashes mid-batch, two windows with the target down); a long transaction open for the first 20 s that
- * sends on every shard right after taking its xid and again near its end. Replay a failure with the logged seed:
- * environment variable {@code TORTURE_SEED} (the writes and the permanent failures replay exactly).
+ * requeues, simulated crashes mid-batch, two windows with the target down); a long transaction open for the first
+ * 20 s that sends on every shard right after taking its xid and again near its end. Replay a failure with the logged
+ * seed: environment variable {@code TORTURE_SEED} (the writes and the permanent failures replay exactly).
  */
 @Tag("slow")
 class TortureIT {
@@ -164,7 +165,7 @@ class TortureIT {
         longTransaction.get(LONG_TRANSACTION.toSeconds() + 10, TimeUnit.SECONDS);
 
         handler.reliable = true;
-        drainEverything(names.retry());
+        drainEverything(names.retry(), names.parked());
         int droppedWhileRunning = partitions.dropped();
         relays.forEach(OutboxRelay::release);
         assertThat(new Maintenance(db, names, config, new OutboxMetrics(null)).runOnce()).isTrue();
@@ -178,11 +179,11 @@ class TortureIT {
             long unkeyed = order.values().stream().filter(row -> row.key() == null).count();
 
             System.out.printf("TortureIT seed %d: committed %d (unkeyed %d), rolled back %d, delivered %d,"
-                            + " duplicates %d, dead %d, transient failures %d, target-down failures %d, crashes %d,"
-                            + " partitions dropped %d (while relaying %d), writers %.1f s, total %.1f s%n",
+                            + " duplicates %d, dead %d, requeued %d, transient failures %d, target-down failures %d,"
+                            + " crashes %d, partitions dropped %d (while relaying %d), writers %.1f s, total %.1f s%n",
                     seed, committed.size(), unkeyed, rolledBack.size(), delivered.size(), handler.duplicates(),
-                    dead.size(), handler.transientFailures.get(), handler.downFailures.get(), handler.crashes.get(),
-                    partitions.dropped(), droppedWhileRunning, (writersDone - started) / 1e9,
+                    dead.size(), handler.requeued.size(), handler.transientFailures.get(), handler.downFailures.get(),
+                    handler.crashes.get(), partitions.dropped(), droppedWhileRunning, (writersDone - started) / 1e9,
                     (System.nanoTime() - started) / 1e9);
 
             // differences, not whole sets: a failure must print only the offending ids
@@ -197,18 +198,21 @@ class TortureIT {
             assertThat(minus(dead, handler.permanentAt.keySet())).as("dead but never failed permanently").isEmpty();
             assertThat(minus(handler.permanentAt.keySet(), dead)).as("failed permanently but not dead").isEmpty();
             assertThat(both(dead, delivered)).as("dead but delivered").isEmpty();
-            assertThat(orderViolations(order, dead, handler.first, handler.permanentAt))
-                    .as("per (topic, key) first deliveries in commit order (and outbox id order), none before a dead"
-                            + " predecessor was attempted")
+            assertThat(orderViolations(order, dead, handler.requeued, handler.first, handler.permanentAt))
+                    .as("per (topic, key) first deliveries of never-requeued messages in commit order (and outbox id"
+                            + " order), each requeued one after those committed before it, none before a dead"
+                            + " never-requeued predecessor was attempted")
                     .isEmpty();
-            // a crash rolls back its whole shard step, whose calls handed over at most batchSize retry heads and a
-            // batchSize chunk, all redelivered; nothing else rolls back delivered work (the reliable phase does not
-            // crash), so no slack: more duplicates mean two steps delivered the same rows
+            // a crash fails its call as a whole, and every record the call delivered is delivered again: a retry-pass
+            // call hands at most batchSize rows, a main-pass call a batchSize chunk with up to batchSize parked rows
+            // merged ahead; nothing else redelivers delivered work (the reliable phase does not crash), so no slack
+            // beyond that: more duplicates mean two steps delivered the same rows
             assertThat(handler.duplicates()).as("duplicates for %d crashes", handler.crashes.get())
-                    .isLessThanOrEqualTo(handler.crashes.get() * 2L * config.batchSize());
+                    .isLessThanOrEqualTo(handler.crashes.get() * 3L * config.batchSize());
 
             assertThat(droppedWhileRunning).as("partitions dropped while relaying").isPositive();
             assertThat(queryLong(c, "select count(*) from " + names.retry())).as("retry table").isZero();
+            assertThat(queryLong(c, "select count(*) from " + names.parked())).as("parked table").isZero();
             long xmin = slowestCursorXmin(c, schema);
             for (var range : PartitionDdl.listRanges(c, names.base())) {
                 if (range.to() != null && Long.parseLong(range.to()) <= xmin) {
@@ -233,26 +237,29 @@ class TortureIT {
     }
 
     /**
-     * Per (topic, key): the committed non-dead messages in commit order ({@code commit_order.n}) against the order of
-     * their first successful deliveries; their outbox ids rise in commit order; and none was first delivered before a
-     * dead predecessor's first permanent failure. One line per diverging key.
+     * Per (topic, key): the committed non-dead never-requeued messages in commit order ({@code commit_order.n}) against
+     * the order of their first successful deliveries; their outbox ids rise in commit order; each requeued message was
+     * first delivered after those committed before it; and none was first delivered before a dead never-requeued
+     * predecessor's first permanent failure (a requeued one may fail after its key went on). One line per diverging
+     * key.
      */
-    private static List<String> orderViolations(Map<UUID, Row> order, Set<UUID> dead, Map<UUID, Delivery> first,
-            Map<UUID, Long> permanentAt) {
-        var byCommit = new HashMap<String, List<UUID>>(); // dead included
-        var byDelivery = new HashMap<String, List<UUID>>();
+    private static List<String> orderViolations(Map<UUID, Row> order, Set<UUID> dead, Set<UUID> requeued,
+            Map<UUID, Delivery> first, Map<UUID, Long> permanentAt) {
+        var byCommit = new HashMap<String, List<UUID>>(); // dead and requeued included
+        var byDelivery = new HashMap<String, List<UUID>>(); // never requeued
         order.values().stream()
                 .filter(row -> row.key() != null)
                 .sorted(Comparator.comparingInt(Row::n))
                 .forEach(row -> byCommit.computeIfAbsent(row.route(), k -> new ArrayList<>()).add(row.messageId()));
         first.entrySet().stream()
-                .filter(e -> order.containsKey(e.getKey()) && order.get(e.getKey()).key() != null)
+                .filter(e -> order.containsKey(e.getKey()) && order.get(e.getKey()).key() != null
+                        && !requeued.contains(e.getKey()))
                 .sorted(Comparator.comparingLong(e -> e.getValue().sequence()))
                 .forEach(e -> byDelivery.computeIfAbsent(order.get(e.getKey()).route(), k -> new ArrayList<>())
                         .add(e.getKey()));
         var violations = new ArrayList<String>();
         byCommit.forEach((route, all) -> {
-            var committed = all.stream().filter(id -> !dead.contains(id)).toList();
+            var committed = all.stream().filter(id -> !dead.contains(id) && !requeued.contains(id)).toList();
             var delivered = byDelivery.getOrDefault(route, List.of());
             for (int i = 0; i < Math.max(committed.size(), delivered.size()); i++) {
                 var expected = i < committed.size() ? committed.get(i) : null;
@@ -270,14 +277,29 @@ class TortureIT {
             }
             UUID lastDead = null;
             long deadAttempted = 0;
+            UUID lastDelivered = null; // the never-requeued one first delivered last so far, in commit order
             for (var id : all) {
                 if (dead.contains(id)) {
-                    lastDead = id;
-                    deadAttempted = Math.max(deadAttempted, permanentAt.getOrDefault(id, 0L));
-                } else if (first.get(id).sequence() < deadAttempted) {
+                    if (!requeued.contains(id)) {
+                        lastDead = id;
+                        deadAttempted = Math.max(deadAttempted, permanentAt.getOrDefault(id, 0L));
+                    }
+                    continue;
+                }
+                long sequence = first.get(id).sequence();
+                if (sequence < deadAttempted) {
                     violations.add(route + ": " + describe(id, order, first) + " delivered before its dead"
                             + " predecessor " + lastDead + " (n " + order.get(lastDead).n() + ") failed at #"
                             + deadAttempted);
+                    return;
+                }
+                if (!requeued.contains(id)) {
+                    if (lastDelivered == null || sequence > first.get(lastDelivered).sequence()) {
+                        lastDelivered = id;
+                    }
+                } else if (lastDelivered != null && sequence < first.get(lastDelivered).sequence()) {
+                    violations.add(route + ": requeued " + describe(id, order, first) + " delivered before "
+                            + describe(lastDelivered, order, first) + ", committed before it and never requeued");
                     return;
                 }
             }
@@ -443,17 +465,18 @@ class TortureIT {
     }
 
     /**
-     * Drains until the retry table is empty: a drain stops at heads not yet due. A drain that finds a shard stuck (a
-     * pause left by the flaky phase) is retried within {@link #FINAL_DRAIN}.
+     * Drains until the retry and parked tables are empty: a drain stops at heads and parked rows not yet due. A drain
+     * that finds a shard stuck (a pause left by the flaky phase) is retried within {@link #FINAL_DRAIN}.
      */
-    private void drainEverything(String retryTable) throws Exception {
+    private void drainEverything(String retryTable, String parkedTable) throws Exception {
         long deadline = System.nanoTime() + FINAL_DRAIN.toNanos();
         String reported = null;
         while (true) {
             try {
                 relays.get(0).drain();
                 try (var c = TestDb.connect()) {
-                    if (queryLong(c, "select count(*) from " + retryTable) == 0) {
+                    if (queryLong(c, "select count(*) from " + retryTable) == 0
+                            && queryLong(c, "select count(*) from " + parkedTable) == 0) {
                         return;
                     }
                 }
@@ -526,11 +549,13 @@ class TortureIT {
     private record Delivery(long sequence, long outboxId) {}
 
     /**
-     * Default {@code handleBatch} over a flaky {@code handle}: every record fails while the target is down, 3%
-     * transient failures otherwise, permanent failures decided by the payload token (0.5%, the same on every
-     * redelivery and replay), and about every 200th call crashes with an {@link Error} at a random point, after
-     * delivering the records before it. Each call draws from its own seeded random. First successes and first
-     * permanent failures get numbers from one sequence.
+     * The default {@code handleBatch} loop (per-key skip included) over a flaky {@code handle}: every record fails
+     * while the target is down, 3% transient failures otherwise, permanent failures decided by the payload token
+     * (0.5%, the same on every redelivery and replay), and about every 200th call crashes with an {@link Error} at a
+     * random point, after delivering the records before it. Outside the reliable phase about 3% of the records the
+     * loop would attempt are requeued instead, and after each requeue the call winds down with even odds
+     * ({@code NotAttempted} for every later record, as a call cut at its soft deadline answers). Each call draws from
+     * its own seeded random. First successes and first permanent failures get numbers from one sequence.
      */
     private static final class FlakyHandler implements OutboxHandler {
 
@@ -542,6 +567,8 @@ class TortureIT {
         final Map<UUID, Delivery> first = new ConcurrentHashMap<>();
         final Map<UUID, Integer> deliveries = new ConcurrentHashMap<>();
         final Map<UUID, Long> permanentAt = new ConcurrentHashMap<>();
+        /** Every message the handler answered {@code requeue} for at least once. */
+        final Set<UUID> requeued = ConcurrentHashMap.newKeySet();
         final AtomicInteger transientFailures = new AtomicInteger();
         final AtomicInteger downFailures = new AtomicInteger();
         final AtomicInteger crashes = new AtomicInteger();
@@ -573,14 +600,47 @@ class TortureIT {
             var call = new Call(random, !reliable && random.nextInt(200) == 0 ? random.nextInt(records.size() + 1) : -1);
             current.set(call);
             try {
-                var outcomes = OutboxHandler.super.handleBatch(records);
-                if (call.crashAt >= 0) { // the crash point was not reached among the attempted records
+                var outcomes = attempt(records, call.random);
+                if (call.crashAt >= 0) { // a crash point that handle() reached was caught there as a Retry
                     throw crash();
                 }
                 return outcomes;
             } finally {
                 current.remove();
             }
+        }
+
+        /** {@link OutboxHandler#handleBatch}'s default loop, with the requeues and wind-downs. */
+        private List<Outcome> attempt(List<OutboxRecord> records, SplittableRandom random) {
+            var outcomes = new ArrayList<Outcome>(records.size());
+            var failed = new HashSet<Object>();
+            boolean anyDelivered = false;
+            boolean windDown = false;
+            for (var record : records) {
+                var key = BatchClassifier.orderingKey(record);
+                if (windDown || failed.contains(key) || (!anyDelivered && failed.size() >= 3)
+                        || OutboxHandler.windDownRequested()) {
+                    outcomes.add(Outcome.notAttempted());
+                    continue;
+                }
+                if (!reliable && random.nextInt(100) < 3) {
+                    requeued.add(record.messageId());
+                    outcomes.add(Outcome.requeue());
+                    windDown = random.nextBoolean();
+                    continue;
+                }
+                try {
+                    handle(record);
+                    outcomes.add(Outcome.delivered());
+                    anyDelivered = true;
+                } catch (OutboxPermanentException e) {
+                    outcomes.add(Outcome.permanent(e));
+                } catch (Throwable e) { // an Error too, as in the default
+                    outcomes.add(Outcome.retry(e));
+                    failed.add(key);
+                }
+            }
+            return outcomes;
         }
 
         @Override
