@@ -15,9 +15,11 @@ import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Park;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
+import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -44,7 +46,7 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 class MaintenanceIT {
 
-    private final JdbcDatabase db = TestDb.newDatabase(10);
+    private final TestDatabase db = TestDb.newDatabase(10);
     // premake 10: 3000 burnt xids (plus a range's worth of start offset) leave more than premake / 2 ranges ahead, so
     // no run extends unless a test drives it there
     private final TestOutboxConfig config =
@@ -1394,7 +1396,8 @@ class MaintenanceIT {
         bootstrap();
         var registry = new SimpleMeterRegistry();
         var sql = new ConcurrentLinkedQueue<String>();
-        var pooled = new Maintenance(TestDb.transactionPooled(db, sql), names, config, new OutboxMetrics(registry));
+        var pooled = new Maintenance(new KoraOutboxTransactions(TestDb.transactionPooled(db, sql)), names, config,
+                new OutboxMetrics(registry));
 
         try (var err = new CapturedStderr()) {
             assertThat(pooled.runOnce()).as("skipped").isFalse();
@@ -1845,7 +1848,7 @@ class MaintenanceIT {
         return new Maintenance(db, names, config, new OutboxMetrics(null));
     }
 
-    private JdbcDatabase pool() {
+    private TestDatabase pool() {
         var pool = TestDb.newDatabase(1);
         pools.add(pool);
         return pool;

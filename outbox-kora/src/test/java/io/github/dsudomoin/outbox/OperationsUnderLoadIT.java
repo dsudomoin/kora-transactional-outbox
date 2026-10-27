@@ -22,6 +22,7 @@ import io.github.dsudomoin.outbox.internal.UuidV7;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -55,7 +56,6 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
@@ -93,7 +93,7 @@ class OperationsUnderLoadIT {
     private static final String LOCK_NOT_AVAILABLE = "55P03";
     private static final String NO_PARTITION = "23514";
 
-    private final JdbcDatabase db = TestDb.newDatabase(30);
+    private final TestDatabase db = TestDb.newDatabase(30);
     // ranges of 30 000 xids: the relay lags the counter by far less, so the range an orphan is made of is the only one
     // relayed below the pinned horizon (relayedRange); premake 16: the extension is due with 8 left, 240 000 xids, so
     // the seconds maintenance is paused never let rows reach the tail

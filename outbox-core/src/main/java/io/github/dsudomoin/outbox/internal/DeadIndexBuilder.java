@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.internal;
 
+import io.github.dsudomoin.outbox.OutboxTransactions;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -7,7 +8,6 @@ import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 
 /**
  * Builds the dead table's {@code <dead>_due} when bootstrap left it out (a dead table with rows) or an interrupted
@@ -33,7 +33,7 @@ final class DeadIndexBuilder {
     private static final Logger log = LoggerFactory.getLogger(DeadIndexBuilder.class);
     private static final String STATE = "select indisvalid from pg_index where indexrelid = to_regclass(?)";
 
-    private final JdbcConnectionFactory db;
+    private final OutboxTransactions db;
     private final TableNames names;
     private final String index;
     private final Duration interval;
@@ -48,7 +48,7 @@ final class DeadIndexBuilder {
     private volatile int failures;
     private volatile long retryAt = System.nanoTime();
 
-    DeadIndexBuilder(JdbcConnectionFactory db, TableNames names, Duration interval, Duration lockTimeout) {
+    DeadIndexBuilder(OutboxTransactions db, TableNames names, Duration interval, Duration lockTimeout) {
         this.db = db;
         this.names = names;
         this.index = names.dead() + "_due";

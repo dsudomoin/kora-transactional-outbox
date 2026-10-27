@@ -11,6 +11,7 @@ import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -30,7 +31,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 /**
@@ -45,7 +45,7 @@ class RollbackCompatibilityIT {
     private static final String COLUMNS =
             "shard, tick_id, target_tick_id, last_id, paused_until, failures, retry_due_at, parked_due_at";
 
-    private final JdbcDatabase db = TestDb.newDatabase(10);
+    private final TestDatabase db = TestDb.newDatabase(10);
     private final TestOutboxConfig config = new TestOutboxConfig().shards(SHARDS).relayEnabled(false)
             .xidsPerPartition(1000).premake(10).maintenanceInterval(Duration.ofSeconds(1))
             .cursorAnchorInterval(Duration.ofSeconds(2));

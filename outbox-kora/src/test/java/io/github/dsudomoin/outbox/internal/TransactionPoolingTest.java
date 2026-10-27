@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.internal;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.lang.reflect.Proxy;
@@ -27,7 +28,7 @@ class TransactionPoolingTest {
 
     @Test
     void outboxBootstrapFailsBeforeAnySessionStatement() {
-        var schema = new OutboxSchema(pooled(), new TestOutboxConfig());
+        var schema = new OutboxSchema(new KoraOutboxTransactions(pooled()), new TestOutboxConfig());
 
         assertThatThrownBy(schema::init)
                 .isInstanceOf(IllegalStateException.class)
@@ -38,7 +39,7 @@ class TransactionPoolingTest {
 
     @Test
     void inboxBootstrapFailsBeforeAnySessionStatement() {
-        var inbox = new PgInbox(pooled(), new TestOutboxConfig(), new OutboxMetrics(null));
+        var inbox = new PgInbox(new KoraOutboxTransactions(pooled()), new TestOutboxConfig(), new OutboxMetrics(null));
 
         assertThatThrownBy(inbox::init)
                 .isInstanceOf(IllegalStateException.class)

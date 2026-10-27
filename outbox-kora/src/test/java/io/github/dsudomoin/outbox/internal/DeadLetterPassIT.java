@@ -16,9 +16,11 @@ import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRelay;
+import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -52,14 +54,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 class DeadLetterPassIT {
 
-    private final JdbcDatabase db = TestDb.newDatabase(8);
+    private final TestDatabase db = TestDb.newDatabase(8);
     private final TestOutboxConfig config = new TestOutboxConfig().relayEnabled(false);
     private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
     private final List<DeadLetterPass> passes = new ArrayList<>();
@@ -459,7 +460,7 @@ class DeadLetterPassIT {
         long id = letter("t", "k", "p", List.of());
         var later = Instant.now().plus(1, ChronoUnit.DAYS).truncatedTo(ChronoUnit.MICROS);
         var other = pass(letters -> all(letters, redriveAt(later))); // another instance's pass
-        var failing = new DeadLetterPass(commitFailsOnce(other::runOnce), names, config,
+        var failing = new DeadLetterPass(new KoraOutboxTransactions(commitFailsOnce(other::runOnce)), names, config,
                 letters -> all(letters, keep()), new OutboxMetrics(registry));
         passes.add(failing);
 

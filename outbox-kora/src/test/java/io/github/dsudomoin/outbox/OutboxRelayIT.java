@@ -18,9 +18,11 @@ import io.github.dsudomoin.outbox.internal.ShardProcessor;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.Ticks;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTelemetry;
+import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -73,7 +75,7 @@ class OutboxRelayIT {
             "FEE_RELEASE", Set.of("FEE_RELEASE", "SYNCHRONIZE"),
             "SYNCHRONIZE", Set.of("SYNCHRONIZE"));
 
-    private final JdbcDatabase db = TestDb.newDatabase(30);
+    private final TestDatabase db = TestDb.newDatabase(30);
     private final TestOutboxConfig config = new TestOutboxConfig();
     private final List<OutboxRelay> relays = new ArrayList<>();
     private OutboxSchema schema;
@@ -576,9 +578,9 @@ class OutboxRelayIT {
             }
             Thread.sleep(20);
         };
-        var relay = new OutboxRelay(factory, config, schema, slow, new KoraOutboxTelemetry(metrics, null),
-                maintenance(db),
-                new DeadLetterPass(factory, schema.names(), config, letters -> {
+        var relay = new OutboxRelay(new KoraOutboxTransactions(factory), config, schema, slow,
+                new KoraOutboxTelemetry(metrics, null), maintenance(db),
+                new DeadLetterPass(new KoraOutboxTransactions(factory), schema.names(), config, letters -> {
                     entered.countDown();
                     done.await(); // until the call is cut
                     return List.of();
@@ -1984,8 +1986,8 @@ class OutboxRelayIT {
     }
 
     private OutboxRelay relay(JdbcConnectionFactory factory, OutboxHandler handler) {
-        var relay = new OutboxRelay(factory, config, schema, handler, TestTelemetry.kora(), maintenance(db),
-                noHook(factory));
+        var relay = new OutboxRelay(new KoraOutboxTransactions(factory), config, schema, handler,
+                TestTelemetry.kora(), maintenance(db), noHook(factory));
         relays.add(relay);
         return relay;
     }
@@ -2029,7 +2031,8 @@ class OutboxRelayIT {
 
     /** A dead-letter pass without a hook: every dead letter is kept. */
     private DeadLetterPass noHook(JdbcConnectionFactory factory) {
-        return new DeadLetterPass(factory, schema.names(), config, null, new OutboxMetrics(null));
+        return new DeadLetterPass(new KoraOutboxTransactions(factory), schema.names(), config, null,
+                new OutboxMetrics(null));
     }
 
     private OutboxRelay relay(OutboxHandler handler, OutboxDeadLetterHandler hook) {
@@ -2119,7 +2122,7 @@ class OutboxRelayIT {
 
     /** Real maintenance; with the 1 h {@code maintenanceInterval} it runs once, right after the relay starts. */
     private Maintenance maintenance(JdbcConnectionFactory factory) {
-        return new Maintenance(factory, schema.names(), config, new OutboxMetrics(null));
+        return new Maintenance(new KoraOutboxTransactions(factory), schema.names(), config, new OutboxMetrics(null));
     }
 
     /** {@link #db} whose new connections report the SQL of every statement they prepare. */

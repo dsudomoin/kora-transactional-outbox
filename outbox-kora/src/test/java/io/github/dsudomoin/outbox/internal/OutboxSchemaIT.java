@@ -11,6 +11,7 @@ import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -31,11 +32,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 
 class OutboxSchemaIT {
 
-    private final JdbcDatabase db = TestDb.newDatabase(10);
+    private final TestDatabase db = TestDb.newDatabase(10);
     private final TestOutboxConfig config = new TestOutboxConfig();
 
     @AfterEach

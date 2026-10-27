@@ -13,6 +13,7 @@ import io.github.dsudomoin.outbox.internal.XidRecovery;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -209,19 +210,19 @@ class XidRegressionDumpRestoreIT {
         }
     }
 
-    private JdbcDatabase database(PostgreSQLContainer pg) {
+    private TestDatabase database(PostgreSQLContainer pg) {
         var db = TestDb.newDatabase(pg.getJdbcUrl(), pg.getUsername(), pg.getPassword(), 10);
         databases.add(db);
         return db;
     }
 
-    private OutboxSchema bootstrap(JdbcDatabase db) throws SQLException {
+    private OutboxSchema bootstrap(TestDatabase db) throws SQLException {
         var schema = new OutboxSchema(db, config);
         schema.init();
         return schema;
     }
 
-    private OutboxRelay relay(JdbcDatabase db, OutboxSchema schema, OutboxHandler handler) {
+    private OutboxRelay relay(TestDatabase db, OutboxSchema schema, OutboxHandler handler) {
         var maintenance = new Maintenance(db, schema.names(), config, new OutboxMetrics(null));
         var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(), maintenance,
                 new DeadLetterPass(db, schema.names(), config, null, new OutboxMetrics(null)));
@@ -230,7 +231,7 @@ class XidRegressionDumpRestoreIT {
     }
 
     /** {@code n} messages, 100 per transaction. */
-    private static List<UUID> send(JdbcDatabase db, PgOutbox outbox, String prefix, int n) {
+    private static List<UUID> send(TestDatabase db, PgOutbox outbox, String prefix, int n) {
         var ids = new ArrayList<UUID>();
         for (int from = 0; from < n; from += 100) {
             var messages = IntStream.range(from, Math.min(n, from + 100))

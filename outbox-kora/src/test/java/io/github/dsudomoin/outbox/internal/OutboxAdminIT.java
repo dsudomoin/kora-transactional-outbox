@@ -20,6 +20,7 @@ import io.github.dsudomoin.outbox.OutboxStatus.OrphanKind;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -48,13 +49,12 @@ import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 class OutboxAdminIT {
 
-    private final JdbcDatabase db = TestDb.newDatabase(8);
+    private final TestDatabase db = TestDb.newDatabase(8);
     private final TestOutboxConfig config = new TestOutboxConfig().relayEnabled(false);
     private final ExecutorService pool = Executors.newCachedThreadPool();
     private final AtomicInteger wakes = new AtomicInteger();

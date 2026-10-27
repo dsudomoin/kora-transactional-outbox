@@ -9,7 +9,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.UUID;
 import java.util.regex.Pattern;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlConsumer;
+import io.github.dsudomoin.outbox.internal.Sql.SqlConsumer;
 
 /**
  * Moves the rows of a standalone outbox range back into the outbox, then drops the range. Moved rows are new messages

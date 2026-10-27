@@ -10,9 +10,11 @@ import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRelay;
+import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
@@ -33,7 +35,6 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
@@ -47,7 +48,7 @@ class ReshardIT {
 
     private static final OutboxDeadLetterHandler HOOK = letters -> List.of();
 
-    private final JdbcDatabase db = TestDb.newDatabase(20);
+    private final TestDatabase db = TestDb.newDatabase(20);
     private final String table = TestDb.uniqueTable();
     private final TableNames names = TableNames.of(table);
     private final RecordingHandler recording = new RecordingHandler();
@@ -357,7 +358,8 @@ class ReshardIT {
                 return db.telemetry();
             }
         };
-        var heartbeat = new Heartbeat(failingOnce, node.schema(), node.schema().config(), false);
+        var heartbeat = new Heartbeat(
+                new KoraOutboxTransactions(failingOnce), node.schema(), node.schema().config(), false);
         try {
             heartbeat.start();
             await(() -> queryLong("select count(*) from " + names.instance()) == 1);

@@ -1,6 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
+import io.github.dsudomoin.outbox.OutboxTransactions;
 import java.net.InetAddress;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
@@ -11,7 +12,6 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 
 /**
  * Keeps this instance's row in {@code <base>_instance} fresh: {@code (instance_id, shards, last_seen, hook_active,
@@ -30,7 +30,7 @@ public final class Heartbeat {
     private static final Logger log = LoggerFactory.getLogger(Heartbeat.class);
     static final Duration FORGET_AFTER = Duration.ofHours(1);
 
-    private final JdbcConnectionFactory db;
+    private final OutboxTransactions db;
     private final TableNames names;
     private final String id;
     private final int shards;
@@ -42,7 +42,7 @@ public final class Heartbeat {
     private volatile boolean stopped;
 
     /** {@code config}: the instance's, as {@link OutboxSchema#config()} resolved it. */
-    public Heartbeat(JdbcConnectionFactory db, OutboxSchema schema, OutboxConfig config, boolean hookActive) {
+    public Heartbeat(OutboxTransactions db, OutboxSchema schema, OutboxConfig config, boolean hookActive) {
         this.db = db;
         this.names = schema.names();
         this.id = schema.instanceId();
@@ -79,7 +79,7 @@ public final class Heartbeat {
     }
 
     /** Deletes the row of {@code id}; a failure is a WARN, as the row expires anyway. */
-    static void delete(JdbcConnectionFactory db, TableNames names, String id) {
+    static void delete(OutboxTransactions db, TableNames names, String id) {
         try (var c = db.newConnection(); var ps = c.prepareStatement(
                 "delete from " + names.instance() + " where instance_id = ?")) {
             c.setAutoCommit(true);

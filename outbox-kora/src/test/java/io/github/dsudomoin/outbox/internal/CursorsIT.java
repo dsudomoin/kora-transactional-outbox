@@ -7,6 +7,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.sql.Connection;
@@ -16,14 +17,13 @@ import java.util.Arrays;
 import java.util.List;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 
 class CursorsIT {
 
     private static final Instant T1 = Instant.parse("2026-10-25T10:00:00.123456Z");
     private static final Instant T2 = Instant.parse("2026-10-25T11:30:00.654321Z");
 
-    private final JdbcDatabase db = TestDb.newDatabase(2);
+    private final TestDatabase db = TestDb.newDatabase(2);
     private final TestOutboxConfig config = new TestOutboxConfig();
 
     @AfterEach

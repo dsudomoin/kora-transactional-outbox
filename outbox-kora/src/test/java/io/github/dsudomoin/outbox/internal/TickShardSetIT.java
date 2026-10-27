@@ -5,6 +5,7 @@ import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.time.Duration;
@@ -15,14 +16,13 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 
 /** The shard sets of ticks made by several makers among concurrent writers, against the batches they stand for. */
 class TickShardSetIT {
 
     private static final int SHARDS = 16;
 
-    private final JdbcDatabase db = TestDb.newDatabase(2);
+    private final TestDatabase db = TestDb.newDatabase(2);
 
     @AfterEach
     void release() {

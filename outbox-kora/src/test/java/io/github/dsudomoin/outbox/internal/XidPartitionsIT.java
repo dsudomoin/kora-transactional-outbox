@@ -13,6 +13,7 @@ import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -34,13 +35,12 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.postgresql.PostgreSQLContainer;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 
 class XidPartitionsIT {
 
     private static final Duration SWAP_LOCK_TIMEOUT = Duration.ZERO; // the default: no wait
 
-    private final JdbcDatabase db = TestDb.newDatabase(4);
+    private final TestDatabase db = TestDb.newDatabase(4);
 
     @AfterEach
     void release() {

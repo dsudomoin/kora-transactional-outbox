@@ -5,6 +5,7 @@ import static io.github.dsudomoin.outbox.testing.TestSql.queryLong;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.sql.Connection;
@@ -17,7 +18,6 @@ import java.util.List;
 import java.util.Locale;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 
 /**
  * The duration of a tick against the shard count and the transactions that ended since the tick before it (README
@@ -96,7 +96,7 @@ class TickCostBenchmark {
         }
     }
 
-    private static void run(JdbcDatabase db, Connection tick, List<Connection> open, int shards, int[] endedCounts,
+    private static void run(TestDatabase db, Connection tick, List<Connection> open, int shards, int[] endedCounts,
             List<Variant> variants, int rounds) throws SQLException {
         var partitions = new OutboxConfig.PartitionsConfig() {};
         var schema = new OutboxSchema(db, new TestOutboxConfig().shards(shards)

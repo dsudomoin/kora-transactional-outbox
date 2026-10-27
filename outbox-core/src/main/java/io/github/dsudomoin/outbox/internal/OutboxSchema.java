@@ -1,6 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
+import io.github.dsudomoin.outbox.OutboxTransactions;
 import jakarta.annotation.Nullable;
 import java.sql.Array;
 import java.sql.Connection;
@@ -14,7 +15,6 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.tinkoff.kora.application.graph.Lifecycle;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 
 /**
  * Idempotent startup bootstrap, on a connection that must keep one server session (no transaction-pooling
@@ -70,7 +70,7 @@ public final class OutboxSchema implements Lifecycle {
     /** Heartbeat rows (this one's too) stay live for this many of the writer's {@code maintenanceInterval}. */
     static final int LIVE_INTERVALS = 3;
 
-    private final JdbcConnectionFactory db;
+    private final OutboxTransactions db;
     private final OutboxConfig config;
     private final TableNames spelled;
     private final int schemaLockAttempts;
@@ -89,11 +89,11 @@ public final class OutboxSchema implements Lifecycle {
      * Validates the whole outbox config: every other outbox component starts after this one, so a bad value fails
      * startup before any DDL or relay thread.
      */
-    public OutboxSchema(JdbcConnectionFactory db, OutboxConfig config) {
+    public OutboxSchema(OutboxTransactions db, OutboxConfig config) {
         this(db, config, SCHEMA_LOCK_ATTEMPTS);
     }
 
-    OutboxSchema(JdbcConnectionFactory db, OutboxConfig config, int schemaLockAttempts) {
+    OutboxSchema(OutboxTransactions db, OutboxConfig config, int schemaLockAttempts) {
         validate(config);
         this.db = db;
         this.config = config;

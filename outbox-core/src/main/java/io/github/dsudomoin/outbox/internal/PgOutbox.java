@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.internal;
 import io.github.dsudomoin.outbox.Outbox;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
+import io.github.dsudomoin.outbox.OutboxTransactions;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -11,9 +12,6 @@ import java.util.List;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import ru.tinkoff.kora.database.jdbc.ConnectionContext;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
-import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 /**
  * Enqueue. A keyed row takes {@code pg_advisory_xact_lock(keyNamespace, keyHash)} in its INSERT statement,
@@ -23,27 +21,27 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 public final class PgOutbox implements Outbox {
 
     private static final Logger log = LoggerFactory.getLogger(PgOutbox.class);
-    private static final String NOT_IN_TX = "Outbox.send must be called inside JdbcConnectionFactory.inTx(...)";
-
-    private final JdbcConnectionFactory db;
+    private final OutboxTransactions db;
+    private final String notInTx;
     private final int keyNamespace;
     private final int shards;
     private final OutboxTelemetry telemetry;
-    private final ConnectionContext.PostCommitAction wakeUpHook;
+    private final Runnable wakeUpHook;
     private final String insertKeyed;
     private final String insertUnkeyed;
     private final Resender resender;
     private final TableNames names;
     private final ShardGuard guard;
 
-    public PgOutbox(JdbcConnectionFactory db, OutboxSchema schema, int shards, Runnable wakeUpRelay,
+    public PgOutbox(OutboxTransactions db, OutboxSchema schema, int shards, Runnable wakeUpRelay,
             OutboxTelemetry telemetry) {
         OutboxSchema.validateShards(shards);
         this.db = db;
+        this.notInTx = "Outbox.send must be called inside " + db.transactionHint();
         this.keyNamespace = schema.names().keyNamespace();
         this.shards = shards;
         this.telemetry = telemetry;
-        this.wakeUpHook = c -> {
+        this.wakeUpHook = () -> {
             try {
                 wakeUpRelay.run();
             } catch (RuntimeException e) {
@@ -61,9 +59,9 @@ public final class PgOutbox implements Outbox {
 
     @Override
     public UUID send(OutboxMessage message) {
-        var ctx = currentTransaction();
-        var id = insert(ctx.connection(), message);
-        wakeUpAfterCommit(ctx);
+        var c = currentTransaction();
+        var id = insert(c, message);
+        wakeUpAfterCommit();
         return id;
     }
 
@@ -71,16 +69,15 @@ public final class PgOutbox implements Outbox {
     public UUID send(Connection connection, OutboxMessage message) {
         requireTransaction(connection);
         var id = insert(connection, message);
-        var ctx = db.currentConnectionContext();
-        if (ctx != null && ctx.connection() == connection) {
-            wakeUpAfterCommit(ctx); // the caller passed Kora's own transaction connection
+        if (connection == db.currentConnection()) {
+            wakeUpAfterCommit(); // the caller passed its transaction's own connection
         }
         return id;
     }
 
     @Override
     public List<UUID> sendAll(List<OutboxMessage> messages) {
-        var ctx = currentTransaction();
+        var c = currentTransaction();
         int n = messages.size();
         if (n == 0) {
             return List.of();
@@ -96,9 +93,9 @@ public final class PgOutbox implements Outbox {
                         ids[i], m.topic(), m.key(), m.payload(), HeaderCodec.encode(enqueue.headers(m.headers()))));
             }
             try {
-                resender.insertAll(ctx.connection(), rows);
+                resender.insertAll(c, rows);
             } catch (SQLException e) {
-                throw new RuntimeSqlException(e);
+                throw db.translate(e);
             }
         } catch (RuntimeException | Error e) {
             enqueue.failed(e);
@@ -108,7 +105,7 @@ public final class PgOutbox implements Outbox {
             telemetry.enqueued(m.topic());
         }
         enqueue.finished();
-        wakeUpAfterCommit(ctx);
+        wakeUpAfterCommit();
         return List.of(ids);
     }
 
@@ -132,7 +129,7 @@ public final class PgOutbox implements Outbox {
             }
             ps.executeUpdate();
         } catch (SQLException e) {
-            var error = new RuntimeSqlException(e);
+            var error = db.translate(e);
             enqueue.failed(error);
             throw error;
         } catch (RuntimeException | Error e) {
@@ -144,36 +141,34 @@ public final class PgOutbox implements Outbox {
         return id;
     }
 
-    private ConnectionContext currentTransaction() {
-        var ctx = db.currentConnectionContext();
-        if (ctx == null || ctx.connection() == null) {
-            throw new IllegalStateException(NOT_IN_TX);
+    private Connection currentTransaction() {
+        var c = db.currentConnection();
+        if (c == null) {
+            throw new IllegalStateException(notInTx);
         }
-        requireTransaction(ctx.connection());
-        return ctx;
+        requireTransaction(c);
+        return c;
     }
 
-    private static void requireTransaction(@Nullable Connection c) {
+    private void requireTransaction(@Nullable Connection c) {
         try {
             if (c == null || c.getAutoCommit()) {
-                throw new IllegalStateException(NOT_IN_TX);
+                throw new IllegalStateException(notInTx);
             }
         } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            throw db.translate(e);
         }
     }
 
     /**
-     * One hook per {@link ConnectionContext}: Kora runs a context's post-commit actions after every {@code inTx}
-     * commit on it, so the relay wakes once per committed transaction however many messages it sent.
+     * One hook per transaction, however many messages it sent: the binding runs the same instance once after the
+     * commit.
      */
-    private void wakeUpAfterCommit(ConnectionContext ctx) {
-        if (!ctx.postCommitActions().contains(wakeUpHook)) {
-            try {
-                ctx.addPostCommitAction(wakeUpHook);
-            } catch (SQLException e) {
-                throw new RuntimeSqlException(e);
-            }
+    private void wakeUpAfterCommit() {
+        try {
+            db.afterCommit(wakeUpHook);
+        } catch (SQLException e) {
+            throw db.translate(e);
         }
     }
 }

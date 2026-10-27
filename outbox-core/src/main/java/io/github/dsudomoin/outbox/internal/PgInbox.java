@@ -4,7 +4,9 @@ import io.github.dsudomoin.outbox.Inbox;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxGauge;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
+import io.github.dsudomoin.outbox.OutboxTransactions;
 import io.github.dsudomoin.outbox.internal.InboxPartitions.Window;
+import io.github.dsudomoin.outbox.internal.Sql.SqlRunnable;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -25,9 +27,6 @@ import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.tinkoff.kora.application.graph.Lifecycle;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlRunnable;
-import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 /**
  * Postgres inbox: {@code <inbox>(message_id uuid, consumer text default '', received_at, primary key
@@ -49,15 +48,14 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 public final class PgInbox implements Inbox, Lifecycle {
 
     private static final Logger log = LoggerFactory.getLogger(PgInbox.class);
-    private static final String NOT_IN_TX =
-            "Inbox.tryAccept and tryAcceptAll must be called inside JdbcConnectionFactory.inTx(...)";
     private static final Duration LOCK_TIMEOUT = Duration.ofSeconds(5);
     private static final String LOCK_NOT_AVAILABLE = "55P03";
     private static final long WARN_INTERVAL = TimeUnit.MINUTES.toNanos(1);
     private static final String UNSCOPED = "";
     private static final Pattern CONSUMER = Pattern.compile("[A-Za-z0-9_.:-]{1,64}");
 
-    private final JdbcConnectionFactory db;
+    private final OutboxTransactions db;
+    private final String notInTx;
     private final OutboxConfig config;
     private final OutboxTelemetry telemetry;
     private final TableNames names;
@@ -72,8 +70,9 @@ public final class PgInbox implements Inbox, Lifecycle {
     @Nullable
     private volatile ScheduledExecutorService scheduler;
 
-    public PgInbox(JdbcConnectionFactory db, OutboxConfig config, OutboxTelemetry telemetry) {
+    public PgInbox(OutboxTransactions db, OutboxConfig config, OutboxTelemetry telemetry) {
         this.db = db;
+        this.notInTx = "Inbox.tryAccept and tryAcceptAll must be called inside " + db.transactionHint();
         this.config = config;
         this.telemetry = telemetry;
         this.names = TableNames.of(config.inbox().table());
@@ -122,7 +121,7 @@ public final class PgInbox implements Inbox, Lifecycle {
         Objects.requireNonNull(messageId, "messageId");
         try {
             if (c == null || c.getAutoCommit()) {
-                throw new IllegalStateException(NOT_IN_TX);
+                throw new IllegalStateException(notInTx);
             }
             if (!dedups(messageId)) {
                 acceptedOutside(messageId);
@@ -134,7 +133,7 @@ public final class PgInbox implements Inbox, Lifecycle {
                 return ps.executeUpdate() == 1;
             }
         } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            throw db.translate(e);
         }
     }
 
@@ -149,7 +148,7 @@ public final class PgInbox implements Inbox, Lifecycle {
         }
         try {
             if (c == null || c.getAutoCommit()) {
-                throw new IllegalStateException(NOT_IN_TX);
+                throw new IllegalStateException(notInTx);
             }
             var accepted = new HashSet<UUID>();
             var dedup = new ArrayList<UUID>(distinct.size());
@@ -175,7 +174,7 @@ public final class PgInbox implements Inbox, Lifecycle {
             }
             return accepted;
         } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            throw db.translate(e);
         }
     }
 
@@ -254,7 +253,7 @@ public final class PgInbox implements Inbox, Lifecycle {
             }
             step("window refresh", () -> window = partitions.window(c));
         } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            throw db.translate(e);
         }
     }
 
@@ -401,11 +400,11 @@ public final class PgInbox implements Inbox, Lifecycle {
     }
 
     private Connection currentConnection() {
-        var ctx = db.currentConnectionContext();
-        if (ctx == null || ctx.connection() == null) {
-            throw new IllegalStateException(NOT_IN_TX);
+        var c = db.currentConnection();
+        if (c == null) {
+            throw new IllegalStateException(notInTx);
         }
-        return ctx.connection();
+        return c;
     }
 
     private boolean dedups(UUID id) {

@@ -5,6 +5,8 @@ import io.github.dsudomoin.outbox.DeadLetterDecision;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
+import io.github.dsudomoin.outbox.OutboxTransactions;
+import io.github.dsudomoin.outbox.internal.Sql.SqlFunction1;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -29,9 +31,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction1;
-import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 /**
  * Hands pending dead letters to the {@link OutboxDeadLetterHandler} and redrives scheduled ones, on its own connection
@@ -64,7 +63,7 @@ public final class DeadLetterPass {
     /** How long a call cut at the timeout gets to end on its interrupt before the hook counts as ignoring it. */
     private static final Duration INTERRUPT_GRACE = Duration.ofSeconds(1);
 
-    private final JdbcConnectionFactory db;
+    private final OutboxTransactions db;
     @Nullable
     private final OutboxDeadLetterHandler hook;
     private final boolean active;
@@ -94,7 +93,7 @@ public final class DeadLetterPass {
     /** A committed hand-over: the letters claimed; the call's failure, or the decisions it committed. */
     private record Batch(int claimed, @Nullable Throwable failure, List<DeadLetterDecision> decisions) {}
 
-    public DeadLetterPass(JdbcConnectionFactory db, TableNames names, OutboxConfig config,
+    public DeadLetterPass(OutboxTransactions db, TableNames names, OutboxConfig config,
             @Nullable OutboxDeadLetterHandler hook, OutboxTelemetry telemetry) {
         OutboxSchema.validate(config);
         this.db = db;
@@ -177,7 +176,7 @@ public final class DeadLetterPass {
             }
             return redriveScheduled(c);
         } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            throw db.translate(e);
         }
     }
 
@@ -197,7 +196,7 @@ public final class DeadLetterPass {
                 return rs.wasNull() ? null : Duration.of(micros, ChronoUnit.MICROS);
             }
         } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            throw db.translate(e);
         }
     }
 

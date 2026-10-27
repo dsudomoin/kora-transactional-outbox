@@ -21,6 +21,7 @@ import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardResult;
 import io.github.dsudomoin.outbox.kora.OutboxTracing;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -69,7 +70,6 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import ru.tinkoff.kora.common.Context;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 class ShardProcessorIT {
@@ -79,7 +79,7 @@ class ShardProcessorIT {
     /** {@link TestOutboxConfig}'s requeue delay. */
     private static final Duration REQUEUE_DELAY = Duration.ofMillis(100);
 
-    private final JdbcDatabase db = TestDb.newDatabase(4);
+    private final TestDatabase db = TestDb.newDatabase(4);
     private final TestOutboxConfig config = new TestOutboxConfig().shards(1);
     private final RecordingHandler handler = new RecordingHandler();
     private final SimpleMeterRegistry meters = new SimpleMeterRegistry();

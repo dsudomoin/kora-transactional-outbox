@@ -18,7 +18,6 @@ import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetryFactory;
 import ru.tinkoff.kora.database.jdbc.ConnectionContext;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabaseConfig;
 import ru.tinkoff.kora.telemetry.common.TelemetryConfig;
@@ -52,22 +51,22 @@ public final class TestDb {
     }
 
     /** Kora pool over the test container; the caller closes it with {@code release()}. */
-    public static JdbcDatabase newDatabase(int maxPoolSize) {
+    public static TestDatabase newDatabase(int maxPoolSize) {
         return newDatabase(maxPoolSize, new Properties());
     }
 
     /** {@link #newDatabase(int)} with pgjdbc connection properties, e.g. {@code defaultRowFetchSize}. */
-    public static JdbcDatabase newDatabase(int maxPoolSize, Properties dsProperties) {
+    public static TestDatabase newDatabase(int maxPoolSize, Properties dsProperties) {
         return newDatabase(jdbcUrl(), user(), password(), maxPoolSize, dsProperties);
     }
 
     /** {@link #newDatabase(int)} logged in as {@code role}, made by {@link #newLoginRole()}. */
-    public static JdbcDatabase newDatabase(int maxPoolSize, String role) {
+    public static TestDatabase newDatabase(int maxPoolSize, String role) {
         return newDatabase(jdbcUrl(), role, role, maxPoolSize, new Properties());
     }
 
     /** Kora pool over any database, e.g. the bench stand's; the caller closes it with {@code release()}. */
-    public static JdbcDatabase newDatabase(String jdbcUrl, String user, String password, int maxPoolSize) {
+    public static TestDatabase newDatabase(String jdbcUrl, String user, String password, int maxPoolSize) {
         return newDatabase(jdbcUrl, user, password, maxPoolSize, new Properties());
     }
 
@@ -84,7 +83,7 @@ public final class TestDb {
         return role;
     }
 
-    private static JdbcDatabase newDatabase(
+    private static TestDatabase newDatabase(
             String jdbcUrl, String user, String password, int maxPoolSize, Properties dsProperties) {
         var poolName = "test-" + POOLS.incrementAndGet();
         var config = new JdbcDatabaseConfig() {
@@ -136,7 +135,7 @@ public final class TestDb {
                 return null; // read only by the DataBaseTelemetryFactory constructor, not the one used below
             }
         };
-        return new JdbcDatabase(config, DataBaseTelemetryFactory.EMPTY);
+        return new TestDatabase(config);
     }
 
     /** {@code ob_} + 10 random lowercase hex digits. */

@@ -9,6 +9,7 @@ import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.lang.reflect.Proxy;
@@ -17,13 +18,12 @@ import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 /** A telemetry whose every hook throws, guarded as the outbox's wiring guards it, breaks neither send nor the relay. */
 class TelemetryFailureIT {
 
-    private final JdbcDatabase db = TestDb.newDatabase(10);
+    private final TestDatabase db = TestDb.newDatabase(10);
     private final TestOutboxConfig config = new TestOutboxConfig();
     private OutboxRelay relay;
 

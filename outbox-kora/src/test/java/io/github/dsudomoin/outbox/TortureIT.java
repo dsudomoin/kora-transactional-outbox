@@ -17,6 +17,7 @@ import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.Ticks;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -49,7 +50,6 @@ import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 /**
@@ -86,7 +86,7 @@ class TortureIT {
     private static final Duration FINAL_DRAIN = Duration.ofMinutes(2);
 
     private final long seed = seed();
-    private final JdbcDatabase db = TestDb.newDatabase(40);
+    private final TestDatabase db = TestDb.newDatabase(40);
     private final TestOutboxConfig config = new TestOutboxConfig()
             .xidsPerPartition(5000)
             .premake(4)

@@ -11,6 +11,7 @@ import io.github.dsudomoin.outbox.internal.BatchClassifier.Dead;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Follower;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Head;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Park;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import jakarta.annotation.Nullable;
@@ -27,7 +28,6 @@ import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 
 class RetryStoreIT {
 
@@ -36,7 +36,7 @@ class RetryStoreIT {
     /** After every due time the tests write. */
     private static final Instant LATER = NOW.plus(Duration.ofMinutes(10));
 
-    private final JdbcDatabase db = TestDb.newDatabase(2);
+    private final TestDatabase db = TestDb.newDatabase(2);
     private TableNames names;
     private RetryStore store;
     private Connection c;

@@ -3,8 +3,10 @@ package io.github.dsudomoin.outbox.internal;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxGauge;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
+import io.github.dsudomoin.outbox.OutboxTransactions;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.Cursors.Position;
+import io.github.dsudomoin.outbox.internal.Sql.SqlFunction0;
 import io.github.dsudomoin.outbox.internal.Ticks.Tick;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
@@ -19,9 +21,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.IntStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
-import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 /**
  * Partition maintenance and log cleanup. Every run first checks the xid counter ({@link #halted()}), then reads, from
@@ -84,7 +83,7 @@ public final class Maintenance {
     static final Duration SHARDS_LOCK_TIMEOUT = Duration.ofMillis(100);
     private static final String LOCK_NOT_AVAILABLE = "55P03";
 
-    private final JdbcConnectionFactory db;
+    private final OutboxTransactions db;
     private final TableNames names;
     private final Duration detachLockTimeout;
     /**
@@ -144,11 +143,11 @@ public final class Maintenance {
     @Nullable
     private volatile Long lastSuccess;
 
-    public Maintenance(JdbcConnectionFactory db, TableNames names, OutboxConfig config, OutboxTelemetry telemetry) {
+    public Maintenance(OutboxTransactions db, TableNames names, OutboxConfig config, OutboxTelemetry telemetry) {
         this(db, names, config, telemetry, PartitionDdl.DETACH_LOCK_TIMEOUT);
     }
 
-    Maintenance(JdbcConnectionFactory db, TableNames names, OutboxConfig config, OutboxTelemetry telemetry,
+    Maintenance(OutboxTransactions db, TableNames names, OutboxConfig config, OutboxTelemetry telemetry,
             Duration detachLockTimeout) {
         this.db = db;
         this.names = names;
@@ -267,7 +266,7 @@ public final class Maintenance {
             checkShards(c);
             return halted();
         } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            throw db.translate(e);
         }
     }
 
@@ -339,7 +338,7 @@ public final class Maintenance {
             }
             return sessionStable(c) && maintain(c, check);
         } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            throw db.translate(e);
         }
     }
 

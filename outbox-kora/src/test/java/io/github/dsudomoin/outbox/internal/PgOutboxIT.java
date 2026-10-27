@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.OutboxMessage;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -33,7 +34,6 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.common.Context;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlConsumer;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction1;
@@ -44,7 +44,7 @@ class PgOutboxIT {
     private static final byte[] PAYLOAD = bytes("payload");
     private static final String NOT_IN_TX = "inside JdbcConnectionFactory.inTx";
 
-    private final JdbcDatabase db = TestDb.newDatabase(20);
+    private final TestDatabase db = TestDb.newDatabase(20);
     private final TestOutboxConfig config = new TestOutboxConfig();
     private final AtomicInteger wakeUps = new AtomicInteger();
     private final ExecutorService pool = Executors.newFixedThreadPool(4);

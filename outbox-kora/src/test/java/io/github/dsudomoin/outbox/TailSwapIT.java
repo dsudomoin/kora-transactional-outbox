@@ -15,6 +15,7 @@ import io.github.dsudomoin.outbox.internal.XidPartitions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -43,7 +44,6 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 /**
@@ -67,7 +67,7 @@ class TailSwapIT {
     /** Business transactions open 1 s after their send, at once: about this many a second. */
     private static final int LONG_WRITERS = 24;
 
-    private final JdbcDatabase db = TestDb.newDatabase(30);
+    private final TestDatabase db = TestDb.newDatabase(30);
     private final TestOutboxConfig config = new TestOutboxConfig()
             .xidsPerPartition(2000)
             .premake(4)

@@ -1,16 +1,16 @@
 package io.github.dsudomoin.outbox;
 
 import io.github.dsudomoin.outbox.internal.Backoff;
-import io.github.dsudomoin.outbox.internal.Cursors;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.Cursors.Position;
+import io.github.dsudomoin.outbox.internal.Cursors;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Heartbeat;
 import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
-import io.github.dsudomoin.outbox.internal.ShardProcessor;
 import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardResult;
 import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardStatus;
+import io.github.dsudomoin.outbox.internal.ShardProcessor;
 import io.github.dsudomoin.outbox.internal.Ticks;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
@@ -39,8 +39,6 @@ import java.util.function.BooleanSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.tinkoff.kora.application.graph.Lifecycle;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
-import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 /**
  * The background relay: {@code relay.workers} daemon threads {@code outbox-relay-N}, each repeatedly making a tick when
@@ -72,7 +70,7 @@ public final class OutboxRelay implements Lifecycle {
     /** The most shards one step takes: a group's statements bind arrays of this size. */
     private static final int MAX_GROUP = 256;
 
-    private final JdbcConnectionFactory db;
+    private final OutboxTransactions db;
     private final OutboxConfig config;
     private final OutboxConfig.RelayConfig relay;
     private final Maintenance maintenance;
@@ -154,7 +152,7 @@ public final class OutboxRelay implements Lifecycle {
      * {@code deadLetters}: the pass this relay runs, and closes on {@link #release()}; its hook, or none, decides the
      * fate of the dead letters.
      */
-    public OutboxRelay(JdbcConnectionFactory db, OutboxConfig config, OutboxSchema schema, OutboxHandler handler,
+    public OutboxRelay(OutboxTransactions db, OutboxConfig config, OutboxSchema schema, OutboxHandler handler,
             OutboxTelemetry telemetry, Maintenance maintenance, DeadLetterPass deadLetters) {
         OutboxSchema.validate(config);
         this.db = db;
@@ -375,7 +373,7 @@ public final class OutboxRelay implements Lifecycle {
                 }
             }
         } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            throw db.translate(e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("outbox drain interrupted", e);

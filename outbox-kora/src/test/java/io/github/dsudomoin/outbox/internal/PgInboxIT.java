@@ -9,8 +9,10 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 import io.github.dsudomoin.outbox.Inbox;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
+import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -40,7 +42,6 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.common.Context;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlRunnable;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
@@ -51,7 +52,7 @@ class PgInboxIT {
     private static final String NOT_IN_TX = "inside JdbcConnectionFactory.inTx";
     private static final String OUTSIDE_WARN = "accepted without dedup";
 
-    private final JdbcDatabase db = TestDb.newDatabase(20);
+    private final TestDatabase db = TestDb.newDatabase(20);
     private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
     private final TestOutboxConfig config = new TestOutboxConfig()
             .inboxPartitionInterval(Duration.ofHours(1))
@@ -397,7 +398,8 @@ class PgInboxIT {
         start();
         var pooledRegistry = new SimpleMeterRegistry();
         var sql = new ConcurrentLinkedQueue<String>();
-        var pooled = new PgInbox(TestDb.transactionPooled(db, sql), config, new OutboxMetrics(pooledRegistry));
+        var pooled = new PgInbox(new KoraOutboxTransactions(TestDb.transactionPooled(db, sql)), config,
+                new OutboxMetrics(pooledRegistry));
 
         try (var err = new CapturedStderr()) {
             pooled.runMaintenance();

@@ -13,6 +13,7 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardResult;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -27,13 +28,12 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 /** One table configured as {@code t} by one instance and {@code public.t} by another shares every lock. */
 class TableSpellingIT {
 
-    private final JdbcDatabase db = TestDb.newDatabase(8);
+    private final TestDatabase db = TestDb.newDatabase(8);
     private final String table = TestDb.uniqueTable();
     private final TestOutboxConfig plainConfig = new TestOutboxConfig().table(table).shards(1);
     private final TestOutboxConfig qualifiedConfig = new TestOutboxConfig().table("public." + table).shards(1);

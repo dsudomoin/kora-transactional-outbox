@@ -16,6 +16,7 @@ import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTelemetry;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTracing;
@@ -46,7 +47,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import ru.tinkoff.kora.common.Context;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 /** The relay with {@link KafkaOutboxSender#handler()} against a real broker. */
@@ -54,7 +54,7 @@ class KafkaEndToEndIT {
 
     private static final Duration CONSUME_TIMEOUT = Duration.ofSeconds(30);
 
-    private final JdbcDatabase db = TestDb.newDatabase(20);
+    private final TestDatabase db = TestDb.newDatabase(20);
     // the sender bounds a call by delivery.timeout.ms (20 s) + 5 s, so the relay must give it longer
     private final TestOutboxConfig config = new TestOutboxConfig().batchTimeout(Duration.ofSeconds(30));
     private final OutboxMetrics metrics = new OutboxMetrics(null);

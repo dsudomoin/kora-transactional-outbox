@@ -5,10 +5,14 @@ import io.github.dsudomoin.outbox.DeadLetterFilter;
 import io.github.dsudomoin.outbox.DeadLetterPage;
 import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.OutboxConfig;
-import io.github.dsudomoin.outbox.OutboxStatus;
 import io.github.dsudomoin.outbox.OutboxStatus.DeadLetterCount;
 import io.github.dsudomoin.outbox.OutboxStatus.OrphanKind;
+import io.github.dsudomoin.outbox.OutboxStatus;
+import io.github.dsudomoin.outbox.OutboxTransactions;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Attachment;
+import io.github.dsudomoin.outbox.internal.Sql.SqlConsumer;
+import io.github.dsudomoin.outbox.internal.Sql.SqlFunction0;
+import io.github.dsudomoin.outbox.internal.Sql.SqlFunction1;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -24,11 +28,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlConsumer;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction1;
-import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 /**
  * {@link OutboxAdmin} on Postgres. A bulk call acts on the letters dead when it began: it first reads the highest id
@@ -49,7 +48,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     static final int CHUNK = 1000;
     private static final String LOCK_NOT_AVAILABLE = "55P03";
 
-    private final JdbcConnectionFactory db;
+    private final OutboxTransactions db;
     private final TableNames names;
     private final int shards;
     private final Maintenance maintenance;
@@ -77,7 +76,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         Chunk run(Connection tx, Where where, long after) throws SQLException;
     }
 
-    public PgOutboxAdmin(JdbcConnectionFactory db, TableNames names, OutboxConfig config, Maintenance maintenance,
+    public PgOutboxAdmin(OutboxTransactions db, TableNames names, OutboxConfig config, Maintenance maintenance,
             Runnable wakeRelay) {
         this.db = db;
         this.names = names;
@@ -115,7 +114,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                     shards,
                     instances(c)));
         } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            throw db.translate(e);
         }
     }
 
@@ -156,7 +155,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             });
             return new DeadLetterPage(letters, letters.size() < limit ? null : letters.get(letters.size() - 1).id());
         } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            throw db.translate(e);
         }
     }
 
@@ -175,7 +174,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                 }
             });
         } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            throw db.translate(e);
         }
     }
 
@@ -238,7 +237,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             if (restoring.get() && !(e instanceof IllegalArgumentException)) {
                 wakeRelay.run(); // for the chunks it may have moved before it failed
             }
-            throw e instanceof SQLException s ? new RuntimeSqlException(s) : (RuntimeException) e;
+            throw e instanceof SQLException s ? db.translate(s) : (RuntimeException) e;
         }
         log.info("outbox admin {} on {} returned {}", call, names.base(), moved);
         if (moved > 0) {
@@ -282,7 +281,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                     log.warn("outbox admin {} on {} failed, nothing re-sent: {}", call, names.base(),
                             printable(e.toString()));
                 }
-                throw e instanceof SQLException s ? new RuntimeSqlException(s) : (RuntimeException) e;
+                throw e instanceof SQLException s ? db.translate(s) : (RuntimeException) e;
             }
             cleanup = e; // after the commit: releasing the maintenance lock, the session setting or the connection
         }
@@ -376,7 +375,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             if (putsBack && done > 0) {
                 wakeRelay.run();
             }
-            throw e instanceof SQLException s ? new RuntimeSqlException(s) : (RuntimeException) e;
+            throw e instanceof SQLException s ? db.translate(s) : (RuntimeException) e;
         }
         log.info("outbox admin {} on {} returned {}", call, dead, done);
         if (putsBack && done > 0) {
@@ -511,9 +510,9 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     }
 
     private void requireOwnTransactions() {
-        if (db.currentConnectionContext() != null) {
-            throw new IllegalStateException("OutboxAdmin manages its own transactions: call it outside"
-                    + " JdbcConnectionFactory.inTx(...)");
+        if (db.currentConnection() != null) {
+            throw new IllegalStateException("OutboxAdmin manages its own transactions: call it outside "
+                    + db.transactionHint());
         }
     }
 

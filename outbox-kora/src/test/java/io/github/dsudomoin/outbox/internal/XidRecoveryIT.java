@@ -13,9 +13,11 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
+import io.github.dsudomoin.outbox.kora.KoraOutboxTransactions;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
@@ -43,14 +45,13 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 class XidRecoveryIT {
 
-    private final JdbcDatabase db = TestDb.newDatabase(10);
+    private final TestDatabase db = TestDb.newDatabase(10);
     private final TestOutboxConfig config = new TestOutboxConfig();
     private final List<OutboxRelay> relays = new ArrayList<>();
     private final AtomicInteger wakes = new AtomicInteger();
@@ -329,7 +330,7 @@ class XidRecoveryIT {
                 return db.telemetry();
             }
         };
-        var maintenance = new Maintenance(factory, names, config, new OutboxMetrics(null));
+        var maintenance = new Maintenance(new KoraOutboxTransactions(factory), names, config, new OutboxMetrics(null));
 
         assertThatThrownBy(maintenance::checkHalt).isInstanceOf(IllegalStateException.class)
                 .hasMessage("injected commit failure");
@@ -792,8 +793,8 @@ class XidRecoveryIT {
         send(outbox(null), messages("m", 5));
         forgeRegression();
         var maintenance = maintenance();
-        var admin = new PgOutboxAdmin(TestDb.killedAfterCommit(db), names, config, maintenance,
-                wakes::incrementAndGet);
+        var admin = new PgOutboxAdmin(new KoraOutboxTransactions(TestDb.killedAfterCommit(db)), names, config,
+                maintenance, wakes::incrementAndGet);
 
         try (var err = new CapturedStderr()) {
             assertThat(admin.recoverXidRegression()).isEqualTo(5);

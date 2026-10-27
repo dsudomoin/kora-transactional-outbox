@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import jakarta.annotation.Nullable;
@@ -27,13 +28,12 @@ import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 
 class TicksIT {
 
     private static final int SHARDS = 8;
 
-    private final JdbcDatabase db = TestDb.newDatabase(2);
+    private final TestDatabase db = TestDb.newDatabase(2);
     private TableNames names;
     private Ticks ticks;
 

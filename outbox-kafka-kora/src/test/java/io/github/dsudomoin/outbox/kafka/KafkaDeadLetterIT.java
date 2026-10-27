@@ -13,6 +13,7 @@ import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.kafka.kora.KafkaOutboxModule;
 import io.github.dsudomoin.outbox.kora.KoraOutboxTelemetry;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.time.Duration;
@@ -25,13 +26,12 @@ import org.apache.kafka.common.header.Header;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.common.Context;
-import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 
 /** The relay and the module's dead-letter hook over one {@link KafkaOutboxSender}, against a real broker. */
 class KafkaDeadLetterIT {
 
-    private final JdbcDatabase db = TestDb.newDatabase(10);
+    private final TestDatabase db = TestDb.newDatabase(10);
     // the sender bounds a call by delivery.timeout.ms (20 s) + 5 s: the relay and the hook must give it longer
     private final TestOutboxConfig config = new TestOutboxConfig()
             .batchTimeout(Duration.ofSeconds(30))

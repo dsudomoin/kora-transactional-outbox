@@ -4,8 +4,8 @@ import io.github.dsudomoin.outbox.Inbox;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
+import io.github.dsudomoin.outbox.OutboxTransactions;
 import io.github.dsudomoin.outbox.internal.PgInbox;
-import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 
 /**
  * Consumer-side dedup ({@link Inbox}) without the outbox: no {@link OutboxHandler}, no relay.
@@ -18,7 +18,7 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  */
 public interface InboxModule extends OutboxCommonModule {
 
-    default Inbox inbox(JdbcConnectionFactory db, OutboxConfig config, OutboxTelemetry telemetry) {
+    default Inbox inbox(OutboxTransactions db, OutboxConfig config, OutboxTelemetry telemetry) {
         return new PgInbox(db, config, telemetry);
     }
 }
