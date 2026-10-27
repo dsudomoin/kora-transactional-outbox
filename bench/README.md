@@ -88,6 +88,7 @@ Postgres нужны `max_locks_per_transaction=256` и `max_connections=300` (co
 | `OUTBOX_TABLE` | `outbox.table` | значение библиотеки по умолчанию, `outbox` |
 | `OUTBOX_RELAY_MAX_TICKS`, `OUTBOX_RELAY_MIN_TICK`, `OUTBOX_RELAY_IDLE_POLL` | `outbox.relay.maxTicksPerBatch`, `minTickInterval`, `idlePollInterval` | значения библиотеки по умолчанию |
 | `OUTBOX_XIDS_PER_PARTITION`, `OUTBOX_MAINTENANCE_INTERVAL` | `outbox.partitions.xidsPerPartition`, `maintenanceInterval` | значения библиотеки по умолчанию |
+| `OUTBOX_CURSOR_ANCHOR_INTERVAL` | `outbox.relay.cursorAnchorInterval` | значение библиотеки по умолчанию |
 | `HANDLER_DELAY_MS` | `bench.handlerDelayMs`: обработчик Kafka перед каждым `handleBatch` спит столько на каждую запись (прерывание обрывает сон: батч получает NotAttempted) | 0 |
 | `ROLLBACK_PERCENT` | `bench.rollbackPercent`: доля заказов генератора нагрузки, откатываемых после отправки | 0 |
 | `CONSUMER_THREADS` | `kafka.consumer.orders.threads` (`0` выключает потребителя) | 4 |
