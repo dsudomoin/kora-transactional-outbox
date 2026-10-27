@@ -1,6 +1,6 @@
 ---
 name: using-outbox
-description: Use when adding kora-transactional-outbox (io.github.dsudomoin:outbox-core, outbox-kafka, outbox-admin-kora) to a Kora 1.x service, sending events with Outbox, TypedOutbox, ProtobufOutbox or KafkaOutboxPublisher, editing outbox.* or outbox.kafka.driverProperties, or preparing the Postgres role and Kafka topics for it. Also «аутбокс», «outbox», «transactional outbox», «отправить событие в Kafka в одной транзакции с БД».
+description: Use when adding kora-transactional-outbox (io.github.dsudomoin:outbox-kora, outbox-kafka-kora, outbox-admin-kora) to a Kora 1.x service, sending events with Outbox, TypedOutbox, ProtobufOutbox or KafkaOutboxPublisher, editing outbox.* or outbox.kafka.driverProperties, or preparing the Postgres role and Kafka topics for it. Also «аутбокс», «outbox», «transactional outbox», «отправить событие в Kafka в одной транзакции с БД».
 ---
 
 # Using outbox

@@ -89,7 +89,7 @@ import ru.tinkoff.kora.application.graph.Lifecycle;
  * until {@code batchTimeout}. The sender honours the interrupt at once: it stops handing records over, closes the
  * producer if records are in flight, and returns acked records as {@code Delivered}, unacked ones as {@code Retry} and
  * the rest as {@code NotAttempted}. Running past the soft cut is therefore safe, but turns slow sends into retries.
- * {@link KafkaOutboxModule} logs a WARN at startup when {@code delivery.timeout.ms} + 5 s + {@code max.block.ms}
+ * {@code KafkaOutboxModule} logs a WARN at startup when {@code delivery.timeout.ms} + 5 s + {@code max.block.ms}
  * exceeds {@code batchTimeout} itself.
  */
 public final class KafkaOutboxSender implements Lifecycle {
@@ -223,7 +223,7 @@ public final class KafkaOutboxSender implements Lifecycle {
      * calls; {@code effect} says what then becomes of slow ones. Such calls are not lost: the caller interrupts them
      * and the sender returns their real outcomes at once, but slow sends then end as retries.
      */
-    void warnIfLongerThan(String setting, Duration limit, String effect) {
+    public void warnIfLongerThan(String setting, Duration limit, String effect) {
         if (longestCall.compareTo(limit) > 0) {
             log.warn("A Kafka outbox call can take up to {} (delivery.timeout.ms + 5 s + max.block.ms), longer than "
                     + "{} ({}). {}. Raise {} or lower the producer timeouts in outbox.kafka.driverProperties",

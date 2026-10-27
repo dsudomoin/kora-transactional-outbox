@@ -120,7 +120,7 @@ Postgres нужны `max_locks_per_transaction=256` и `max_connections=300` (co
 консьюмера (пропускная способность, задержка, CPU БД, WAL на доставленное сообщение, пакетов relay в секунду, размер
 таблиц outbox в конце окна, в том числе на хранимое сообщение) и малую нагрузку 100 и 1000 msg/s, как в `low-load.sh`. `WARMUP` (60 с) и `STEADY` (180 с) задают прогрев и окно
 каждого прогона; одно число шардов занимает около 18 минут. Длительность тика отдельно измеряет `TickCostBenchmark` из
-модуля `outbox-core`, который не входит в обычную сборку: `./gradlew :outbox-core:test -Pbenchmark --tests '*TickCostBenchmark'`
+модуля `outbox-kora`, который не входит в обычную сборку: `./gradlew :outbox-kora:test -Pbenchmark --tests '*TickCostBenchmark'`
 запускает его на тестовом контейнере, а с `-Dbench.jdbcUrl=jdbc:postgresql://localhost:5432/outbox -Dbench.user=outbox
 -Dbench.password=outbox` — на стенде; `-Dbench.shards` (32,256,1024), `-Dbench.ended` (0,100,400) и `-Dbench.rounds`
 (200) задают сетку. Он печатает p50 и p99 запроса-пробы тика отдельно (только чтение, не зависит от fsync) и всей

@@ -1,12 +1,12 @@
 package io.github.dsudomoin.outbox.bench
 
-import io.github.dsudomoin.outbox.InboxModule
+import io.github.dsudomoin.outbox.kora.InboxModule
 import io.github.dsudomoin.outbox.OutboxHandler
-import io.github.dsudomoin.outbox.OutboxModule
+import io.github.dsudomoin.outbox.kora.OutboxModule
 import io.github.dsudomoin.outbox.OutboxRecord
 import io.github.dsudomoin.outbox.Outcome
-import io.github.dsudomoin.outbox.json.OutboxJsonModule
-import io.github.dsudomoin.outbox.kafka.KafkaOutboxModule
+import io.github.dsudomoin.outbox.kora.OutboxJsonModule
+import io.github.dsudomoin.outbox.kafka.kora.KafkaOutboxModule
 import io.github.dsudomoin.outbox.kafka.KafkaOutboxSender
 import io.micrometer.core.instrument.Counter
 import io.opentelemetry.sdk.trace.samplers.Sampler

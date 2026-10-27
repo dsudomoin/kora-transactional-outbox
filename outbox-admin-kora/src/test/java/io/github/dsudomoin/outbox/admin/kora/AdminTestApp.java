@@ -1,6 +1,6 @@
 package io.github.dsudomoin.outbox.admin.kora;
 
-import io.github.dsudomoin.outbox.OutboxModule;
+import io.github.dsudomoin.outbox.kora.OutboxModule;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiDelegate;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import java.lang.reflect.InvocationTargetException;

@@ -2,11 +2,17 @@ package io.github.dsudomoin.outbox.testing;
 
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.concurrent.ThreadLocalRandom;
 
 /** One-statement JDBC helpers for assertions. */
 public final class TestSql {
 
     private TestSql() {}
+
+    /** {@code ob_} + 10 random lowercase hex digits. */
+    public static String uniqueTable() {
+        return String.format("ob_%010x", ThreadLocalRandom.current().nextLong(1L << 40));
+    }
 
     public static void execute(Connection c, String sql) throws SQLException {
         try (var st = c.createStatement()) {

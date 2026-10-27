@@ -24,7 +24,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * {@link KafkaOutboxModule}'s dead-letter hook. With {@code outbox.kafka.deadLetterTopic} set, it publishes each
+ * {@code KafkaOutboxModule}'s dead-letter hook. With {@code outbox.kafka.deadLetterTopic} set, it publishes each
  * letter through the relay's {@link KafkaOutboxSender} to the topic that template names, {@code {topic}} replaced by
  * the letter's topic: the letter's key, payload and headers, then {@link #DEAD_TOPIC}, {@link #DEAD_ERROR},
  * {@link #DEAD_ATTEMPTS}, {@link #DEAD_FAILED_AT} and the sender's {@link KafkaOutboxHeaders#MESSAGE_ID}. Letters Kafka
@@ -78,7 +78,7 @@ public final class KafkaDeadLetterHandler implements OutboxDeadLetterHandler {
     private final Warning refusedBefore = new Warning();
 
     /** A null {@code template} keeps every letter; an invalid one throws {@link IllegalArgumentException}. */
-    KafkaDeadLetterHandler(KafkaOutboxSender sender, @Nullable String template) {
+    public KafkaDeadLetterHandler(KafkaOutboxSender sender, @Nullable String template) {
         // the shortest topic it names, for a one-character topic, must be valid; {topic} alone names the letter's own
         if (template != null
                 && (template.equals(TOPIC) || !KafkaOutboxPublisher.validTopic(template.replace(TOPIC, "x")))) {

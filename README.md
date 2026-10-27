@@ -17,7 +17,7 @@ Transactional outbox для сервисов на [Kora](https://github.com/Tink
 > (`annotation-processors` или `symbol-processors` для KSP) тоже на 1.2.23, чтобы сгенерированный код и runtime
 > совпадали.
 
-- Артефакты: `io.github.dsudomoin:outbox-core`, `io.github.dsudomoin:outbox-kafka` и
+- Артефакты для Kora: `io.github.dsudomoin:outbox-kora`, `io.github.dsudomoin:outbox-kafka-kora` и
   `io.github.dsudomoin:outbox-admin-kora`, `0.1.0-SNAPSHOT` (пока только через `mavenLocal()`).
 - Байткод Java 17; работает из Java и Kotlin. Блокирующий API: `send` выполняется внутри `JdbcConnectionFactory.inTx`.
 
@@ -228,24 +228,24 @@ repositories {
 }
 
 dependencies {
-    implementation("io.github.dsudomoin:outbox-core:0.1.0-SNAPSHOT")
-    implementation("io.github.dsudomoin:outbox-kafka:0.1.0-SNAPSHOT") // обработчик Kafka; без Kafka не нужен
+    implementation("io.github.dsudomoin:outbox-kora:0.1.0-SNAPSHOT")
+    implementation("io.github.dsudomoin:outbox-kafka-kora:0.1.0-SNAPSHOT") // обработчик Kafka; без Kafka не нужен
     implementation("io.github.dsudomoin:outbox-admin-kora:0.1.0-SNAPSHOT") // админ-API по HTTP; без него — из кода
 }
 ```
 
-`outbox-core` приносит `database-jdbc`, `config-common`, `opentelemetry-common` и `micrometer-core` (1.12.13).
-`outbox-kafka` добавляет `kafka-clients` 3.9.2. `outbox-admin-kora` добавляет `http-server-common` и
-`json-common`; HTTP-сервер (`http-server-undertow`) и JSON-модуль (`json-module`) подключает сервис
-([Админ-API и HTTP](#админ-api-и-http)).
+`outbox-kora` приносит ядро `outbox-core`, `database-jdbc`, `config-common`, `opentelemetry-common` и `micrometer-core`
+(1.12.13). `outbox-kafka-kora` добавляет `outbox-kafka` с `kafka-clients` 3.9.2. `outbox-admin-kora` добавляет
+`http-server-common` и `json-common`; HTTP-сервер (`http-server-undertow`) и JSON-модуль (`json-module`) подключает
+сервис ([Админ-API и HTTP](#админ-api-и-http)).
 
 Двум опциональным модулям нужна зависимость, которую библиотека не приносит (она только компилируется с ней). Без неё
 `@KoraApp`, включающий такой модуль, не скомпилируется или не стартует (`NoClassDefFoundError`).
 
 | Модуль | Что нужно в вашем classpath |
 |---|---|
-| `io.github.dsudomoin.outbox.json.OutboxJsonModule` | `ru.tinkoff.kora:json-common` (его приносит любой JSON-модуль Kora, например `json-module`) |
-| `io.github.dsudomoin.outbox.protobuf.OutboxProtobufModule` | `com.google.protobuf:protobuf-java` 3.x или новее (его приносят классы, сгенерированные protobuf) |
+| `io.github.dsudomoin.outbox.kora.OutboxJsonModule` | `ru.tinkoff.kora:json-common` (его приносит любой JSON-модуль Kora, например `json-module`) |
+| `io.github.dsudomoin.outbox.kora.OutboxProtobufModule` | `com.google.protobuf:protobuf-java` 3.x или новее (его приносят классы, сгенерированные protobuf) |
 
 ## Быстрый старт
 

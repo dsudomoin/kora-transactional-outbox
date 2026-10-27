@@ -11,7 +11,7 @@ import org.apache.kafka.common.KafkaException;
  * The relay's handler over a {@link KafkaOutboxSender} ({@link KafkaOutboxSender#handler()}): {@code handleBatch} is
  * {@link KafkaOutboxSender#send}; {@code handle} sends one record and throws {@link OutboxPermanentException} or a
  * {@link KafkaException} unless it was delivered. A type of its own, so that an app's handler can replace
- * {@link KafkaOutboxModule}'s default.
+ * {@code KafkaOutboxModule}'s default.
  *
  * <p>A decorator (logging, metrics) must delegate {@code handleBatch} to {@code handleBatch}, not only {@code handle}:
  * {@link io.github.dsudomoin.outbox.OutboxHandler}'s default {@code handleBatch} calls {@code handle} once per

@@ -53,12 +53,12 @@ tasks.test {
 }
 
 dependencies {
-    api(project(":outbox-core"))
+    api(project(":outbox-kora"))
     api("ru.tinkoff.kora:http-server-common")
     api("ru.tinkoff.kora:json-common")
     annotationProcessor("ru.tinkoff.kora:annotation-processors")
 
-    testImplementation(testFixtures(project(":outbox-core")))
+    testImplementation(testFixtures(project(":outbox-kora")))
     testImplementation("ru.tinkoff.kora:http-server-undertow")
     testImplementation("ru.tinkoff.kora:json-module")
     testImplementation("ru.tinkoff.kora:openapi-management")

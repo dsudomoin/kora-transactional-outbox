@@ -13,7 +13,7 @@ import java.util.UUID;
  * A failing serializer, or one that returns {@code null} for a value, throws {@link OutboxSerializationException}
  * before anything is written: only a {@code null} value makes a tombstone, which deletes the key on a compacted topic.
  * <p>
- * {@link OutboxModule} provides {@code TypedOutbox<T>} for every {@code T} with a serializer; for {@code @Json}
+ * {@code OutboxModule} provides {@code TypedOutbox<T>} for every {@code T} with a serializer; for {@code @Json}
  * classes add {@code OutboxJsonModule}.
  * <pre>{@code
  * @Component

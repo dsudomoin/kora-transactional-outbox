@@ -7,12 +7,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.Outcome;
-import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import jakarta.annotation.Nullable;
 import java.time.Clock;
 import java.time.Duration;
@@ -281,28 +279,6 @@ class KafkaOutboxSenderTest {
         sender.send(List.of(recordTo("missing-2", 5, "k")));
         assertThat(lookups.get("missing-2")).as("missing-2 was free to probe, not leased by the call that skipped it")
                 .hasValue(2);
-    }
-
-    /**
-     * A call can take delivery.timeout.ms + 5 s + max.block.ms; the relay gives it batchTimeout. The defaults fit:
-     * 20 s + 5 s + 5 s against 30 s.
-     */
-    @Test
-    void warnsOnlyWhenACallCanOutlastBatchTimeout() {
-        KafkaOutboxConfig defaults = () -> props("bootstrap.servers", "localhost:9092");
-        KafkaOutboxConfig slowMetadata = () -> props("bootstrap.servers", "localhost:9092", "max.block.ms", 10000);
-        var module = new KafkaOutboxModule() {};
-        var relayDefault = outboxConfig(new OutboxConfig.RelayConfig() {}.batchTimeout());
-        try (var err = new CapturedStderr()) {
-            module.kafkaOutboxSender(defaults, relayDefault).release();
-            module.kafkaOutboxSender(slowMetadata, outboxConfig(Duration.ofSeconds(35))).release();
-            module.kafkaOutboxSender(slowMetadata, null).release(); // no relay in the app
-            assertThat(err.text()).doesNotContain("batchTimeout");
-        }
-        try (var err = new CapturedStderr()) {
-            module.kafkaOutboxSender(slowMetadata, relayDefault).release();
-            assertThat(err.text()).contains("WARN").contains("batchTimeout");
-        }
     }
 
     @Test
@@ -1111,20 +1087,6 @@ class KafkaOutboxSenderTest {
         } catch (InterruptedException e) {
             throw new IllegalStateException(e);
         }
-    }
-
-    private static OutboxConfig outboxConfig(Duration batchTimeout) {
-        return new OutboxConfig() {
-            @Override
-            public RelayConfig relay() {
-                return new RelayConfig() {
-                    @Override
-                    public Duration batchTimeout() {
-                        return batchTimeout;
-                    }
-                };
-            }
-        };
     }
 
     private static Properties props(Object... keyValues) {

@@ -10,7 +10,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.DeadLetter;
 import io.github.dsudomoin.outbox.DeadLetterDecision;
-import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.kafka.KafkaOutboxSenderTest.TestProducer;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
@@ -21,7 +20,6 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
@@ -266,29 +264,6 @@ class KafkaDeadLetterHandlerTest {
         assertThat(producers).isEmpty();
     }
 
-    /**
-     * A sender's call can take delivery.timeout.ms + 5 s + max.block.ms; the dead-letter pass gives a hook call
-     * {@code outbox.deadLetters.timeout}. The defaults fit: 20 s + 5 s + 5 s against 30 s.
-     */
-    @Test
-    void warnsOnlyWhenACallCanOutlastTheHookTimeout() {
-        var module = new KafkaOutboxModule() {};
-        var outbox = new OutboxConfig() {};
-        var defaults = kafkaConfig(TEMPLATE, props("bootstrap.servers", "dlq-test:9092"));
-        var slow = kafkaConfig(TEMPLATE, props("bootstrap.servers", "dlq-test:9092", "max.block.ms", "10000"));
-        var off = kafkaConfig(null, props("bootstrap.servers", "dlq-test:9092", "max.block.ms", "10000"));
-        try (var err = new CapturedStderr()) {
-            module.kafkaDeadLetterHandler(defaults, new KafkaOutboxSender(defaults), outbox);
-            module.kafkaDeadLetterHandler(slow, new KafkaOutboxSender(slow), null); // no relay in the app
-            module.kafkaDeadLetterHandler(off, new KafkaOutboxSender(off), outbox); // no calls
-            assertThat(err.text()).doesNotContain("deadLetters.timeout");
-        }
-        try (var err = new CapturedStderr()) {
-            module.kafkaDeadLetterHandler(slow, new KafkaOutboxSender(slow), outbox);
-            assertThat(err.text()).contains("WARN").contains("outbox.deadLetters.timeout");
-        }
-    }
-
     private KafkaDeadLetterHandler handler(@Nullable String template,
             Function<ProducerRecord<byte[], byte[]>, RuntimeException> failure) {
         return handler(template, true, failure);
@@ -312,28 +287,6 @@ class KafkaDeadLetterHandlerTest {
             Thread.sleep(5);
         }
         return producers.get(producer);
-    }
-
-    private static KafkaOutboxConfig kafkaConfig(@Nullable String template, Properties driverProperties) {
-        return new KafkaOutboxConfig() {
-            @Override
-            public Properties driverProperties() {
-                return driverProperties;
-            }
-
-            @Override
-            public String deadLetterTopic() {
-                return template;
-            }
-        };
-    }
-
-    private static Properties props(String... keyValues) {
-        var p = new Properties();
-        for (int i = 0; i < keyValues.length; i += 2) {
-            p.put(keyValues[i], keyValues[i + 1]);
-        }
-        return p;
     }
 
     private static DeadLetter letter(long id, String key, String payload, @Nullable String error,

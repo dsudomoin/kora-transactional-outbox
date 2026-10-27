@@ -20,7 +20,7 @@ dependencies {
     koraBom(platform("ru.tinkoff.kora:kora-parent:$koraVersion"))
     ksp("ru.tinkoff.kora:symbol-processors")
 
-    implementation(project(":outbox-kafka"))
+    implementation(project(":outbox-kafka-kora"))
     implementation("ru.tinkoff.kora:database-jdbc")
     implementation("ru.tinkoff.kora:config-hocon")
     implementation("ru.tinkoff.kora:logging-logback")

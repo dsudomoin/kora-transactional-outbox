@@ -4,7 +4,7 @@ import io.github.dsudomoin.outbox.OutboxConfig;
 import java.time.Duration;
 
 /**
- * Mutable config with fast test defaults and fresh {@link TestDb#uniqueTable()} names for both tables. Relay, retry,
+ * Mutable config with fast test defaults and fresh {@link TestSql#uniqueTable()} names for both tables. Relay, retry,
  * requeue, partition, tail conversion (its window off by default) and recovery settings live on this object itself
  * ({@link #relay()}, {@link #retry()}, {@link #requeue()}, {@link #partitions()}, {@link #tailConversion()} and
  * {@link #recovery()} return {@code this}); the inbox and dead-letter
@@ -15,7 +15,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
         OutboxConfig.RequeueConfig, OutboxConfig.PartitionsConfig, OutboxConfig.TailConversionConfig,
         OutboxConfig.RecoveryConfig {
 
-    private String table = TestDb.uniqueTable();
+    private String table = TestSql.uniqueTable();
     private Integer shards = 4;
     private boolean relayEnabled = true;
     private int workers = 2;
@@ -41,7 +41,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private String tailConversionWindow = ""; // off, whatever time the test runs at
     private Duration tailConversionMaxStall = Duration.ofSeconds(1);
     private String tailConversionZone = java.time.ZoneId.systemDefault().getId();
-    private String inboxTable = TestDb.uniqueTable();
+    private String inboxTable = TestSql.uniqueTable();
     private Duration inboxPartitionInterval = Duration.ofHours(1);
     private Duration inboxPremake = Duration.ofHours(24);
     private Duration inboxRetention = Duration.ofHours(24);
