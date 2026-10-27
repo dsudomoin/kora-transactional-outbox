@@ -33,6 +33,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.MatchResult;
@@ -89,9 +90,12 @@ class TailSwapIT {
     /** {@code outbox.partitions.xids_left} values other than NaN: a sample that found the tail not attached. */
     private final Queue<Double> xidsLeft = new ConcurrentLinkedQueue<>();
     private volatile boolean burning;
+    /** Xids the burner burns every 10 ms while {@link #burning}. */
+    private int burnBatch = 100;
     /** How long each writer sleeps between its transactions; zero: they run flat out. */
     private Duration writerPause = Duration.ZERO;
     private long loadStarted;
+    private long xidAtStart;
     private TableNames names;
     private OutboxSchema schema;
     private OutboxRelay relay;
@@ -108,6 +112,12 @@ class TailSwapIT {
 
     @Test
     void emptyTailSwapsUnderLoad() throws Exception {
+        // every swap must find the tail empty, so the margin left when an extension is due, 2 ranges = 4000 xids,
+        // must outlast a maintenance interval and a run on a loaded machine: paced writers and a slow burner keep
+        // the xid rate near 1500/s, over 2 s of margin; flat out (about 15 000/s here) a run slowed to a quarter of a
+        // second lets rows reach the tail, and the swap rightly takes the hot path
+        writerPause = Duration.ofMillis(20);
+        burnBatch = 10;
         bootstrap();
         start();
         burning = true;
@@ -152,14 +162,17 @@ class TailSwapIT {
         bootstrap();
         start();
         var entered = new CountDownLatch(1);
+        var began = new AtomicLong();
         var returned = new AtomicLong();
         var commitsAtReturn = new AtomicLong();
+        var swapsAtReturn = new AtomicInteger(-1);
         try (var pause = TestDb.connect(); var c = TestDb.connect()) {
             maintenanceLock(pause, "pg_advisory_lock");
             var partitions = new XidPartitions(names, config.partitions());
             burnUntil(() -> partitions.premadeAhead(c) <= config.premake() / 2); // the extension is due
             int before = swaps().size();
             beforeNextCall.set(() -> {
+                began.set(System.nanoTime());
                 entered.countDown();
                 try {
                     Thread.sleep(SLOW_CALL.toMillis());
@@ -167,12 +180,14 @@ class TailSwapIT {
                     Thread.currentThread().interrupt();
                 }
                 commitsAtReturn.set(commits.get());
+                swapsAtReturn.set(swaps().size()); // the step has not committed yet: no swap may have run
                 returned.set(System.nanoTime());
             });
             assertThat(entered.await(5, TimeUnit.SECONDS)).as("a step calls the slow handler").isTrue();
             maintenanceLock(pause, "pg_advisory_unlock"); // the extension starts while that step runs
 
-            await(SLOW_CALL, () -> quiesceWaits(c));
+            // the budget runs from the slow call's start, not from the unpause: the wait must be seen within the call
+            await(Duration.ofNanos(began.get() + SLOW_CALL.toNanos() - System.nanoTime()), () -> quiesceWaits(c));
             long waitSeen = System.nanoTime();
             long waiting = commits.get();
             assertThat(returned).as("the step still runs").hasValue(0);
@@ -181,7 +196,7 @@ class TailSwapIT {
             System.out.printf("TailSwapIT: the swap waited for the slow step at least %d ms%n",
                     TimeUnit.NANOSECONDS.toMillis(swapped - waitSeen));
 
-            assertThat(returned.get()).as("the swap came after the step").isNotZero().isLessThan(swapped);
+            assertThat(swapsAtReturn).as("no swap while the step ran").hasValue(before);
             assertThat(swaps().get(before).group(2)).as("the extension that waited swapped the empty tail").isNull();
             assertThat(commitsAtReturn.get() - waiting).as("writers committed while the swap waited").isPositive();
         }
@@ -233,7 +248,8 @@ class TailSwapIT {
      * Starts the writers, a 10 ms sampler of {@code outbox.partitions.xids_left}, the xid burner (idle until
      * {@link #burning}) and the relay with its maintenance.
      */
-    private void start() {
+    private void start() throws SQLException {
+        xidAtStart = currentXid();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
         relay = new OutboxRelay(db, config, schema, new OutboxHandler() {
             @Override
@@ -285,7 +301,7 @@ class TailSwapIT {
             try (var c = TestDb.connect()) {
                 while (!stopping.get()) {
                     if (burning) {
-                        burn(c, 100);
+                        burn(c, burnBatch);
                     }
                     Thread.sleep(10);
                 }
@@ -302,11 +318,13 @@ class TailSwapIT {
     private List<MatchResult> finish(String test) throws Exception {
         stopLoad();
         long loadMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - loadStarted);
+        long xids = currentXid() - xidAtStart;
         var swaps = swaps();
         System.out.printf("TailSwapIT %s: %d swaps, ACCESS EXCLUSIVE held %s ms after waiting %s ms for it; %d writer"
-                        + " commits in %d ms, the slowest %.1f ms (bound %d ms)%n", test, swaps.size(),
+                        + " commits in %d ms, %d xids/s, the slowest %.1f ms (bound %d ms)%n", test, swaps.size(),
                 swaps.stream().map(swap -> swap.group(3)).toList(), swaps.stream().map(swap -> swap.group(4)).toList(),
-                commits.get(), loadMillis, maxLatency.get() / 1e6, WRITER_BOUND.toMillis());
+                commits.get(), loadMillis, xids * 1000 / Math.max(1, loadMillis), maxLatency.get() / 1e6,
+                WRITER_BOUND.toMillis());
 
         assertThat(errors).as("writer failures").isEmpty();
         assertThat(Duration.ofNanos(maxLatency.get())).as("the slowest writer transaction").isLessThan(WRITER_BOUND);
@@ -371,6 +389,12 @@ class TailSwapIT {
                 assertThat(System.nanoTime()).as("burnt enough within 30 s").isLessThan(deadline);
                 burn(c, 100);
             }
+        }
+    }
+
+    private static long currentXid() throws SQLException {
+        try (var c = TestDb.connect()) {
+            return queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint");
         }
     }
 

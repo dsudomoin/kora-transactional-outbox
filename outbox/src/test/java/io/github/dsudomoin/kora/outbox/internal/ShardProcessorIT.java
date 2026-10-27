@@ -999,6 +999,74 @@ class ShardProcessorIT {
         swapLock(swap, "pg_advisory_unlock");
     }
 
+    @Test
+    void aQueuedSwapLockTurnsNewStepsAway() throws Exception {
+        config.shards(2);
+        bootstrap();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        script = records -> {
+            if (payloads(records).contains("a#1")) { // shard 0's step stays in flight
+                entered.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return records.stream().map(r -> Outcome.delivered()).toList();
+        };
+        send(msg("t", keyOnShard(0), "a#1"), msg("t", keyOnShard(1), "b#1"));
+        tick();
+        var swap = TestDb.connect();
+        open.add(swap);
+        var step = new FutureTask<>(this::process);
+        var quiesce = new FutureTask<Void>(() -> {
+            swapLock(swap, "pg_advisory_lock");
+            return null;
+        });
+        try {
+            new Thread(step).start();
+            assertThat(entered.await(5, TimeUnit.SECONDS)).as("the handler is called").isTrue();
+            new Thread(quiesce).start();
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (!swapLockQueued()) {
+                assertThat(System.nanoTime()).as("the swap lock queued within 5 s").isLessThan(deadline);
+                Thread.sleep(5);
+            }
+
+            // no step holds shard 1 or waits for it: only the queued exclusive request turns this one away, so a
+            // stream of new steps cannot keep the swap waiting
+            assertThat(process(processor, 1, false)).isEqualTo(new ShardResult(NOT_LOCKED, 0, false));
+            assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("a#1"));
+
+            release.countDown();
+            assertThat(step.get(5, TimeUnit.SECONDS)).isEqualTo(new ShardResult(PROGRESS, 1, true));
+            quiesce.get(5, TimeUnit.SECONDS);
+        } finally {
+            release.countDown();
+        }
+        swapLock(swap, "pg_advisory_unlock");
+        assertThat(process(processor, 1, false)).isEqualTo(new ShardResult(PROGRESS, 1, true));
+    }
+
+    /** A session waits for {@code LOCK_SWAP} exclusively: the swap's quiesce request is queued. */
+    private boolean swapLockQueued() throws SQLException {
+        return Long.parseLong(rows("select count(*) from pg_locks where locktype = 'advisory' and classid::bigint = "
+                + Integer.toUnsignedLong(names.internalNamespace()) + " and objid = " + TableNames.LOCK_SWAP
+                + " and objsubid = 2 and mode = 'ExclusiveLock' and not granted", rs -> rs.getString(1)).get(0)) > 0;
+    }
+
+    /** A key of topic {@code t} on {@code shard}. */
+    private String keyOnShard(int shard) {
+        for (int i = 0; ; i++) {
+            var key = "k" + i;
+            if (Hashing.shard(Hashing.keyHash("t", key.getBytes(UTF_8)), config.shards()) == shard) {
+                return key;
+            }
+        }
+    }
+
     /** {@code function(internalNs, LOCK_SWAP)} on {@code c}, as maintenance quiesces the relay for a tail swap. */
     private void swapLock(Connection c, String function) throws SQLException {
         try (var ps = c.prepareStatement("select " + function + "(?, ?)")) {
@@ -2721,6 +2789,10 @@ class ShardProcessorIT {
     }
 
     private ShardResult process(ShardProcessor processor, boolean draining) throws Exception {
+        return process(processor, 0, draining);
+    }
+
+    private ShardResult process(ShardProcessor processor, int shard, boolean draining) throws Exception {
         long latest;
         try (var c = TestDb.connect()) {
             latest = ticks.latest(c).id();
@@ -2728,7 +2800,7 @@ class ShardProcessorIT {
         try (var c = recording(TestDb.connect())) {
             ShardProcessor.prepareTransaction(c, config.batchTimeout());
             try {
-                var result = processor.tryProcess(c, 0, latest, now, draining);
+                var result = processor.tryProcess(c, shard, latest, now, draining);
                 c.commit();
                 return result;
             } catch (Throwable t) {
