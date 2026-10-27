@@ -527,7 +527,9 @@ public final class Maintenance {
      * re-read, and the row written from it would move that cursor back): each shard's lock without waiting
      * ({@code pg_try_advisory_xact_lock(internalNs, LOCK_SHARD_BASE + shard)}, a step's; a shard a step holds waits for
      * the next run), their rows read again by a statement after the lock, so from the cursor and tables a step left,
-     * and appended in one statement. Returns the rows appended.
+     * and appended in one statement. Returns the rows appended. A chunk that fails fails the step with the chunks before
+     * it written: harmless, as each written row is a valid cursor of its own, and the next run finds the shards still
+     * needing one and finishes them.
      */
     private int anchor(Connection c) throws SQLException {
         var wanted = cursors.anchors(c, IntStream.range(0, shards).boxed().toList(), anchorInterval).stream()
