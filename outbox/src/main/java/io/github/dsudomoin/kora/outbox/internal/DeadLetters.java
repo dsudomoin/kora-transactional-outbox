@@ -32,7 +32,8 @@ final class DeadLetters {
 
     DeadLetters(TableNames names, OutboxConfig config) {
         this.resender = new Resender(names, config);
-        this.lockTimeout = "set local lock_timeout = '" + XidPartitions.lockWait(config.partitions()).toMillis() + "ms'";
+        this.lockTimeout = "set local lock_timeout = '" + XidPartitions.lockWait(config.partitions()).toMillis()
+                + "ms'";
         // one row per message, should two of its letters be redriven together
         this.remember = "insert into " + names.redriven() + " (message_id, redrives)"
                 + " select m, max(r) from unnest(?::uuid[], ?::int[]) u(m, r) group by m"

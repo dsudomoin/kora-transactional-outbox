@@ -18,7 +18,10 @@ import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
+import java.time.Clock;
 import java.time.Duration;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
@@ -503,6 +506,98 @@ class XidPartitionsIT {
             assertNoCheck(c, names);
             send(c, names, 10);
             assertThat(queryLong(c, "select count(*) from " + names.tail())).isEqualTo(10_011);
+        }
+    }
+
+    /**
+     * A tail over maxTailScan is converted only inside {@code tailConversion.window}, by the same swap, its scan cut at
+     * maxStall: at noon it stays hot with the ERROR naming the window, at 04:00 it becomes a range.
+     */
+    @Test
+    void oversizedHotTailIsConvertedOnlyInsideTheWindow() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
+                .tailConversion("03:00-05:00", Duration.ofSeconds(5));
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+
+        try (var c = TestDb.connect()) {
+            long lower = overflowTail(c, names, 1000);
+            partitions.clock = at(12, 0);
+
+            String log;
+            try (var err = new CapturedStderr()) {
+                partitions.ensurePremade(c);
+                log = err.text();
+            }
+
+            assertThat(tail(c, names)).as("outside the window: still hot").isEqualTo(lower);
+            assertThat(partitions.overflow()).isTrue();
+            assertThat(log).contains("ERROR").contains("over outbox.partitions.maxTailScan")
+                    .contains("outbox.partitions.tailConversion.window 03:00-05:00").contains("maxStall 5000 ms");
+            partitions.clock = at(4, 0);
+
+            partitions.ensurePremade(c);
+
+            assertThat(queryLong(c, "select count(*) from " + formerTail(c, names, lower).name())).isEqualTo(1000);
+            assertThat(queryLong(c, "select count(*) from " + names.tail())).isZero();
+            assertThat(partitions.overflow()).isFalse();
+            assertTailAboveLastRange(c, names);
+            assertNoCheck(c, names);
+        }
+    }
+
+    /**
+     * Inside the window, a scan longer than maxStall rolls the swap back: the tail stays attached and hot, nothing of
+     * the attempt stays attached or pending, a WARN names the size and maxStall, and every insert meanwhile succeeds.
+     */
+    @Test
+    void aScanLongerThanMaxStallRollsBackCleanly() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
+                .tailConversion("23:00-01:00", Duration.ofMillis(1));
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+        partitions.clock = at(0, 30);
+        var done = new AtomicBoolean();
+        var errors = new ConcurrentLinkedQueue<Throwable>();
+        var inserts = new AtomicLong();
+        var writer = new Thread(() -> {
+            try (var w = TestDb.connect()) {
+                while (!done.get()) {
+                    send(w, names, 1);
+                    inserts.incrementAndGet();
+                }
+            } catch (Throwable e) {
+                errors.add(e);
+            }
+        });
+
+        try (var c = TestDb.connect()) {
+            long lower = overflowTail(c, names, 300_000);
+            var before = PartitionDdl.listRanges(c, names.base());
+            writer.start();
+            while (inserts.get() == 0 && errors.isEmpty()) {
+                Thread.sleep(5);
+            }
+
+            String log;
+            try (var err = new CapturedStderr()) {
+                partitions.ensurePremade(c);
+                log = err.text();
+            } finally {
+                done.set(true);
+                writer.join();
+            }
+
+            assertThat(errors).as("failed inserts").isEmpty();
+            assertThat(inserts.get()).isPositive();
+            assertThat(log).contains("WARN").contains(names.tail()).contains(" MB").contains("maxStall 1 ms");
+            assertThat(tail(c, names)).isEqualTo(lower);
+            assertThat(PartitionDdl.listRanges(c, names.base())).as("the same partitions attached")
+                    .containsExactlyInAnyOrderElementsOf(before);
+            assertThat(detachPending(c, names.tail())).as("still attached").isEqualTo("false");
+            assertThat(partitions.overflow()).isTrue();
+            assertThat(swapLocks(c, names)).as("the quiesce lock released").isZero();
+            assertThat(queryLong(c, "select count(*) from " + names.tail())).isEqualTo(300_000 + inserts.get());
         }
     }
 
@@ -1339,6 +1434,12 @@ class XidPartitionsIT {
                 .filter(b -> names.unqualified(b.name()).equals(names.unqualified(names.partitionPrefix()) + lower))
                 .findFirst()
                 .orElseThrow(() -> new AssertionError("no range " + names.partitionPrefix() + lower));
+    }
+
+    /** A clock at {@code hour:minute} today in the JVM's zone. */
+    private static Clock at(int hour, int minute) {
+        var zone = ZoneId.systemDefault();
+        return Clock.fixed(LocalDate.now(zone).atTime(hour, minute).atZone(zone).toInstant(), zone);
     }
 
     /** No check on the outbox or any of its partitions: none of the library's, so none that refuses a row. */

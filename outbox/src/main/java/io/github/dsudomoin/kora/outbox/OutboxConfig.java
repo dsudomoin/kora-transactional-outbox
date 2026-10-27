@@ -172,7 +172,7 @@ public interface OutboxConfig {
         /**
          * Largest tail, in bytes ({@code pg_relation_size}), that the swap turns into a range when rows went to it,
          * which scans it under the swap's lock: writers wait for the scan. A larger tail stays hot, writes going on
-         * into it, until {@code OutboxAdmin.convertTail}. Default 16 MB.
+         * into it, until {@link #tailConversion()}'s window. Default 16 MB.
          */
         default long maxTailScan() {
             return 16L * 1024 * 1024;
@@ -184,6 +184,32 @@ public interface OutboxConfig {
          */
         default boolean restoreOrphans() {
             return true;
+        }
+
+        default TailConversionConfig tailConversion() {
+            return new TailConversionConfig() {};
+        }
+    }
+
+    /** When a hot tail over {@code maxTailScan} is turned into a range all the same: writers wait for its scan. */
+    @ConfigValueExtractor
+    interface TailConversionConfig {
+
+        /**
+         * {@code HH:mm-HH:mm} in the JVM's default time zone, crossing midnight when the end comes first; empty: never.
+         * Default {@code 03:00-05:00}.
+         */
+        default String window() {
+            return "03:00-05:00";
+        }
+
+        /**
+         * The scan's {@code statement_timeout} in the window, so about the longest writers wait for its hold: keep it
+         * below their own {@code lock_timeout} and {@code statement_timeout}. A scan that does not fit rolls back,
+         * nothing left behind, and the next run tries again. Default 1 s.
+         */
+        default Duration maxStall() {
+            return Duration.ofSeconds(1);
         }
     }
 

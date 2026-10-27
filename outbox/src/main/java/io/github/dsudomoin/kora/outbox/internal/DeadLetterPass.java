@@ -320,8 +320,8 @@ public final class DeadLetterPass {
     }
 
     /**
-     * One batch of due scheduled letters, but those whose key is held, which are deferred; {@code ids} as claimed.
-     * Its waits are bounded by {@link XidPartitions#lockWait} from right after the claim: from the key locks on, writers of
+     * One batch of due scheduled letters, but those whose key is held, which are deferred; {@code ids} as claimed. Its
+     * waits are bounded by {@link XidPartitions#lockWait} from right after the claim: from the key locks on, writers of
      * those keys wait with it.
      */
     private DeadLetters.Split redriveBatch(Connection tx, List<Long> ids) throws SQLException {

@@ -18,7 +18,8 @@ class OutboxConfigTest {
             new $OutboxConfig_RelayConfig_ConfigValueExtractor(DURATION,
                     new $OutboxConfig_RetryConfig_ConfigValueExtractor(DURATION),
                     new $OutboxConfig_RequeueConfig_ConfigValueExtractor(DURATION)),
-            new $OutboxConfig_PartitionsConfig_ConfigValueExtractor(DURATION),
+            new $OutboxConfig_PartitionsConfig_ConfigValueExtractor(DURATION,
+                    new $OutboxConfig_TailConversionConfig_ConfigValueExtractor(DURATION)),
             new $OutboxConfig_InboxConfig_ConfigValueExtractor(DURATION),
             new $OutboxConfig_DeadLettersConfig_ConfigValueExtractor(DURATION),
             new $OutboxConfig_RecoveryConfig_ConfigValueExtractor(DURATION));
@@ -118,6 +119,22 @@ class OutboxConfigTest {
     }
 
     @Test
+    void tailConversionIsReadAndValidated() {
+        var tail = parse("outbox.partitions.tailConversion { window = \"23:00-01:00\", maxStall = 300ms }")
+                .partitions().tailConversion();
+        assertThat(tail.window()).isEqualTo("23:00-01:00");
+        assertThat(tail.maxStall()).isEqualTo(Duration.ofMillis(300));
+        OutboxSchema.validate(parse("outbox.partitions.tailConversion.window = \"\""));
+
+        assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox.partitions.tailConversion.window = 3-5")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("outbox.partitions.tailConversion.window").hasMessageContaining("HH:mm-HH:mm");
+        assertThatThrownBy(() -> OutboxSchema.validate(parse("outbox.partitions.tailConversion.maxStall = 0s")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("outbox.partitions.tailConversion.maxStall must be at least 1ms: PT0S");
+    }
+
+    @Test
     void requeueKeysAreReadAndValidated() {
         var requeue = parse("outbox.relay.requeue { delay = 250ms, maxRequeues = 5 }").relay().requeue();
 
@@ -193,6 +210,8 @@ class OutboxConfigTest {
         assertThat(partitions.swapLockTimeout()).isZero();
         assertThat(partitions.maxTailScan()).isEqualTo(16L * 1024 * 1024);
         assertThat(partitions.restoreOrphans()).isTrue();
+        assertThat(partitions.tailConversion().window()).isEqualTo("03:00-05:00");
+        assertThat(partitions.tailConversion().maxStall()).isEqualTo(Duration.ofSeconds(1));
 
         var inbox = config.inbox();
         assertThat(inbox.table()).isEqualTo("inbox");

@@ -5,13 +5,15 @@ import java.time.Duration;
 
 /**
  * Mutable config with fast test defaults and fresh {@link TestDb#uniqueTable()} names for both tables. Relay, retry,
- * requeue, partition and recovery settings live on this object itself ({@link #relay()}, {@link #retry()},
- * {@link #requeue()}, {@link #partitions()} and {@link #recovery()} return {@code this}); the inbox and dead-letter
+ * requeue, partition, tail conversion (its window off by default) and recovery settings live on this object itself
+ * ({@link #relay()}, {@link #retry()}, {@link #requeue()}, {@link #partitions()}, {@link #tailConversion()} and
+ * {@link #recovery()} return {@code this}); the inbox and dead-letter
  * blocks are separate because their {@code table()}, {@code premake()} and {@code batchSize()} clash with the outbox
  * ones.
  */
 public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayConfig, OutboxConfig.RetryConfig,
-        OutboxConfig.RequeueConfig, OutboxConfig.PartitionsConfig, OutboxConfig.RecoveryConfig {
+        OutboxConfig.RequeueConfig, OutboxConfig.PartitionsConfig, OutboxConfig.TailConversionConfig,
+        OutboxConfig.RecoveryConfig {
 
     private String table = TestDb.uniqueTable();
     private Integer shards = 4;
@@ -36,6 +38,8 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private Duration swapLockTimeout = Duration.ZERO;
     private long maxTailScan = new PartitionsConfig() {}.maxTailScan();
     private boolean restoreOrphans = true;
+    private String tailConversionWindow = ""; // off, whatever time the test runs at
+    private Duration tailConversionMaxStall = Duration.ofSeconds(1);
     private String inboxTable = TestDb.uniqueTable();
     private Duration inboxPartitionInterval = Duration.ofHours(1);
     private Duration inboxPremake = Duration.ofHours(24);
@@ -350,6 +354,27 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
 
     public TestOutboxConfig maxTailScan(long maxTailScan) {
         this.maxTailScan = maxTailScan;
+        return this;
+    }
+
+    @Override
+    public TailConversionConfig tailConversion() {
+        return this;
+    }
+
+    @Override
+    public String window() {
+        return tailConversionWindow;
+    }
+
+    @Override
+    public Duration maxStall() {
+        return tailConversionMaxStall;
+    }
+
+    public TestOutboxConfig tailConversion(String window, Duration maxStall) {
+        this.tailConversionWindow = window;
+        this.tailConversionMaxStall = maxStall;
         return this;
     }
 

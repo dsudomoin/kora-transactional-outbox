@@ -155,6 +155,10 @@ public final class OutboxSchema implements Lifecycle {
                 "outbox.partitions.swapLockTimeout must be 0 or at least 1ms: " + swapWait);
         require(partitions.maxTailScan() >= 0,
                 "outbox.partitions.maxTailScan must not be negative: " + partitions.maxTailScan());
+        XidPartitions.Window.parse(partitions.tailConversion().window()); // its message names the key
+        require(partitions.tailConversion().maxStall().toMillis() >= 1,
+                "outbox.partitions.tailConversion.maxStall must be at least 1ms: "
+                        + partitions.tailConversion().maxStall());
         require(deadLetters.batchSize() >= 1,
                 "outbox.deadLetters.batchSize must be at least 1: " + deadLetters.batchSize());
         // a batch's redrive holds a key lock per letter in one transaction, as an admin chunk does
