@@ -72,8 +72,8 @@ Testcontainers 2.x packages: `org.testcontainers.postgresql`, `org.testcontainer
 
 - **Custom handler without Kafka**: a test `@KoraApp` whose `OutboxHandler` factory returns a handler that records
   what it got. The library's own test fixtures are not published; write the ten lines.
-- **Retry path**: `drain()` throws `IllegalStateException` after 2 × `batchTimeout` without progress (a stub
-  answering 500). Lower `batchTimeout` only with a non-Kafka handler; with Kafka it must stay ≥
+- **Retry path**: `drain()` throws `IllegalStateException` after 2 × (`batchTimeout` + 5 s) without progress
+  (a stub answering 500). Lower `batchTimeout` only with a non-Kafka handler; with Kafka it must stay ≥
   `delivery.timeout.ms + 5 s + max.block.ms`.
 - **Unit tests**: `Outbox` and `Inbox` are interfaces; mock them. `new TypedOutbox<>(outbox, serializer)` wraps a mock.
 - **Ambiguous `inTx`**: an expression lambda needs a cast, `db.inTx((SqlFunction0<UUID>) () -> outbox.send(m))`.

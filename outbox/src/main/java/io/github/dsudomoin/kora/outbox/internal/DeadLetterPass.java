@@ -9,7 +9,6 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
@@ -24,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
@@ -41,10 +41,13 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * Scheduled letters due are then redriven, a batch per transaction ({@link Resender}, the {@code <redriven>} count,
  * the dead rows deleted). Their key locks are taken without waiting ({@code pg_try_advisory_xact_lock}): a letter
  * whose key is held, by an open {@code send} of it, is due again after {@code relay.retry.initialDelay} while the
- * others go on. Any other lock the insert waits for is waited for at most {@code partitions.swapLockTimeout} each:
- * while it waits, writers of the keys it holds wait too. A batch that fails after its claim rolls back, and its
- * letters are then due again after {@code initialDelay}, so they hold back no letter behind them; a lock timeout
- * (55P03) is a WARN, at most once a minute, and ends the phase until the next pass; any other failure propagates.
+ * others of its batch go on, and the phase ends with that batch. Right after the claim the batch's
+ * {@code lock_timeout} becomes {@code partitions.swapLockTimeout}: it bounds each lock wait of the batch, not their
+ * sum, and while one lasts the writers of the keys the batch holds wait too, so a batch that meets several held
+ * table locks stalls them for that many waits. A batch that fails after its claim rolls back, and those of its
+ * letters still due are then due again after {@code initialDelay} (none another pass decided meanwhile), so they hold
+ * back no letter behind them; a lock timeout (55P03) is a WARN, at most once a minute, and ends the phase until the
+ * next pass; any other failure propagates. Hook failures have a WARN of their own, at most once a minute too.
  */
 public final class DeadLetterPass {
 
@@ -68,11 +71,13 @@ public final class DeadLetterPass {
     private final String fail;
     private final String defer;
     private final String keepPending;
-    private final String nextDue;
+    private final String untilNextDue;
     private final ThreadPoolExecutor executor;
-    /** When a WARN was last logged ({@code nanoTime}), and how many went unlogged since. */
-    private final AtomicLong warned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
-    private final AtomicInteger suppressed = new AtomicInteger();
+    /** One {@link #runOnce} at a time; not {@code synchronized}, which pins a virtual thread's carrier (JDK 21+). */
+    private final ReentrantLock running = new ReentrantLock();
+    private final Warnings hookFailures = new Warnings();
+    private final Warnings lockTimeouts = new Warnings();
+    private volatile boolean closed;
 
     /** A committed hand-over: the letters claimed; the call's failure, or the decisions it committed. */
     private record Batch(int claimed, @Nullable Throwable failure, List<DeadLetterDecision> decisions) {}
@@ -96,11 +101,14 @@ public final class DeadLetterPass {
                 + " due_at = least(greatest(?, now()), now() + interval '7 days') where id = ?";
         fail = "update " + dead + " set handler_attempts = handler_attempts + 1, last_handler_error = ?,"
                 + " due_at = now() + make_interval(secs => ?) where id = ?";
-        defer = "update " + dead + " set due_at = now() + make_interval(secs => ?) where id = any(?)";
+        // only letters still due: one another pass decided since the batch rolled back keeps its decision
+        defer = "update " + dead + " set due_at = now() + make_interval(secs => ?) where id = any(?)"
+                + " and due_at <= now()";
         // due_at is set on every pending letter: the partial index finds them, not a scan of all the kept ones
         keepPending = "update " + dead + " set status = 'kept', due_at = null where id in (select id from " + dead
                 + " where status = 'pending' and due_at is not null for update skip locked)";
-        nextDue = "select min(due_at) from " + dead + " where due_at > now()";
+        untilNextDue = "select (extract(epoch from min(due_at) - now()) * 1000000)::bigint from " + dead
+                + " where due_at > now()";
         this.executor = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(), r -> {
             var t = new Thread(r, "outbox-dead-letter-hook");
             t.setDaemon(true);
@@ -120,7 +128,8 @@ public final class DeadLetterPass {
      * redrove: the caller wakes the relay when there are any. One run at a time per pass, so a second caller's hook
      * call never waits for the first one's inside its own timeout.
      */
-    public synchronized int runOnce() {
+    public int runOnce() {
+        running.lock();
         try (var c = db.newConnection()) {
             if (active()) {
                 handOver(c);
@@ -134,29 +143,38 @@ public final class DeadLetterPass {
             return redriveScheduled(c);
         } catch (SQLException e) {
             throw new RuntimeSqlException(e);
+        } finally {
+            running.unlock();
         }
     }
 
     /**
-     * The earliest {@code due_at} still ahead, null when none: a letter due already was handled by the last run or is
-     * held by another pass, which decides it or sets its backoff.
+     * How long until the earliest {@code due_at} still ahead, by the database clock (which every {@code due_at} is
+     * set by), so a skewed local clock does not turn the wait into a spin; null when none. A letter due already was
+     * handled by the last run, is held by another pass, which decides it or sets its backoff, or waits behind a
+     * batch that deferred a held key, which is due again within {@code initialDelay}.
      */
     @Nullable
-    public Instant nextDue() {
+    public Duration untilNextDue() {
         try (var c = db.newConnection()) {
             c.setAutoCommit(true);
-            try (var st = c.createStatement(); var rs = st.executeQuery(nextDue)) {
+            try (var st = c.createStatement(); var rs = st.executeQuery(untilNextDue)) {
                 rs.next();
-                var at = rs.getObject(1, OffsetDateTime.class);
-                return at == null ? null : at.toInstant();
+                long micros = rs.getLong(1);
+                return rs.wasNull() ? null : Duration.of(micros, ChronoUnit.MICROS);
             }
         } catch (SQLException e) {
             throw new RuntimeSqlException(e);
         }
     }
 
-    /** Stops the hook thread, interrupting a call in progress; a later {@link #runOnce} with letters fails. */
+    /**
+     * Stops the hook thread, interrupting a call in progress: its letters roll back, without a failed attempt, and
+     * those still due are due again after {@code initialDelay}. A run in progress stops after its batch; a later
+     * {@link #runOnce} with letters fails.
+     */
     public void close() {
+        closed = true;
         executor.shutdownNow();
     }
 
@@ -172,7 +190,7 @@ public final class DeadLetterPass {
             }
             if (batch.failure() != null) {
                 metrics.deadHookFailure();
-                warn("outbox dead-letter hook failed on " + batch.claimed() + " letters of " + dead
+                hookFailures.warn("outbox dead-letter hook failed on " + batch.claimed() + " letters of " + dead
                         + "; they stay pending and are handed to it again after a backoff", batch.failure());
                 return;
             }
@@ -195,9 +213,13 @@ public final class DeadLetterPass {
         List<DeadLetterDecision> decisions;
         try {
             decisions = call(claimed.stream().map(DeadLetters.Claimed::letter).toList());
-        } catch (ExecutionException e) {
-            return failed(tx, claimed, e.getCause());
-        } catch (TimeoutException e) {
+        } catch (ExecutionException | TimeoutException e) {
+            if (closed) { // cut by close(), most likely by its interrupt: no failure of the hook
+                throw new IllegalStateException("outbox dead-letter pass closed during a hook call", e);
+            }
+            if (e instanceof ExecutionException x) {
+                return failed(tx, claimed, x.getCause());
+            }
             return failed(tx, claimed, new TimeoutException("outbox dead-letter hook exceeded"
                     + " outbox.deadLetters.timeout " + timeout));
         } catch (InterruptedException e) {
@@ -236,38 +258,54 @@ public final class DeadLetterPass {
         return new Batch(claimed.size(), null, decisions);
     }
 
-    /** Due scheduled letters, batch after batch until one is not full; returns how many were redriven. */
+    /**
+     * Due scheduled letters, batch after batch until one is not full or deferred a held key's letter, which is due
+     * again within {@code initialDelay}: looping on would claim it again and again while the key is held. Returns how
+     * many were redriven.
+     */
     private int redriveScheduled(Connection c) throws SQLException {
         int redriven = 0;
-        while (true) {
+        while (!closed) {
             var ids = new ArrayList<Long>();
+            DeadLetters.Split split;
             try {
-                redriven += inTx(c, tx -> redriveBatch(tx, ids));
+                split = inTx(c, tx -> redriveBatch(tx, ids));
             } catch (SQLException | RuntimeException e) {
                 recover(c, ids, e);
                 return redriven;
             }
-            if (ids.size() < batchSize) {
+            redriven += split.ready().size();
+            if (ids.size() < batchSize || !split.held().isEmpty()) {
                 return redriven;
             }
         }
-    }
-
-    /** One batch of due scheduled letters, but those whose key is held, which are deferred; {@code ids} as claimed. */
-    private int redriveBatch(Connection tx, List<Long> ids) throws SQLException {
-        var claimed = claim(tx, "scheduled");
-        claimed.forEach(c -> ids.add(c.letter().id()));
-        var split = rows.tryKeyLocks(tx, claimed);
-        defer(tx, split.held().stream().map(c -> c.letter().id()).toList());
-        rows.redrive(tx, split.ready()); // its key locks are ours already: Resender takes them again without waiting
-        return split.ready().size();
+        return redriven;
     }
 
     /**
-     * After a batch rolled back on {@code failure}: its claimed letters, if any, are due again after
-     * {@code initialDelay}, set in a fresh transaction, so they hold back no letter behind them and {@link #nextDue}
-     * finds them. Returns after a lock timeout (a WARN), which ends the phase: no key lock is waited for, so it was a
-     * table's lock, which the batches after it would wait for too. Rethrows any other failure.
+     * One batch of due scheduled letters, but those whose key is held, which are deferred; {@code ids} as claimed.
+     * Its waits are bounded by {@code swapLockTimeout} from right after the claim: from the key locks on, writers of
+     * those keys wait with it.
+     */
+    private DeadLetters.Split redriveBatch(Connection tx, List<Long> ids) throws SQLException {
+        var claimed = claim(tx, "scheduled");
+        claimed.forEach(c -> ids.add(c.letter().id()));
+        if (claimed.isEmpty()) {
+            return new DeadLetters.Split(List.of(), List.of());
+        }
+        rows.limitLockWaits(tx);
+        var split = rows.tryKeyLocks(tx, claimed);
+        defer(tx, split.held().stream().map(c -> c.letter().id()).toList());
+        rows.redrive(tx, split.ready()); // its key locks are ours already: Resender takes them again without waiting
+        return split;
+    }
+
+    /**
+     * After a batch rolled back on {@code failure}: its claimed letters, if any, that are still due are due again
+     * after {@code initialDelay}, set in a fresh transaction, so they hold back no letter behind them and
+     * {@link #untilNextDue} finds them; one another pass has decided since the rollback keeps that decision. Returns
+     * after a lock timeout (a WARN), which ends the phase: no key lock is waited for, so it was a table's lock, which
+     * the batches after it would wait for too. Rethrows any other failure.
      */
     private void recover(Connection c, List<Long> ids, Exception failure) throws SQLException {
         if (!ids.isEmpty()) {
@@ -386,8 +424,8 @@ public final class DeadLetterPass {
         if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
             return false;
         }
-        warn("outbox dead-letter pass on " + dead + " timed out waiting for a lock: its batch rolled back and is"
-                + " due again after outbox.relay.retry.initialDelay; " + e.getMessage(), null);
+        lockTimeouts.warn("outbox dead-letter pass on " + dead + " timed out waiting for a lock: its batch rolled back"
+                + " and is due again after outbox.relay.retry.initialDelay; " + e.getMessage(), null);
         return true;
     }
 
@@ -402,18 +440,25 @@ public final class DeadLetterPass {
         return "redrive_at";
     }
 
-    /** A WARN at most once a minute for this pass. */
-    private void warn(String what, @Nullable Throwable error) {
-        long now = System.nanoTime();
-        long last = warned.get();
-        if (now - last < WARN_INTERVAL || !warned.compareAndSet(last, now)) {
-            suppressed.incrementAndGet();
-            return;
-        }
-        if (error == null) {
-            log.warn("{} ({} more since the previous report not logged)", what, suppressed.getAndSet(0));
-        } else {
-            log.warn("{} ({} more since the previous report not logged)", what, suppressed.getAndSet(0), error);
+    /** One kind of WARN of this pass, at most once a minute, so a frequent kind never hides another. */
+    private static final class Warnings {
+
+        /** When this WARN was last logged ({@code nanoTime}), and how many went unlogged since. */
+        private final AtomicLong warned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
+        private final AtomicInteger suppressed = new AtomicInteger();
+
+        void warn(String what, @Nullable Throwable error) {
+            long now = System.nanoTime();
+            long last = warned.get();
+            if (now - last < WARN_INTERVAL || !warned.compareAndSet(last, now)) {
+                suppressed.incrementAndGet();
+                return;
+            }
+            if (error == null) {
+                log.warn("{} ({} more since the previous report not logged)", what, suppressed.getAndSet(0));
+            } else {
+                log.warn("{} ({} more since the previous report not logged)", what, suppressed.getAndSet(0), error);
+            }
         }
     }
 }

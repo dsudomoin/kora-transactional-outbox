@@ -16,12 +16,16 @@ import io.github.dsudomoin.kora.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.kora.outbox.OutboxHeader;
 import io.github.dsudomoin.kora.outbox.OutboxMessage;
 import io.github.dsudomoin.kora.outbox.OutboxRelay;
+import io.github.dsudomoin.kora.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.kora.outbox.testing.TestSql;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import jakarta.annotation.Nullable;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
@@ -37,12 +41,16 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
+import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
+import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
@@ -153,7 +161,7 @@ class DeadLetterPassIT {
         long soon = letter("t", "a", "soon", List.of());
         long later = letter("t", "b", "later", List.of());
         long never = letter("t", "c", "never", List.of());
-        var at = Instant.now().plusMillis(700).truncatedTo(ChronoUnit.MICROS);
+        var at = Instant.now().plusSeconds(3).truncatedTo(ChronoUnit.MICROS);
         var pass = pass(letters -> letters.stream()
                 .map(l -> redriveAt(l.id() == soon ? at
                         : l.id() == later ? Instant.now().plus(30, ChronoUnit.DAYS) : Instant.MAX))
@@ -171,9 +179,10 @@ class DeadLetterPassIT {
                     .as("clamped to now + 7 days").isLessThan(60);
             assertThat(queryLong(c, "select count(*) from " + names.base())).isZero();
         }
-        assertThat(pass.nextDue()).isEqualTo(at);
+        assertThat(pass.untilNextDue()).as("by the database clock")
+                .isPositive().isLessThanOrEqualTo(Duration.ofSeconds(3));
 
-        await(Duration.ofSeconds(5), () -> pass.runOnce() == 1);
+        await(Duration.ofSeconds(10), () -> pass.runOnce() == 1);
 
         assertThat(status(soon)).isNull();
         assertThat(status(later)).isEqualTo("scheduled");
@@ -359,11 +368,12 @@ class DeadLetterPassIT {
 
     @Test
     void oneRunAtATimePerPass() throws Exception {
-        config.deadLettersBatchSize(1).deadLettersTimeout(Duration.ofMillis(700));
+        // serialized, each call has 2 s to spare; queued behind the other, the second would need 5 s
+        config.deadLettersBatchSize(1).deadLettersTimeout(Duration.ofMillis(4500));
         long a = letter("t", "a", "p", List.of());
         long b = letter("t", "b", "p", List.of());
         var pass = pass(letters -> {
-            Thread.sleep(400);
+            Thread.sleep(2500);
             return all(letters, keep());
         });
         var start = new CountDownLatch(1);
@@ -376,13 +386,127 @@ class DeadLetterPassIT {
         }
         start.countDown();
         for (var run : runs) {
-            run.get(10, SECONDS);
+            run.get(20, SECONDS);
         }
 
         assertThat(registry.find("outbox.dead.hook.failures").counter())
                 .as("no call timed out waiting for the other run's").isNull();
         assertThat(status(a)).isEqualTo("kept");
         assertThat(status(b)).isEqualTo("kept");
+    }
+
+    @Test
+    void aFailedBatchNeverOverwritesADecisionMadeSinceItsRollback() throws Exception {
+        long id = letter("t", "k", "p", List.of());
+        var later = Instant.now().plus(1, ChronoUnit.DAYS).truncatedTo(ChronoUnit.MICROS);
+        var other = pass(letters -> all(letters, redriveAt(later))); // another instance's pass
+        var failing = new DeadLetterPass(commitFailsOnce(other::runOnce), names, config,
+                letters -> all(letters, keep()), new OutboxMetrics(registry));
+        passes.add(failing);
+
+        assertThatThrownBy(failing::runOnce).isInstanceOf(RuntimeSqlException.class)
+                .hasMessageContaining("injected");
+
+        assertThat(status(id)).isEqualTo("scheduled");
+        assertThat(dueAt(id)).as("the other pass's decision").isEqualTo(later);
+        assertThat(handlerAttempts(id)).isZero();
+    }
+
+    @Test
+    void aBatchThatDeferredAHeldKeyEndsTheRedrivePhase() throws Exception {
+        // a deferred letter is due again at once: a phase that looped on full batches would claim it until the send
+        // ends, holding the run lock drain() waits for
+        config.deadLettersBatchSize(1).retry(Duration.ofMillis(1), Duration.ofMillis(500), 0);
+        letter("t", "k", "first", List.of());
+        letter("t", "k", "second", List.of());
+        execute("update " + names.dead() + " set status = 'scheduled'");
+        var commit = new CountDownLatch(1);
+        var sender = openSend("k", "live", commit);
+        var pass = pass(null);
+        try {
+            assertThat(pool.submit(pass::runOnce).get(5, SECONDS)).isZero();
+        } finally {
+            commit.countDown();
+        }
+        sender.get(10, SECONDS);
+
+        var redriven = new AtomicInteger();
+        await(Duration.ofSeconds(5), () -> redriven.addAndGet(pass.runOnce()) == 2);
+    }
+
+    @Test
+    void aRedriveHoldsAKeyLockNoLongerThanSwapLockTimeoutWhileItWaits() throws Exception {
+        config.swapLockTimeout(Duration.ofSeconds(1));
+        letter("t", "k", "held", List.of());
+        letter("t", "j", "free", List.of());
+        execute("update " + names.dead() + " set status = 'scheduled'");
+        var commit = new CountDownLatch(1);
+        var sender = openSend("k", "live", commit);
+        var pass = pass(letters -> all(letters, keep())); // without a hook, the update of pending letters would wait
+        long heldFor;
+        try (var locker = TestDb.connect()) {
+            locker.setAutoCommit(false);
+            // the claim passes it; the deferral of the held key's letter waits for it, holding the lock of key j
+            TestSql.execute(locker, "lock table " + names.dead() + " in share mode");
+            var run = pool.submit(pass::runOnce);
+            await(Duration.ofSeconds(5), () -> keyLockGranted("j"));
+            long taken = System.nanoTime();
+            await(Duration.ofSeconds(10), () -> !keyLockGranted("j"));
+            heldFor = System.nanoTime() - taken;
+            locker.rollback();
+            assertThat(run.get(10, SECONDS)).isZero();
+        } finally {
+            commit.countDown();
+        }
+        sender.get(10, SECONDS);
+
+        // writers of key j waited this long; the step's own lock_timeout is 5 s
+        assertThat(Duration.ofNanos(heldFor)).isLessThan(Duration.ofSeconds(3));
+    }
+
+    @Test
+    void closeInterruptsTheHookWithoutCostingAnAttempt() throws Exception {
+        long id = letter("t", "k", "p", List.of());
+        var entered = new CountDownLatch(1);
+        var pass = pass(letters -> {
+            entered.countDown();
+            Thread.sleep(60_000);
+            return all(letters, keep());
+        });
+        var run = pool.submit(pass::runOnce);
+        assertThat(entered.await(10, SECONDS)).isTrue();
+
+        pass.close();
+
+        assertThatThrownBy(() -> run.get(10, SECONDS)).hasCauseInstanceOf(IllegalStateException.class);
+        assertThat(status(id)).isEqualTo("pending");
+        assertThat(handlerAttempts(id)).isZero();
+        assertThat(registry.find("outbox.dead.hook.failures").counter()).isNull();
+    }
+
+    @Test
+    void hookFailuresAndLockTimeoutsWarnApart() throws Exception {
+        letter("t", "a", "p", List.of());
+        var calls = new AtomicInteger();
+        var pass = pass(letters -> {
+            if (calls.incrementAndGet() == 1) {
+                throw new IllegalStateException("alerting is down");
+            }
+            return all(letters, keep());
+        });
+        try (var err = new CapturedStderr()) {
+            pass.runOnce();
+            long scheduled = letter("t", "b", "p", List.of());
+            execute("update " + names.dead() + " set status = 'scheduled' where id = " + scheduled);
+            try (var locker = TestDb.connect()) {
+                locker.setAutoCommit(false);
+                TestSql.execute(locker, "lock table " + names.base() + " in access exclusive mode");
+                pass.runOnce();
+                locker.rollback();
+            }
+
+            assertThat(err.text()).contains("dead-letter hook failed").contains("timed out waiting for a lock");
+        }
     }
 
     @Test
@@ -451,6 +575,66 @@ class DeadLetterPassIT {
         }));
         assertThat(sent.await(10, SECONDS)).as("the sender holds the key lock").isTrue();
         return sender;
+    }
+
+    /**
+     * {@link #db} whose first commit fails; right after the rollback of that transaction, {@code afterRollback} runs,
+     * as another instance's pass would, before the failed one goes on.
+     */
+    private JdbcConnectionFactory commitFailsOnce(Runnable afterRollback) {
+        var failed = new AtomicBoolean();
+        var ran = new AtomicBoolean();
+        return new JdbcConnectionFactory() {
+            @Override
+            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
+                return db.withConnection(callback);
+            }
+
+            @Override
+            public Connection currentConnection() {
+                return db.currentConnection();
+            }
+
+            @Override
+            public Connection newConnection() {
+                var c = db.newConnection();
+                return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                        new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                            if (method.getName().equals("commit") && failed.compareAndSet(false, true)) {
+                                throw new SQLException("injected commit failure");
+                            }
+                            Object result;
+                            try {
+                                result = method.invoke(c, args);
+                            } catch (InvocationTargetException e) {
+                                throw e.getCause();
+                            }
+                            if (method.getName().equals("rollback") && failed.get() && ran.compareAndSet(false, true)) {
+                                afterRollback.run();
+                            }
+                            return result;
+                        });
+            }
+
+            @Override
+            public DataBaseTelemetry telemetry() {
+                return db.telemetry();
+            }
+        };
+    }
+
+    /** Some transaction holds the key lock of {@code key} on topic t. */
+    private boolean keyLockGranted(String key) throws SQLException {
+        try (var c = TestDb.connect(); var ps = c.prepareStatement("select count(*) from pg_locks"
+                + " where locktype = 'advisory' and granted and classid::bigint = ? and objid::bigint = ?"
+                + " and objsubid = 2")) {
+            ps.setLong(1, Integer.toUnsignedLong(names.keyNamespace()));
+            ps.setLong(2, Integer.toUnsignedLong(Hashing.keyHash("t", bytes(key))));
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getLong(1) > 0;
+            }
+        }
     }
 
     private DeadLetterPass pass(@Nullable OutboxDeadLetterHandler hook) {

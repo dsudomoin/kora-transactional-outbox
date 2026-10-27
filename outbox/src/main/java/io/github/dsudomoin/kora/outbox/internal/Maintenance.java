@@ -97,7 +97,7 @@ public final class Maintenance {
         this.names = names;
         this.shards = config.shards();
         this.detachLockTimeout = detachLockTimeout;
-        this.quiesceTimeout = config.relay().batchTimeout().plusSeconds(5);
+        this.quiesceTimeout = quiesceTimeout(config);
         this.partitions = new XidPartitions(names, config.partitions());
         this.ticks = new Ticks(names, config.shards());
         this.cursors = new Cursors(names);
@@ -127,6 +127,11 @@ public final class Maintenance {
             var at = lastSuccess;
             return at == null ? Double.NaN : (System.nanoTime() - at) / 1e9;
         });
+    }
+
+    /** How long the tail swap waits for relay steps in flight, which it keeps out meanwhile: batchTimeout + 5 s. */
+    public static Duration quiesceTimeout(OutboxConfig config) {
+        return config.relay().batchTimeout().plusSeconds(5);
     }
 
     /**

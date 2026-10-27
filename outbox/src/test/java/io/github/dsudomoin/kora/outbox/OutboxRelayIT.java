@@ -370,11 +370,32 @@ class OutboxRelayIT {
 
         var drain = CompletableFuture.supplyAsync(relay::drain);
 
-        assertThatThrownBy(() -> drain.get(10, TimeUnit.SECONDS))
+        assertThatThrownBy(() -> drain.get(20, TimeUnit.SECONDS))
                 .isInstanceOf(ExecutionException.class)
                 .cause()
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("no progress");
+    }
+
+    @Test
+    void drainOutlastsTheQuiesceOfATailSwap() throws Exception {
+        config.relayEnabled(false).batchTimeout(Duration.ofMillis(500));
+        bootstrap();
+        var handler = new RecordingHandler();
+        var relay = relay(handler);
+        var ids = send(outbox(relay::wake), msg("t", "k", "p"));
+        try (var swap = TestDb.connect()) {
+            var lock = "(" + schema.names().internalNamespace() + ", " + TableNames.LOCK_SWAP + ")";
+            execute(swap, "select pg_advisory_lock" + lock); // as the swap holds it: every step is NOT_LOCKED
+
+            var drain = CompletableFuture.supplyAsync(relay::drain);
+            Thread.sleep(config.batchTimeout().plusSeconds(5).toMillis()); // the longest quiesce wait
+            assertThat(drain).isNotDone();
+            execute(swap, "select pg_advisory_unlock" + lock);
+
+            assertThat(drain.get(10, TimeUnit.SECONDS)).isOne();
+        }
+        assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(ids);
     }
 
     @Test

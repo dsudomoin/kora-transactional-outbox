@@ -208,20 +208,22 @@ public final class OutboxRelay implements Lifecycle {
      * call delivered. Works whether or not the relay runs: it contends with the workers for shard locks. Handler
      * failures are outcomes (see {@link OutboxHandler}); a database failure of a step propagates.
      *
-     * @throws IllegalStateException when no shard advanced for {@code 2 × batchTimeout} while work remains (e.g. a
-     *     shard paused by a down target), or while maintenance has halted the relay (xid regression)
+     * @throws IllegalStateException when no shard advanced for {@code 2 × (batchTimeout + 5 s)}, twice the longest a
+     *     tail swap waits for relay steps in flight, while work remains (e.g. a shard paused by a down target), or
+     *     while maintenance has halted the relay (xid regression)
      */
     public int drain() {
         maintenance.checkHalt(); // the recorded halt: maintenance does not run while the relay is disabled
         requireNotHalted();
-        long stall = relay.batchTimeout().multipliedBy(2).toNanos();
+        // a swap keeps every step out while it waits for those in flight: no progress for that long is no stall
+        var stallAfter = Maintenance.quiesceTimeout(config).multipliedBy(2);
+        long stall = stallAfter.toNanos();
         try (var c = db.newConnection()) {
             c.setAutoCommit(true);
             long since = System.nanoTime();
             while (!ticks.make(c, Duration.ZERO)) { // false only on the 1 s tick lock timeout
                 if (System.nanoTime() - since > stall) {
-                    throw new IllegalStateException("outbox drain could not make a tick for " + relay.batchTimeout()
-                            .multipliedBy(2));
+                    throw new IllegalStateException("outbox drain could not make a tick for " + stallAfter);
                 }
             }
             long target = ticks.latest(c).id();
@@ -245,9 +247,8 @@ public final class OutboxRelay implements Lifecycle {
                     positions = current;
                     progressed = System.nanoTime();
                 } else if (System.nanoTime() - progressed > stall) {
-                    throw new IllegalStateException("outbox drain made no progress for "
-                            + relay.batchTimeout().multipliedBy(2) + " towards tick " + target + "; pending: "
-                            + pending);
+                    throw new IllegalStateException("outbox drain made no progress for " + stallAfter
+                            + " towards tick " + target + "; pending: " + pending);
                 }
                 boolean worked = false;
                 for (var cursor : pending) {

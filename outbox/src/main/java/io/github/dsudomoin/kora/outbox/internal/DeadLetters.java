@@ -113,9 +113,7 @@ final class DeadLetters {
         if (letters.isEmpty()) {
             return;
         }
-        try (var st = tx.createStatement()) {
-            st.execute(lockTimeout); // after the claim: the insert waits for a lock no longer than the swap
-        }
+        limitLockWaits(tx); // after the claim: the insert waits for a lock no longer than the swap
         resender.insertAll(tx, letters.stream().map(c -> new Resender.Row(c.letter().messageId(),
                 c.letter().topic(), c.letter().key(), c.letter().payload(), c.headers())).toList());
         try (var ps = tx.prepareStatement(remember)) {
@@ -124,6 +122,13 @@ final class DeadLetters {
             ps.executeUpdate();
         }
         delete(tx, letters.stream().map(c -> c.letter().id()).toList());
+    }
+
+    /** Each lock wait of the rest of {@code tx} at most {@code partitions.swapLockTimeout}, as a writer's at a swap. */
+    void limitLockWaits(Connection tx) throws SQLException {
+        try (var st = tx.createStatement()) {
+            st.execute(lockTimeout);
+        }
     }
 
     void delete(Connection tx, List<Long> ids) throws SQLException {
