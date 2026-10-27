@@ -93,9 +93,9 @@ wal_split() {
   own=$(filenodes "relname like '${1}%' and relnamespace = current_schema()::regnamespace")
   cat=$(filenodes "relnamespace = 'pg_catalog'::regnamespace")
   dir=$(psql_q "show data_directory")/pg_wal
-  WAL_PARTS=$(docker exec -u postgres "$PG" pg_waldump -p "$dir" -s "$2" -e "$3" 2> /dev/null |
+  WAL_PARTS=$({ docker exec -u postgres "$PG" pg_waldump -p "$dir" -s "$2" -e "$3" 2> /dev/null || true; } |
     python3 -c "$WAL_SPLIT_PY" "$own" "$cat" "$4")
-  WAL_AUTO=$(diff <(echo "$5") <(analyzed) | python3 -c '
+  WAL_AUTO=$({ diff <(echo "$5") <(analyzed) || true; } | python3 -c '
 import sys
 old, new = {}, {}
 for line in sys.stdin:
