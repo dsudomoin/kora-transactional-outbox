@@ -1310,6 +1310,10 @@ class OutboxRelayIT {
             waves.add(List.copyOf(groups.subList(from, groups.size())));
         }
 
+        // the first wave, with nothing known: a step cut behind its first shards leaves the rest untouched, and those
+        // then step alone (not in groups that are cut again, each progressing a shard or two)
+        assertThat(waves.get(0).stream().mapToInt(List::size).sum()).as("shards stepped in the first wave")
+                .isLessThanOrEqualTo(3 * 32);
         // 600 rows a shard: two do not fit in one batchSize read, which would be cut after the first (the rest of
         // the second read again in the next step, the shards after it untouched); one row a shard: all in one step
         assertThat(waves.get(1)).as("steps of the second wave of 600 rows a shard").isNotEmpty()
@@ -1317,6 +1321,103 @@ class OutboxRelayIT {
         assertThat(waves.get(3).stream().mapToInt(List::size).max().orElse(0)).as("largest step of the second wave"
                 + " of 1 row a shard").isGreaterThanOrEqualTo(16);
         assertIdOrderPerKey(handler.delivered());
+    }
+
+    @Test
+    void aShardInFlightWhenANewerTickMarksItIsSteppedAgainAtOnce() throws Exception {
+        config.shards(4).workers(2).idlePollInterval(Duration.ofSeconds(30)); // only wake-ups tick
+        bootstrap();
+        var handler = new RecordingHandler();
+        var first = new CountDownLatch(1);
+        var relay = start(new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) throws Exception {
+                if (payload(record).equals("r#1")) {
+                    first.countDown();
+                    Thread.sleep(500); // its step in flight while the second row commits and is ticked
+                }
+                handler.handle(record);
+            }
+        });
+        var outbox = outbox(relay::wake);
+        awaitParked();
+        var key = keyOnShard(1, "k");
+        send(outbox, msg("t", key, "r#1"));
+        assertThat(first.await(5, TimeUnit.SECONDS)).isTrue();
+        Thread.sleep(100); // past minTickInterval: the wake-up's tick is made by the other worker
+        send(outbox, msg("t", key, "r#2"));
+
+        // the newer round found the shard in flight; the step, caught up only to its own tick, puts it back
+        await(Duration.ofSeconds(3), () -> handler.delivered().size() == 2);
+        assertThat(handler.delivered()).extracting(OutboxRelayIT::payload).containsExactly("r#1", "r#2");
+    }
+
+    @Test
+    void aShardCaughtUpWithItsStepsTickIsNotSteppedAgain() throws Exception {
+        config.shards(32).workers(1).idlePollInterval(Duration.ofSeconds(30));
+        bootstrap();
+        var steps = new ConcurrentHashMap<Integer, AtomicInteger>();
+        var handler = new RecordingHandler();
+        var relay = relay(countingSteps(steps), handler);
+        relay.init();
+        var outbox = outbox(relay::wake);
+        awaitParked();
+        steps.clear();
+
+        send(outbox, msg("t", keyOnShard(5, "k"), "m"));
+        await(Duration.ofSeconds(5), () -> handler.delivered().size() == 1);
+        awaitParked();
+
+        assertThat(steps).containsOnlyKeys(5);
+        assertThat(steps.get(5)).as("steps of shard 5").hasValue(1);
+    }
+
+    @Test
+    void aSlowShardDoesNotHoldItsNeighboursBackAcrossRounds() throws Exception {
+        // 8 shards, one worker: a group of up to 8. Shard 0's call of 3 slow records winds down at the soft deadline
+        // (800 ms) after its last one, so its batch ends while the shards after it in the call are not attempted
+        config.shards(8).workers(1).batchTimeout(Duration.ofSeconds(1));
+        bootstrap();
+        var slow = keyOnShard(0, "slow");
+        var slowDone = new AtomicInteger();
+        var delays = new CopyOnWriteArrayList<Long>();
+        var relay = start(new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+                if (payload(record).equals("slow")) { // 300 ms, deaf to the wind-down's interrupt
+                    long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300);
+                    while (System.nanoTime() < end) {
+                        Thread.onSpinWait();
+                    }
+                    slowDone.incrementAndGet();
+                } else {
+                    delays.add(Duration.between(record.createdAt(), Instant.now()).toMillis());
+                }
+            }
+        });
+        var outbox = outbox(relay::wake);
+        awaitParked();
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(8);
+        int sent = 0;
+        for (int round = 0; System.nanoTime() < until; round++) {
+            if (round % 5 == 0) { // every second: 3 slow records, about one call of 900 ms
+                send(outbox, IntStream.range(0, 3).mapToObj(i -> msg("t", slow, "slow"))
+                        .toArray(OutboxMessage[]::new));
+            }
+            int r = round;
+            send(outbox, IntStream.range(1, 8).mapToObj(shard -> msg("t", keyOnShard(shard, "n" + shard + "-"),
+                    "n" + r)).toArray(OutboxMessage[]::new));
+            sent += 7;
+            Thread.sleep(200);
+        }
+        int total = sent;
+        await(Duration.ofSeconds(20), () -> delays.size() == total);
+
+        long max = delays.stream().mapToLong(Long::longValue).max().orElse(0);
+        System.out.printf("neighbours: %d records, max delay %d ms; slow records done %d%n", total, max,
+                slowDone.get());
+        // a slow call of about 900 ms, then the neighbours' step: they never wait for two of them
+        assertThat(max).as("longest delivery delay of a neighbour, ms").isLessThan(2000);
     }
 
     @Test

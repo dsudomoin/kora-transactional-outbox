@@ -85,12 +85,19 @@ public final class ShardProcessor implements AutoCloseable {
      * {@code batchFinished}: no batch is in progress on the shard after the call (false when not locked or paused), as
      * the cursor stands: a step that handed only parked rows and left the chunk of a fresh batch unread stores no
      * target, so it reports true. {@code deadLettered}: the step moved a row to the dead table, from any of its passes;
-     * once it commits, the dead-letter pass has a new letter.
+     * once it commits, the dead-letter pass has a new letter. {@code caughtUp}: the shard has nothing to do up to the
+     * step's latest tick: no batch in progress, its position at that tick, and no retry head or parked row due at the
+     * step's clock (one due later does not count); a further step before a newer tick would find nothing.
      */
-    public record ShardResult(ShardStatus status, int delivered, boolean batchFinished, boolean deadLettered) {
+    public record ShardResult(ShardStatus status, int delivered, boolean batchFinished, boolean deadLettered,
+            boolean caughtUp) {
 
         public ShardResult(ShardStatus status, int delivered, boolean batchFinished) {
-            this(status, delivered, batchFinished, false);
+            this(status, delivered, batchFinished, false, false);
+        }
+
+        public ShardResult(ShardStatus status, int delivered, boolean batchFinished, boolean deadLettered) {
+            this(status, delivered, batchFinished, deadLettered, false);
         }
     }
 
@@ -343,7 +350,7 @@ public final class ShardProcessor implements AutoCloseable {
                 }
                 boolean waits = deferred && (due(s.retryDue, now) || due(s.parkedDue, now));
                 results[s.index] = waits ? new ShardResult(ShardStatus.PROGRESS, 0, cursor.targetTickId() == null)
-                        : new ShardResult(ShardStatus.NO_WORK, 0, true);
+                        : new ShardResult(ShardStatus.NO_WORK, 0, true, false, true);
                 continue;
             }
             anyCall |= !heads.isEmpty() || !dueParked.isEmpty();
@@ -463,8 +470,10 @@ public final class ShardProcessor implements AutoCloseable {
             if (!s.untouched || !s.next.equals(s.cursor)) {
                 appends.add(s.next);
             }
-            results[s.index] = new ShardResult(s.status, s.delivered,
-                    s.status == ShardStatus.PROGRESS && s.next.targetTickId() == null, s.deadLettered);
+            boolean finished = s.status == ShardStatus.PROGRESS && s.next.targetTickId() == null;
+            results[s.index] = new ShardResult(s.status, s.delivered, finished, s.deadLettered, finished
+                    && !s.untouched && s.next.tickId() >= latestTickId && !due(s.next.retryDueAt(), now)
+                    && !due(s.next.parkedDueAt(), now));
         }
         cursors.appendAll(inTx, appends);
         if (!work.isEmpty()) {

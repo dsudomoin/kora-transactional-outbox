@@ -105,14 +105,24 @@ public final class OutboxRelay implements Lifecycle {
      */
     private final AtomicIntegerArray isolated;
     /**
-     * Per shard, the rows its next step is expected to read: {@code batchSize} while its batch is unfinished, else
-     * the rows its last batch delivered (0 before it delivered any). A group takes shards until their rows would pass
-     * {@code batchSize}, which a group's read and call share, so a busy shard is stepped alone (a cut read leaves the
-     * shards after it untouched and its own rest to be read again) while many shards with a few rows each share one
-     * step. In memory, per relay instance; {@link #batchRows}: what the batch in progress delivered so far.
+     * Per shard, the rows its next step is expected to read: {@code batchSize} while its batch is unfinished, after a
+     * step that left it untouched (unread behind a cut, or not attempted) and after a step in which it kept the call
+     * or the read from shards after it; else the rows its last batch delivered (0 before it delivered any). A group
+     * takes shards until their rows would pass {@code batchSize}, which a group's read and call share, so a busy or
+     * slow shard is stepped alone (a cut read leaves the shards after it untouched and its own rest to be read again)
+     * while many shards with a few rows each share one step. In memory, per relay instance; {@link #batchRows}: what
+     * the batch in progress delivered so far.
      */
     private final AtomicIntegerArray expected;
     private final AtomicIntegerArray batchRows;
+    /**
+     * Per shard, 1 while a worker of this relay steps it (from {@link Round#take} to the end of its step): another
+     * round passes it over and sets {@link #wanted}, and the step then puts it into the round current at its end.
+     */
+    private final AtomicIntegerArray inFlight;
+    private final AtomicIntegerArray wanted;
+    /** Per shard, the latest tick of the step of it that {@link #stepStarted} times. */
+    private final AtomicLongArray steppedTick;
     /** The candidates of the latest tick a worker read them for; replaced under {@link #roundLock}. */
     @Nullable
     private volatile Round round;
@@ -159,6 +169,9 @@ public final class OutboxRelay implements Lifecycle {
         this.isolated = new AtomicIntegerArray(config.shards());
         this.expected = new AtomicIntegerArray(config.shards());
         this.batchRows = new AtomicIntegerArray(config.shards());
+        this.inFlight = new AtomicIntegerArray(config.shards());
+        this.wanted = new AtomicIntegerArray(config.shards());
+        this.steppedTick = new AtomicLongArray(config.shards());
         long created = System.nanoTime();
         for (int i = 0; i < config.shards(); i++) {
             stepStarted.set(i, created);
@@ -333,10 +346,10 @@ public final class OutboxRelay implements Lifecycle {
                             + " towards tick " + target + "; pending: " + pending);
                 }
                 boolean worked = false;
-                for (int from = 0; from < pending.size(); from += MAX_GROUP) {
-                    var group = pending.subList(from, Math.min(pending.size(), from + MAX_GROUP)).stream()
-                            .map(Cursor::shard).toList();
-                    for (var result : processInOwnTransaction(c, group, target, now)) {
+                for (var group : groups(pending.stream().map(Cursor::shard).toList())) {
+                    var results = processInOwnTransaction(c, group, target, now);
+                    learn(group, results);
+                    for (var result : results) {
                         delivered += result.delivered();
                         worked |= result.status() == ShardStatus.PROGRESS || result.status() == ShardStatus.PAUSED;
                         if (result.delivered() > 0) {
@@ -399,9 +412,74 @@ public final class OutboxRelay implements Lifecycle {
         }
     }
 
+    /** {@code shards} in groups of at most {@link #MAX_GROUP} whose {@link #expected} rows fit in {@code batchSize}. */
+    private List<List<Integer>> groups(List<Integer> shards) {
+        var groups = new ArrayList<List<Integer>>();
+        var group = new ArrayList<Integer>();
+        long rows = 0;
+        for (var shard : shards) {
+            if (!group.isEmpty() && (group.size() == MAX_GROUP || rows + expected.get(shard) > relay.batchSize())) {
+                groups.add(group);
+                group = new ArrayList<>();
+                rows = 0;
+            }
+            group.add(shard);
+            rows += expected.get(shard);
+        }
+        if (!group.isEmpty()) {
+            groups.add(group);
+        }
+        return groups;
+    }
+
+    /** Untouched by its step: it has work, and the step delivered none of it (unread behind a cut, not attempted). */
+    private static boolean untouched(ShardResult result) {
+        return result.status() == ShardStatus.PROGRESS && result.delivered() == 0 && !result.caughtUp();
+    }
+
+    /** Updates {@link #expected} from the results of one step of {@code group}. */
+    private void learn(List<Integer> group, List<ShardResult> results) {
+        int lastUntouched = -1;
+        for (int i = 0; i < results.size(); i++) {
+            if (untouched(results.get(i))) {
+                lastUntouched = i;
+            }
+        }
+        for (int i = 0; i < group.size(); i++) {
+            var result = results.get(i);
+            int shard = group.get(i);
+            int rows = batchRows.addAndGet(shard, result.delivered());
+            if (result.status() == ShardStatus.PROGRESS && !result.batchFinished()) {
+                expected.set(shard, relay.batchSize()); // more rows than one read took
+            } else if (result.status() == ShardStatus.PROGRESS && rows > 0) {
+                expected.set(shard, rows); // its batch ended
+                batchRows.set(shard, 0);
+            } // else nothing new about its rows: nothing to do, paused or locked elsewhere
+            // PROGRESS (an untouched shard is caught by the first test) or PAUSED: the 3-key stop pauses the first
+            boolean worked = result.status() == ShardStatus.PROGRESS || result.status() == ShardStatus.PAUSED;
+            if (untouched(result) || worked && i < lastUntouched) {
+                // unread, or it kept the call or the read from shards after it (a call wound down at the soft
+                // deadline behind it, a hot shard filling the read): alone next, until it delivers a small batch
+                // alone; a later round re-sorts by effective tick and would put it at their head again
+                expected.set(shard, relay.batchSize());
+            }
+        }
+    }
+
     private void wakeAll() {
         for (var t : workers) {
             LockSupport.unpark(t);
+        }
+    }
+
+    /** Unparks one parked worker, if any. */
+    private void wakeOne() {
+        for (var t : workers) {
+            var state = t.getState();
+            if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING) {
+                LockSupport.unpark(t);
+                return;
+            }
         }
     }
 
@@ -462,6 +540,20 @@ public final class OutboxRelay implements Lifecycle {
         }
     }
 
+    /** Whether {@code failure} lost {@code c}: a connection-class SQL state, or the connection no longer valid. */
+    private static boolean connectionLost(Connection c, Throwable failure) {
+        for (var t = failure; t != null; t = t.getCause()) {
+            if (t instanceof SQLException e && e.getSQLState() != null && e.getSQLState().startsWith("08")) {
+                return true;
+            }
+        }
+        try {
+            return c.isClosed() || !c.isValid(1);
+        } catch (SQLException e) {
+            return true;
+        }
+    }
+
     private static void rollback(Connection c, Throwable cause) {
         try {
             c.rollback();
@@ -494,11 +586,12 @@ public final class OutboxRelay implements Lifecycle {
     /**
      * The candidates of one read of every shard's cursor for the latest tick {@link #latest}, shared by the workers of
      * this relay whose pass sees that tick: each takes the next group of shards in candidate order
-     * ({@link Worker#candidates}, {@link #take}). A shard a step left with work (any {@code PROGRESS}) goes back to the end of the
-     * round, while it is current, those the step left untouched (nothing delivered) ahead of the others, so a shard
-     * that keeps a group's call or read to itself (a slow call wound down at the soft deadline, a hot shard filling the
-     * read, the default handler's stop after 3 failing keys) comes after the shards it left unread. A new tick ends
-     * the round: the next pass reads the cursors again, and that read decides which shards still have work.
+     * ({@link Worker#candidates}, {@link #take}). A shard a step left with work (not caught up to the step's tick)
+     * goes back to the end of the round current when the step ends, those the step left untouched ahead of the others.
+     * A shard that kept a group's call or read to itself (a slow call wound down at the soft deadline, a hot shard
+     * filling the read, the default handler's stop after 3 failing keys) is stepped alone after that
+     * ({@link #expected}), so the shards it left unread do not wait behind it again in the next round, which sorts by
+     * effective tick afresh. A new tick ends the round: the next pass reads the cursors again.
      */
     private final class Round {
 
@@ -524,24 +617,36 @@ public final class OutboxRelay implements Lifecycle {
 
         /**
          * The next group, empty when the round is done: at most {@link #groupSize} shards, and no more than fit in
-         * {@code batchSize} by their {@link #expected} rows (at least one). A shard a sibling stepped after the read is
-         * skipped: its candidacy is stale, and that sibling's step put it back if it left work. A shard
-         * {@link #isolated} is a group of its own.
+         * {@code batchSize} by their {@link #expected} rows (at least one); each is {@link #inFlight} until its step
+         * ends. A shard another worker steps is passed over and {@link #wanted}: that step puts it into the round
+         * current then. A shard a sibling stepped after the read at this round's tick or a newer one is skipped: its
+         * candidacy is stale, and that step put it back if it left work. A shard {@link #isolated} is a group of its
+         * own.
          */
         synchronized List<Integer> take() {
             var group = new ArrayList<Integer>(Math.min(groupSize, queue.size()));
             long rows = 0;
             while (group.size() < groupSize && !queue.isEmpty()) {
                 int shard = queue.peekFirst();
+                if (inFlight.get(shard) == 1) {
+                    wanted.set(shard, 1);
+                    if (inFlight.get(shard) == 1) { // else its step ended meanwhile, maybe without seeing wanted
+                        drop(shard);
+                        continue;
+                    }
+                    wanted.set(shard, 0);
+                }
+                if (!back.get(shard) && stepStarted.get(shard) - read > 0 && steppedTick.get(shard) >= latest) {
+                    drop(shard);
+                    continue;
+                }
                 boolean alone = isolated.get(shard) == 1;
                 if (!group.isEmpty() && (alone || rows + expected.get(shard) > relay.batchSize())) {
                     break;
                 }
-                queue.pollFirst();
-                queued.clear(shard);
-                boolean stale = !back.get(shard) && stepStarted.get(shard) - read > 0;
-                back.clear(shard);
-                if (stale) {
+                drop(shard);
+                if (!inFlight.compareAndSet(shard, 0, 1)) { // taken from another round just now
+                    wanted.set(shard, 1);
                     continue;
                 }
                 group.add(shard);
@@ -553,13 +658,22 @@ public final class OutboxRelay implements Lifecycle {
             return group;
         }
 
-        /** Puts {@code shards} back at the end, in their order; a shard still queued keeps its place. */
+        private void drop(int shard) {
+            queue.pollFirst();
+            queued.clear(shard);
+            back.clear(shard);
+        }
+
+        /**
+         * Puts {@code shards} back at the end, in their order, as put back by a step (not stale); a shard still queued
+         * keeps its place.
+         */
         synchronized void putBack(List<Integer> shards) {
             for (var shard : shards) {
+                back.set(shard);
                 if (!queued.get(shard)) {
                     queue.addLast(shard);
                     queued.set(shard);
-                    back.set(shard);
                 }
             }
         }
@@ -675,14 +789,44 @@ public final class OutboxRelay implements Lifecycle {
         }
 
         /**
-         * One step of {@code group} in its own transaction; puts the shards it left with work back into the round. A
-         * step of several shards that fails is redone with each shard alone, at once, so a shard that keeps failing
-         * holds up no neighbour; one that fails alone is {@link #isolated}, logged, and retried in a later pass.
+         * One step of {@code group}, taken from a round ({@link Round#take}): {@link #stepHeld}, then the shards it
+         * left with work go into the round current now (not caught up to the step's tick, untouched ones first), with
+         * any a newer round passed over meanwhile ({@link #wanted}), and one parked worker is woken for them.
          */
         private boolean step(Connection c, Round r, List<Integer> group) throws Exception {
+            var back = new ArrayList<Integer>();
+            try {
+                return stepHeld(c, r, group, back);
+            } finally {
+                for (var shard : group) {
+                    inFlight.set(shard, 0);
+                }
+                for (var shard : group) { // after inFlight: a take that saw it in flight set wanted before
+                    if (wanted.getAndSet(shard, 0) == 1 && !back.contains(shard)) {
+                        back.add(shard);
+                    }
+                }
+                if (!back.isEmpty()) {
+                    round.putBack(back);
+                    requeued.incrementAndGet();
+                    wakeOne();
+                }
+            }
+        }
+
+        /**
+         * One step of {@code group} in its own transaction; adds the shards it left with work to {@code back}. A step
+         * of several shards that fails rolls back for all of them, so every shard of the group is stepped again and the
+         * records its handler call delivered are delivered again (at least once, as after any rolled-back step); it is
+         * redone at once with each shard alone, so a shard that keeps failing holds up no neighbour. One that fails
+         * alone is {@link #isolated}, logged, and retried in a later pass. A failure of the connection ends the pass,
+         * as a failure outside a step does.
+         */
+        private boolean stepHeld(Connection c, Round r, List<Integer> group, List<Integer> back) throws Exception {
             long started = System.nanoTime();
             for (var shard : group) {
                 stepStarted.set(shard, started);
+                steppedTick.set(shard, r.latest);
             }
             // a fresh clock per step: a long pass must not pause shards or schedule retries from a stale one; a later
             // clock keeps a selected shard unpaused or due (a clock stepped back only yields NO_WORK)
@@ -693,7 +837,7 @@ public final class OutboxRelay implements Lifecycle {
             } catch (InterruptedException | VirtualMachineError e) {
                 throw e;
             } catch (Throwable e) { // rolled back
-                if (stopping) { // e.g. the processor closed under it: run() logs it at debug
+                if (stopping || connectionLost(c, e)) { // run() logs it (at debug while stopping)
                     throw e;
                 }
                 if (group.size() == 1) {
@@ -704,39 +848,25 @@ public final class OutboxRelay implements Lifecycle {
                 log.debug("outbox step of shards {} failed; stepping each alone", group, e);
                 boolean worked = false;
                 for (var shard : group) {
-                    worked |= step(c, r, List.of(shard));
+                    worked |= stepHeld(c, r, List.of(shard), back);
                 }
                 return worked;
             }
-            if (group.size() == 1) {
-                isolated.set(group.get(0), 0);
-            }
+            learn(group, results);
             boolean worked = false;
-            var untouched = new ArrayList<Integer>();
             var progressed = new ArrayList<Integer>();
             for (int i = 0; i < group.size(); i++) {
                 var result = results.get(i);
-                worked |= result.status() == ShardStatus.PROGRESS || result.status() == ShardStatus.PAUSED;
-                int shard = group.get(i);
-                int rows = batchRows.addAndGet(shard, result.delivered());
-                if (result.status() == ShardStatus.PROGRESS && !result.batchFinished()) {
-                    expected.set(shard, relay.batchSize()); // more rows than one read took
-                } else if (result.status() == ShardStatus.PROGRESS && rows > 0) {
-                    expected.set(shard, rows); // its batch ended
-                    batchRows.set(shard, 0);
-                } // else nothing new about its rows: nothing to do, untouched, paused or locked elsewhere
-                if (result.status() == ShardStatus.PROGRESS) {
-                    (result.delivered() == 0 ? untouched : progressed).add(group.get(i));
+                boolean did = result.status() == ShardStatus.PROGRESS || result.status() == ShardStatus.PAUSED;
+                worked |= did;
+                if (group.size() == 1 && did) {
+                    isolated.set(group.get(0), 0);
+                }
+                if (result.status() == ShardStatus.PROGRESS && !result.caughtUp()) {
+                    (untouched(result) ? back : progressed).add(group.get(i));
                 }
             }
-            untouched.addAll(progressed);
-            // into its own round only: a newer one read the cursors itself, and a shard this step caught up would
-            // otherwise take a step (a cursor row) for every idle tick made meanwhile
-            if (!untouched.isEmpty() && r == round) {
-                r.putBack(untouched);
-                requeued.incrementAndGet();
-                wakeAll();
-            }
+            back.addAll(progressed);
             return worked;
         }
 

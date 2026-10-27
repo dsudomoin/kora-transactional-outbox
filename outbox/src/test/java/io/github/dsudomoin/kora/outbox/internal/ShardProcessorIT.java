@@ -1146,11 +1146,11 @@ class ShardProcessorIT {
                     .isEqualTo("read committed");
             ShardProcessor.prepareTransaction(first, config.batchTimeout());
             assertThat(processor.tryProcess(first, 0, latest, now))
-                    .isEqualTo(new ShardResult(PROGRESS, 2, true));
+                    .isEqualTo(new ShardResult(PROGRESS, 2, true, false, true));
             first.commit();
 
             assertThat(processor.tryProcess(second, 0, latest, now))
-                    .isEqualTo(new ShardResult(NO_WORK, 0, true));
+                    .isEqualTo(new ShardResult(NO_WORK, 0, true, false, true));
             second.commit();
         }
         assertThat(delivered()).containsExactly("a#1", "b#1");
@@ -3127,6 +3127,38 @@ class ShardProcessorIT {
     }
 
     @Test
+    void aStepSaysWhetherItsShardCaughtUpWithTheLatestTick() throws Exception {
+        config.shards(4).batchSize(10);
+        bootstrap();
+        var key = keysOnShard(1, 2);
+        script = answering(Map.of("r#1", Outcome.retry(new RuntimeException("once"))));
+        send(msg("t", keyOnShard(0), "a#1"));
+        send(IntStream.range(0, 15).mapToObj(i -> msg("t", keyOnShard(2), "c#" + i))
+                .toArray(OutboxMessage[]::new));
+        send(msg("t", key.get(0), "r#1"), msg("t", key.get(1), "b#1"));
+        tick();
+
+        // one shard a step: a cut group read would leave every shard with rows mid-batch
+        var caughtUp = new ArrayList<Boolean>();
+        for (int shard = 0; shard < 4; shard++) {
+            processGroup(shard);
+            caughtUp.addAll(lastCaughtUp);
+        }
+        // 0: up to the latest tick; 1: a retry head due later; 2: mid-batch (15 rows, limit 10); 3: nothing to do
+        assertThat(caughtUp).containsExactly(true, true, false, true);
+        assertThat(cursor(1).retryDueAt()).isAfter(now);
+
+        now = now.plus(INITIAL); // the retry head is due now; shard 2's batch ends
+        processGroup(1);
+        assertThat(lastCaughtUp).as("the head was delivered").containsExactly(true);
+        processGroup(2);
+        assertThat(lastCaughtUp).as("the batch ended").containsExactly(true);
+        send(msg("t", keyOnShard(3), "d#1"));
+        processGroup(3);
+        assertThat(lastCaughtUp).as("rows after the step's latest tick are no work yet").containsExactly(true);
+    }
+
+    @Test
     void aGroupOfRepeatedShardsIsRefused() throws Exception {
         config.shards(2);
         bootstrap();
@@ -3177,7 +3209,7 @@ class ShardProcessorIT {
             try {
                 var result = processor.tryProcess(c, shard, latest, now);
                 c.commit();
-                return result;
+                return withoutCaughtUp(result);
             } catch (Throwable t) {
                 c.rollback();
                 throw t;
@@ -3196,12 +3228,20 @@ class ShardProcessorIT {
             try {
                 var results = processor.tryProcess(c, List.of(shards), latest, now);
                 c.commit();
-                return results;
+                lastCaughtUp = results.stream().map(ShardResult::caughtUp).toList();
+                return results.stream().map(ShardProcessorIT::withoutCaughtUp).toList();
             } catch (Throwable t) {
                 c.rollback();
                 throw t;
             }
         }
+    }
+
+    /** {@code caughtUp} of each result of the last {@link #processGroup}, which compares results without it. */
+    private List<Boolean> lastCaughtUp = List.of();
+
+    private static ShardResult withoutCaughtUp(ShardResult r) {
+        return new ShardResult(r.status(), r.delivered(), r.batchFinished(), r.deadLettered());
     }
 
     private Cursor cursor(int shard) throws SQLException {
