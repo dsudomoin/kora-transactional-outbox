@@ -11,6 +11,7 @@ import io.github.dsudomoin.kora.outbox.OutboxHandler;
 import io.github.dsudomoin.kora.outbox.OutboxMessage;
 import io.github.dsudomoin.kora.outbox.OutboxRecord;
 import io.github.dsudomoin.kora.outbox.OutboxRelay;
+import io.github.dsudomoin.kora.outbox.Outcome;
 import io.github.dsudomoin.kora.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.kora.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
@@ -20,6 +21,7 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -37,6 +39,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
+import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 class XidRecoveryIT {
 
@@ -243,14 +246,37 @@ class XidRecoveryIT {
         config.headFailuresBeforeDivert(1);
         bootstrap();
         var down = new AtomicBoolean(true);
-        var handler = new RecordingHandler()
+        var recording = new RecordingHandler()
                 .failAlways(r -> down.get() && "r".equals(key(r)), () -> new RuntimeException("target down"));
+        OutboxHandler handler = new OutboxHandler() { // and requeues key p while down: it waits parked
+            @Override
+            public void handle(OutboxRecord record) throws Exception {
+                recording.handle(record);
+            }
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                boolean parks = down.get();
+                var others = new ArrayDeque<>(recording.handleBatch(
+                        records.stream().filter(r -> !parks || !"p".equals(key(r))).toList()));
+                return records.stream()
+                        .map(r -> parks && "p".equals(key(r)) ? Outcome.requeue() : others.poll())
+                        .toList();
+            }
+        };
         var maintenance = maintenance();
         var relay = relay(handler, maintenance);
         relay.init();
         var outbox = outbox(relay);
         var held = send(outbox, msg("t", "r", "head"), msg("t", "r", "follower"));
-        await(Duration.ofSeconds(5), () -> count(names.retry()) == 2); // the head diverted with its follower
+        var parked = send(outbox, msg("t", "p", "parked"));
+        await(Duration.ofSeconds(5), // the head diverted with its follower, p requeued
+                () -> count(names.retry()) == 2 && count(names.parked(), parked) == 1);
+        try (var c = TestDb.connect()) { // a parked row whose outbox range is gone: its id above every outbox id
+            execute(c, "insert into " + names.parked() + " (id, shard, message_id, topic, key, created_at, due_at)"
+                    + " values (1000000000, 0, gen_random_uuid(), 't', convert_to('q', 'UTF8'), now(),"
+                    + " now() + interval '1 hour')");
+        }
         forgeRegression();
         var other = send(outbox, msg("t", "k", "other"));
 
@@ -259,12 +285,18 @@ class XidRecoveryIT {
         assertThat(maintenance.halted()).isFalse();
         assertThat(count(names.retry(), held)).as("the retry rows survive").isEqualTo(2);
         assertThat(count(names.base(), held)).as("not copied into the outbox").isZero();
+        assertThat(count(names.base(), parked)).as("nor the parked one").isZero();
+        try (var c = TestDb.connect()) {
+            assertThat(queryLong(c, "select min(id) from " + names.base())).as("re-sent above every parked id")
+                    .isGreaterThan(1_000_000_000L);
+        }
         down.set(false);
-        await(Duration.ofSeconds(10),
-                () -> delivered(handler).containsAll(held) && delivered(handler).containsAll(other));
-        assertThat(handler.delivered()).extracting(r -> new String(r.payload(), UTF_8))
-                .filteredOn(p -> !p.equals("other"))
+        await(Duration.ofSeconds(10), () -> delivered(recording).containsAll(held)
+                && delivered(recording).containsAll(other) && delivered(recording).containsAll(parked));
+        assertThat(recording.delivered()).extracting(r -> new String(r.payload(), UTF_8))
+                .filteredOn(p -> p.equals("head") || p.equals("follower"))
                 .containsExactly("head", "follower");
+        assertThat(recording.delivered()).filteredOn(r -> parked.contains(r.messageId())).as("once").hasSize(1);
         await(Duration.ofSeconds(5), () -> count(names.retry()) == 0);
     }
 
@@ -467,10 +499,13 @@ class XidRecoveryIT {
         recovery.beforeTransaction = rc -> detachPending(range.name()); // after the finish before the transaction
 
         try (var c = TestDb.connect()) {
+            var probe = names.base() + "_recovery"; // the copy's table: a copy before the check would fail on it
+            execute(c, "create table " + probe + " (x int)");
             assertThatThrownBy(() -> recovery.recover(c)).isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("became pending");
             assertThat(tickExists(forged)).as("rolled back").isTrue();
-            assertThat(detachPending(c, range.name())).isEqualTo("true");
+            assertThat(isDetachPending(c, range.name())).isEqualTo("true");
+            execute(c, "drop table " + probe);
 
             recovery.beforeTransaction = null;
             assertThat(recovery.recover(c)).as("the next attempt finishes it first").isEqualTo(3);
@@ -478,6 +513,85 @@ class XidRecoveryIT {
             assertThat(PartitionDdl.pendingDetach(c, names.base())).isNull();
         }
         assertThat(haltRows()).isZero();
+    }
+
+    @Test
+    void rangeNamesWhoseDigitsFitNoLongAreLeftAlone() throws Exception {
+        bootstrap();
+        send(outbox(null), messages("m", 3));
+        forgeRegression();
+        var empty = names.partitionPrefix() + "9".repeat(20);
+        var withRow = names.partitionPrefix() + "9".repeat(21);
+        try (var c = TestDb.connect()) {
+            PartitionDdl.create(c, names.base(), empty, Duration.ofSeconds(5));
+            PartitionDdl.create(c, names.base(), withRow, Duration.ofSeconds(5));
+            execute(c, "insert into " + withRow + " (id, shard, xid, message_id, topic) values (1, 0, '1',"
+                    + " gen_random_uuid(), 't')");
+
+            assertThat(new XidRecovery(names, config).recover(c)).isEqualTo(3);
+
+            assertThat(PartitionDdl.standalone(c, names.base(), "_o[0-9]+")).as("nothing set aside").isEmpty();
+        }
+        assertThat(exists(empty)).as("not dropped").isTrue();
+        assertThat(count(withRow)).isOne();
+    }
+
+    @Test
+    void adminReturnsTheRowsWhenTheSessionDiesAfterTheCommit() throws Exception {
+        bootstrap();
+        send(outbox(null), messages("m", 5));
+        forgeRegression();
+        var maintenance = maintenance();
+        var admin = new PgOutboxAdmin(TestDb.killedAfterCommit(db), names, config, maintenance,
+                wakes::incrementAndGet);
+
+        try (var err = new CapturedStderr()) {
+            assertThat(admin.recoverXidRegression()).isEqualTo(5);
+
+            var text = err.text();
+            assertThat(text).contains("WARN").contains("the recovery committed, then releasing the maintenance lock")
+                    .doesNotContain("nothing re-sent");
+            assertThat(text.indexOf("returned 5, the rows re-sent")).as("the INFO, then the WARN").isNotNegative()
+                    .isLessThan(text.indexOf("the recovery committed, then"));
+        }
+        assertThat(wakes).hasValue(1);
+        assertThat(maintenance.halted()).isFalse();
+        assertThat(haltRows()).isZero();
+        assertThat(maintenance.runOnce()).as("the maintenance lock went with the session").isTrue();
+    }
+
+    @Test
+    void adminReturnsTheRowsWhenReadingTheHaltAgainFails() throws Exception {
+        bootstrap();
+        send(outbox(null), messages("m", 5));
+        forgeRegression();
+        var closed = TestDb.newDatabase(1);
+        var maintenance = new Maintenance(closed, names, config, new OutboxMetrics(null));
+        closed.release(); // its checkHalt cannot connect
+
+        try (var err = new CapturedStderr()) {
+            assertThat(admin(maintenance).recoverXidRegression()).isEqualTo(5);
+
+            assertThat(err.text()).contains("WARN").contains("reading the halt again failed");
+        }
+        assertThat(wakes).hasValue(1);
+        assertThat(haltRows()).isZero();
+    }
+
+    @Test
+    void adminWarnsOnAFailureBeforeTheRecoveryBegan() throws Exception {
+        bootstrap();
+        try (var c = TestDb.connect()) {
+            execute(c, "drop table " + names.halt()); // the check's read fails
+        }
+
+        try (var err = new CapturedStderr()) {
+            assertThatThrownBy(admin(maintenance())::recoverXidRegression).isInstanceOf(RuntimeSqlException.class);
+
+            assertThat(err.text()).contains("WARN")
+                    .contains("recoverXidRegression() on " + names.base() + " failed, nothing re-sent");
+        }
+        assertThat(wakes).hasValue(0);
     }
 
     /** Leaves {@code range} detach-pending: its DETACH CONCURRENTLY times out waiting for an older snapshot. */
@@ -492,7 +606,7 @@ class XidRecoveryIT {
         }
     }
 
-    private static String detachPending(Connection c, String table) throws SQLException {
+    private static String isDetachPending(Connection c, String table) throws SQLException {
         return queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)", table);
     }
 

@@ -58,7 +58,7 @@ public final class XidRecovery {
      * since T, the {@code created_at} of the tick with the highest xmax (the newest made before the regression) less
      * {@code clockMargin}: written into the restored database, their xids may look relayed. An earlier T only adds
      * duplicates, which consumers drop within their inbox window. A shard without a cursor, or whose tick is gone,
-     * keeps every row. Rows the retry or the dead table holds stay there.
+     * keeps every row. Rows the retry, parked or dead table holds stay there.
      */
     private final String saved;
     final String xidCheck; // for a test of its plan
@@ -88,8 +88,10 @@ public final class XidRecovery {
                 + " order by pg_snapshot_xmax(snapshot) desc limit 1) - " + margin + " * interval '1 microsecond')"
                 + " and not exists (select 1 from " + names.retry() + " r where r.id = o.id"
                 + " and r.message_id = o.message_id)"
+                + " and not exists (select 1 from " + names.parked() + " p where p.id = o.id"
+                + " and p.message_id = o.message_id)"
                 + " and not exists (select 1 from " + names.dead() + " d where d.id = o.id"
-                + " and d.message_id = o.message_id)"; // parked rows: added after the requeue merge
+                + " and d.message_id = o.message_id)"; // each keeps the id and message id of its outbox row
         // every tick, not just the newest: workers keep ticking after a regression, and their new ticks look fine; the
         // highest xmax comes from the index <tick>_xmax, as ticks pile up while a paused shard holds cleanup back
         this.xidCheck = "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint,"
@@ -174,15 +176,17 @@ public final class XidRecovery {
      * 0 with no change when there is neither a regression nor a halt row. First, outside it, a detach left pending is
      * finished ({@link XidPartitions#finishPendingDetach}), so its wait for older snapshots stalls no writer. Then:
      * ACCESS EXCLUSIVE on the cursor and tick tables, in the order relay steps read them (a step that read its cursor
-     * ends first, one that reads it later sees the new one), then on the outbox, which writers wait for, not fail;
-     * the rows to re-send ({@link #saved}) copied into {@code <base>_recovery}; every standalone range, and a tail that
-     * is not attached, set aside as {@code <base>_o<digits>} when it holds rows (they lie outside the outbox and are
-     * never re-sent by themselves: {@code restoreOrphan} moves them back) and dropped when empty; the id sequence set
-     * above every id of the outbox, retry and dead tables; every partition dropped; ticks, cursors, dropping markers
-     * and the halt deleted; ranges from the one holding the oldest running xid (a writer waiting for the lock may hold
-     * it) and a tail above the current xid ({@link XidPartitions#ensurePremade}, its fresh-table path); one tick and
-     * one cursor per shard at it, due for a retry check where the shard holds retry rows; the saved rows inserted in
-     * {@code created_at, id} order, which gives the ids, as no {@code send} gets in before the commit.
+     * ends first, one that reads it later sees the new one), then on the outbox, which writers wait for, not fail; a
+     * detach found pending since that finish fails it at once (see the throws); the rows to re-send ({@link #saved})
+     * copied into {@code <base>_recovery}; every standalone range, and a tail that is not attached, set aside as
+     * {@code <base>_o<digits>} when it holds rows (they lie outside the outbox and are never re-sent by themselves:
+     * {@code restoreOrphan} moves them back) and dropped when empty; the id sequence set above every id of the outbox,
+     * retry, parked and dead tables; every partition dropped; ticks, cursors, dropping markers and the halt deleted;
+     * ranges from the one holding the oldest running xid (a writer waiting for the lock may hold it) and a tail above
+     * the current xid ({@link XidPartitions#ensurePremade}, its fresh-table path); one tick and one cursor per shard at
+     * it, due for a retry check where the shard holds retry rows and at its earliest parked {@code due_at} where it
+     * holds parked rows; the saved rows inserted in {@code created_at, id} order, which gives the ids, as no
+     * {@code send} gets in before the commit.
      *
      * @throws IllegalStateException when {@code outbox.shards} differs from the shards of the cursors: saved rows keep
      *     their shard; or when a detach became pending after the finish before the transaction: the next attempt
@@ -209,6 +213,15 @@ public final class XidRecovery {
                 c.rollback();
                 return 0;
             }
+            // before the copy, so writers do not wait it out: the parent hides the rows of a pending detach, which the
+            // drop below would lose, and a FINALIZE here would wait for older snapshots, writers queued behind the
+            // outbox lock among them
+            var pending = PartitionDdl.pendingDetach(c, names.base());
+            if (pending != null) {
+                throw new IllegalStateException("the detach of " + pending + " became pending after the recovery of "
+                        + names.base() + " finished the one before it: rolled back, the next attempt finishes it"
+                        + " first");
+            }
             long shardsPresent = queryLong(st, "select count(distinct shard) from " + names.cursor());
             if (shardsPresent != 0 && shardsPresent != shards) {
                 throw new IllegalStateException("outbox.shards = " + shards + " but " + names.cursor() + " holds"
@@ -217,10 +230,11 @@ public final class XidRecovery {
             }
             st.execute("create unlogged table " + holding + " as " + saved);
             setAside(c, st);
-            // parked rows: added after the requeue merge (the parked table's max id joins the greatest())
+            // above the ids the retry, parked and dead rows keep, which may outlive every outbox row of theirs
             try (var ps = c.prepareStatement("select setval(pg_get_serial_sequence(?, 'id'), greatest("
                     + "(select coalesce(max(id), 0) from " + names.base() + "),"
                     + " (select coalesce(max(id), 0) from " + names.retry() + "),"
+                    + " (select coalesce(max(id), 0) from " + names.parked() + "),"
                     + " (select coalesce(max(id), 0) from " + names.dead() + "), 1))")) {
                 ps.setString(1, names.base());
                 ps.execute();
@@ -232,10 +246,12 @@ public final class XidRecovery {
                     + names.dropping() + "; delete from " + names.halt());
             makeRanges(c);
             long tick = insertTick(c);
-            // parked rows: added after the requeue merge
-            try (var ps = c.prepareStatement("insert into " + names.cursor() + " (shard, tick_id, retry_due_at)"
-                    + " select s, ?, case when exists (select 1 from " + names.retry() + " r where r.shard = s)"
-                    + " then now() end from generate_series(0, ? - 1) s")) {
+            // a step reads the retry or parked table only when its cursor says it is due (null: no rows) or on its
+            // full check, so new cursors carry them: retry due now, parked at the earliest due_at, as steps store it
+            try (var ps = c.prepareStatement("insert into " + names.cursor() + " (shard, tick_id, retry_due_at,"
+                    + " parked_due_at) select s, ?, case when exists (select 1 from " + names.retry() + " r where"
+                    + " r.shard = s) then now() end, (select min(due_at) from " + names.parked() + " p where p.shard"
+                    + " = s) from generate_series(0, ? - 1) s")) {
                 ps.setLong(1, tick);
                 ps.setInt(2, shards);
                 ps.executeUpdate();
@@ -260,17 +276,9 @@ public final class XidRecovery {
 
     /**
      * The tables outside the outbox's partition tree whose rows the parent does not show: every standalone range (but
-     * one whose digits fit no long, no table of the library's) and a standalone tail is set aside. A detach begun
-     * since the finish before the transaction rolls it back instead: the parent hides the rows of a pending one, which
-     * a drop would lose, and a FINALIZE here would wait for older snapshots, writers queued behind the outbox lock
-     * among them.
+     * one whose digits fit no long, no table of the library's) and a standalone tail is set aside.
      */
     private void setAside(Connection c, Statement st) throws SQLException {
-        var pending = PartitionDdl.pendingDetach(c, names.base());
-        if (pending != null) {
-            throw new IllegalStateException("the detach of " + pending + " became pending after the recovery of "
-                    + names.base() + " finished the one before it: rolled back, the next attempt finishes it first");
-        }
         int prefix = names.unqualified(names.partitionPrefix()).length();
         for (var table : PartitionDdl.standalone(c, names.base(), "_x[0-9]+")) {
             var digits = names.unqualified(table).substring(prefix);

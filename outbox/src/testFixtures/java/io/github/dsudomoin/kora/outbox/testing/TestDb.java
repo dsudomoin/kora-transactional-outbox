@@ -11,6 +11,7 @@ import java.time.Duration;
 import java.util.Collection;
 import java.util.Properties;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
@@ -205,6 +206,66 @@ public final class TestDb {
                         String other = "select " + pid.incrementAndGet();
                         return stName.equals("execute") ? st.execute(other) : st.executeQuery(other);
                     });
+                });
+            }
+
+            @Override
+            public DataBaseTelemetry telemetry() {
+                return db.telemetry();
+            }
+        };
+    }
+
+    /**
+     * {@code db} whose new connections lose their server session right after their first {@code commit()}: the commit
+     * goes through, then the backend is terminated, and waited for until gone, so the next statement fails.
+     */
+    public static JdbcConnectionFactory killedAfterCommit(JdbcConnectionFactory db) {
+        return new JdbcConnectionFactory() {
+            @Override
+            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
+                return db.withConnection(callback);
+            }
+
+            @Nullable
+            @Override
+            public Connection currentConnection() {
+                return db.currentConnection();
+            }
+
+            @Nullable
+            @Override
+            public ConnectionContext currentConnectionContext() {
+                return db.currentConnectionContext();
+            }
+
+            @Override
+            public Connection newConnection() {
+                var c = db.newConnection();
+                var committed = new AtomicBoolean();
+                return delegate(Connection.class, c, (name, args) -> {
+                    if (!name.equals("commit") || committed.getAndSet(true)) {
+                        return null;
+                    }
+                    int pid;
+                    try (var st = c.createStatement(); var rs = st.executeQuery("select pg_backend_pid()")) {
+                        rs.next();
+                        pid = rs.getInt(1);
+                    }
+                    c.commit();
+                    try (var other = connect(); var st = other.createStatement()) {
+                        st.execute("select pg_terminate_backend(" + pid + ")");
+                        while (true) {
+                            try (var rs = st.executeQuery("select count(*) from pg_stat_activity where pid = " + pid)) {
+                                rs.next();
+                                if (rs.getInt(1) == 0) {
+                                    break;
+                                }
+                            }
+                            Thread.sleep(5);
+                        }
+                    }
+                    return Boolean.TRUE; // non-null: the delegate's commit is not called again
                 });
             }
 

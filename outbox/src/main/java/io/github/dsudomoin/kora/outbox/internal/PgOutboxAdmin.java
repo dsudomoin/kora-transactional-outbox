@@ -21,6 +21,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
@@ -56,6 +57,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private final DeadLetters rows;
     private final XidPartitions partitions;
     private final RetryStore retries;
+    private final ParkedStore parked;
     private final XidRecovery recovery;
     final OrphanRestore orphanRestore; // for a test's seam
     private final String dead;
@@ -83,6 +85,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         this.rows = new DeadLetters(names, config);
         this.partitions = new XidPartitions(names, config.partitions());
         this.retries = new RetryStore(names);
+        this.parked = new ParkedStore(names);
         this.recovery = new XidRecovery(names, config);
         this.orphanRestore = new OrphanRestore(
                 names, new Resender(names, config.shards()), config.partitions().swapLockTimeout());
@@ -98,7 +101,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                     queryBoolean(c, "select exists (select 1 from " + names.halt() + ")"),
                     maintenance.lagSeconds(c),
                     retries.size(c),
-                    parkedSize(c),
+                    parked.size(c),
                     deadLetterCounts(c),
                     partitions.orphans(c).stream().map(o -> new OutboxStatus.Orphan(o.table(), o.setAside()
                             ? OrphanKind.SET_ASIDE : o.ours() ? OrphanKind.DETACHED_BY_LIBRARY : OrphanKind.FOREIGN))
@@ -183,8 +186,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
 
     /**
      * Under the maintenance lock ({@link #underMaintenanceLock}), so the tail's lower bound, which tells an orphan from
-     * a range the extension made ahead of its swap, holds still: {@code table} must be one {@link XidPartitions#orphans}
-     * lists, then {@link OrphanRestore} validates it again and moves its rows.
+     * a range the extension made ahead of its swap, holds still: {@code table} must be one
+     * {@link XidPartitions#orphans} lists, then {@link OrphanRestore} validates it again and moves its rows.
      */
     @Override
     public long restoreOrphan(String table, long fromXid) {
@@ -227,18 +230,21 @@ public final class PgOutboxAdmin implements OutboxAdmin {
 
     /**
      * Under the maintenance lock ({@link #underMaintenanceLock}), the recovery maintenance runs
-     * ({@link XidRecovery#recover}), whatever {@code outbox.recovery} says. Then this instance's halt is refreshed
-     * ({@link Maintenance#checkHalt}), so the relay woken resumes at once; other instances resume at their next
-     * maintenance run.
+     * ({@link XidRecovery#recover}), whatever {@code outbox.recovery} says. Once it committed the call no longer fails:
+     * the INFO line, then this instance's halt refreshed ({@link Maintenance#checkHalt}), so the relay woken resumes
+     * at once (other instances resume at their next maintenance run); a failure of that refresh, or of releasing the
+     * lock and the session setting, is a WARN, and the relay is woken whatever happens.
      */
     @Override
     public long recoverXidRegression() {
         requireOwnTransactions();
-        long sent;
+        var call = "recoverXidRegression()";
         var recovering = new AtomicBoolean();
+        var sent = new AtomicLong(-1); // the rows re-sent, once the recovery committed
+        Exception cleanup = null;
         try (var c = db.newConnection()) {
             c.setAutoCommit(true);
-            sent = underMaintenanceLock(c, "recoverXidRegression()", () -> {
+            underMaintenanceLock(c, call, () -> {
                 var check = recovery.check(c);
                 if (check.current() >= check.tickXmax() && check.recorded() == null) {
                     throw new IllegalStateException("no xid regression to recover: the xid counter of " + names.base()
@@ -246,19 +252,39 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                             + ") and " + names.halt() + " holds no row");
                 }
                 recovering.set(true);
-                return recovery.recover(c);
+                sent.set(recovery.recover(c));
+                return null;
             });
         } catch (SQLException | RuntimeException e) {
-            if (recovering.get()) {
-                log.warn("outbox admin recoverXidRegression() on {} failed, its transaction rolled back; calling again"
-                        + " retries: {}", names.base(), printable(e.toString()));
+            if (sent.get() < 0) {
+                // refused, nothing changed: maintenance running, no regression, or a transaction-pooled connection
+                boolean refused = e instanceof IllegalStateException && !recovering.get();
+                if (!refused) {
+                    log.warn("outbox admin {} on {} failed, nothing re-sent: {}", call, names.base(),
+                            printable(e.toString()));
+                }
+                throw e instanceof SQLException s ? new RuntimeSqlException(s) : (RuntimeException) e;
             }
-            throw e instanceof SQLException s ? new RuntimeSqlException(s) : (RuntimeException) e;
+            cleanup = e; // after the commit: releasing the maintenance lock, the session setting or the connection
         }
-        log.info("outbox admin recoverXidRegression() on {} returned {}, the rows re-sent", names.base(), sent);
-        maintenance.checkHalt();
-        wakeRelay.run();
-        return sent;
+        try {
+            log.info("outbox admin {} on {} returned {}, the rows re-sent", call, names.base(), sent.get());
+            if (cleanup != null) {
+                log.warn("outbox admin {} on {}: the recovery committed, then releasing the maintenance lock or"
+                        + " resetting idle_session_timeout failed: {}", call, names.base(),
+                        printable(cleanup.toString()));
+            }
+            try {
+                maintenance.checkHalt();
+            } catch (RuntimeException e) {
+                log.warn("outbox admin {} on {}: the recovery committed, but reading the halt again failed, so this"
+                        + " instance's relay resumes at its next maintenance run: {}", call, names.base(),
+                        printable(e.toString()));
+            }
+        } finally {
+            wakeRelay.run();
+        }
+        return sent.get();
     }
 
     /**
@@ -416,24 +442,6 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private static void execute(Connection c, String sql) throws SQLException {
         try (var st = c.createStatement()) {
             st.execute(sql);
-        }
-    }
-
-    /** Rows in {@code <base>_parked}, which a later version makes: 0 while it does not exist. */
-    private long parkedSize(Connection c) throws SQLException {
-        var parked = names.base() + "_parked";
-        try (var ps = c.prepareStatement("select to_regclass(?) is null")) {
-            ps.setString(1, parked);
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                if (rs.getBoolean(1)) {
-                    return 0;
-                }
-            }
-        }
-        try (var st = c.createStatement(); var rs = st.executeQuery("select count(*) from " + parked)) {
-            rs.next();
-            return rs.getLong(1);
         }
     }
 

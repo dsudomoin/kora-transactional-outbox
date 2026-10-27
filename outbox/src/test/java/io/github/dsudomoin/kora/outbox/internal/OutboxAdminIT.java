@@ -523,6 +523,8 @@ class OutboxAdminIT {
         execute("insert into " + names.halt() + " (max_tick_xmax) values ('1')");
         execute("insert into " + names.retry() + " (id, shard, message_id, topic, created_at) values"
                 + " (1, 0, gen_random_uuid(), 't', now()), (2, 0, gen_random_uuid(), 't', now())");
+        execute("insert into " + names.parked() + " (id, shard, message_id, topic, created_at, due_at)"
+                + " values (3, 0, gen_random_uuid(), 't', now(), now())");
         var now = Instant.now();
         letter("a", "1", "boom", now, KEPT);
         letter("a", "2", "boom", now, KEPT);
@@ -548,7 +550,7 @@ class OutboxAdminIT {
         assertThat(status.halted()).isTrue();
         assertThat(status.lagSeconds()).isZero();
         assertThat(status.retrySize()).isEqualTo(2);
-        assertThat(status.parkedSize()).isZero();
+        assertThat(status.parkedSize()).isOne();
         assertThat(status.deadLetters()).containsExactlyInAnyOrder(new DeadLetterCount("a", KEPT, 2),
                 new DeadLetterCount("a", PENDING, 1), new DeadLetterCount("b", SCHEDULED, 1));
         assertThat(status.orphans()).as("not the pre-created range").containsExactlyInAnyOrder(
