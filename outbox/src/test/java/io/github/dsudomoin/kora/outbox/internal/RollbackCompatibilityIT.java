@@ -1,5 +1,6 @@
 package io.github.dsudomoin.kora.outbox.internal;
 
+import static io.github.dsudomoin.kora.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryLong;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -14,7 +15,10 @@ import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Types;
+import java.time.Clock;
 import java.time.Duration;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -193,6 +197,123 @@ class RollbackCompatibilityIT {
         try (var c = TestDb.connect()) {
             assertThat(undelivered(c, all)).isEmpty();
         }
+    }
+
+    /**
+     * A rollback to 5fc60dd in each state this version may leave the tail in: empty, hot after a swap that failed, and
+     * hot over maxTailScan. No check is on any partition, so the previous release's maintenance (its extension below)
+     * and writers go on with no human step: every insert succeeds while xids run far past any bound, a hot tail
+     * taking the rows. Upgrading again, this version's maintenance heals the tail by itself.
+     */
+    @Test
+    void aRollbackInEveryTailStateKeepsInsertsWorkingAndTheUpgradeHealsIt() throws Exception {
+        for (var state : List.of("empty", "hot", "hot over maxTailScan")) {
+            var cfg = new TestOutboxConfig().shards(SHARDS).relayEnabled(false).xidsPerPartition(1000).premake(10)
+                    .maxTailScan(state.equals("hot over maxTailScan") ? 0 : 16L * 1024 * 1024)
+                    .tailConversion("03:00-05:00", Duration.ofSeconds(5));
+            schema = new OutboxSchema(db, cfg);
+            schema.init();
+            names = schema.names();
+            var partitions = new XidPartitions(names, cfg.partitions());
+            partitions.clock = clockAt(12, 0); // outside the window
+            try (var holder = TestDb.connect(); var c = TestDb.connect()) {
+                if (!state.equals("empty")) { // rows in the tail, then a swap that fails on a young lock holder
+                    TestDb.burnXids((int) (tailLower(c) - currentXid(c)) + 10);
+                    insert(c);
+                    holder.setAutoCommit(false);
+                    execute(holder, "lock table only " + names.base() + " in access share mode");
+                    try {
+                        partitions.ensurePremade(c);
+                    } catch (SQLException e) {
+                        assertThat(e.getSQLState()).isEqualTo("55P03");
+                    }
+                    holder.commit();
+                    assertThat(queryLong(c, "select count(*) from " + names.tail())).as(state).isOne();
+                }
+                long tail = tailLower(c);
+
+                var failed = new ArrayList<SQLException>();
+                for (int i = 0; i < 30; i++) { // the previous release, 30 ranges on
+                    TestDb.burnXids(1000);
+                    try {
+                        insert(c);
+                    } catch (SQLException e) {
+                        failed.add(e);
+                    }
+                    previousExtension(c, cfg.xidsPerPartition(), cfg.premake());
+                }
+
+                assertThat(failed).as("%s: failed inserts", state).isEmpty();
+                assertThat(queryLong(c, "select count(*) from pg_constraint where contype = 'c' and conrelid in"
+                        + " (select inhrelid from pg_inherits where inhparent = '" + names.base() + "'::regclass)"))
+                        .as("%s: checks", state).isZero();
+                if (!state.equals("empty")) {
+                    assertThat(tailLower(c)).as("%s: the previous release leaves a hot tail be", state)
+                            .isEqualTo(tail);
+                }
+                partitions.clock = clockAt(4, 0); // upgraded again; an oversized tail waits for the window
+                partitions.ensurePremade(c);
+
+                assertThat(queryLong(c, "select count(*) from " + names.tail())).as("%s: healed", state).isZero();
+                assertThat(partitions.premadeAhead(c)).as(state).isGreaterThanOrEqualTo(cfg.premake());
+                insert(c);
+            }
+        }
+    }
+
+    /**
+     * 5fc60dd XidPartitions#ensurePremade for an attached tail, its statements verbatim, without its long-transaction
+     * check (this test has none): a hot tail (rows, or the current xid within a range of it) is left be; else, once
+     * half of premake is used, the empty tail is detached concurrently and dropped, ranges are created until premake
+     * lie above the current xid's, and a new tail is attached.
+     */
+    private void previousExtension(Connection c, long size, int premake) throws SQLException {
+        long current = currentXid(c);
+        Long upper = null;
+        int ahead = 0;
+        for (var b : PartitionDdl.listRanges(c, names.base())) {
+            if (b.to() != null) {
+                ahead += Long.parseLong(b.from()) > current ? 1 : 0;
+                upper = upper == null ? Long.parseLong(b.to()) : Math.max(upper, Long.parseLong(b.to()));
+            }
+        }
+        if (ahead > premake / 2 || PartitionDdl.hasRows(c, names.tail()) || current + size > tailLower(c)) {
+            return;
+        }
+        PartitionDdl.detach(c, names.base(), names.tail(), PartitionDdl.DETACH_LOCK_TIMEOUT);
+        assertThat(PartitionDdl.dropIfEmptyElseAttach(c, names.base(), names.tail(), Long.toString(upper), null,
+                PartitionDdl.DETACH_LOCK_TIMEOUT)).isTrue();
+        long floor = Math.floorDiv(current, size) * size;
+        long from = upper;
+        if (from < floor) {
+            PartitionDdl.createAndAttach(c, names.base(), names.partitionPrefix() + from, Long.toString(from),
+                    Long.toString(floor), PartitionDdl.CREATE_LOCK_TIMEOUT);
+            from = floor;
+        }
+        for (long target = floor + (premake + 1) * size; from < target; from += size) {
+            PartitionDdl.createAndAttach(c, names.base(), names.partitionPrefix() + from, Long.toString(from),
+                    Long.toString(from + size), PartitionDdl.CREATE_LOCK_TIMEOUT);
+        }
+        PartitionDdl.createAndAttach(c, names.base(), names.tail(), Long.toString(from), null,
+                PartitionDdl.CREATE_LOCK_TIMEOUT);
+    }
+
+    private void insert(Connection c) throws SQLException {
+        execute(c, "insert into " + names.base() + " (shard, message_id, topic) values (0, gen_random_uuid(), 't')");
+    }
+
+    private long tailLower(Connection c) throws SQLException {
+        return PartitionDdl.listRanges(c, names.base()).stream().filter(b -> b.to() == null)
+                .mapToLong(b -> Long.parseLong(b.from())).findFirst().orElseThrow();
+    }
+
+    private static long currentXid(Connection c) throws SQLException {
+        return queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint");
+    }
+
+    private static Clock clockAt(int hour, int minute) {
+        var zone = ZoneId.systemDefault();
+        return Clock.fixed(LocalDate.now(zone).atTime(hour, minute).atZone(zone).toInstant(), zone);
     }
 
     private Cursor oldLatest(Connection c, int shard) throws SQLException {
