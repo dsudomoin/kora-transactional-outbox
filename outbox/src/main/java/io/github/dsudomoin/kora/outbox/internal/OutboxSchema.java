@@ -29,7 +29,9 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * minute. The schema lock and every bootstrap DDL statement wait at
  * most 5 s for a lock ({@code lock_timeout}), and every bootstrap statement runs under a 1 min
  * {@code statement_timeout} (replacing a shorter role default): one that needs longer, such as an index built anew on a
- * populated table, fails startup with SQLState 57014 and is left to run by hand. The schema lock is retried for a
+ * populated table, fails startup with SQLState 57014 and is left to run by hand; the dead table's {@code <dead>_due},
+ * new with the dead-letter hook, is built here only while that table has no row, otherwise (an INFO) by
+ * {@link Maintenance}, concurrently. The schema lock is retried for a
  * minute, then startup fails. On existing tables the bootstrap takes no lock that writers wait behind (index creation
  * is skipped when the index exists, partition extension is optional and left to maintenance when it times out). A tick
  * table made before {@code max_id} or {@code dirty}, a cursor table made before {@code parked_due_at}, a retry table
@@ -321,7 +323,17 @@ public final class OutboxSchema implements Lifecycle {
                         + (noStatus ? ", add constraint " + n.unqualified(n.dead()) + "_status"
                                 + " check (status in ('pending', 'kept', 'scheduled')) not valid" : ""));
             }
-            createIndex(c, n.dead() + "_due", n.dead() + " (due_at) where due_at is not null");
+            // on a dead table with rows (kept forever by default) the build would hold dead inserts and outlast the
+            // statement_timeout: Maintenance builds it concurrently, and the pass claims by a scan meanwhile
+            String deadDue = n.dead() + "_due";
+            if (indexMissing(c, deadDue)) {
+                if (PartitionDdl.hasRows(c, n.dead())) {
+                    log.info("outbox index {} is missing on {}, which holds rows: maintenance builds it concurrently"
+                            + " in its next run", deadDue, n.dead());
+                } else {
+                    createIndex(c, deadDue, n.dead() + " (due_at) where due_at is not null");
+                }
+            }
             // how many times a message was redriven, read by its next dead row
             st.execute("create table if not exists " + n.redriven() + """
                      (
@@ -406,17 +418,21 @@ public final class OutboxSchema implements Lifecycle {
     }
 
     private void createIndex(Connection c, String index, String definition) throws SQLException {
+        if (!indexMissing(c, index)) {
+            return; // CREATE INDEX IF NOT EXISTS would still queue a SHARE lock behind running writers
+        }
+        try (var st = c.createStatement()) {
+            st.execute("create index " + spelled.unqualified(index) + " on " + definition);
+        }
+    }
+
+    private static boolean indexMissing(Connection c, String index) throws SQLException {
         try (var ps = c.prepareStatement("select to_regclass(?) is null")) {
             ps.setString(1, index);
             try (var rs = ps.executeQuery()) {
                 rs.next();
-                if (!rs.getBoolean(1)) {
-                    return; // CREATE INDEX IF NOT EXISTS would still queue a SHARE lock behind running writers
-                }
+                return rs.getBoolean(1);
             }
-        }
-        try (var st = c.createStatement()) {
-            st.execute("create index " + spelled.unqualified(index) + " on " + definition);
         }
     }
 

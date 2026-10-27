@@ -1335,6 +1335,70 @@ class MaintenanceIT {
         }
     }
 
+    @Test
+    void deadDueIndexIsBuiltConcurrently() throws Exception {
+        bootstrap();
+        String index = names.dead() + "_due";
+        try (var c = TestDb.connect(); var holder = TestDb.connect(); var writer = TestDb.connect()) {
+            execute(c, "drop index " + index); // as bootstrap leaves an upgraded dead table with rows
+            execute(c, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
+                    + " select s, 0, gen_random_uuid(), 't', now(), 1 from generate_series(1, 200000) s");
+            execute(c, "update " + names.dead() + " set status = 'pending', due_at = now() where id <= 3");
+            // an open dead insert: the build waits for it
+            holder.setAutoCommit(false);
+            execute(holder, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
+                    + " values (300000, 0, gen_random_uuid(), 't', now(), 1)");
+            var run = CompletableFuture.supplyAsync(() -> maintenance().runOnce());
+            await(Duration.ofSeconds(10), () -> queryLong(c, "select count(*) from pg_stat_activity"
+                    + " where query like 'create index concurrently%' and wait_event_type = 'Lock'") == 1);
+
+            // a plain CREATE INDEX waiting there would queue every new dead insert behind it
+            long start = System.nanoTime();
+            execute(writer, "set statement_timeout = '1s'");
+            execute(writer, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
+                    + " values (300001, 0, gen_random_uuid(), 't', now(), 1)");
+            assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(1));
+
+            holder.commit();
+            assertThat(run.get(30, TimeUnit.SECONDS)).isTrue();
+            assertThat(queryString(c, "select indisvalid::text from pg_index where indexrelid = to_regclass(?)", index))
+                    .isEqualTo("true");
+            assertThat(queryString(c, "select pg_get_indexdef(to_regclass(?))", index))
+                    .endsWith(" (due_at) WHERE (due_at IS NOT NULL)");
+            assertThat(queryLong(c, "select count(*) from " + names.dead() + " where due_at is not null"))
+                    .isEqualTo(3);
+        }
+    }
+
+    @Test
+    void invalidDeadDueIndexIsRebuilt() throws Exception {
+        bootstrap();
+        String index = names.dead() + "_due";
+        String state = "select indexrelid || ':' || indisvalid from pg_index where indexrelid = to_regclass(?)";
+        String invalid;
+        try (var c = TestDb.connect(); var holder = TestDb.connect()) {
+            execute(c, "drop index " + index);
+            deadLetter(1, "pending", "1 minute");
+            holder.setAutoCommit(false);
+            execute(holder, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
+                    + " values (2, 0, gen_random_uuid(), 't', now(), 1)");
+            execute(c, "set lock_timeout = '300ms'");
+            assertThatThrownBy(() -> execute(c, "create index concurrently " + names.unqualified(index) + " on "
+                    + names.dead() + " (due_at) where due_at is not null")).isInstanceOf(SQLException.class);
+            execute(c, "reset lock_timeout");
+            holder.rollback();
+            invalid = queryString(c, state, index);
+            assertThat(invalid).as("a cancelled concurrent build leaves it invalid").endsWith(":false");
+        }
+
+        assertThat(maintenance().runOnce()).isTrue();
+
+        try (var c = TestDb.connect()) {
+            var rebuilt = queryString(c, state, index);
+            assertThat(rebuilt).endsWith(":true").isNotEqualTo(invalid.replace(":false", ":true"));
+        }
+    }
+
     /** A dead letter of {@code status} that failed {@code age} ago (an interval), due now unless kept. */
     private void deadLetter(long id, String status, String age) throws SQLException {
         try (var c = TestDb.connect()) {

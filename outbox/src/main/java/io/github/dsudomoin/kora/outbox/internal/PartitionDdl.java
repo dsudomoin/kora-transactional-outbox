@@ -336,7 +336,8 @@ public final class PartitionDdl {
         execute(c, lockTimeout, lockTimeout.plus(DDL_MARGIN), sql);
     }
 
-    private static void execute(Connection c, Duration lockTimeout, Duration statementTimeout, String sql)
+    /** {@link #execute(Connection, Duration, String)} with its own {@code statementTimeout}, zero for none. */
+    static void execute(Connection c, Duration lockTimeout, Duration statementTimeout, String sql)
             throws SQLException {
         String lock;
         String statement;

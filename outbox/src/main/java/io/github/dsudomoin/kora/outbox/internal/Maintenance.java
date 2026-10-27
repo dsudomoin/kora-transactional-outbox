@@ -48,7 +48,8 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * {@code outbox.partitions.orphaned} counts the ones kept, with an ERROR each run, as their rows lie outside the
  * outbox), tick cleanup, cursor cleanup, deletion of kept dead letters older than
  * {@code outbox.deadLetters.retention} (by {@code failed_at}; none when it is 0, pending or scheduled ones never) and
- * of redrive counts older than {@code outbox.deadLetters.redriveHistory}, gauges; when none failed, the run is recorded
+ * of redrive counts older than {@code outbox.deadLetters.redriveHistory}, the dead table's {@code <dead>_due} built
+ * concurrently when missing or invalid, gauges; when none failed, the run is recorded
  * as the last success. One long-lived instance per outbox table: it registers the gauges {@code outbox.shard.lag},
  * {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.dead.pending} (letters waiting for the hook),
  * {@code outbox.dead.pending.oldest} (seconds since the oldest of them failed, 0 when none),
@@ -452,6 +453,10 @@ public final class Maintenance {
             step("dead-letter retention", () -> deleteOlder(c, deleteOldKept, deadRetention));
         }
         step("redrive history cleanup", () -> deleteOlder(c, deleteOldRedrives, redriveHistory));
+        step("dead-letter index", () -> {
+            ensureDeadDueIndex(c);
+            return null;
+        });
         step("gauges", () -> {
             refreshGauges(c, read);
             return null;
@@ -482,6 +487,37 @@ public final class Maintenance {
         }
         stepFailed = true; // no success recorded while rows lie outside the outbox
         return false;
+    }
+
+    /**
+     * Builds {@code <dead>_due} when bootstrap left it to this run (a dead table with rows) or an interrupted build left
+     * it invalid, which is dropped first. Concurrently, on this autocommit connection: SHARE UPDATE EXCLUSIVE, which
+     * dead inserts pass. No {@code statement_timeout}, as the scan takes as long as the table needs, all under the
+     * maintenance lock; each lock wait, the build's wait for older transactions included, under
+     * {@code detachLockTimeout}.
+     */
+    private void ensureDeadDueIndex(Connection c) throws SQLException {
+        // ponytail: a transaction open longer than detachLockTimeout fails the build at its end and the next run starts
+        // over from a scan; give the wait its own setting if that ever repeats on a large dead table
+        String index = names.dead() + "_due";
+        Boolean valid;
+        try (var ps = c.prepareStatement("select indisvalid from pg_index where indexrelid = to_regclass(?)")) {
+            ps.setString(1, index);
+            try (var rs = ps.executeQuery()) {
+                valid = rs.next() ? rs.getBoolean(1) : null;
+            }
+        }
+        if (Boolean.TRUE.equals(valid)) {
+            return;
+        }
+        if (valid != null) {
+            PartitionDdl.execute(c, detachLockTimeout, "drop index concurrently if exists " + index);
+            log.info("outbox maintenance dropped {}, left invalid by an interrupted concurrent build", index);
+        }
+        long start = System.nanoTime();
+        PartitionDdl.execute(c, detachLockTimeout, Duration.ZERO, "create index concurrently if not exists "
+                + names.unqualified(index) + " on " + names.dead() + " (due_at) where due_at is not null");
+        log.info("outbox maintenance built {} concurrently in {} ms", index, (System.nanoTime() - start) / 1_000_000);
     }
 
     /** {@code delete} with the one parameter: {@code age} in seconds; returns the rows deleted. */

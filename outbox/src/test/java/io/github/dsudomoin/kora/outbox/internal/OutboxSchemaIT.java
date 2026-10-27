@@ -8,6 +8,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 import io.github.dsudomoin.kora.outbox.OutboxRelay;
+import io.github.dsudomoin.kora.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
@@ -250,7 +251,8 @@ class OutboxSchemaIT {
             assertThat(queryString(c, check, n.dead(), checkName)).as("not valid: the old letters are not scanned")
                     .isEqualTo("false");
             assertThat(queryString(c, "select (to_regclass(?) is not null)::text", n.dead() + "_due"))
-                    .isEqualTo("true");
+                    .as("a dead table with rows: left to maintenance, which builds it concurrently")
+                    .isEqualTo("false");
             assertThatThrownBy(() -> execute(c, "update " + n.dead() + " set status = 'gone' where id = 1"))
                     .isInstanceOf(SQLException.class)
                     .hasMessageContaining(n.unqualified(n.dead()) + "_status");
@@ -264,6 +266,34 @@ class OutboxSchemaIT {
             }
             assertThat(queryString(c, letters)).isEqualTo("1:kept:null:0:null:0,2:kept:null:0:null:0");
             assertThat(queryString(c, check, n.dead(), checkName)).isEqualTo("false");
+        }
+    }
+
+    @Test
+    void upgradeOfALargeDeadTableDoesNotBuildTheIndexAtStartup() throws Exception {
+        var n = TableNames.of(config.table());
+        try (var c = TestDb.connect(); var err = new CapturedStderr()) {
+            execute(c, "create table " + n.dead() + """
+                     (
+                      id         bigint primary key,
+                      shard      smallint not null,
+                      message_id uuid not null,
+                      topic      text not null,
+                      key        bytea,
+                      payload    bytea,
+                      headers    bytea,
+                      created_at timestamptz not null,
+                      attempts   int not null,
+                      failed_at  timestamptz not null default now(),
+                      error      text
+                    )"""); // a dead table of a version before the dead-letter hook
+            execute(c, "insert into " + n.dead() + " (id, shard, message_id, topic, created_at, attempts)"
+                    + " select s, 0, gen_random_uuid(), 't', now(), 1 from generate_series(1, 200000) s");
+
+            assertTimeoutPreemptively(Duration.ofSeconds(5), () -> new OutboxSchema(db, config).init());
+
+            assertThat(queryString(c, "select (to_regclass(?) is null)::text", n.dead() + "_due")).isEqualTo("true");
+            assertThat(err.text()).contains(n.dead() + "_due").contains("maintenance");
         }
     }
 
