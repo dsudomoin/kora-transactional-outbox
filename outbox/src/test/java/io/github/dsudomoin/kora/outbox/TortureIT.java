@@ -195,7 +195,8 @@ class TortureIT {
 
             System.out.printf("TortureIT seed %d: committed %d (unkeyed %d), rolled back %d, delivered %d,"
                             + " duplicates %d, failed permanently %d, dead letters handed %d (last kept %d, discarded"
-                            + " %d, redriven %d), requeue answers %d (first delivered or dead after parking %d),"
+                            + " %d, redriven %d), requeue answers %d (first delivered or failed permanently after"
+                            + " parking %d),"
                             + " transient failures %d, target-down failures %d, crashes %d, partitions dropped %d (while"
                             + " relaying %d), writers %.1f s, total %.1f s%n",
                     seed, committed.size(), unkeyed, rolledBack.size(), delivered.size(), handler.duplicates(),
@@ -214,6 +215,11 @@ class TortureIT {
                     .as("committed but neither delivered nor last decided keep or discard").isEmpty();
             assertThat(both(delivered, rolledBack)).as("rolled back but delivered").isEmpty();
             assertThat(minus(delivered, committed)).as("delivered but never committed").isEmpty();
+            assertThat(kept).as("letters last decided keep").isNotEmpty();
+            assertThat(discarded).as("letters last decided discard").isNotEmpty();
+            assertThat(redriven).as("letters last decided redrive").isNotEmpty();
+            assertThat(hook.redrivesAhead).as("letters whose redrives() exceeds the redrive decisions for them")
+                    .isEmpty();
             assertThat(minus(failed, hook.last.keySet())).as("failed permanently but never handed to the hook")
                     .isEmpty();
             assertThat(minus(hook.last.keySet(), failed)).as("handed to the hook but never failed permanently")
@@ -592,8 +598,9 @@ class TortureIT {
         final Map<UUID, Integer> crashedDeliveries = new ConcurrentHashMap<>();
         final Map<UUID, Long> permanentAt = new ConcurrentHashMap<>();
         /**
-         * The messages whose first delivery, or first permanent failure, carried {@code requeues() > 0}: they parked
-         * before it. A requeue answer the relay did not apply (its call crashed or paused the shard) parks nothing.
+         * The messages whose first delivery or first permanent failure, whichever came first, carried
+         * {@code requeues() > 0}: they parked before it. A requeue answer the relay did not apply (its call crashed or
+         * paused the shard) parks nothing.
          */
         final Set<UUID> requeued = ConcurrentHashMap.newKeySet();
         /** Pairs [M, R]: a call that then crashed first delivered R after answering requeue for M, of R's key. */
@@ -709,8 +716,9 @@ class TortureIT {
                 transientFailures.incrementAndGet();
                 throw new Exception("flaky " + id);
             }
+            // a redriven message's fresh row may park: its first permanent failure came first and decides
             if (first.putIfAbsent(id, new Delivery(sequence.incrementAndGet(), record.id())) == null
-                    && record.requeues() > 0) {
+                    && record.requeues() > 0 && !permanentAt.containsKey(id)) {
                 requeued.add(id);
             }
             deliveries.merge(id, 1, Integer::sum);
@@ -753,6 +761,12 @@ class TortureIT {
         final Map<UUID, Integer> redrives = new ConcurrentHashMap<>();
         /** Letters handed, counted before deciding: one handed while a drain ran shows as a change. */
         final AtomicLong handed = new AtomicLong();
+        /**
+         * Letters whose {@code redrives()} exceeds the redrive decisions recorded for their message: every redrive here
+         * is one, recorded before it commits, so the count may only over-count. Asserted at the end: a hook that threw
+         * would only leave its letters pending.
+         */
+        final List<String> redrivesAhead = new CopyOnWriteArrayList<>();
 
         DecidingHook(long seed) {
             this.seed = seed;
@@ -763,6 +777,10 @@ class TortureIT {
             var decisions = new ArrayList<DeadLetterDecision>(letters.size());
             for (var letter : letters) {
                 handed.incrementAndGet();
+                int decided = redrives.getOrDefault(letter.messageId(), 0);
+                if (letter.redrives() > decided) {
+                    redrivesAhead.add(letter.messageId() + " redrives " + letter.redrives() + ", decided " + decided);
+                }
                 // ~seed: a stream of its own, not the permanent failure's of the same token and generation
                 var random = new SplittableRandom(mix(~seed, letter.payload(), letter.redrives()));
                 var decision = switch (random.nextInt(4)) {
