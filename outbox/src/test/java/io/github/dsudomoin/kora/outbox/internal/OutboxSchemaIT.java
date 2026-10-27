@@ -274,26 +274,6 @@ class OutboxSchemaIT {
     }
 
     @Test
-    void xidRegressionFailsFast() throws Exception {
-        var schema = new OutboxSchema(db, config);
-        schema.init();
-        try (var c = TestDb.connect()) {
-            long ahead = queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint") + 1_000_000;
-            try (var ps = c.prepareStatement("update " + schema.names().tick()
-                    + " set snapshot = (? || ':' || ? || ':')::pg_snapshot where id = (select max(id) from "
-                    + schema.names().tick() + ")")) {
-                ps.setLong(1, ahead);
-                ps.setLong(2, ahead);
-                assertThat(ps.executeUpdate()).isEqualTo(1);
-            }
-        }
-
-        assertThatThrownBy(new OutboxSchema(db, config)::init)
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("xid counter went backwards");
-    }
-
-    @Test
     void insertLandsInXidPartition() throws Exception {
         var schema = new OutboxSchema(db, config);
         schema.init();

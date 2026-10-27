@@ -22,7 +22,10 @@ public final class OrphanRestore {
     private final TableNames names;
     private final Resender resender;
     private final Duration keyLockTimeout;
-    /** {@code <base>_x<digits>}, unqualified (as listed on the search_path) or qualified as the outbox is named. */
+    /**
+     * {@code <base>_x<digits>}, or {@code <base>_o<digits>} as the xid-regression recovery sets one aside, unqualified
+     * (as listed on the search_path) or qualified as the outbox is named.
+     */
     private final Pattern range;
     private final String unmarkDropping;
     /** For tests: runs after each chunk's commit, to end the session there. */
@@ -38,10 +41,10 @@ public final class OrphanRestore {
         this.names = names;
         this.resender = resender;
         this.keyLockTimeout = keyLockTimeout;
-        var prefix = names.partitionPrefix();
-        var unqualified = names.unqualified(prefix);
-        this.range = Pattern.compile("(?:" + Pattern.quote(prefix.substring(0, prefix.length() - unqualified.length()))
-                + ")?" + Pattern.quote(unqualified) + "[0-9]+");
+        var base = names.base();
+        var unqualified = names.unqualified(base);
+        this.range = Pattern.compile("(?:" + Pattern.quote(base.substring(0, base.length() - unqualified.length()))
+                + ")?" + Pattern.quote(unqualified) + "_[xo][0-9]+");
         this.unmarkDropping = "delete from " + names.dropping() + " where table_name = ?";
     }
 
@@ -56,13 +59,15 @@ public final class OrphanRestore {
      * deletes its {@code <base>_dropping} marker. A lock timeout (SQLState 55P03) rolls back the chunk it hits, rows
      * and locks. Returns the rows moved.
      *
-     * @throws IllegalArgumentException before any SQL that names it, unless {@code table} is {@code <base>_x<digits>},
-     *     unqualified or qualified as the outbox is named, and a table in the outbox's schema that is no partition
+     * @throws IllegalArgumentException before any SQL that names it, unless {@code table} is {@code <base>_x<digits>}
+     *     or {@code <base>_o<digits>}, unqualified or qualified as the outbox is named, and a table in the outbox's
+     *     schema that is no partition
      */
     public long restore(Connection autocommit, String table, long fromXid, Duration lockTimeout) throws SQLException {
         if (!range.matcher(table).matches() || !standalone(autocommit, table)) {
             throw new IllegalArgumentException(table + " is not a standalone range of the outbox " + names.base()
-                    + ": a table " + names.partitionPrefix() + "<digits> in its schema and in no partition tree");
+                    + ": a table " + names.partitionPrefix() + "<digits> or " + names.setAsidePrefix() + "<digits> in"
+                    + " its schema and in no partition tree");
         }
         PartitionDdl.execute(autocommit, lockTimeout,
                 "create index if not exists " + names.unqualified(table) + "_id on " + table + " (id)");

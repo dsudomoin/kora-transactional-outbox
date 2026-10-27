@@ -25,15 +25,18 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * {@code outbox.maintenance.transaction_pooling} at 1 (0 otherwise). It runs on at most one instance at a time: it
  * holds the session lock {@code pg_try_advisory_lock(internalNs, LOCK_MAINTENANCE)} on one autocommit connection with
  * {@code idle_session_timeout = 60s}, so Postgres ends the session of a frozen holder and frees the lock; the setting
- * is reset and the lock released before the connection goes back to the pool. Steps, each on its own (a failure is
- * logged and the next step still runs): finish a pending detach, premade partitions (the extension swaps the tail in
- * one transaction, a tail with rows becoming a range in it, the library's one ACCESS EXCLUSIVE on the parent: writers
+ * is reset and the lock released before the connection goes back to the pool. While halted the one step under the
+ * lock is the recovery ({@link XidRecovery#autoRecover}), with {@code outbox.recovery.xidRegression = auto}; with
+ * {@code halt} the run takes no lock. Otherwise the steps, each on its own (a failure is logged and the next step
+ * still runs): finish a pending detach, premade partitions (the extension swaps the tail in one transaction, a tail
+ * with rows becoming a range in it, the library's one ACCESS EXCLUSIVE on the parent besides the recovery's: writers
  * stall for its lock wait, at most {@code outbox.partitions.swapLockTimeout}, and the milliseconds it holds the lock;
  * before it, a wait of up to {@code batchTimeout} + 5 s for relay steps in flight blocks no writer), drop of processed
  * partitions, drop of ranges left detached but not dropped: by a crash of this library's maintenance once relayed
  * (one still holding rows at or above the horizon first has those moved back into the outbox as new messages,
  * {@link OrphanRestore}, unless {@code outbox.partitions.restoreOrphans} is off), by anyone else only when empty
- * ({@code outbox.partitions.orphaned} counts the ones kept, with an ERROR each run, as their rows lie outside the
+ * (and ranges the xid-regression recovery set aside, {@code <base>_o<digits>}, likewise:
+ * {@code outbox.partitions.orphaned} counts the ones kept, with an ERROR each run, as their rows lie outside the
  * outbox), tick cleanup, cursor cleanup, gauges; when none failed, the run is recorded as the last success. One
  * long-lived instance per outbox table: it registers the gauges {@code outbox.shard.lag},
  * {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.parked.size}, {@code outbox.partitions.premade},
@@ -61,15 +64,15 @@ public final class Maintenance {
     private final ParkedStore parked;
     final OrphanRestore orphanRestore; // for a test's seam
     private final boolean restoreOrphans;
-    final String xidCheck; // for a test of its plan
-    private final String haltInsert;
+    final XidRecovery recovery; // for a test of its check's plan
+    private final boolean autoRecovery;
     private final String sinceSuccess;
     private final String succeeded;
     private final Duration staleAfter;
     private final AtomicLong poolingLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong staleLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    private final AtomicLong haltLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private volatile boolean halted;
-    private long haltLogged; // under this
     private volatile boolean stepFailed; // in the current run, under LOCK_MAINTENANCE
 
     private volatile double lag = Double.NaN;
@@ -103,14 +106,8 @@ public final class Maintenance {
         this.orphanRestore = new OrphanRestore(
                 names, new Resender(names, config.shards()), config.partitions().swapLockTimeout());
         this.restoreOrphans = config.partitions().restoreOrphans();
-        // every tick, not just the newest: workers keep ticking after a regression, and their new ticks look fine; the
-        // highest xmax comes from the index <tick>_xmax, as ticks pile up while a paused shard holds cleanup back
-        this.xidCheck = "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint,"
-                + " (select pg_snapshot_xmax(snapshot)::text::bigint from " + names.tick()
-                + " order by pg_snapshot_xmax(snapshot) desc limit 1),"
-                + " (select max_tick_xmax::text::bigint from " + names.halt() + ")";
-        this.haltInsert = "insert into " + names.halt() + " as h (max_tick_xmax) values (?::text::xid8)"
-                + " on conflict (id) do update set max_tick_xmax = greatest(h.max_tick_xmax, excluded.max_tick_xmax)";
+        this.recovery = new XidRecovery(names, config);
+        this.autoRecovery = config.recovery().xidRegression().equals("auto");
         // the database clock for both ends, so instances with skewed clocks agree
         this.sinceSuccess = "select extract(epoch from clock_timestamp() - succeeded_at)::float8 from "
                 + names.maintenance();
@@ -137,18 +134,22 @@ public final class Maintenance {
      * the counter below a tick's xmax (dump/restore or logical migration: relaying would skip new rows) records it with
      * the highest tick xmax; relay workers then take no shards and {@code drain()} fails, on every instance and across
      * restarts. The counter catching up does not end it (cursors still sit on pre-regression ticks and would skip the
-     * rows written meanwhile): only ticks repaired below the recorded xmax with a consistent counter, or an operator
-     * deleting the row, do (README "xid regression recovery").
+     * rows written meanwhile): only ticks repaired below the recorded xmax with a consistent counter do, as the
+     * recovery ({@link XidRecovery}) leaves them, or an operator deleting the row. While halted an ERROR at most once a
+     * minute says why no recovery ran.
      */
     public boolean halted() {
         return halted;
     }
 
-    /** The xid-regression check alone, without the maintenance lock: refreshes {@link #halted()} and returns it. */
+    /**
+     * The xid-regression check alone, without the maintenance lock: refreshes {@link #halted()} and returns it; never
+     * recovers, and leaves the ERROR to the run that says why it did not.
+     */
     public boolean checkHalt() {
         try (var c = db.newConnection()) {
             c.setAutoCommit(true);
-            return checkXidCounter(c);
+            return checkXidCounter(c) != null;
         } catch (SQLException e) {
             throw new RuntimeSqlException(e);
         }
@@ -156,14 +157,19 @@ public final class Maintenance {
 
     /**
      * One run; false without maintaining anything when another session holds the maintenance lock or the connection
-     * does not keep one server session. While halted only the reads and the xid check run (true).
+     * does not keep one server session. While halted only the reads, the xid check and, in {@code auto} mode, the
+     * recovery run (true with {@code halt}: no lock is taken).
      */
     public boolean runOnce() {
         try (var c = db.newConnection()) {
             c.setAutoCommit(true);
-            boolean halted = checkXidCounter(c); // first: nothing may keep it from running
-            readLastSuccess(c, halted);
-            return halted || (sessionStable(c) && maintain(c));
+            var check = checkXidCounter(c); // first: nothing may keep it from running
+            readLastSuccess(c, check != null);
+            if (check != null && !autoRecovery) {
+                logHalt(check, XidRecovery.HALT_MODE);
+                return true;
+            }
+            return sessionStable(c) && maintain(c, check);
         } catch (SQLException e) {
             throw new RuntimeSqlException(e);
         }
@@ -216,14 +222,23 @@ public final class Maintenance {
         return now - last >= LOG_INTERVAL && logged.compareAndSet(last, now);
     }
 
-    private boolean maintain(Connection c) throws SQLException {
+    /** {@code check}: the halt found by this run's check, null when none. */
+    private boolean maintain(Connection c, @Nullable XidRecovery.Check check) throws SQLException {
         // before the lock, so a holder frozen right after taking it loses it too
         execute(c, "set idle_session_timeout = '60s'");
         boolean locked = false;
         Throwable failure = null;
         try {
             locked = advisory(c, "pg_try_advisory_lock");
-            if (locked && run(c)) {
+            if (!locked && check != null) {
+                logHalt(check, XidRecovery.LOCK_BUSY);
+            } else if (check != null) { // halted: the one step is the recovery
+                var why = recovery.autoRecover(c);
+                var still = checkXidCounter(c); // resumes once recovered, by this run or by another instance
+                if (still != null && why != null) {
+                    logHalt(still, why);
+                }
+            } else if (locked && run(c)) {
                 execute(c, succeeded);
                 lastSuccess = System.nanoTime();
             }
@@ -281,15 +296,17 @@ public final class Maintenance {
                                 orphan.table(), names.base(), horizon, names.base(), orphan.table(), horizon);
                     } else {
                         left++;
-                        log.error("outbox table {} holds rows and is a range detached from {}, but not by this"
-                                + " library's maintenance: rows of a range detached before the relay reached them were"
-                                + " never delivered. It is kept (gauge outbox.partitions.orphaned); compare its rows"
-                                + " with what was delivered, then move the undelivered ones back with"
-                                + " OutboxAdmin.restoreOrphan(\"{}\", fromXid) or POST"
+                        log.error("outbox table {} holds rows and is a range {}: rows of a range detached before the"
+                                + " relay reached them were never delivered. It is kept (gauge"
+                                + " outbox.partitions.orphaned); compare its rows with what was delivered, then move"
+                                + " the undelivered ones back with OutboxAdmin.restoreOrphan(\"{}\", fromXid) or POST"
                                 + " /kora-outbox/admin/v1/orphans/{}/restore?fromXid=<xid>: rows at or above fromXid"
                                 + " get new ids, so they are delivered after later messages of their keys, and the rest"
-                                + " go with the table, which is dropped", orphan.table(), names.base(), orphan.table(),
-                                orphan.table());
+                                + " go with the table, which is dropped", orphan.table(), orphan.setAside()
+                                ? "the xid-regression recovery of " + names.base() + " set aside, as it was not"
+                                        + " attached to it"
+                                : "detached from " + names.base() + ", but not by this library's maintenance",
+                                orphan.table(), orphan.table());
                     }
                 }
                 orphaned = left;
@@ -375,48 +392,36 @@ public final class Maintenance {
     }
 
     /**
-     * The xid-regression check (README "xid regression recovery") against the recorded halt; sets {@link #halted()}
-     * and returns it.
+     * The xid-regression check against the recorded halt: sets {@link #halted()} and returns what it found while
+     * halted, else null. A halt found is recorded, with the highest tick xmax; one whose ticks were repaired is lifted.
      */
-    private synchronized boolean checkXidCounter(Connection c) throws SQLException {
-        long current;
-        long tickXmax;
-        Long recorded;
-        try (var st = c.createStatement(); var rs = st.executeQuery(xidCheck)) {
-            rs.next();
-            current = rs.getLong(1);
-            tickXmax = rs.getLong(2); // 0 without ticks
-            recorded = rs.getObject(3, Long.class);
-        }
-        boolean consistent = current >= tickXmax;
-        if (consistent && recorded != null && tickXmax < recorded) { // ticks repaired: the regressed ones are gone
-            execute(c, "delete from " + names.halt());
-            recorded = null;
-        }
-        if (consistent && recorded == null) {
+    @Nullable
+    private synchronized XidRecovery.Check checkXidCounter(Connection c) throws SQLException {
+        var check = recovery.check(c);
+        if (!check.halted()) {
+            if (check.recorded() != null) { // ticks repaired: the regressed ones are gone
+                execute(c, "delete from " + names.halt());
+            }
             if (halted) {
                 halted = false;
+                haltLogged.set(System.nanoTime() - LOG_INTERVAL); // a later halt is logged at once
                 log.info("outbox relay resumed: no xid-regression halt recorded in {} and the xid counter is above"
                         + " every tick", names.halt());
             }
-            return false;
+            return null;
         }
-        if (recorded == null || tickXmax > recorded) {
-            try (var ps = c.prepareStatement(haltInsert)) {
-                ps.setLong(1, tickXmax);
-                ps.executeUpdate();
-            }
-        }
-        long now = System.nanoTime();
-        if (!halted || now - haltLogged >= LOG_INTERVAL) {
-            log.error("outbox relay halted: xid counter went backwards (current xid {}, highest tick xmax {} in {};"
-                    + " restored from a dump or logically migrated?): relaying would skip rows; it stays halted, on"
-                    + " every instance and across restarts, while {} holds a row,"
-                    + " see README \"xid regression recovery\"", current, tickXmax, names.tick(), names.halt());
-            haltLogged = now;
+        if (check.recorded() == null || check.tickXmax() > check.recorded()) {
+            recovery.recordHalt(c, check.tickXmax());
         }
         halted = true;
-        return true;
+        return check;
+    }
+
+    /** The halt ERROR, at most once a minute. */
+    private void logHalt(XidRecovery.Check check, String why) {
+        if (due(haltLogged)) {
+            log.error(recovery.halted(check, why));
+        }
     }
 
     private boolean advisory(Connection c, String function) throws SQLException {

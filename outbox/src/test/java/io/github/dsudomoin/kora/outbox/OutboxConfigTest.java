@@ -20,7 +20,8 @@ class OutboxConfigTest {
                     new $OutboxConfig_RequeueConfig_ConfigValueExtractor(DURATION)),
             new $OutboxConfig_PartitionsConfig_ConfigValueExtractor(DURATION),
             new $OutboxConfig_InboxConfig_ConfigValueExtractor(DURATION),
-            new $OutboxConfig_DeadLettersConfig_ConfigValueExtractor(DURATION));
+            new $OutboxConfig_DeadLettersConfig_ConfigValueExtractor(DURATION),
+            new $OutboxConfig_RecoveryConfig_ConfigValueExtractor(DURATION));
 
     private static OutboxConfig parse(String hocon) {
         var config = HoconConfigFactory.fromHocon(
@@ -59,6 +60,9 @@ class OutboxConfigTest {
                   inbox.retention = 2h
                   inbox.attachOrphans = false
                   deadLetters.retention = 90d
+                  recovery.xidRegression = halt
+                  recovery.maxRows = 5000
+                  recovery.clockMargin = 1h
                 }
                 """);
 
@@ -71,6 +75,9 @@ class OutboxConfigTest {
         assertThat(config.inbox().retention()).isEqualTo(Duration.ofHours(2));
         assertThat(config.inbox().attachOrphans()).isFalse();
         assertThat(config.deadLetters().retention()).isEqualTo(Duration.ofDays(90));
+        assertThat(config.recovery().xidRegression()).isEqualTo("halt");
+        assertThat(config.recovery().maxRows()).isEqualTo(5000);
+        assertThat(config.recovery().clockMargin()).isEqualTo(Duration.ofHours(1));
     }
 
     @Test
@@ -113,6 +120,15 @@ class OutboxConfigTest {
                 "outbox.deadLetters.retention must not be negative: PT-0.001S");
         assertRejected("outbox.deadLetters.redriveHistory = 0ms",
                 "outbox.deadLetters.redriveHistory must be positive: PT0S");
+    }
+
+    @Test
+    void badRecoveryValuesAreRejected() {
+        assertRejected("outbox.recovery.xidRegression = manual",
+                "outbox.recovery.xidRegression must be auto or halt: manual");
+        assertRejected("outbox.recovery.maxRows = -1", "outbox.recovery.maxRows must not be negative: -1");
+        assertRejected("outbox.recovery.clockMargin = -1ms",
+                "outbox.recovery.clockMargin must not be negative: PT-0.001S");
     }
 
     private static void assertRejected(String hocon, String message) {
@@ -163,5 +179,10 @@ class OutboxConfigTest {
         assertThat(deadLetters.timeout()).isEqualTo(Duration.ofSeconds(30));
         assertThat(deadLetters.retention()).isZero();
         assertThat(deadLetters.redriveHistory()).isEqualTo(Duration.ofDays(30));
+
+        var recovery = config.recovery();
+        assertThat(recovery.xidRegression()).isEqualTo("auto");
+        assertThat(recovery.maxRows()).isEqualTo(1_000_000L);
+        assertThat(recovery.clockMargin()).isEqualTo(Duration.ofMinutes(10));
     }
 }

@@ -111,6 +111,14 @@ public record TableNames(
         return base + "_redriven";
     }
 
+    /**
+     * {@code <base>_o<digits>}: a range the xid-regression recovery set aside ({@link XidRecovery}), as long as a
+     * {@link #partitionPrefix()} name.
+     */
+    public String setAsidePrefix() {
+        return base + "_o";
+    }
+
     /** The next tail, created beside the current one before the swap that replaces it. */
     public String tailNext() {
         return base + "_tail_next";

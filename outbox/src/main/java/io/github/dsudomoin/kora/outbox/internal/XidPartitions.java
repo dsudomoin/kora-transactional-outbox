@@ -23,10 +23,12 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
  * followed by the tail {@code [horizon, MAXVALUE)} that catches rows if maintenance falls behind (README "tail
  * overflow") until the next extension turns it into a range. The current xid is
  * {@code pg_snapshot_xmax(pg_current_snapshot())}, the next xid Postgres will assign. All methods need an autocommit
- * connection, and callers serialise them under {@code LOCK_MAINTENANCE}: bootstrap takes it after {@code LOCK_SCHEMA};
- * {@link Maintenance} takes it with {@code pg_try_advisory_lock} and never takes {@code LOCK_SCHEMA}. The extension's
- * tail swap ({@link #ensurePremade}) is the one place the library takes ACCESS EXCLUSIVE on the parent, for
- * milliseconds after a wait of at most {@code outbox.partitions.swapLockTimeout}; range drops detach concurrently.
+ * connection (but {@link #ensurePremade} for a missing tail, which {@link XidRecovery} runs in its transaction: it
+ * only creates and attaches), and callers serialise them under {@code LOCK_MAINTENANCE}: bootstrap takes it after
+ * {@code LOCK_SCHEMA}; {@link Maintenance} takes it with {@code pg_try_advisory_lock} and never takes
+ * {@code LOCK_SCHEMA}. Besides the xid-regression recovery, the extension's tail swap ({@link #ensurePremade}) is the
+ * one place the library takes ACCESS EXCLUSIVE on the parent, for milliseconds after a wait of at most
+ * {@code outbox.partitions.swapLockTimeout}; range drops detach concurrently.
  */
 public final class XidPartitions {
 
@@ -93,9 +95,10 @@ public final class XidPartitions {
 
     /**
      * A standalone range {@link #dropOrphans} kept; {@code ours} when maintenance detached it as relayed, and then
-     * {@link Maintenance} moves its rows back ({@link OrphanRestore}) unless {@code restoreOrphans} is off.
+     * {@link Maintenance} moves its rows back ({@link OrphanRestore}) unless {@code restoreOrphans} is off;
+     * {@code setAside} when the xid-regression recovery set it aside ({@link XidRecovery}).
      */
-    record Orphan(String table, boolean ours) {}
+    record Orphan(String table, boolean ours, boolean setAside) {}
 
     private final TableNames names;
     private final String markDropping;
@@ -527,10 +530,11 @@ public final class XidPartitions {
      * longer lists), as a run that died, or whose DROP failed, after its detach leaves them. One recorded in
      * {@code <base>_dropping} was detached by {@link #dropProcessed} as relayed: dropped when no row is at or above
      * {@code minCursorXmin}, checked on the data. Any other was detached by someone else, perhaps before the relay
-     * reached its rows: dropped only when empty (as a create whose attach never ran leaves one). Records whose table is
-     * gone are deleted first. Ranges at or above the tail's lower bound are not looked at: only the extension makes
-     * them there, standalone until its swap, and a swap that failed or was deferred leaves them for the next attempt.
-     * Returns the ones kept.
+     * reached its rows: dropped only when empty (as a create whose attach never ran leaves one), as is a range the
+     * xid-regression recovery set aside ({@code <base>_o<digits>}). Records whose table is gone are deleted first.
+     * Ranges at or above the tail's lower bound are not looked at: only the extension makes them there, standalone
+     * until its swap, and a swap that failed or was deferred leaves them for the next attempt; set-aside ones are
+     * looked at whatever their digits. Returns the ones kept.
      */
     List<Orphan> dropOrphans(Connection c, long minCursorXmin, Duration lockTimeout) throws SQLException {
         try (var ps = c.prepareStatement(deleteStaleMarkers)) { // their table is gone
@@ -549,19 +553,21 @@ public final class XidPartitions {
                 .findFirst()
                 .orElse(Long.MAX_VALUE);
         int prefix = names.unqualified(names.partitionPrefix()).length();
+        var setAsidePrefix = names.unqualified(names.setAsidePrefix());
         var kept = new ArrayList<Orphan>();
-        for (var table : PartitionDdl.standalone(c, names.base(), "_x[0-9]+")) {
+        for (var table : PartitionDdl.standalone(c, names.base(), "_[xo][0-9]+")) {
             var range = names.unqualified(table);
-            if (Long.parseLong(range.substring(prefix)) >= tailLower) {
+            boolean setAside = range.startsWith(setAsidePrefix);
+            if (!setAside && Long.parseLong(range.substring(prefix)) >= tailLower) {
                 continue;
             }
-            boolean ours = marked.contains(range);
+            boolean ours = !setAside && marked.contains(range);
             // anyone else's detach may have come before the relay reached its rows: only an empty one goes
             boolean dropped = ours
                     ? PartitionDdl.dropUnlessFound(c, table, ROW_AT_OR_ABOVE, Long.toString(minCursorXmin), lockTimeout)
                     : PartitionDdl.dropUnlessFound(c, table, "select 1 from {table} limit 1", null, lockTimeout);
             if (!dropped) {
-                kept.add(new Orphan(table, ours));
+                kept.add(new Orphan(table, ours, setAside));
             } else if (ours) {
                 marker(c, unmarkDropping, range);
             }

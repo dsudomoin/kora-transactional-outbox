@@ -13,10 +13,12 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Range-partition DDL shared by the outbox (xid8 bounds) and the inbox (uuid bounds). Every method needs an autocommit
- * connection ({@code DETACH ... CONCURRENTLY} cannot run in a transaction block) and runs each DDL statement under its
- * own {@code lock_timeout} and a {@code statement_timeout} {@link #DDL_MARGIN} longer (a validate: its own), so a
- * shorter role or database {@code statement_timeout} cannot end the lock wait first (57014). Both are given back
- * afterwards on every path: the session's own value, or a reset when it had none. Bound values are unquoted text
+ * connection ({@code DETACH ... CONCURRENTLY} cannot run in a transaction block, the drop-or-attach methods commit),
+ * except the reads, {@link #create} and {@link #attach}, which {@link XidRecovery} also runs in its transaction. Each
+ * DDL statement runs under its own {@code lock_timeout} and a {@code statement_timeout} {@link #DDL_MARGIN} longer (a
+ * validate: its own), so a shorter role or database {@code statement_timeout} cannot end the lock wait first (57014).
+ * Both are given back afterwards on every path: the session's own value, or a reset when it had none (inside a
+ * transaction, as {@code SET LOCAL}, so its end restores what the session had before). Bound values are unquoted text
  * ({@code "1000"}); a {@code null} upper bound is {@code MAXVALUE}. Names are interpolated, so they and the values are
  * checked against a strict charset.
  */
@@ -325,7 +327,11 @@ public final class PartitionDdl {
         }
     }
 
-    /** Runs {@code sql} under the class's per-statement timeouts, then gives the session's own back. */
+    /**
+     * Runs {@code sql} under the class's per-statement timeouts, then gives the session's own back. Inside a
+     * transaction (autocommit off) both are {@code SET LOCAL}: a plain SET there would outlive the commit, carrying the
+     * transaction's own {@code SET LOCAL} values (which {@code pg_settings} reports as the session's) into the session.
+     */
     static void execute(Connection c, Duration lockTimeout, String sql) throws SQLException {
         execute(c, lockTimeout, lockTimeout.plus(DDL_MARGIN), sql);
     }
@@ -339,33 +345,36 @@ public final class PartitionDdl {
             lock = rs.getString(1);
             statement = rs.getString(2);
         }
+        boolean local = !c.getAutoCommit();
         try (var st = c.createStatement()) {
-            st.execute("set lock_timeout = " + lockTimeout.toMillis());
-            st.execute("set statement_timeout = " + statementTimeout.toMillis());
+            st.execute((local ? "set local" : "set") + " lock_timeout = " + lockTimeout.toMillis());
+            st.execute((local ? "set local" : "set") + " statement_timeout = " + statementTimeout.toMillis());
             st.execute(sql);
         } catch (SQLException | RuntimeException e) {
             try {
-                restore(c, "lock_timeout", lock);
-                restore(c, "statement_timeout", statement);
+                restore(c, "lock_timeout", lock, local);
+                restore(c, "statement_timeout", statement, local);
             } catch (SQLException cleanup) { // a terminated session: keep its cause on top
                 e.addSuppressed(cleanup);
             }
             throw e;
         }
-        restore(c, "lock_timeout", lock);
-        restore(c, "statement_timeout", statement);
+        restore(c, "lock_timeout", lock, local);
+        restore(c, "statement_timeout", statement, local);
     }
 
-    private static void restore(Connection c, String setting, @Nullable String sessionValue) throws SQLException {
+    private static void restore(Connection c, String setting, @Nullable String sessionValue, boolean local)
+            throws SQLException {
         if (sessionValue == null) {
             try (var st = c.createStatement()) {
-                st.execute("reset " + setting);
+                st.execute(local ? "set local " + setting + " to default" : "reset " + setting);
             }
             return;
         }
-        try (var ps = c.prepareStatement("select set_config(?, ?, false)")) {
+        try (var ps = c.prepareStatement("select set_config(?, ?, ?)")) {
             ps.setString(1, setting);
             ps.setString(2, sessionValue);
+            ps.setBoolean(3, local);
             ps.execute();
         }
     }

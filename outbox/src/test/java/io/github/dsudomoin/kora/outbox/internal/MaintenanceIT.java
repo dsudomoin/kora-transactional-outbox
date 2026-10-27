@@ -203,6 +203,7 @@ class MaintenanceIT {
 
     @Test
     void xidRegressionHalts() throws Exception {
+        config.xidRegression("halt"); // the halt itself; XidRecoveryIT covers the recovery
         config.relayEnabled(true).idlePollInterval(Duration.ofSeconds(30)); // no idle ticks while the test forges one
         bootstrap();
         var handler = new RecordingHandler();
@@ -258,8 +259,8 @@ class MaintenanceIT {
                         .as("while halted only the check runs")
                         .isEqualTo(cursorRows);
             }
-            assertThat(err.text().split("xid counter went backwards", -1)).as("ERROR at most once a minute").hasSize(2);
-            assertThat(err.text()).contains("ERROR").contains("xid regression recovery");
+            assertThat(err.text().split("xid regression detected", -1)).as("ERROR at most once a minute").hasSize(2);
+            assertThat(err.text()).contains("ERROR").contains("OutboxAdmin.recoverXidRegression()");
         }
         send(outbox, msg("t", "k", "while halted"));
         Thread.sleep(500); // the wake-up would deliver within milliseconds
@@ -269,7 +270,7 @@ class MaintenanceIT {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageStartingWith("outbox halted");
 
-        try (var c = TestDb.connect()) { // the README procedure repairs the ticks
+        try (var c = TestDb.connect()) { // ticks repaired, as the recovery leaves them
             execute(c, "update " + names.tick() + " set snapshot = '" + original + "'::pg_snapshot"
                     + " where id = " + forged);
         }
@@ -292,7 +293,7 @@ class MaintenanceIT {
                     + " from generate_series(1, 50000)");
             execute(c, "analyze " + names.tick());
             var plan = new StringBuilder();
-            try (var st = c.createStatement(); var rs = st.executeQuery("explain " + maintenance.xidCheck)) {
+            try (var st = c.createStatement(); var rs = st.executeQuery("explain " + maintenance.recovery.xidCheck)) {
                 while (rs.next()) {
                     plan.append(rs.getString(1)).append('\n');
                 }
@@ -308,6 +309,7 @@ class MaintenanceIT {
 
     @Test
     void haltSurvivesRestart() throws Exception {
+        config.xidRegression("halt");
         bootstrap();
         assertThat(maintenance().runOnce()).isTrue(); // the first instance: consistent
         forgeNewestTickAhead(2000);
@@ -335,6 +337,7 @@ class MaintenanceIT {
 
     @Test
     void haltCheckComesFirstAndOwnsTheStaleWarning() throws Exception {
+        config.xidRegression("halt");
         bootstrap();
         forgeNewestTickAhead(2000);
         try (var c = TestDb.connect()) { // no success for a day: the halt is why
@@ -344,7 +347,7 @@ class MaintenanceIT {
             var maintenance = maintenance();
             assertThat(maintenance.runOnce()).isTrue();
             assertThat(maintenance.halted()).isTrue();
-            assertThat(err.text()).contains("xid counter went backwards").doesNotContain("has not completed");
+            assertThat(err.text()).contains("xid regression detected").doesNotContain("has not completed");
         }
         try (var c = TestDb.connect()) { // an operator drops the success marker
             execute(c, "drop table " + names.maintenance());
@@ -360,6 +363,7 @@ class MaintenanceIT {
 
     @Test
     void operatorDeleteOfMarkerResumes() throws Exception {
+        config.xidRegression("halt");
         bootstrap();
         var maintenance = maintenance();
         forgeNewestTickAhead(2000);
@@ -371,7 +375,7 @@ class MaintenanceIT {
         assertThatThrownBy(drainOnly::drain).isInstanceOf(IllegalStateException.class).hasMessageStartingWith("outbox");
 
         try (var c = TestDb.connect()) {
-            execute(c, "delete from " + names.halt()); // the operator, per README "xid regression recovery"
+            execute(c, "delete from " + names.halt()); // the operator
         }
         assertThat(maintenance.runOnce()).isTrue();
 

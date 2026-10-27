@@ -5,12 +5,13 @@ import java.time.Duration;
 
 /**
  * Mutable config with fast test defaults and fresh {@link TestDb#uniqueTable()} names for both tables. Relay, retry,
- * requeue and partition settings live on this object itself ({@link #relay()}, {@link #retry()}, {@link #requeue()} and
- * {@link #partitions()} return {@code this}); the inbox and dead-letter blocks are separate because their
- * {@code table()}, {@code premake()} and {@code batchSize()} clash with the outbox ones.
+ * requeue, partition and recovery settings live on this object itself ({@link #relay()}, {@link #retry()},
+ * {@link #requeue()}, {@link #partitions()} and {@link #recovery()} return {@code this}); the inbox and dead-letter
+ * blocks are separate because their {@code table()}, {@code premake()} and {@code batchSize()} clash with the outbox
+ * ones.
  */
 public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayConfig, OutboxConfig.RetryConfig,
-        OutboxConfig.RequeueConfig, OutboxConfig.PartitionsConfig {
+        OutboxConfig.RequeueConfig, OutboxConfig.PartitionsConfig, OutboxConfig.RecoveryConfig {
 
     private String table = TestDb.uniqueTable();
     private int shards = 4;
@@ -42,6 +43,9 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private Duration deadLettersTimeout = Duration.ofSeconds(5);
     private Duration deadLettersRetention = Duration.ZERO;
     private Duration deadLettersRedriveHistory = Duration.ofDays(30);
+    private String xidRegression = "auto";
+    private long maxRows = 1_000_000L;
+    private Duration clockMargin = Duration.ofMinutes(10);
 
     // OutboxConfig
 
@@ -128,6 +132,11 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
                 return deadLettersRedriveHistory;
             }
         };
+    }
+
+    @Override
+    public RecoveryConfig recovery() {
+        return this;
     }
 
     // RelayConfig
@@ -376,6 +385,38 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
 
     public TestOutboxConfig deadLettersRedriveHistory(Duration deadLettersRedriveHistory) {
         this.deadLettersRedriveHistory = deadLettersRedriveHistory;
+        return this;
+    }
+
+    // RecoveryConfig
+
+    @Override
+    public String xidRegression() {
+        return xidRegression;
+    }
+
+    public TestOutboxConfig xidRegression(String xidRegression) {
+        this.xidRegression = xidRegression;
+        return this;
+    }
+
+    @Override
+    public long maxRows() {
+        return maxRows;
+    }
+
+    public TestOutboxConfig maxRows(long maxRows) {
+        this.maxRows = maxRows;
+        return this;
+    }
+
+    @Override
+    public Duration clockMargin() {
+        return clockMargin;
+    }
+
+    public TestOutboxConfig clockMargin(Duration clockMargin) {
+        this.clockMargin = clockMargin;
         return this;
     }
 }

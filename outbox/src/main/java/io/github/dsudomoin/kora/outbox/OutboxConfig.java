@@ -31,6 +31,10 @@ public interface OutboxConfig {
         return new DeadLettersConfig() {};
     }
 
+    default RecoveryConfig recovery() {
+        return new RecoveryConfig() {};
+    }
+
     @ConfigValueExtractor
     interface RelayConfig {
 
@@ -203,6 +207,36 @@ public interface OutboxConfig {
          */
         default Duration redriveHistory() {
             return Duration.ofDays(30);
+        }
+    }
+
+    /** What happens when the xid counter is found below a tick's xmax (a logical restore or migration). */
+    @ConfigValueExtractor
+    interface RecoveryConfig {
+
+        /**
+         * {@code auto} (default): the instance holding the maintenance lock recovers by itself, when at most
+         * {@link #maxRows()} rows are to be re-sent; {@code halt}: never by itself, the relay stays halted until
+         * {@code OutboxAdmin.recoverXidRegression()}.
+         */
+        default String xidRegression() {
+            return "auto";
+        }
+
+        /**
+         * Rows to re-send above which the automatic recovery leaves the relay halted: writers wait while it copies
+         * them. Default 1 000 000.
+         */
+        default long maxRows() {
+            return 1_000_000L;
+        }
+
+        /**
+         * Rows written since the newest pre-regression tick, less this margin for clock skew between the old and the
+         * new server, are re-sent. Default 10 min.
+         */
+        default Duration clockMargin() {
+            return Duration.ofMinutes(10);
         }
     }
 }

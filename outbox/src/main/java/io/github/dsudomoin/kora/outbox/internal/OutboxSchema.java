@@ -17,10 +17,15 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * premade xid partitions with the tail, one initial tick and one cursor per shard, all under
  * {@code pg_advisory_lock(internalNs, LOCK_SCHEMA)}; like every lock namespace, {@code internalNs} comes from the table
  * the configured name resolves to ({@link TableNames#resolve}), which {@link #names()} hands to the other components.
- * Fails fast with {@link IllegalStateException} when {@code shards} differs from the shards in the cursor table or when
- * the xid counter is below the newest tick's xmax, unless {@link Maintenance} already persisted that halt in
- * {@code <base>_halt}: then it starts halted (the relay delivers nothing, writes go on); and when an identity sequence
- * of the outbox, tick or cursor table has {@code CACHE > 1}. The schema lock and every bootstrap DDL statement wait at
+ * Fails fast with {@link IllegalStateException} when {@code shards} differs from the shards in the cursor table and
+ * when an identity sequence of the outbox, tick or cursor table has {@code CACHE > 1}. An xid regression (the counter
+ * below a tick's xmax) never fails it: it is recorded in {@code <base>_halt} and, with
+ * {@code outbox.recovery.xidRegression = auto} and at most {@code outbox.recovery.maxRows} rows to re-send, recovered
+ * before any relay starts ({@link XidRecovery}, under {@code LOCK_MAINTENANCE}, taken after {@code LOCK_SCHEMA});
+ * otherwise, or while another session holds that lock, startup goes on halted (the relay delivers nothing, writes go
+ * on) with an ERROR naming the admin call that runs the recovery. The recovery runs under its own timeouts (a
+ * 10 min {@code statement_timeout}), and other instances' startups wait for it behind the schema lock, at most a
+ * minute. The schema lock and every bootstrap DDL statement wait at
  * most 5 s for a lock ({@code lock_timeout}), and every bootstrap statement runs under a 1 min
  * {@code statement_timeout} (replacing a shorter role default): one that needs longer, such as an index built anew on a
  * populated table, fails startup with SQLState 57014 and is left to run by hand. The schema lock is retried for a
@@ -118,6 +123,12 @@ public final class OutboxSchema implements Lifecycle {
                 "outbox.deadLetters.retention must not be negative: " + deadLetters.retention());
         require(deadLetters.redriveHistory().compareTo(Duration.ZERO) > 0,
                 "outbox.deadLetters.redriveHistory must be positive: " + deadLetters.redriveHistory());
+        var recovery = config.recovery();
+        require(recovery.xidRegression().equals("auto") || recovery.xidRegression().equals("halt"),
+                "outbox.recovery.xidRegression must be auto or halt: " + recovery.xidRegression());
+        require(recovery.maxRows() >= 0, "outbox.recovery.maxRows must not be negative: " + recovery.maxRows());
+        require(!recovery.clockMargin().isNegative(),
+                "outbox.recovery.clockMargin must not be negative: " + recovery.clockMargin());
     }
 
     static void validateShards(int shards) {
@@ -314,26 +325,24 @@ public final class OutboxSchema implements Lifecycle {
                     )""");
 
             checkSequenceCache(c, n);
-            checkXidCounter(st, n);
             long shardsPresent = queryLong(st, "select count(distinct shard) from " + n.cursor());
             if (shardsPresent != 0 && shardsPresent != config.shards()) {
                 throw new IllegalStateException("outbox.shards = " + config.shards() + " but " + n.cursor()
                         + " holds cursors for " + shardsPresent + " shards; resharding requires an empty outbox"
                         + " (see README)");
             }
+            checkXidCounter(c, n);
 
             ensurePartitions(c, n);
 
             st.execute("insert into " + n.tick() + " (snapshot, max_id) select pg_current_snapshot(), "
                     + Ticks.maxIdQuery(c, n) + " where not exists (select 1 from " + n.tick() + ")");
-            if (shardsPresent == 0) {
-                long tickId = queryLong(st, "select max(id) from " + n.tick());
-                try (var ps = c.prepareStatement("insert into " + n.cursor()
-                        + " (shard, tick_id) select s, ? from generate_series(0, ? - 1) s")) {
-                    ps.setLong(1, tickId);
-                    ps.setInt(2, config.shards());
-                    ps.executeUpdate();
-                }
+            // not after a recovery, which makes them
+            try (var ps = c.prepareStatement("insert into " + n.cursor() + " (shard, tick_id) select s, (select max(id)"
+                    + " from " + n.tick() + ") from generate_series(0, ? - 1) s where not exists (select 1 from "
+                    + n.cursor() + ")")) {
+                ps.setInt(1, config.shards());
+                ps.executeUpdate();
             }
         }
     }
@@ -435,16 +444,47 @@ public final class OutboxSchema implements Lifecycle {
         }
     }
 
-    private static void checkXidCounter(Statement st, TableNames n) throws SQLException {
-        try (var rs = st.executeQuery("select pg_snapshot_xmax(pg_current_snapshot())::text::bigint,"
-                + " pg_snapshot_xmax(snapshot)::text::bigint, exists (select 1 from " + n.halt() + ")"
-                + " from " + n.tick() + " order by id desc limit 1")) {
-            if (rs.next() && rs.getLong(1) < rs.getLong(2) && !rs.getBoolean(3)) {
-                throw new IllegalStateException("xid counter went backwards: current xid " + rs.getLong(1)
-                        + " is below xmax " + rs.getLong(2) + " of the newest tick in " + n.tick()
-                        + " (restored from a dump or logically migrated?); relaying would skip new rows,"
-                        + " see README \"xid regression recovery\"");
+    /**
+     * The xid check {@link Maintenance} runs too: a halt found is recorded, then recovered as
+     * {@link XidRecovery#autoRecover} decides, under {@code LOCK_MAINTENANCE} waited for within the session's
+     * {@code lock_timeout}; else an ERROR, and startup goes on halted. A halt whose ticks were repaired is left for
+     * {@link Maintenance}'s check to lift.
+     */
+    private void checkXidCounter(Connection c, TableNames n) throws SQLException {
+        var recovery = new XidRecovery(n, config);
+        var check = recovery.check(c);
+        if (!check.halted()) {
+            return;
+        }
+        if (check.recorded() == null) {
+            recovery.recordHalt(c, check.tickXmax());
+        }
+        String why = XidRecovery.HALT_MODE;
+        if (config.recovery().xidRegression().equals("auto")) {
+            why = XidRecovery.LOCK_BUSY;
+            if (lockMaintenance(c, n)) {
+                try {
+                    why = recovery.autoRecover(c);
+                } finally {
+                    advisory(c, "pg_advisory_unlock", n, TableNames.LOCK_MAINTENANCE);
+                }
             }
+        }
+        if (why != null) {
+            log.error(recovery.halted(check, why));
+        }
+    }
+
+    /** {@code pg_advisory_lock(internalNs, LOCK_MAINTENANCE)}; false when the session's lock_timeout ran out. */
+    private static boolean lockMaintenance(Connection c, TableNames n) throws SQLException {
+        try {
+            advisory(c, "pg_advisory_lock", n, TableNames.LOCK_MAINTENANCE);
+            return true;
+        } catch (SQLException e) {
+            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                throw e;
+            }
+            return false;
         }
     }
 
