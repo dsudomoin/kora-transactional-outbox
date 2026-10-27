@@ -14,6 +14,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -22,16 +23,20 @@ import java.util.Locale;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
+import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlConsumer;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction1;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 /**
- * {@link OutboxAdmin} on Postgres. A bulk call claims chunks of {@link #CHUNK} letters matching it in id order, each
- * above the last chunk's, {@code for update skip locked}, in a read-committed transaction of its own; a redrive chunk
- * then tries their key locks without waiting ({@link DeadLetters#tryKeyLocks}) and redrives the ready ones as the
- * dead-letter pass does ({@link DeadLetters#redrive}), so no writer waits for one of its key locks. Filters are bound
- * parameters, never interpolated. {@code restoreOrphan} holds the maintenance lock for its whole run, so maintenance's
- * partition steps never run beside it.
+ * {@link OutboxAdmin} on Postgres. A bulk call acts on the letters dead when it began: it first reads the highest id
+ * and the time, then claims chunks of {@link #CHUNK} letters matching it with an id up to that one and a
+ * {@code failed_at} up to that time (a redriven letter dying again comes back with a new, higher id; an older message
+ * dying meanwhile, with a later {@code failed_at}), in id order, each above the last chunk's,
+ * {@code for update skip locked}, in a read-committed transaction of its own. A redrive chunk then tries their key
+ * locks without waiting ({@link DeadLetters#tryKeyLocks}) and redrives the ready ones as the dead-letter pass does
+ * ({@link DeadLetters#redrive}), so no writer waits for one of its key locks. Filters are bound parameters, never
+ * interpolated; user text is logged with control characters escaped ({@link #printable}). {@code restoreOrphan} holds
+ * the maintenance lock for its whole run, so maintenance's partition steps never run beside it.
  */
 public final class PgOutboxAdmin implements OutboxAdmin {
 
@@ -48,10 +53,13 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private final DeadLetters rows;
     private final XidPartitions partitions;
     private final RetryStore retries;
-    private final OrphanRestore orphanRestore;
+    final OrphanRestore orphanRestore; // for a test's seam
     private final String dead;
     /** How long {@code restoreOrphan} waits for a maintenance run in progress; shorter in tests. */
     Duration maintenanceWait = Duration.ofSeconds(60);
+    /** For tests: runs after each bulk chunk's commit. */
+    @Nullable
+    SqlConsumer<Connection> afterChunk;
 
     /** A chunk's claim: the letters claimed, the last one's id, and how many it acted on. */
     private record Chunk(int claimed, long lastId, long done) {}
@@ -147,43 +155,50 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     @Override
     public long redriveDeadLetters(Collection<Long> ids) {
         requireOwnTransactions();
-        return woke(bulk("redriveDeadLetters(" + ids + ")", Where.ids(ids), this::redrive));
+        return bulk("redriveDeadLetters(" + ids + ")", Where.ids(ids), true, this::redrive);
     }
 
     @Override
     public long redriveDeadLetters(DeadLetterFilter filter) {
         requireOwnTransactions();
-        return woke(bulk("redriveDeadLetters(" + filter + ")", Where.of(nonEmpty(filter)), this::redrive));
+        return bulk("redriveDeadLetters(" + filter + ")", Where.of(nonEmpty(filter)), true, this::redrive);
     }
 
     @Override
     public long discardDeadLetters(Collection<Long> ids) {
         requireOwnTransactions();
-        return bulk("discardDeadLetters(" + ids + ")", Where.ids(ids), this::discard);
+        return bulk("discardDeadLetters(" + ids + ")", Where.ids(ids), false, this::discard);
     }
 
     @Override
     public long discardDeadLetters(DeadLetterFilter filter) {
         requireOwnTransactions();
-        return bulk("discardDeadLetters(" + filter + ")", Where.of(nonEmpty(filter)), this::discard);
+        return bulk("discardDeadLetters(" + filter + ")", Where.of(nonEmpty(filter)), false, this::discard);
     }
 
     /**
      * Under the maintenance lock, so the tail's lower bound, which tells an orphan from a range the extension made
      * ahead of its swap, holds still: {@code table} must be one {@link XidPartitions#orphans} lists, then
-     * {@link OrphanRestore} validates it again and moves its rows.
+     * {@link OrphanRestore} validates it again and moves its rows. The session gets {@code idle_session_timeout = 60s}
+     * first, as {@link Maintenance} does, so Postgres ends the session of a frozen holder and frees the lock; reset,
+     * and the lock released, before the connection goes back to the pool.
      */
     @Override
     public long restoreOrphan(String table, long fromXid) {
         requireOwnTransactions();
-        var call = "restoreOrphan(" + table + ", " + fromXid + ")";
+        var call = printable("restoreOrphan(" + table + ", " + fromXid + ")");
         long moved;
+        boolean restoring = false;
         try (var c = db.newConnection()) {
             c.setAutoCommit(true);
             PartitionDdl.requireSessionStable(c, "outbox admin " + call + " on " + names.base());
-            lockMaintenance(c);
+            // before the lock, so a holder frozen right after taking it loses it too
+            execute(c, "set idle_session_timeout = '60s'");
+            boolean locked = false;
             Throwable failure = null;
             try {
+                lockMaintenance(c);
+                locked = true;
                 var name = names.unqualified(table);
                 if (partitions.orphans(c).stream().noneMatch(o -> names.unqualified(o.table()).equals(name))) {
                     throw new IllegalArgumentException(table + " is not an orphan of the outbox " + names.base()
@@ -191,40 +206,68 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                             + " below the partition tail's lower bound, or " + names.setAsidePrefix() + "<digits>, in"
                             + " its schema and in no partition tree");
                 }
+                restoring = true;
                 moved = orphanRestore.restore(c, table, fromXid, PartitionDdl.DETACH_LOCK_TIMEOUT);
             } catch (Throwable t) {
                 failure = t;
                 throw t;
             } finally {
                 try {
-                    advisory(c, "pg_advisory_unlock");
-                } catch (SQLException e) { // the session died, and its lock with it: keep the cause on top
+                    if (locked) {
+                        advisory(c, "pg_advisory_unlock");
+                    }
+                    execute(c, "reset idle_session_timeout");
+                } catch (SQLException e) { // the session died, and its lock and setting with it: keep the cause
                     if (failure == null) {
                         throw e;
                     }
                     failure.addSuppressed(e);
                 }
             }
-        } catch (IllegalArgumentException | IllegalStateException e) {
-            throw e; // refused, nothing changed
         } catch (SQLException | RuntimeException e) {
-            log.warn("outbox admin {} on {} failed; rows moved so far stay moved, and calling again goes on: {}",
-                    call, names.base(), e.toString());
+            // refused, nothing changed: OrphanRestore validates before any SQL that names the table
+            boolean refused = e instanceof IllegalArgumentException || e instanceof IllegalStateException && !restoring;
+            if (!refused) {
+                log.warn("outbox admin {} on {} failed; rows moved so far stay moved, and calling again goes on: {}",
+                        call, names.base(), printable(e.toString()));
+            }
+            if (restoring && !(e instanceof IllegalArgumentException)) {
+                wakeRelay.run(); // for the chunks it may have moved before it failed
+            }
             throw e instanceof SQLException s ? new RuntimeSqlException(s) : (RuntimeException) e;
         }
         log.info("outbox admin {} on {} returned {}", call, names.base(), moved);
-        return woke(moved);
+        if (moved > 0) {
+            wakeRelay.run();
+        }
+        return moved;
     }
 
-    /** Chunk after chunk until one claims fewer than {@link #CHUNK}; one INFO line, or a WARN on a failure. */
-    private long bulk(String call, Where where, Step step) {
+    /**
+     * Chunk after chunk until one claims fewer than {@link #CHUNK}, among the letters dead when the call began; one
+     * INFO line, or a WARN on a failure. {@code putsBack}: the relay is woken when it put rows back into the outbox,
+     * also when it failed after some chunks did.
+     */
+    private long bulk(String call, Where filter, boolean putsBack, Step step) {
+        call = printable(call);
         long done = 0;
         try (var c = db.newConnection()) {
+            c.setAutoCommit(true);
+            Where where;
+            try (var st = c.createStatement(); var rs = st.executeQuery("select max(id), now() from " + dead)) {
+                rs.next();
+                long last = rs.getLong(1);
+                where = filter.and("id <= ?", rs.wasNull() ? Long.MIN_VALUE : last)
+                        .and("failed_at <= ?", rs.getObject(2, OffsetDateTime.class));
+            }
             long after = Long.MIN_VALUE;
             while (true) {
                 long above = after;
                 var chunk = inTx(c, tx -> step.run(tx, where, above));
                 done += chunk.done();
+                if (afterChunk != null) {
+                    afterChunk.accept(c);
+                }
                 if (chunk.claimed() < CHUNK) {
                     break;
                 }
@@ -232,10 +275,16 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             }
         } catch (SQLException | RuntimeException e) {
             log.warn("outbox admin {} on {} failed after {} letters, which stay done; calling again goes on: {}",
-                    call, dead, done, e.toString());
+                    call, dead, done, printable(e.toString()));
+            if (putsBack && done > 0) {
+                wakeRelay.run();
+            }
             throw e instanceof SQLException s ? new RuntimeSqlException(s) : (RuntimeException) e;
         }
         log.info("outbox admin {} on {} returned {}", call, dead, done);
+        if (putsBack && done > 0) {
+            wakeRelay.run();
+        }
         return done;
     }
 
@@ -289,12 +338,33 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         }
     }
 
-    /** Wakes the relay when {@code moved} rows went back into the outbox; returns {@code moved}. */
-    private long woke(long moved) {
-        if (moved > 0) {
-            wakeRelay.run();
+    /**
+     * {@code text} with control characters (CR, LF, tab, any other C0 or C1 one) and the Unicode line and paragraph
+     * separators escaped, so text a caller supplied cannot forge log lines.
+     */
+    static String printable(String text) {
+        var out = new StringBuilder(text.length());
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (ch == '\n') {
+                out.append("\\n");
+            } else if (ch == '\r') {
+                out.append("\\r");
+            } else if (ch == '\t') {
+                out.append("\\t");
+            } else if (Character.isISOControl(ch) || ch == '\u2028' || ch == '\u2029') {
+                out.append(String.format("\\u%04x", (int) ch));
+            } else {
+                out.append(ch);
+            }
         }
-        return moved;
+        return out.toString();
+    }
+
+    private static void execute(Connection c, String sql) throws SQLException {
+        try (var st = c.createStatement()) {
+            st.execute(sql);
+        }
     }
 
     /** Rows in {@code <base>_parked}, which a later version makes: 0 while it does not exist. */
@@ -385,6 +455,12 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             add(sql, params, "failed_at < ?", f.failedTo() == null ? null : f.failedTo().atOffset(ZoneOffset.UTC));
             add(sql, params, "status = ?", f.status() == null ? null : f.status().name().toLowerCase(Locale.ROOT));
             return new Where(sql.isEmpty() ? "true" : String.join(" and ", sql), params);
+        }
+
+        Where and(String condition, Object value) {
+            var all = new ArrayList<>(params);
+            all.add(value);
+            return new Where(sql + " and " + condition, all);
         }
 
         static Where ids(Collection<Long> ids) {

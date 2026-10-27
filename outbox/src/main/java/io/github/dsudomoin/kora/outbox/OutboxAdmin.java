@@ -8,8 +8,9 @@ import java.util.Collection;
  * kept orphans. Every call manages its own transactions, so it fails with {@link IllegalStateException} inside the
  * caller's {@code inTx}; any instance gives the same answers, as all act on the shared database.
  *
- * <p>Bulk calls work in chunks of 1 000 letters in id order, one transaction each, so a large redrive never holds more
- * than 1 000 key locks. A failing chunk rolls back alone: the chunks before it stay done, and calling again goes on.
+ * <p>Bulk calls act on the letters dead when they began, none that die meanwhile (a redriven letter dying again
+ * included), in chunks of 1 000 letters in id order, one transaction each, so a large redrive never holds more than
+ * 1 000 key locks. A failing chunk rolls back alone: the chunks before it stay done, and calling again goes on.
  * They skip, without waiting and without counting them, the letters a running dead-letter hook call holds and, for a
  * redrive, those whose (topic, key) an open transaction is sending: call again for those. Each mutating call logs its
  * arguments and result in one INFO line, or in one WARN when it fails after it began.

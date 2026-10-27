@@ -7,8 +7,9 @@ import java.util.HexFormat;
 /**
  * Which dead letters an {@link OutboxAdmin} call means: a letter matches when every non-null field does.
  * {@code errorContains} is a plain substring of the error text, never a pattern ({@code %} and {@code _} match
- * themselves); {@code failedFrom} is inclusive, {@code failedTo} exclusive. All null ({@link #any()}) matches every
- * letter.
+ * themselves); {@code failedFrom} is inclusive, {@code failedTo} exclusive. A blank {@code topic} or
+ * {@code errorContains} counts as absent (it becomes null), so it never widens a filter to every letter. All null
+ * ({@link #any()}) matches every letter.
  */
 public record DeadLetterFilter(
         @Nullable String topic,
@@ -17,6 +18,11 @@ public record DeadLetterFilter(
         @Nullable Instant failedFrom,
         @Nullable Instant failedTo,
         @Nullable DeadLetter.Status status) {
+
+    public DeadLetterFilter {
+        topic = topic == null || topic.isBlank() ? null : topic;
+        errorContains = errorContains == null || errorContains.isBlank() ? null : errorContains;
+    }
 
     /** Every letter. */
     public static DeadLetterFilter any() {

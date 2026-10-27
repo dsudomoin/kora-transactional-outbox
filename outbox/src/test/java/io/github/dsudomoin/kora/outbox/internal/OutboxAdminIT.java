@@ -18,6 +18,7 @@ import io.github.dsudomoin.kora.outbox.OutboxStatus.DeadLetterCount;
 import io.github.dsudomoin.kora.outbox.OutboxStatus.Orphan;
 import io.github.dsudomoin.kora.outbox.OutboxStatus.OrphanKind;
 import io.github.dsudomoin.kora.outbox.internal.PartitionDdl.Bound;
+import io.github.dsudomoin.kora.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.kora.outbox.testing.TestSql;
@@ -37,8 +38,10 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -205,6 +208,70 @@ class OutboxAdminIT {
     }
 
     @Test
+    void blankFilterFieldsAreAbsent() throws Exception {
+        long id = letter("t", "k");
+
+        for (var blank : List.of("", "  ")) {
+            assertThatThrownBy(() -> admin.discardDeadLetters(filter(null, null, blank, null, null, null)))
+                    .as("errorContains '%s'", blank).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> admin.redriveDeadLetters(filter(blank, null, null, null, null, null)))
+                    .as("topic '%s'", blank).isInstanceOf(IllegalArgumentException.class);
+        }
+
+        assertThat(deadIds()).containsExactly(id);
+        assertThat(outboxMessageIds()).isEmpty();
+    }
+
+    @Test
+    void aFilterCallLeavesLettersThatDieDuringIt() throws Exception {
+        deadLetters(1000); // a full chunk and one more letter: the call claims a second chunk after the two below
+        execute("insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
+                + " values (2000, 0, gen_random_uuid(), 't', now(), 3)");
+        var appeared = new AtomicBoolean();
+        admin.afterChunk = c -> {
+            if (appeared.compareAndSet(false, true)) {
+                // an older message dying now: an id below the highest when the call began, only failed_at keeps it out
+                execute("insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
+                        + " values (1500, 0, gen_random_uuid(), 't', now(), 3)");
+                // a redriven one dying again: a new, higher id; failed_at set back, so only the id keeps it out
+                execute("insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts,"
+                        + " failed_at) values (900000, 0, gen_random_uuid(), 't', now(), 3, now() - interval '1 day')");
+            }
+        };
+
+        assertThat(admin.redriveDeadLetters(filter("t", null, null, null, null, null))).isEqualTo(1001);
+
+        assertThat(deadIds()).containsExactly(1500L, 900_000L);
+    }
+
+    @Test
+    void aCallFailingAfterAChunkStillWakesTheRelay() throws Exception {
+        deadLetters(1001);
+        admin.afterChunk = c -> {
+            throw new IllegalStateException("killed after a chunk");
+        };
+
+        try (var err = new CapturedStderr()) {
+            assertThatThrownBy(() -> admin.redriveDeadLetters(filter("t", null, null, null, null, null)))
+                    .hasMessage("killed after a chunk");
+
+            assertThat(err.text()).contains("WARN").contains("failed after 1000 letters");
+        }
+        assertThat(outboxMessageIds()).hasSize(1000);
+        assertThat(wakes).hasValue(1);
+    }
+
+    @Test
+    void userTextIsLoggedWithoutLineBreaks() throws Exception {
+        try (var err = new CapturedStderr()) {
+            admin.discardDeadLetters(filter("t\r\nINFO forged", null, "a\nb\u0007", null, null, null));
+
+            assertThat(err.text()).contains("topic=t\\r\\nINFO forged").contains("errorContains=a\\nb\\u0007")
+                    .doesNotContain("\nINFO forged");
+        }
+    }
+
+    @Test
     void lettersHeldByTheHookAreSkipped() throws Exception {
         long held = letter("t", "a", "boom", Instant.now(), PENDING);
         execute("update " + names.dead() + " set due_at = now() where id = " + held);
@@ -264,9 +331,7 @@ class OutboxAdminIT {
         // distinct keys, so key locks: one transaction can take about 56 000 on the test database (64
         // max_locks_per_transaction × 522 backends, plus the slack of shared memory), so not all of these
         int letters = 100_000;
-        execute("insert into " + names.dead() + " (id, shard, message_id, topic, key, created_at, attempts, error)"
-                + " select g, 0, gen_random_uuid(), 't', convert_to('k' || g, 'UTF8'), now(), 3, 'boom'"
-                + " from generate_series(1, " + letters + ") g");
+        deadLetters(letters);
 
         assertThat(admin.redriveDeadLetters(filter("t", null, null, null, null, null))).isEqualTo(letters);
 
@@ -346,6 +411,42 @@ class OutboxAdminIT {
         }
 
         assertThat(admin.restoreOrphan(orphan, 0)).as("once it ended").isOne();
+    }
+
+    @Test
+    void restoreOrphanHoldsTheMaintenanceLockAsMaintenanceDoes() throws Exception {
+        var orphan = foreignOrphan();
+        execute("insert into " + orphan + " (id, shard, xid, message_id, topic, key)"
+                + " select g, 0, '10', gen_random_uuid(), 't', convert_to('k' || g, 'UTF8')"
+                + " from generate_series(1, 1001) g");
+        var one = TestDb.newDatabase(1); // one session: what the call leaves on it is seen by the next
+        try {
+            var single = new PgOutboxAdmin(one, names, config, new Maintenance(one, names, config,
+                    new OutboxMetrics(null)), wakes::incrementAndGet);
+            var idleTimeout = new AtomicReference<String>();
+            single.orphanRestore.afterChunk = c -> {
+                if (idleTimeout.compareAndExchange(null, queryString(c, "show idle_session_timeout")) == null) {
+                    throw new RuntimeException("killed after a chunk");
+                }
+            };
+
+            assertThatThrownBy(() -> single.restoreOrphan(orphan, 0)).hasMessage("killed after a chunk");
+
+            assertThat(idleTimeout).as("a frozen holder loses the lock").hasValue("1min");
+            assertThat(wakes).as("rows went back before it failed").hasValue(1);
+            try (var c = one.newConnection()) {
+                assertThat(queryString(c, "show idle_session_timeout")).as("reset").isEqualTo("0");
+            }
+            try (var c = TestDb.connect()) {
+                assertThat(queryLong(c, "select count(*) from pg_locks where locktype = 'advisory' and classid::bigint"
+                        + " = " + Integer.toUnsignedLong(names.internalNamespace()) + " and objid = "
+                        + TableNames.LOCK_MAINTENANCE)).as("released").isZero();
+            }
+            assertThat(single.restoreOrphan(orphan, 0)).as("the rest").isOne();
+            assertThat(outboxMessageIds()).hasSize(1001);
+        } finally {
+            one.release();
+        }
     }
 
     @Test
@@ -446,6 +547,13 @@ class OutboxAdminIT {
             @Nullable String errorContains, @Nullable Instant from, @Nullable Instant to,
             @Nullable DeadLetter.Status status) {
         return new DeadLetterFilter(topic, key == null ? null : bytes(key), errorContains, from, to, status);
+    }
+
+    /** Kept letters 1..n on topic t with distinct keys, dead before the call that follows. */
+    private void deadLetters(int n) throws SQLException {
+        execute("insert into " + names.dead() + " (id, shard, message_id, topic, key, created_at, attempts, error)"
+                + " select g, 0, gen_random_uuid(), 't', convert_to('k' || g, 'UTF8'), now(), 3, 'boom'"
+                + " from generate_series(1, " + n + ") g");
     }
 
     private List<Long> find(DeadLetterFilter filter) {
