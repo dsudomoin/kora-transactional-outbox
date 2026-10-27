@@ -10,7 +10,10 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Per-shard progress as an insert-only log {@code <base>_cursor}: the row with the highest {@code seq} of
@@ -119,6 +122,8 @@ public final class Cursors {
     private final TableNames names;
     private final int shards;
     private final String latest;
+    private final String latestMany;
+    private final String appendAll;
     private final String positions;
     private final String checkpoint;
 
@@ -128,10 +133,16 @@ public final class Cursors {
         this.shards = shards;
         var effective = effective(shards);
         // every statement opens the cursor table, then the checkpoint, then the tick table, as XidRecovery locks them
+        var withTick = " left join " + newestCheckpoint(names) + " k on true cross join lateral (select " + effective
+                + " eff) e left join " + names.tick() + " t on t.id = e.eff";
         this.latest = "select c.*, e.eff, t.snapshot::text, t.created_at, t.max_id from (select " + COLUMNS + " from "
-                + names.cursor() + " where shard = ? order by seq desc limit 1) c left join " + newestCheckpoint(names)
-                + " k on true cross join lateral (select " + effective + " eff) e left join " + names.tick()
-                + " t on t.id = e.eff";
+                + names.cursor() + " where shard = ? order by seq desc limit 1) c" + withTick;
+        // the same per shard: one cursor probe each, the checkpoint read once
+        this.latestMany = "select c.*, e.eff, t.snapshot::text, t.created_at, t.max_id from unnest(?::int[]) s(shard)"
+                + " cross join lateral (select " + COLUMNS + " from " + names.cursor()
+                + " where shard = s.shard order by seq desc limit 1) c" + withTick;
+        this.appendAll = "insert into " + names.cursor() + " (" + COLUMNS + ") select * from unnest(?::smallint[],"
+                + " ?::int8[], ?::int8[], ?::int8[], ?::timestamptz[], ?::int[], ?::timestamptz[], ?::timestamptz[])";
         var ones = "repeat('1', " + shards + ")::varbit";
         // one pass over the ticks after the lowest effective tick (not below the checkpoint's): for each tick, the
         // shards that any tick after it up to the latest may hold rows of (a window bit_or, newest first); each shard
@@ -258,12 +269,42 @@ public final class Cursors {
                 if (!rs.next()) {
                     throw new IllegalStateException("no cursor for shard " + shard + " in " + names.cursor());
                 }
-                var snapshot = rs.getString(10);
-                return new Current(cursor(rs), rs.getLong(9), snapshot == null ? null : new Tick(rs.getLong(9),
-                        PgSnapshot.parse(snapshot), rs.getObject(11, OffsetDateTime.class).toInstant(),
-                        rs.getObject(12, Long.class)));
+                return current(rs);
             }
         }
+    }
+
+    /**
+     * {@link #latest(Connection, int)} of each of {@code shards}, in one statement (one snapshot of the cursors, the
+     * checkpoint and the ticks), keyed by shard. Throws {@link IllegalStateException} when a shard has no cursor.
+     */
+    public Map<Integer, Current> latest(Connection c, Collection<Integer> shards) throws SQLException {
+        var result = new HashMap<Integer, Current>();
+        if (shards.isEmpty()) {
+            return result;
+        }
+        try (var ps = c.prepareStatement(latestMany)) {
+            ps.setArray(1, c.createArrayOf("int4", shards.toArray()));
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    var current = current(rs);
+                    result.put(current.cursor().shard(), current);
+                }
+            }
+        }
+        for (var shard : shards) {
+            if (!result.containsKey(shard)) {
+                throw new IllegalStateException("no cursor for shard " + shard + " in " + names.cursor());
+            }
+        }
+        return result;
+    }
+
+    private static Current current(ResultSet rs) throws SQLException {
+        var snapshot = rs.getString(10);
+        return new Current(cursor(rs), rs.getLong(9), snapshot == null ? null : new Tick(rs.getLong(9),
+                PgSnapshot.parse(snapshot), rs.getObject(11, OffsetDateTime.class).toInstant(),
+                rs.getObject(12, Long.class)));
     }
 
     public void append(Connection c, Cursor cursor) throws SQLException {
@@ -279,6 +320,49 @@ public final class Cursors {
             ps.setObject(8, utc(cursor.parkedDueAt()), Types.TIMESTAMP_WITH_TIMEZONE);
             ps.executeUpdate();
         }
+    }
+
+    /** {@link #append} of each of {@code cursors}, in order, in one statement. */
+    public void appendAll(Connection c, List<Cursor> cursors) throws SQLException {
+        if (cursors.isEmpty()) {
+            return;
+        }
+        int n = cursors.size();
+        var shard = new Integer[n];
+        var tickId = new Long[n];
+        var target = new Long[n];
+        var lastId = new Long[n];
+        var paused = new String[n];
+        var failures = new Integer[n];
+        var retryDue = new String[n];
+        var parkedDue = new String[n];
+        for (int i = 0; i < n; i++) {
+            var cursor = cursors.get(i);
+            shard[i] = cursor.shard();
+            tickId[i] = cursor.tickId();
+            target[i] = cursor.targetTickId();
+            lastId[i] = cursor.lastId();
+            paused[i] = text(cursor.pausedUntil());
+            failures[i] = cursor.failures();
+            retryDue[i] = text(cursor.retryDueAt());
+            parkedDue[i] = text(cursor.parkedDueAt());
+        }
+        try (var ps = c.prepareStatement(appendAll)) {
+            ps.setArray(1, c.createArrayOf("int4", shard));
+            ps.setArray(2, c.createArrayOf("int8", tickId));
+            ps.setArray(3, c.createArrayOf("int8", target));
+            ps.setArray(4, c.createArrayOf("int8", lastId));
+            ps.setArray(5, c.createArrayOf("text", paused)); // ISO 8601 in UTC, as timestamptz reads it exactly
+            ps.setArray(6, c.createArrayOf("int4", failures));
+            ps.setArray(7, c.createArrayOf("text", retryDue));
+            ps.setArray(8, c.createArrayOf("text", parkedDue));
+            ps.executeUpdate();
+        }
+    }
+
+    @Nullable
+    private static String text(@Nullable Instant t) {
+        return t == null ? null : t.toString();
     }
 
     /** Deletes every row that is not the newest of its shard; returns the number deleted. */

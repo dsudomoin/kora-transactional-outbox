@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.within;
 import io.github.dsudomoin.kora.outbox.OutboxMessage;
 import io.github.dsudomoin.kora.outbox.OutboxRecord;
 import io.github.dsudomoin.kora.outbox.internal.BatchReader.BatchRow;
+import io.github.dsudomoin.kora.outbox.internal.BatchReader.ShardRead;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
 import jakarta.annotation.Nullable;
@@ -18,7 +19,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Random;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -250,6 +253,110 @@ class BatchReaderIT {
         assertThat(messageIds(read(0, noneInFlight, tick(), 0, 100, true))).containsExactly(dId);
     }
 
+    @Test
+    void readManyEqualsPerShardReads() throws Exception {
+        config.shards(16);
+        bootstrap();
+        var random = new Random(42);
+        var o = tick();
+        var a = begin(); // in flight at p, committed before c: the xip branch
+        for (int i = 0; i < 40; i++) {
+            outbox.send(a, OutboxMessage.of("t", "a" + random.nextInt(20), PAYLOAD)); // keys no other writer locks
+        }
+        sendRandom(random, 10); // a later xid ends, so p lists a in its xip
+        var p = tick();
+        a.commit();
+        sendRandom(random, 10);
+        var c = tick();
+        try (var conn = TestDb.connect()) { // some keys blocked in the retry table
+            execute(conn, "insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at)"
+                    + " select 1000000 + row_number() over (), shard, gen_random_uuid(), topic, key, now() from"
+                    + " (select distinct shard, topic, key from " + names.base() + " order by key limit 15) k");
+        }
+        assertThat(p.xip()).isNotEmpty();
+        var spans = List.of(new PgSnapshot[] {o, p}, new PgSnapshot[] {p, c}, new PgSnapshot[] {o, c});
+
+        for (int round = 0; round < 5; round++) {
+            var reads = new ArrayList<ShardRead>();
+            for (int shard : shuffled(random, 16)) {
+                var span = spans.get(random.nextInt(spans.size()));
+                var all = read(shard, span[0], span[1], 0, 1000, true);
+                long lastId = all.isEmpty() || random.nextBoolean() ? 0
+                        : all.get(random.nextInt(all.size())).record().id();
+                reads.add(new ShardRead(shard, span[0], span[1], lastId, 1 + random.nextInt(30), random.nextBoolean()));
+            }
+            var batch = readMany(reads, 100_000);
+
+            assertThat(batch.cut()).isFalse();
+            assertThat(batch.rows().keySet()).as("every shard, in the order read")
+                    .containsExactlyElementsOf(reads.stream().map(ShardRead::shard).toList());
+            for (var r : reads) {
+                assertThat(rowKeys(batch.rows().get(r.shard()))).as("shard %s", r.shard())
+                        .isEqualTo(rowKeys(read(r.shard(), r.prev(), r.target(), r.lastId(), r.limit(),
+                                r.checkBlocked())));
+            }
+            assertThat(batch.rows().values().stream().flatMap(List::stream).filter(BatchRow::blocked))
+                    .as("the retry table is read").isNotEmpty();
+        }
+    }
+
+    @Test
+    void cutKeepsEachShardsRowsAPrefix() throws Exception {
+        config.shards(16);
+        bootstrap();
+        var random = new Random(7);
+        var p = tick();
+        sendRandom(random, 20);
+        var c = tick();
+        var reads = IntStream.range(0, 16).mapToObj(shard -> new ShardRead(shard, p, c, 0, 1000, true)).toList();
+        var full = readMany(reads, 100_000);
+        int total = full.rows().values().stream().mapToInt(List::size).sum();
+        assertThat(full.cut()).isFalse();
+
+        for (int limit : List.of(1, total / 3, total - 1)) {
+            var batch = readMany(reads, limit);
+
+            assertThat(batch.cut()).as("limit %s", limit).isTrue();
+            assertThat(batch.rows().values().stream().mapToInt(List::size).sum()).isEqualTo(limit);
+            for (var r : reads) {
+                var rows = rowKeys(batch.rows().get(r.shard()));
+                var expected = rowKeys(full.rows().get(r.shard()));
+                assertThat(expected.subList(0, rows.size())).as("shard %s, limit %s", r.shard(), limit)
+                        .isEqualTo(rows);
+            }
+        }
+        assertThat(readMany(reads, total).cut()).as("exactly the limit counts as cut").isTrue();
+    }
+
+    @Test
+    void readManyPrunesPartitions() throws Exception {
+        config.shards(16).xidsPerPartition(1000).premake(20);
+        bootstrap();
+        var random = new Random(3);
+        var a = begin();
+        outbox.send(a, OutboxMessage.of("t", "a", PAYLOAD));
+        sendRandom(random, 3);
+        var p = tick();
+        a.commit();
+        sendRandom(random, 3);
+        var c = tick();
+        assertThat(p.xip()).as("both union branches have candidates").isNotEmpty();
+        var reads = IntStream.range(0, 16).mapToObj(shard -> new ShardRead(shard, p, c, 0, 100, shard % 2 == 0))
+                .toList();
+        assertThat(readMany(reads, 1000).rows().values().stream().mapToInt(List::size).sum()).isPositive();
+
+        try (var conn = TestDb.connect()) {
+            long ranges = queryLong(conn, "select count(*) from pg_inherits where inhparent = to_regclass('"
+                    + names.base() + "') and inhrelid::regclass::text like '" + names.partitionPrefix() + "%'");
+            assertThat(ranges).isGreaterThanOrEqualTo(20);
+            var covering = new TreeSet<String>(); // the ranges of [p.xmax, c.xmax) and of p's xip
+            for (long x : List.of(p.xmax(), c.xmax() - 1, p.xip()[0], p.xip()[p.xip().length - 1])) {
+                covering.add(names.unqualified(names.partitionPrefix()) + x / 1000 * 1000);
+            }
+            assertThat(partitionsScanned(conn, reads)).as("partitions scanned").isNotEmpty().isSubsetOf(covering);
+        }
+    }
+
     /**
      * EXPLAIN of the statement {@code read} runs with the parameters bound exactly as {@code read} binds them, under a
      * custom plan. Inlined literals would hide a parameter cast the planner cannot fold (a varchar bound to
@@ -307,6 +414,62 @@ class BatchReaderIT {
             }
             return buffers;
         }
+    }
+
+    /**
+     * {@code EXPLAIN (ANALYZE)} of the statement {@code readMany} runs, bound as it binds it: the partitions whose scans
+     * ran (pruned ones are left out of the plan or marked never executed).
+     */
+    private TreeSet<String> partitionsScanned(Connection c, List<ShardRead> reads) throws SQLException {
+        var used = new TreeSet<String>();
+        var partition = Pattern.compile(Pattern.quote(names.unqualified(names.partitionPrefix())) + "\\d+");
+        c.setAutoCommit(false);
+        try (var ps = c.prepareStatement("explain (analyze) " + reader.manySql())) {
+            reader.bindMany(ps, reads, 1000);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    var line = rs.getString(1);
+                    var m = partition.matcher(line);
+                    while (m.find() && !line.contains("never executed")) {
+                        used.add(m.group());
+                    }
+                }
+            }
+        } finally {
+            c.rollback();
+        }
+        return used;
+    }
+
+    private BatchReader.Batch readMany(List<ShardRead> reads, int totalLimit) throws SQLException {
+        try (var c = TestDb.connect()) {
+            c.setAutoCommit(false);
+            execute(c, "set local plan_cache_mode = force_custom_plan");
+            var batch = reader.readMany(c, reads, totalLimit);
+            c.commit();
+            return batch;
+        }
+    }
+
+    /** {@code n} committed transactions of 1 to 10 rows each over 100 keys. */
+    private void sendRandom(Random random, int n) {
+        for (int tx = 0; tx < n; tx++) {
+            int rows = 1 + random.nextInt(10);
+            var messages = IntStream.range(0, rows)
+                    .mapToObj(i -> OutboxMessage.of("t", "k" + random.nextInt(100), PAYLOAD)).toList();
+            db.inTx((SqlFunction0<List<UUID>>) () -> outbox.sendAll(messages));
+        }
+    }
+
+    private static List<Integer> shuffled(Random random, int n) {
+        var list = new ArrayList<>(IntStream.range(0, n).boxed().toList());
+        Collections.shuffle(list, random);
+        return list;
+    }
+
+    /** What identifies a row and its flag (a record compares its byte arrays by reference). */
+    private static List<String> rowKeys(List<BatchRow> rows) {
+        return rows.stream().map(r -> r.record().id() + ":" + r.record().messageId() + ":" + r.blocked()).toList();
     }
 
     private void bootstrap() throws Exception {

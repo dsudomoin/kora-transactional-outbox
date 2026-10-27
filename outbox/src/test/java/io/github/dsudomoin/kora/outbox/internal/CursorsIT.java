@@ -4,6 +4,7 @@ import static io.github.dsudomoin.kora.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryString;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
@@ -57,6 +58,66 @@ class CursorsIT {
                     .isEqualTo(new Ticks(TableNames.of(config.table()), 4).get(c, bootstrapped.effectiveTickId()));
             assertThat(newest0).isEqualTo(new Cursor(0, 9, null, 0, null, 0, T1, T2));
             assertThat(newest2.parkedDueAt()).isNull();
+        }
+    }
+
+    @Test
+    void appendAllWritesOneRowPerShard() throws Exception {
+        var names = bootstrap();
+        var cursors = new Cursors(names, 4);
+        try (var c = TestDb.connect()) {
+            var initial = all(cursors, c);
+            long rows = queryLong(c, "select count(*) from " + names.cursor());
+            var s0 = initial.get(0).withProgress(9, null, 0).withPause(T2, 3).withRetryDueAt(T1).withParkedDueAt(T2);
+            var s2 = initial.get(2).withProgress(7, 8L, 42);
+            var s3 = initial.get(3).withProgress(5, 6L, 1).withPause(T1, 1).withParkedDueAt(T1);
+            cursors.appendAll(c, List.of(s0, s2, s3));
+            cursors.appendAll(c, List.of());
+
+            assertThat(queryLong(c, "select count(*) from " + names.cursor())).isEqualTo(rows + 3);
+            assertThat(all(cursors, c)).containsExactly(s0, initial.get(1), s2, s3);
+
+            cursors.appendAll(c, List.of(s3.cleared(), s0.withProgress(10, null, 0)));
+            assertThat(all(cursors, c)).as("each row the newest of its shard, as append writes it")
+                    .containsExactly(s0.withProgress(10, null, 0), initial.get(1), s2, s3.cleared());
+        }
+    }
+
+    @Test
+    void latestOfManyShardsEqualsLatestOfEach() throws Exception {
+        var names = bootstrap(); // 4 shards, every cursor on the bootstrap tick
+        var cursors = new Cursors(names, config.shards());
+        var shards = List.of(3, 0, 1, 2);
+        try (var c = TestDb.connect()) {
+            assertSameLatest(cursors, c, shards); // no checkpoint
+            long b = queryLong(c, "select max(id) from " + names.tick());
+            tick(c, names, "B'0100'", 10);
+            long t2 = tick(c, names, "B''", 20);
+            cursors.checkpoint(c, t2, cursors.positions(c, t2)); // busy 0100 at t2
+            cursors.append(c, cursors.latest(c, 3).cursor().withProgress(b, t2, 1)); // a batch in progress
+            cursors.append(c, cursors.latest(c, 2).cursor().withProgress(t2 + 50, null, 0)); // its tick has no row
+            assertSameLatest(cursors, c, shards);
+            assertThat(cursors.latest(c, shards).get(0).effectiveTickId()).isEqualTo(t2);
+            assertThat(cursors.latest(c, shards).get(1).effectiveTickId()).isEqualTo(b);
+            assertThat(cursors.latest(c, shards).get(2).tick()).isNull();
+
+            // from another history: counts for nothing in both
+            execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + (t2 + 1)
+                    + ", B'0000', " + (t2 + 1) + ")");
+            assertSameLatest(cursors, c, shards);
+            assertThat(cursors.latest(c, List.of(1, 2))).containsOnlyKeys(1, 2);
+            assertThat(cursors.latest(c, List.of())).isEmpty();
+            assertThatThrownBy(() -> cursors.latest(c, List.of(1, 7))).isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("shard 7");
+        }
+    }
+
+    private static void assertSameLatest(Cursors cursors, Connection c, List<Integer> shards) throws Exception {
+        var many = cursors.latest(c, shards);
+        assertThat(many).containsOnlyKeys(shards);
+        for (int shard : shards) {
+            assertThat(many.get(shard)).as("shard %s", shard).usingRecursiveComparison()
+                    .isEqualTo(cursors.latest(c, shard));
         }
     }
 

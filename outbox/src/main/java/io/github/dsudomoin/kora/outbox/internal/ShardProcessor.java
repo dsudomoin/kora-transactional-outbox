@@ -253,10 +253,11 @@ public final class ShardProcessor implements AutoCloseable {
             }
             var candidates = ticks.between(inTx, cursor.tickId(),
                     Math.min(latestTickId, cursor.tickId() + relay.maxTicksPerBatch()));
-            // a gap in tick ids (e.g. a rolled-back tick insert) must not stop the shard
+            // a gap in tick ids (e.g. a rolled-back tick insert) must not stop the shard; the candidates come without
+            // snapshots, so the chosen one's is read (below the latest tick, above the effective one: it exists)
             target = candidates.isEmpty()
                     ? ticks.oldestAfter(inTx, cursor.tickId())
-                    : chooseTarget(prev.maxId(), candidates, batchIds);
+                    : ticks.get(inTx, chooseTarget(prev.maxId(), candidates, batchIds).id());
         }
         // Retry rows of a shard are written only under its lock (divert, retry pass), and each (topic, key) group in
         // the retry table always has exactly one head, the only rows with next_attempt_at; every step that writes

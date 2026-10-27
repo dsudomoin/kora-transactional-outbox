@@ -8,7 +8,10 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -77,9 +80,10 @@ public final class Ticks {
 
     /**
      * {@code maxId}: the last id the outbox's id sequence had handed out when the tick was made (0 before the first),
-     * null for a tick made before the column existed.
+     * null for a tick made before the column existed. {@code snapshot}: null only in the ticks of {@link #between},
+     * which leaves it unread.
      */
-    public record Tick(long id, PgSnapshot snapshot, Instant createdAt, @Nullable Long maxId) {}
+    public record Tick(long id, @Nullable PgSnapshot snapshot, Instant createdAt, @Nullable Long maxId) {}
 
     private static final Logger log = LoggerFactory.getLogger(Ticks.class);
     private static final String LOCK_NOT_AVAILABLE = "55P03";
@@ -430,15 +434,39 @@ public final class Ticks {
         }
     }
 
-    /** The ticks with {@code afterId < id <= upToId}, in id order. */
+    /** The ticks with these ids, keyed by id; an id without a tick is absent. One statement. */
+    public Map<Long, Tick> get(Connection c, Collection<Long> ids) throws SQLException {
+        var result = new HashMap<Long, Tick>();
+        if (ids.isEmpty()) {
+            return result;
+        }
+        try (var ps = c.prepareStatement(SELECT + names.tick() + " where id = any(?)")) {
+            ps.setArray(1, c.createArrayOf("int8", ids.toArray()));
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    var tick = tick(rs);
+                    result.put(tick.id(), tick);
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * The ticks with {@code afterId < id <= upToId}, in id order, without their snapshots ({@link Tick#snapshot()}
+     * null): choosing a batch's target needs only the ids and high-water marks, and a snapshot of a busy moment is a
+     * few KB of text; {@link #get} reads the one chosen.
+     */
     public List<Tick> between(Connection c, long afterId, long upToId) throws SQLException {
-        try (var ps = c.prepareStatement(SELECT + names.tick() + " where id > ? and id <= ? order by id")) {
+        try (var ps = c.prepareStatement("select id, created_at, max_id from " + names.tick()
+                + " where id > ? and id <= ? order by id")) {
             ps.setLong(1, afterId);
             ps.setLong(2, upToId);
             try (var rs = ps.executeQuery()) {
                 var ticks = new ArrayList<Tick>();
                 while (rs.next()) {
-                    ticks.add(tick(rs));
+                    ticks.add(new Tick(rs.getLong(1), null, rs.getObject(2, OffsetDateTime.class).toInstant(),
+                            rs.getObject(3, Long.class)));
                 }
                 return ticks;
             }

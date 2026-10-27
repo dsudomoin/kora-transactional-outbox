@@ -6,6 +6,7 @@ import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryString;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 import io.github.dsudomoin.kora.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
@@ -268,8 +269,8 @@ class TicksIT {
             assertThat(last.snapshot().xmax()).isGreaterThanOrEqualTo(first.snapshot().xmax());
             assertThat(last.createdAt()).isAfterOrEqualTo(first.createdAt());
             assertThat(ticks.get(c, middle.id())).usingRecursiveComparison().isEqualTo(middle);
-            assertThat(ticks.between(c, first.id(), last.id())).usingRecursiveFieldByFieldElementComparator()
-                    .containsExactly(middle, last);
+            assertThat(ticks.between(c, first.id(), last.id())).extracting(Ticks.Tick::id)
+                    .containsExactly(middle.id(), last.id());
             assertThat(ticks.between(c, last.id(), last.id() + 100)).isEmpty();
 
             assertThat(ticks.deleteBelow(c, middle.id())).isEqualTo(1);
@@ -277,6 +278,37 @@ class TicksIT {
             assertThatThrownBy(() -> ticks.get(c, first.id())).isInstanceOf(IllegalStateException.class);
             assertThat(ticks.between(c, 0, last.id())).extracting(Ticks.Tick::id)
                     .containsExactly(middle.id(), last.id());
+        }
+    }
+
+    @Test
+    void getManyAndBetweenWithoutSnapshots() throws Exception {
+        try (var c = TestDb.connect()) {
+            var first = ticks.latest(c);
+            var running = TestDb.connect(); // in flight at the ticks below: a snapshot with an xip
+            running.setAutoCommit(false);
+            xid(running);
+            xid(c); // a later xid ends, so the running one lies below xmax
+            ticks.make(c, Duration.ZERO);
+            var middle = ticks.latest(c);
+            ticks.make(c, Duration.ZERO);
+            var last = ticks.latest(c);
+            running.rollback();
+            running.close();
+            assertThat(middle.snapshot().xip()).isNotEmpty();
+
+            var many = ticks.get(c, List.of(first.id(), middle.id(), last.id() + 100));
+            assertThat(many).containsOnlyKeys(first.id(), middle.id());
+            assertThat(many.get(first.id())).usingRecursiveComparison().isEqualTo(first);
+            assertThat(many.get(middle.id())).as("as the single get reads it").usingRecursiveComparison()
+                    .isEqualTo(ticks.get(c, middle.id()));
+            assertThat(ticks.get(c, List.of())).isEmpty();
+
+            var between = ticks.between(c, first.id(), last.id());
+            assertThat(between).extracting(Ticks.Tick::id, Ticks.Tick::createdAt, Ticks.Tick::maxId)
+                    .containsExactly(tuple(middle.id(), middle.createdAt(), middle.maxId()),
+                            tuple(last.id(), last.createdAt(), last.maxId()));
+            assertThat(between).extracting(Ticks.Tick::snapshot).containsOnlyNulls();
         }
     }
 
