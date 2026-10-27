@@ -101,6 +101,28 @@ class OutboxAdminInterceptorTest {
         }
     }
 
+    /** The server's own response exceptions keep their status, 5xx included; only other failures become 500. */
+    @Test
+    void aServerResponseExceptionKeepsItsStatus() {
+        var authorization = new AtomicReference<Runnable>();
+        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops"),
+                deferred(authorization), new $ModelError_JsonWriter());
+
+        try (var stderr = new CapturedStderr()) {
+            var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"),
+                    (context, request) -> CompletableFuture.failedFuture(HttpServerResponseException.of(503,
+                            "draining")));
+            authorization.get().run();
+
+            var answered = response.toCompletableFuture().join();
+            assertThat(answered.code()).isEqualTo(503);
+            assertThat(body(answered)).isEqualTo("{\"message\":\"draining\"}");
+            var call = "outbox admin GET \"/kora-outbox/admin/v1/status\" by \"ops\"";
+            assertThat(stderr.text()).contains("WARN " + OutboxAdminInterceptor.class.getName() + " - " + call
+                    + " failed, answered 503").contains(call + ": 503");
+        }
+    }
+
     /** Undertow leaves {@code %5C} encoded, so a backslash in a path is tested here. */
     @Test
     void auditLinePathIsOneQuotedToken() {

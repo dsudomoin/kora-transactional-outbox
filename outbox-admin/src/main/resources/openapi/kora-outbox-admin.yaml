@@ -9,7 +9,8 @@ info:
     "authorization failed", when it fails). A call refused for its input answers 400, a request body with a field
     this contract does not name included; one that cannot run in the outbox's current state (maintenance running, no
     xid regression to recover) answers 409; any other failure of an allowed call answers 500 with the failure's
-    message. Every one of them carries an Error.
+    message, or the HTTP server's own status for one it raised itself (a 503, say). Every one of them carries an
+    Error.
 paths:
   /kora-outbox/admin/v1/status:
     get:

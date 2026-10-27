@@ -25,8 +25,9 @@ import ru.tinkoff.kora.json.common.JsonWriter;
  * an I/O thread. A denied call gets a JSON {@code Error} with the decision's status and never reaches the route; an
  * authorizer that fails gets a WARN with its exception and the caller a 500 {@code Error} "authorization failed",
  * nothing of why. For an allowed call, a 4xx the server raises before the route runs (a malformed parameter or body)
- * is answered as an {@code Error} too, and any other failure as a 500 {@code Error} with the failure's message (its
- * class name when it has none), for the authenticated operator, after one WARN with the exception.
+ * is answered as an {@code Error} of its status too, as is any response exception of the server (a 503), and any
+ * other failure as a 500 {@code Error} with the failure's message (its class name when it has none), for the
+ * authenticated operator; a 5xx after one WARN with the exception.
  *
  * <p>Every call leaves one INFO audit line, written before its response completes:
  * {@code outbox admin <method> "<path>" by "<identity>": <status>} when allowed, {@code outbox admin <method>
@@ -80,12 +81,15 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
     }
 
     /**
-     * A 4xx the server raised (a malformed parameter or body) as an {@code Error} of its code; anything else, after a
-     * WARN, as a 500 {@code Error} with its message.
+     * The server's own response exception (a malformed parameter or body, a 503) as an {@code Error} of its code;
+     * anything else as a 500 {@code Error} with its message. A 5xx gets a WARN with the exception first.
      */
     private HttpServerResponse failure(Context context, String caller, Throwable failure) {
         var cause = unwrap(failure);
-        if (cause instanceof HttpServerResponseException e && e.code() >= 400 && e.code() < 500) {
+        if (cause instanceof HttpServerResponseException e) {
+            if (e.code() >= 500) {
+                log.warn("outbox admin {} failed, answered {}", caller, e.code(), e);
+            }
             var message = Objects.requireNonNullElse(e.getMessage(), "HTTP " + e.code());
             return error(context, e.code(), e.headers(), message);
         }
