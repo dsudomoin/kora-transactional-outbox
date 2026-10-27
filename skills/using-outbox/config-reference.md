@@ -2,7 +2,8 @@
 
 HOCON path `outbox` (`OutboxConfig`); every key is optional except `outbox.kafka.driverProperties."bootstrap.servers"`
 when `KafkaOutboxModule` is in the graph. Values are validated at startup, before any DDL; a key that does not exist
-here is silently ignored.
+here is silently ignored. Without Kora the same keys are the methods of `OutboxConfig` and `KafkaOutboxConfig`, with
+the same defaults: override the ones you change.
 
 ```hocon
 outbox {

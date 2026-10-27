@@ -1,9 +1,10 @@
 # outbox
 
-Transactional outbox для сервисов на [Kora](https://github.com/Tinkoff/kora) 1.x с Postgres. Вы записываете сообщение
-в той же транзакции базы данных, что и бизнес-данные; relay внутри вашего сервиса доставляет его после коммита — в Kafka
-или в ваш собственный обработчик. Сообщение больше не теряется, если между коммитом и отправкой сервис упал, Kafka была
-недоступна или шёл передеплой, а откаченная транзакция не отправляет ничего.
+Transactional outbox для Postgres: ядро без фреймворков и адаптер для сервисов на
+[Kora](https://github.com/Tinkoff/kora) 1.x. Вы записываете сообщение в той же транзакции базы данных, что и
+бизнес-данные; relay внутри вашего сервиса доставляет его после коммита — в Kafka или в ваш собственный обработчик.
+Сообщение больше не теряется, если между коммитом и отправкой сервис упал, Kafka была недоступна или шёл передеплой, а
+откаченная транзакция не отправляет ничего.
 
 > **Доставка at-least-once: каждый получатель обязан быть идемпотентным по id сообщения.** Одно и то же сообщение
 > может прийти больше одного раза (падение между отправкой и коммитом relay, таймаут, повтор). Exactly-once из outbox
@@ -11,15 +12,17 @@ Transactional outbox для сервисов на [Kora](https://github.com/Tink
 > стороне получателя: у каждого сообщения стабильный UUIDv7, в Kafka это заголовок `outbox-message-id` (потребитель на
 > Kora отсеивает повторы через [inbox](#потребление-через-inbox)), для HTTP передавайте его как `Idempotency-Key`.
 
-> **Требуется Kora 1.2.23 или новее.** Библиотека объявляет `api(platform("ru.tinkoff.kora:kora-parent:1.2.23"))`.
-> В сборке Gradle её подключение поднимает все модули Kora в вашем runtime classpath до 1.2.23, а через
-> `database-jdbc` — и HikariCP до 7.1.0. Выставьте свою платформу `kora-parent` и annotation processors
-> (`annotation-processors` или `symbol-processors` для KSP) тоже на 1.2.23, чтобы сгенерированный код и runtime
-> совпадали.
+> **Адаптеру Kora нужна Kora 1.2.23 или новее.** `outbox-kora` объявляет
+> `api(platform("ru.tinkoff.kora:kora-parent:1.2.23"))`. В сборке Gradle её подключение поднимает все модули Kora в
+> вашем runtime classpath до 1.2.23, а через `database-jdbc` — и HikariCP до 7.1.0. Выставьте свою платформу
+> `kora-parent` и annotation processors (`annotation-processors` или `symbol-processors` для KSP) тоже на 1.2.23, чтобы
+> сгенерированный код и runtime совпадали.
 
-- Артефакты для Kora: `io.github.dsudomoin:outbox-kora`, `io.github.dsudomoin:outbox-kafka-kora` и
-  `io.github.dsudomoin:outbox-admin-kora`, `0.1.0-SNAPSHOT` (пока только через `mavenLocal()`).
-- Байткод Java 17; работает из Java и Kotlin. Блокирующий API: `send` выполняется внутри `JdbcConnectionFactory.inTx`.
+- Артефакты (группа `io.github.dsudomoin`, `0.1.0-SNAPSHOT`, пока только через `mavenLocal()`): `outbox-core` без
+  фреймворков, `outbox-kafka`, `outbox-micrometer` и адаптеры для Kora `outbox-kora`, `outbox-kafka-kora`,
+  `outbox-admin-kora`; что для чего — в [Установке](#установка).
+- Байткод Java 17; работает из Java и Kotlin. Блокирующий API: `send` выполняется внутри транзакции приложения, в Kora
+  это `JdbcConnectionFactory.inTx`, без фреймворка — `JdbcTransactions.inTx` ([Без Kora](#без-kora)).
 
 Общая схема: сообщение записывается одной транзакцией с бизнес-данными, relay на любом инстансе сервиса после коммита
 передаёт его обработчику, а потребитель отбрасывает повторы через inbox.
@@ -46,6 +49,7 @@ flowchart TD
 - [Требования](#требования)
 - [Установка](#установка)
 - [Быстрый старт](#быстрый-старт): подключение, настройка, отправка, Kafka, свои обработчики, inbox
+- [Без Kora](#без-kora)
 - [Как работает relay](#как-работает-relay)
 - [Обработка сбоев](#обработка-сбоев)
 - [Справочник по конфигурации](#справочник-по-конфигурации)
@@ -234,10 +238,22 @@ dependencies {
 }
 ```
 
-`outbox-kora` приносит ядро `outbox-core`, `database-jdbc`, `config-common`, `opentelemetry-common` и `micrometer-core`
-(1.12.13). `outbox-kafka-kora` добавляет `outbox-kafka` с `kafka-clients` 3.9.2. `outbox-admin-kora` добавляет
-`http-server-common` и `json-common`; HTTP-сервер (`http-server-undertow`) и JSON-модуль (`json-module`) подключает
-сервис ([Админ-API и HTTP](#админ-api-и-http)).
+| Артефакт | Для чего | Приносит |
+|---|---|---|
+| `outbox-core` | Ядро: `Outbox`, relay, `Inbox`, `OutboxAdmin`, сборка `OutboxRuntime`, SPI транзакций и телеметрии | только `slf4j-api` |
+| `outbox-kafka` | Обработчик Kafka `KafkaOutboxSender` без фреймворка | `outbox-core`, `kafka-clients` 3.9.2 |
+| `outbox-micrometer` | Метры `outbox.*` на Micrometer: `OutboxMetrics` | `outbox-core`, `micrometer-core` 1.12.13 |
+| `outbox-kora` | Модули Kora: `OutboxModule`, `InboxModule`, `OutboxJsonModule`, `OutboxProtobufModule` | `outbox-core`, `outbox-micrometer`, `database-jdbc`, `config-common`, `opentelemetry-common` |
+| `outbox-kafka-kora` | `KafkaOutboxModule` | `outbox-kafka`, `outbox-kora` |
+| `outbox-admin-kora` | Админ-API по HTTP: `OutboxAdminHttpModule` | `outbox-kora`, `http-server-common`, `json-common` |
+
+HTTP-сервер (`http-server-undertow`) и JSON-модуль (`json-module`) для админ-API подключает сервис
+([Админ-API и HTTP](#админ-api-и-http)).
+
+Продюсеры Kafka `KafkaOutboxSender` создаёт сам из проверенных `driverProperties`. Чтобы их создавала фабрика клиентов
+вашего сервиса (со своими метриками или интерсепторами), передайте её вторым аргументом:
+`new KafkaOutboxSender(config, properties -> clients.producer(properties))`. Она получает свойства, в которых
+обязательные значения и значения по умолчанию уже выставлены.
 
 Двум опциональным модулям нужна зависимость, которую библиотека не приносит (она только компилируется с ней). Без неё
 `@KoraApp`, включающий такой модуль, не скомпилируется или не стартует (`NoClassDefFoundError`).
@@ -246,6 +262,21 @@ dependencies {
 |---|---|
 | `io.github.dsudomoin.outbox.kora.OutboxJsonModule` | `ru.tinkoff.kora:json-common` (его приносит любой JSON-модуль Kora, например `json-module`) |
 | `io.github.dsudomoin.outbox.kora.OutboxProtobufModule` | `com.google.protobuf:protobuf-java` 3.x или новее (его приносят классы, сгенерированные protobuf) |
+
+### Переход с 0.1.0-SNAPSHOT
+
+Меняются только координаты и импорты. Ключи HOCON, имена модулей Kora, таблицы, метрики, span-ы, заголовки Kafka и
+HTTP-контракт админ-API прежние.
+
+| Было | Стало |
+|---|---|
+| `io.github.dsudomoin:kora-outbox` | `io.github.dsudomoin:outbox-kora` (приносит `outbox-core`) |
+| `io.github.dsudomoin:kora-outbox-kafka` | `io.github.dsudomoin:outbox-kafka-kora` (приносит `outbox-kafka`) |
+| `io.github.dsudomoin:kora-outbox-admin` | `io.github.dsudomoin:outbox-admin-kora` |
+| пакет `io.github.dsudomoin.kora.outbox` (`Outbox`, `OutboxHandler`, …) | `io.github.dsudomoin.outbox` |
+| `OutboxModule`, `InboxModule`, `json.OutboxJsonModule`, `protobuf.OutboxProtobufModule` | `io.github.dsudomoin.outbox.kora` |
+| `kafka.KafkaOutboxModule` | `io.github.dsudomoin.outbox.kafka.kora` |
+| `admin.*` (`OutboxAdminHttpModule`, `OutboxAdminAuthorizer`) | `io.github.dsudomoin.outbox.admin.kora` |
 
 ## Быстрый старт
 
@@ -271,7 +302,9 @@ interface App : HoconConfigModule, JdbcDatabaseModule, JsonModule,
 - `InboxModule` без `OutboxModule` даёт сервису, который только потребляет, `Inbox` без обработчика и relay.
 - Метрики включаются, когда в графе есть Micrometer `MeterRegistry` (`MetricsModule` из Kora). Трассировка включается,
   когда в нём есть OpenTelemetry `Tracer` (`OpentelemetryTracingModule` из Kora).
-- Как всегда в Kora, компонент, от которого не зависит ни один root, не попадает в граф. Relay сам является root.
+- Модули лежат в `io.github.dsudomoin.outbox.kora` и `io.github.dsudomoin.outbox.kafka.kora`, остальной API — в
+  `io.github.dsudomoin.outbox`.
+- Как всегда в Kora, компонент, от которого не зависит ни один root, не попадает в граф. Outbox сам является root.
 
 ### Настройка
 
@@ -782,6 +815,39 @@ fun process(records: ConsumerRecords<String, ByteArray>) = db.inTx<Unit> { _: Co
   не в формате UUIDv7 принимается без дедупликации (`true`, ничего не записывается, WARN не чаще раза в минуту и
   счётчик `outbox.inbox.outside_window`); транзакцию это никогда не валит. Задайте `retention` больше самого большого
   лага потребителя или повторного чтения (replay), которое нужно покрыть.
+
+## Без Kora
+
+Ядро `outbox-core` от фреймворков не зависит. `OutboxRuntime` собирает outbox из конфига, привязки к транзакциям
+приложения (`OutboxTransactions`) и обработчика. Для кода без фреймворка есть `JdbcTransactions` поверх `DataSource`:
+`inTx` выполняет вызов в транзакции, привязанной к потоку, и `send` присоединяется к ней.
+
+```java
+var transactions = new JdbcTransactions(dataSource);
+var runtime = OutboxRuntime.builder(new OutboxConfig() {}, transactions, record -> deliver(record))
+        .telemetry(new OutboxMetrics(meterRegistry)) // необязательно: метры outbox.* из outbox-micrometer
+        .build();                                    // проверяет конфиг, в базу не ходит
+runtime.start();                                     // таблицы, затем relay
+
+transactions.inTx(c -> {
+    orders.insert(c, order);
+    return runtime.outbox().send(OutboxMessage.of("orders", order.userId(), payload));
+});
+
+runtime.close();                                     // relay останавливается за relay.shutdownTimeout
+```
+
+- `OutboxConfig` — интерфейс с теми же ключами и значениями по умолчанию, что в
+  [справочнике](#справочник-по-конфигурации); переопределите нужные методы.
+- Компоненты (`outbox()`, `relay()`, `admin()`) появляются после `start()`. Dead letters уходят в хук
+  `deadLetterHandler(...)` билдера, без него остаются в dead-таблице.
+- Kafka: `new KafkaOutboxSender(kafkaConfig)` из `outbox-kafka`, обработчик — `sender.handler()`; закройте отправитель
+  после runtime.
+- Inbox без outbox: `InboxRuntime.builder(config, transactions).build()`, затем `start()` и
+  `transactions.inTx(c -> runtime.inbox().tryAccept(id))`.
+- Своя привязка к транзакциям (например, к менеджеру транзакций фреймворка) реализует `OutboxTransactions`: соединение
+  текущей транзакции, действие после коммита (один экземпляр — один запуск на транзакцию), новое соединение для работы
+  самого outbox, подсказка для сообщения об ошибке и перевод `SQLException` в исключение фреймворка.
 
 ## Как работает relay
 
@@ -2157,10 +2223,23 @@ Gauges регистрируются один раз на имя, и побежд
    записываются в него.
 3. Обработчик получает запись, в которой заголовки трассы заменены на заголовки этого span. Обработчик Kafka пересылает
    их, поэтому Kafka-потребитель на Kora продолжает ту же трассу; `handleBatch` по умолчанию выполняет `handle` в
-   контексте Kora, несущем этот span, поэтому клиенты Kora, вызванные из него, тоже продолжают трассу.
+   контексте Kora, несущем этот span, поэтому клиенты Kora, вызванные из него, тоже продолжают трассу. Свой
+   `handleBatch` получает тот же контекст для записи через `OutboxHandler.inRecordScope(record, () -> ...)`.
 
 С parent-based сэмплером (по умолчанию в OpenTelemetry) span-ы доставки сэмплируются, если была сэмплирована трасса
 писателя. Несэмплированные span-ы всё равно создаются на каждую запись — небольшая цена на потоке relay.
+
+### Телеметрия как SPI
+
+Ядро сообщает о себе через один интерфейс `OutboxTelemetry`: обёртку вокруг каждого `send`/`sendAll` (какие заголовки
+трассы сохранить), обёртку вокруг каждого вызова обработчика (какие записи он получит, область каждой записи, исходы),
+события на каждый исход и шаг и gauges из `OutboxGauge`. Все методы по умолчанию ничего не делают, новые события
+появятся новыми методами по умолчанию. Исключение реализации пишется в WARN не чаще раза в 10 с на хук и не мешает ни
+отправке, ни relay.
+
+В Kora метрики и span-ы выше даёт `KoraOutboxTelemetry`: метры через `OutboxMetrics` из `outbox-micrometer`, span-ы
+через `Tracer`. Без Kora передайте реализацию в `OutboxRuntime.builder(...).telemetry(...)`, например
+`new OutboxMetrics(registry)` для тех же метров.
 
 ### Локальный стенд
 

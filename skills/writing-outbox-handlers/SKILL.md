@@ -16,11 +16,11 @@ timeout well below it (Kora's default: 2 min).
 batchSize × p99(one record) ≤ 0.8 × batchTimeout − per-record timeout
 ```
 
-p99 2 s, request timeout 5 s, defaults: (24 − 5) / 2 → `batchSize` ≤ 9, for every handler, Kafka included.
+p99 2 s, request timeout 5 s, defaults: (24 − 5) / 2 → `batchSize` ≤ 9, Kafka included.
 
 A sequential handler delivers at most min(shards, instances × workers) / mean seconds per record (2 × 4 / 0.3 s ≈
 26 msg/s), whatever the `batchSize`. If too low, follow every rule in [concurrent-delivery.md](concurrent-delivery.md).
-The soft deadline is a safety net, not flow control: it interrupts a live request while later `byTopic` routes wait.
+The soft deadline is a safety net, not flow control.
 
 ## Outcomes
 
@@ -46,7 +46,8 @@ The soft deadline is a safety net, not flow control: it interrupts a live reques
 - never throw: a thrown call retries all its records;
 - after a (topic, key) fails, its later records in the call are `notAttempted()`;
 - check `OutboxHandler.windDownRequested()` before each record and, if concurrent, while waiting (Kora's JDK
-  HTTP client clears the interrupt flag); restore the flag after `InterruptedException`.
+  HTTP client clears the interrupt flag); restore the flag after `InterruptedException`;
+- run each record in `OutboxHandler.inRecordScope(record, () -> ...)` to keep its trace, like the default.
 
 ## Dead letters
 

@@ -31,7 +31,9 @@ contract in SKILL.md still holds: one outcome per record in input order, no null
 - **Retry bound for this route only.** `outbox.relay.retry.maxAttempts` is global, so it stays 0 while an ordered Kafka
   topic shares the relay. Return `Outcome.permanent(e)` instead of `Outcome.retry(e)` once
   `record.attempts() + 1 >= N` (`attempts` counts earlier failed deliveries).
-- **Tracing.** The default `handleBatch` runs each `handle` in the record's trace context; an override does not.
+- **Tracing.** The default `handleBatch` runs each `handle` in the record's trace context; an override gets it with
+  `OutboxHandler.inRecordScope(record, () -> ...)`, on the handler thread only: work handed to other threads runs
+  without it.
 
 ## Worked numbers
 
