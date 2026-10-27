@@ -1299,7 +1299,7 @@ class OutboxRelayIT {
         awaitParked();
         int sent = 0;
         var waves = new ArrayList<List<List<Integer>>>();
-        for (int rows : new int[] {600, 600, 1, 1}) { // one transaction each, rows per shard
+        for (int rows : new int[] {600, 600, 1, 1, 100, 100}) { // one transaction each, rows per shard
             int from = groups.size();
             send(outbox, IntStream.range(0, 32).boxed().flatMap(shard -> IntStream.range(0, rows)
                     .mapToObj(i -> msg("t", keyOnShard(shard, "k"), "m"))).toArray(OutboxMessage[]::new));
@@ -1320,6 +1320,9 @@ class OutboxRelayIT {
                 .allSatisfy(group -> assertThat(group).hasSize(1));
         assertThat(waves.get(3).stream().mapToInt(List::size).max().orElse(0)).as("largest step of the second wave"
                 + " of 1 row a shard").isGreaterThanOrEqualTo(16);
+        // 100 rows a shard, more than batchSize / 16: ten would fit in one read, but each steps alone
+        assertThat(waves.get(5)).as("steps of the second wave of 100 rows a shard").isNotEmpty()
+                .allSatisfy(group -> assertThat(group).hasSize(1));
         assertIdOrderPerKey(handler.delivered());
     }
 

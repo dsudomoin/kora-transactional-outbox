@@ -418,7 +418,8 @@ public final class OutboxRelay implements Lifecycle {
         var group = new ArrayList<Integer>();
         long rows = 0;
         for (var shard : shards) {
-            if (!group.isEmpty() && (group.size() == MAX_GROUP || rows + expected.get(shard) > relay.batchSize())) {
+            if (!group.isEmpty() && (group.size() == MAX_GROUP || busy(group.get(group.size() - 1)) || busy(shard)
+                    || rows + expected.get(shard) > relay.batchSize())) {
                 groups.add(group);
                 group = new ArrayList<>();
                 rows = 0;
@@ -430,6 +431,16 @@ public final class OutboxRelay implements Lifecycle {
             groups.add(group);
         }
         return groups;
+    }
+
+    /**
+     * Expected to read more than {@code batchSize / 16} rows: such a shard steps alone. Its step's own statements cost
+     * little next to its rows, while a group of a few such shards would share one {@code batchSize} read, be cut, and
+     * read the rest of its shards again (bulk at 32 shards, about 600 rows a shard per batch, lagged several ticks
+     * behind stepping shards alone); grouping pays off for many shards with a few rows each.
+     */
+    private boolean busy(int shard) {
+        return expected.get(shard) > relay.batchSize() / 16;
     }
 
     /** Untouched by its step: it has work, and the step delivered none of it (unread behind a cut, not attempted). */
@@ -617,7 +628,8 @@ public final class OutboxRelay implements Lifecycle {
 
         /**
          * The next group, empty when the round is done: at most {@link #groupSize} shards, and no more than fit in
-         * {@code batchSize} by their {@link #expected} rows (at least one); each is {@link #inFlight} until its step
+         * {@code batchSize} by their {@link #expected} rows (at least one; a {@link #busy} shard alone); each is
+         * {@link #inFlight} until its step
          * ends. A shard another worker steps is passed over and {@link #wanted}: that step puts it into the round
          * current then. A shard a sibling stepped after the read at this round's tick or a newer one is skipped: its
          * candidacy is stale, and that step put it back if it left work. A shard {@link #isolated} is a group of its
@@ -640,7 +652,7 @@ public final class OutboxRelay implements Lifecycle {
                     drop(shard);
                     continue;
                 }
-                boolean alone = isolated.get(shard) == 1;
+                boolean alone = isolated.get(shard) == 1 || busy(shard);
                 if (!group.isEmpty() && (alone || rows + expected.get(shard) > relay.batchSize())) {
                     break;
                 }
