@@ -190,7 +190,7 @@ class XidRecoveryIT {
         var maintenance = new Maintenance(db, names, resharded, new OutboxMetrics(null));
 
         try (var err = new CapturedStderr()) {
-            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(maintenance.runOnce()).as("the shard guard: nothing maintained").isFalse();
 
             assertThat(err.text()).contains("ERROR").contains("outbox.shards = 8").contains("4 shards");
         }

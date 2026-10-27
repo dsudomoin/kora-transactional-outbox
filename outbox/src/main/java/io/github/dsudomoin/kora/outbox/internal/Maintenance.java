@@ -26,10 +26,9 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * {@code <base>_maintenance}, when a run last completed every step on any instance
  * ({@code outbox.maintenance.since_success}, seconds; unless halted, a WARN at most once a minute once that is over 5 ×
  * {@code maintenanceInterval}); neither needs a lock, so every instance does both, and a failed read is a WARN. Then it
- * compares the cursors' shard count ({@code max(shard) + 1}, an index probe: bootstrap and a reshard make the cursors
- * of shards 0..n-1 together) with {@code outbox.shards}: a mismatch, as another instance's reshard leaves it, halts
- * this instance ({@link #halted()}) until they match again, with an ERROR at most once a minute, and the run stops
- * there, taking no lock. The
+ * compares the cursors' shard count ({@link Cursors#shardCount}) with {@code outbox.shards}: a mismatch, as another
+ * instance's reshard leaves it, halts this instance ({@link #halted()}) until they match again, with an ERROR at most
+ * once a minute, and the run stops there, taking no lock ({@link #runOnce()} returns false). The
  * rest needs a connection that keeps one server session: behind a transaction-pooling proxy
  * ({@link PartitionDdl#backendChanges}) the run stops there, with an ERROR at most once a minute and
  * {@code outbox.maintenance.transaction_pooling} at 1 (0 otherwise). It runs on at most one instance at a time: it
@@ -168,7 +167,7 @@ public final class Maintenance {
         this.succeeded = "insert into " + names.maintenance() + " (succeeded_at) values (clock_timestamp())"
                 + " on conflict (id) do update set succeeded_at = excluded.succeeded_at";
         this.staleAfter = config.partitions().maintenanceInterval().multipliedBy(STALE_INTERVALS);
-        this.cursorShards = "select max(shard) + 1 from " + names.cursor();
+        this.cursorShards = Cursors.shardCount(names);
         this.deadIndex = new DeadIndexBuilder(db, names, config.partitions().maintenanceInterval(), detachLockTimeout);
         this.deadRetention = config.deadLetters().retention();
         this.redriveHistory = config.deadLetters().redriveHistory();
@@ -253,13 +252,13 @@ public final class Maintenance {
      */
     @Nullable
     private Integer checkShards(Connection c) throws SQLException {
-        Integer present;
+        int present;
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
             st.execute("set local lock_timeout = " + SHARDS_LOCK_TIMEOUT.toMillis()); // a transaction's: no leak
             try (var rs = st.executeQuery(cursorShards)) {
                 rs.next();
-                present = rs.getObject(1, Integer.class);
+                present = rs.getInt(1);
             }
             c.commit();
         } catch (SQLException e) {
@@ -271,7 +270,7 @@ public final class Maintenance {
         } finally {
             c.setAutoCommit(true);
         }
-        var found = present == null || present == shards ? null : present;
+        Integer found = present == 0 || present == shards ? null : present;
         var before = mismatch;
         mismatch = found;
         if (found == null && before != null) {
@@ -291,9 +290,10 @@ public final class Maintenance {
     }
 
     /**
-     * One run; false without maintaining anything when another session holds the maintenance lock or the connection
-     * does not keep one server session. While halted only the reads, the xid check and, in {@code auto} mode, the
-     * recovery run (true with {@code halt}: no lock is taken).
+     * One run; false without maintaining anything when another session holds the maintenance lock, the connection
+     * does not keep one server session, or the cursors' shard count differs from this instance's. While halted only
+     * the reads, the xid check and, in {@code auto} mode, the recovery run (true with {@code halt}: no lock is
+     * taken).
      */
     public boolean runOnce() {
         try (var c = db.newConnection()) {
@@ -305,7 +305,7 @@ public final class Maintenance {
                 if (due(mismatchLogged)) {
                     log.error(mismatchText(present) + "; this ERROR repeats at most once a minute");
                 }
-                return true;
+                return false; // nothing maintained
             }
             if (check != null && !autoRecovery) {
                 logHalt(check, XidRecovery.HALT_MODE);

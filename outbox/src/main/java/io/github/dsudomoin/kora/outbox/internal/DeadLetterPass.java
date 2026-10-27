@@ -76,8 +76,6 @@ public final class DeadLetterPass {
     private final String fail;
     private final String defer;
     private final String keepPending;
-    /** How recently an instance with an active hook must have been seen for a hookless pass to keep no letter. */
-    private final Duration hookSeen;
     private final String untilNextDue;
     private final ThreadPoolExecutor executor;
     /** One {@link #runOnce} at a time; not {@code synchronized}, which pins a virtual thread's carrier (JDK 21+). */
@@ -113,11 +111,10 @@ public final class DeadLetterPass {
         defer = "update " + dead + " set due_at = now() + make_interval(secs => ?) where id = any(?)"
                 + " and due_at <= now()";
         // due_at is set on every pending letter: the partial index finds them, not a scan of all the kept ones. None
-        // while an instance with an active hook was seen lately: a rolling deploy that adds one leaves them to it
+        // while an instance with an active hook is live: a rolling deploy that adds one leaves them to it
         keepPending = "update " + dead + " set status = 'kept', due_at = null where id in (select id from " + dead
                 + " where status = 'pending' and due_at is not null for update skip locked) and not exists (select 1"
-                + " from " + names.instance() + " where hook_active and last_seen > now() - make_interval(secs => ?))";
-        this.hookSeen = config.partitions().maintenanceInterval().multipliedBy(2);
+                + " from " + names.instance() + " where hook_active and expires_at > now())";
         untilNextDue = "select (extract(epoch from min(due_at) - now()) * 1000000)::bigint from " + dead
                 + " where due_at > now()";
         this.executor = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(), r -> {
@@ -138,7 +135,7 @@ public final class DeadLetterPass {
     /**
      * With an active hook, hands due pending letters to it batch after batch, until a batch is not full or a call fails
      * (its backoff then holds the hook back, not just its letters); without one, makes every pending letter kept,
-     * unless an instance with an active hook was seen within 2 × {@code maintenanceInterval} ({@link Heartbeat}). Then
+     * unless an instance with an active hook is live: its {@link Heartbeat} row has not expired. Then
      * redrives the due scheduled letters, those just decided {@code redrive} included. Returns the letters this run
      * redrove: the caller wakes the relay when there are any. One run at a time per pass, so a second caller's hook
      * call never waits for the first one's inside its own timeout; the wait for it is interruptible. A run that starts
@@ -165,9 +162,8 @@ public final class DeadLetterPass {
                 handOver(c);
             } else {
                 inTx(c, tx -> {
-                    try (var ps = tx.prepareStatement(keepPending)) {
-                        ps.setDouble(1, hookSeen.toNanos() / 1e9);
-                        return ps.executeUpdate();
+                    try (var st = tx.createStatement()) {
+                        return st.executeUpdate(keepPending);
                     }
                 });
             }

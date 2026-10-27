@@ -167,8 +167,8 @@ public final class OutboxRelay implements Lifecycle {
         this.cursors = new Cursors(schema.names(), config.shards());
         this.deadLetters = deadLetters;
         this.processor = new ShardProcessor(schema.names(), config, handler, metrics, tracer, deadLetters.active());
-        this.heartbeat = new Heartbeat(db, schema.names(), config.shards(), deadLetters.active(),
-                config.partitions().maintenanceInterval());
+        // the pass runs only where the relay does
+        this.heartbeat = new Heartbeat(db, schema, config, relay.enabled() && deadLetters.active());
         this.idleNanos = relay.idlePollInterval().toNanos();
         this.minTickNanos = relay.minTickInterval().toNanos();
         this.idleTickAge = Duration.ofNanos(Math.max(minTickNanos, idleNanos - idleNanos / 4));

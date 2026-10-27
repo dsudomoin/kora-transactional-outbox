@@ -33,6 +33,8 @@ public final class PgOutbox implements Outbox {
     private final String insertKeyed;
     private final String insertUnkeyed;
     private final Resender resender;
+    private final TableNames names;
+    private final ShardGuard guard;
 
     public PgOutbox(
             JdbcConnectionFactory db, OutboxSchema schema, int shards, Runnable wakeUpRelay, OutboxMetrics metrics) {
@@ -52,7 +54,9 @@ public final class PgOutbox implements Outbox {
         var insert = "insert into " + schema.names().base() + " (shard, message_id, topic, key, payload, headers) ";
         this.insertKeyed = insert + "select ?, ?, ?, ?, ?, ? from (select pg_advisory_xact_lock(?, ?)) l";
         this.insertUnkeyed = insert + "values (?, ?, ?, ?, ?, ?)";
-        this.resender = new Resender(schema.names(), shards);
+        this.names = schema.names();
+        this.guard = schema.shardGuard(); // the cursors' count as this instance's heartbeat last read it
+        this.resender = new Resender(names, shards, guard);
     }
 
     @Override
@@ -103,6 +107,7 @@ public final class PgOutbox implements Outbox {
     }
 
     private UUID insert(Connection c, OutboxMessage m) {
+        guard.require(names, shards);
         var id = UuidV7.next();
         boolean keyed = m.key() != null;
         int hash = keyed ? Hashing.keyHash(m.topic(), m.key()) : 0;

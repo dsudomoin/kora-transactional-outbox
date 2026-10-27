@@ -35,7 +35,7 @@ final class DeadLetters {
     private final String delete;
 
     DeadLetters(TableNames names, OutboxConfig config) {
-        this.resender = new Resender(names, config.shards());
+        this.resender = new Resender(names, config);
         this.keyNamespace = names.keyNamespace();
         this.lockTimeout = "set local lock_timeout = '" + config.partitions().swapLockTimeout().toMillis() + "ms'";
         // one row whatever the driver's fetch size, so every hash is tried (see Resender.LOCK_ALL); never waits

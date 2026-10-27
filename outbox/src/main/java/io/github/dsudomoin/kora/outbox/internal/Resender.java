@@ -1,5 +1,6 @@
 package io.github.dsudomoin.kora.outbox.internal;
 
+import io.github.dsudomoin.kora.outbox.OutboxConfig;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -30,10 +31,24 @@ public final class Resender {
             UUID messageId, String topic, @Nullable byte[] key, @Nullable byte[] payload, @Nullable byte[] headers) {}
 
     private final int keyNamespace;
+    private final TableNames names;
     private final int shards;
+    private final ShardGuard guard;
     private final String insertAll;
 
+    /** Without the instance's {@link ShardGuard}, as tests build it. */
     public Resender(TableNames names, int shards) {
+        this(names, shards, ShardGuard.NONE);
+    }
+
+    /** {@code config}: the instance's, as {@link OutboxSchema#config()} resolved it; every insert checks its guard. */
+    public Resender(TableNames names, OutboxConfig config) {
+        this(names, config.shards(), ShardGuard.of(config));
+    }
+
+    Resender(TableNames names, int shards, ShardGuard guard) {
+        this.names = names;
+        this.guard = guard;
         this.keyNamespace = names.keyNamespace();
         this.shards = shards;
         this.insertAll = "insert into " + names.base() + " (shard, message_id, topic, key, payload, headers)"
@@ -45,9 +60,11 @@ public final class Resender {
     /**
      * Locks the rows' distinct key hashes in one statement, then inserts them in one, ids in list order; unkeyed rows
      * take no lock and land on a random shard. Every key lock is held until {@code inTx} ends, so callers bound the
-     * list. Returns the rows inserted.
+     * list. Returns the rows inserted. Throws {@link IllegalStateException} while the instance's {@link ShardGuard}
+     * finds the cursors on another shard count.
      */
     public int insertAll(Connection inTx, List<Row> rows) throws SQLException {
+        guard.require(names, shards);
         int n = rows.size();
         if (n == 0) {
             return 0;

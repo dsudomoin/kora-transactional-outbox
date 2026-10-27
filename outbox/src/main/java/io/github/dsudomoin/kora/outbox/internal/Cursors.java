@@ -250,6 +250,14 @@ public final class Cursors {
         return result;
     }
 
+    /**
+     * The cursors' shard count, 0 without cursors: {@code max(shard) + 1}, an index probe, as bootstrap and a reshard
+     * make the cursors of shards 0..n-1 together. The bootstrap, {@link Maintenance} and {@link Heartbeat} read it.
+     */
+    static String shardCount(TableNames names) {
+        return "select coalesce(max(shard) + 1, 0) from " + names.cursor();
+    }
+
     /** The lowest {@code tick_id} of the shards' latest cursor rows; null without cursors. */
     @Nullable
     public Long lowestTick(Connection c) throws SQLException {

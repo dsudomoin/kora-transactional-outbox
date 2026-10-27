@@ -599,20 +599,19 @@ class DeadLetterPassIT {
     }
 
     @Test
-    void aHooklessPassKeepsNoPendingLetterWhileAnInstanceWithAHookIsSeen() throws Exception {
-        config.maintenanceInterval(Duration.ofSeconds(10));
+    void aHooklessPassKeepsNoPendingLetterWhileAnInstanceWithAHookIsLive() throws Exception {
         long pending = letter("t", "a", "p", List.of());
-        execute("insert into " + names.instance() + " (instance_id, shards, hook_active)"
-                + " values ('with-hook/1/00000001', " + config.shards() + ", true)");
+        execute("insert into " + names.instance() + " (instance_id, shards, hook_active, expires_at)"
+                + " values ('with-hook/1/00000001', " + config.shards() + ", true, now() + interval '1 minute')");
         var none = pass(null);
 
         none.runOnce();
         assertThat(status(pending)).as("a rolling deploy that adds a hook: the letter waits for it")
                 .isEqualTo("pending");
 
-        execute("update " + names.instance() + " set last_seen = now() - interval '21 seconds'");
+        execute("update " + names.instance() + " set expires_at = now() - interval '1 second'");
         none.runOnce();
-        assertThat(status(pending)).as("no instance with a hook seen within 2 × maintenanceInterval")
+        assertThat(status(pending)).as("its heartbeat expired")
                 .isEqualTo("kept");
     }
 
