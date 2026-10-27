@@ -7,8 +7,10 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.dsudomoin.outbox.internal.RecordScope;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import jakarta.annotation.Nullable;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -276,15 +278,18 @@ class OutboxHandlerTest {
     }
 
     @Test
-    void handleSeesTraceContextOfRecord() {
+    void handleSeesTraceContextOfRecord() throws Exception {
         var traceIds = new ArrayList<String>();
         OutboxHandler handler = r -> traceIds.add(OpentelemetryContext.getSpan() == null
                 ? null
                 : OpentelemetryContext.getSpan().getSpanContext().getTraceId());
         var traced = record("t", "k", List.of(header("traceparent", TRACEPARENT)));
         var untraced = record("t", "k", List.of());
+        var records = List.of(traced, untraced);
+        // as the relay runs a call: the Kora app's delivery bound to the handler thread
+        var delivery = TestTelemetry.kora().deliveryStarted(records, Instant.now());
 
-        handler.handleBatch(List.of(traced, untraced));
+        RecordScope.bound(delivery, () -> handler.handleBatch(records));
 
         assertThat(traceIds.get(0)).isEqualTo(TRACE_ID);
         assertThat(traceIds.get(1)).as("no span leaks from the previous record").isNotEqualTo(TRACE_ID);

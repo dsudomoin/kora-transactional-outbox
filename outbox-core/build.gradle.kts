@@ -5,8 +5,6 @@ plugins {
 dependencies {
     api("ru.tinkoff.kora:database-jdbc")
     api("ru.tinkoff.kora:config-common")
-    api("ru.tinkoff.kora:opentelemetry-common")
-    api("io.micrometer:micrometer-core:1.12.13")
     // optional: ProtobufOutbox needs it on the app's classpath
     compileOnly("com.google.protobuf:protobuf-java:3.25.8")
 

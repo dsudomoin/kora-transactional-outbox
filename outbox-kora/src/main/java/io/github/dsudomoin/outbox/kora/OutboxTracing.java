@@ -1,4 +1,4 @@
-package io.github.dsudomoin.outbox.internal;
+package io.github.dsudomoin.outbox.kora;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 

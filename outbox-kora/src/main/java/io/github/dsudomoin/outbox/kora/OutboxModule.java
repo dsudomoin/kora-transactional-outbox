@@ -7,10 +7,10 @@ import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.OutboxSerializer;
+import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.TypedOutbox;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Maintenance;
-import io.github.dsudomoin.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.PgOutboxAdmin;
@@ -41,25 +41,25 @@ public interface OutboxModule extends OutboxCommonModule {
         return new OutboxSchema(db, config);
     }
 
-    default Maintenance outboxMaintenance(JdbcConnectionFactory db, OutboxSchema schema, OutboxMetrics metrics) {
-        return new Maintenance(db, schema.names(), schema.config(), metrics);
+    default Maintenance outboxMaintenance(JdbcConnectionFactory db, OutboxSchema schema, OutboxTelemetry telemetry) {
+        return new Maintenance(db, schema.names(), schema.config(), telemetry);
     }
 
     /** The relay runs it and closes it; without a hook component every dead letter is kept. */
     default DeadLetterPass outboxDeadLetterPass(JdbcConnectionFactory db, OutboxSchema schema,
-            @Nullable OutboxDeadLetterHandler hook, OutboxMetrics metrics) {
+            @Nullable OutboxDeadLetterHandler hook, OutboxTelemetry telemetry) {
         return new DeadLetterPass(db, schema.names(), schema.config(),
-                hook == null ? OutboxDeadLetterHandler.NONE : hook, metrics);
+                hook == null ? OutboxDeadLetterHandler.NONE : hook, telemetry);
     }
 
     @Root
     default OutboxRelay outboxRelay(JdbcConnectionFactory db, OutboxSchema schema, OutboxHandler handler,
-            OutboxMetrics metrics, @Nullable Tracer tracer, Maintenance maintenance, DeadLetterPass deadLetters) {
-        return new OutboxRelay(db, schema.config(), schema, handler, metrics, tracer, maintenance, deadLetters);
+            OutboxTelemetry telemetry, Maintenance maintenance, DeadLetterPass deadLetters) {
+        return new OutboxRelay(db, schema.config(), schema, handler, telemetry, maintenance, deadLetters);
     }
 
-    default Outbox outbox(JdbcConnectionFactory db, OutboxSchema schema, OutboxRelay relay, OutboxMetrics metrics) {
-        return new PgOutbox(db, schema, schema.config().shards(), relay::wake, metrics);
+    default Outbox outbox(JdbcConnectionFactory db, OutboxSchema schema, OutboxRelay relay, OutboxTelemetry telemetry) {
+        return new PgOutbox(db, schema, schema.config().shards(), relay::wake, telemetry);
     }
 
     /** For the service's own code; nothing runs unless it is called. */

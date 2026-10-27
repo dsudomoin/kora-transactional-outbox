@@ -1,7 +1,7 @@
 package io.github.dsudomoin.outbox;
 
 import io.github.dsudomoin.outbox.internal.BatchClassifier;
-import io.github.dsudomoin.outbox.internal.OutboxTracing;
+import io.github.dsudomoin.outbox.internal.RecordScope;
 import io.github.dsudomoin.outbox.internal.ShardProcessor;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -10,6 +10,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -20,7 +21,8 @@ public interface OutboxHandler {
 
     /**
      * Delivers one record. Throw {@link OutboxPermanentException} for a record that can never succeed; anything else
-     * thrown, an {@link Error} included, means "retry later". Runs in a Kora context carrying the record's trace, so
+     * thrown, an {@link Error} included, means "retry later". The default {@link #handleBatch} runs it in the
+     * record's scope ({@link #inRecordScope}): with the Kora adapter, a Kora context carrying the record's trace, so
      * Kora clients called from here continue it.
      */
     void handle(OutboxRecord record) throws Exception;
@@ -68,7 +70,7 @@ public interface OutboxHandler {
                 continue;
             }
             try {
-                OutboxTracing.withKoraContext(OutboxTracing.extract(record.headers()), () -> {
+                inRecordScope(record, () -> {
                     handle(record);
                     return null;
                 });
@@ -85,6 +87,16 @@ public interface OutboxHandler {
             }
         }
         return outcomes;
+    }
+
+    /**
+     * Runs {@code call} in the scope of {@code record}, one of the records the relay handed to the {@link #handleBatch}
+     * call running on this thread: whatever the application's telemetry binds to a record (with the Kora adapter, a
+     * Kora context carrying the record's trace). The default {@code handleBatch} wraps each {@link #handle} in it; an
+     * override that delivers records itself calls it the same way. Outside a relay call it runs {@code call} alone.
+     */
+    static <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
+        return RecordScope.run(record, call);
     }
 
     /**

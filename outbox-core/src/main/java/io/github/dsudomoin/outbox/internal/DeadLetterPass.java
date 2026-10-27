@@ -4,6 +4,7 @@ import io.github.dsudomoin.outbox.DeadLetter;
 import io.github.dsudomoin.outbox.DeadLetterDecision;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
+import io.github.dsudomoin.outbox.OutboxTelemetry;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -67,7 +68,7 @@ public final class DeadLetterPass {
     @Nullable
     private final OutboxDeadLetterHandler hook;
     private final boolean active;
-    private final OutboxMetrics metrics;
+    private final OutboxTelemetry telemetry;
     private final DeadLetters rows;
     private final String dead;
     private final int batchSize;
@@ -94,12 +95,12 @@ public final class DeadLetterPass {
     private record Batch(int claimed, @Nullable Throwable failure, List<DeadLetterDecision> decisions) {}
 
     public DeadLetterPass(JdbcConnectionFactory db, TableNames names, OutboxConfig config,
-            @Nullable OutboxDeadLetterHandler hook, OutboxMetrics metrics) {
+            @Nullable OutboxDeadLetterHandler hook, OutboxTelemetry telemetry) {
         OutboxSchema.validate(config);
         this.db = db;
         this.hook = hook;
         this.active = hook != null && hook.active(); // read once: the relay's steps write by it
-        this.metrics = metrics;
+        this.telemetry = telemetry;
         this.rows = new DeadLetters(names, config);
         this.dead = names.dead();
         this.batchSize = config.deadLetters().batchSize();
@@ -222,13 +223,13 @@ public final class DeadLetterPass {
                 throw e;
             }
             if (batch.failure() != null) {
-                metrics.deadHookFailure();
+                telemetry.deadLetterHookFailed();
                 hookFailures.warn("outbox dead-letter hook failed on " + batch.claimed() + " letters of " + dead
                         + "; they stay pending and are handed to it again after a backoff", batch.failure());
                 return;
             }
             for (var decision : batch.decisions()) {
-                metrics.deadDecision(name(decision));
+                telemetry.deadLetterDecision(name(decision));
             }
             if (batch.claimed() < batchSize) {
                 return;
@@ -390,7 +391,7 @@ public final class DeadLetterPass {
                     }
                     return decisions;
                 } finally {
-                    ru.tinkoff.kora.common.Context.clear(); // nothing leaks into the next call on this thread
+                    telemetry.releaseThread(); // nothing leaks into the next call on this thread
                     ended.countDown();
                 }
             });

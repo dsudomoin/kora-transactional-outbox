@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.internal;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.lang.reflect.Proxy;
 import java.sql.Connection;

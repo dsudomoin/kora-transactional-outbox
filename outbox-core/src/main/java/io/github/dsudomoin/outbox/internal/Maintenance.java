@@ -1,6 +1,8 @@
 package io.github.dsudomoin.outbox.internal;
 
 import io.github.dsudomoin.outbox.OutboxConfig;
+import io.github.dsudomoin.outbox.OutboxGauge;
+import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.Cursors.Position;
 import io.github.dsudomoin.outbox.internal.Ticks.Tick;
@@ -142,11 +144,11 @@ public final class Maintenance {
     @Nullable
     private volatile Long lastSuccess;
 
-    public Maintenance(JdbcConnectionFactory db, TableNames names, OutboxConfig config, OutboxMetrics metrics) {
-        this(db, names, config, metrics, PartitionDdl.DETACH_LOCK_TIMEOUT);
+    public Maintenance(JdbcConnectionFactory db, TableNames names, OutboxConfig config, OutboxTelemetry telemetry) {
+        this(db, names, config, telemetry, PartitionDdl.DETACH_LOCK_TIMEOUT);
     }
 
-    Maintenance(JdbcConnectionFactory db, TableNames names, OutboxConfig config, OutboxMetrics metrics,
+    Maintenance(JdbcConnectionFactory db, TableNames names, OutboxConfig config, OutboxTelemetry telemetry,
             Duration detachLockTimeout) {
         this.db = db;
         this.names = names;
@@ -181,18 +183,18 @@ public final class Maintenance {
         // due_at is set on every pending letter: the partial index finds them, not a scan of all the kept ones
         this.deadPending = "select count(*), coalesce(extract(epoch from now() - min(failed_at)), 0)::float8 from "
                 + names.dead() + " where status = 'pending' and due_at is not null";
-        metrics.gauge("outbox.shard.lag", () -> lag);
-        metrics.gauge("outbox.retry.size", () -> retrySize);
-        metrics.gauge("outbox.dead.size", () -> deadSize);
-        metrics.gauge("outbox.dead.pending", () -> deadPendingCount);
-        metrics.gauge("outbox.dead.pending.oldest", () -> deadPendingOldest);
-        metrics.gauge("outbox.parked.size", () -> parkedSize);
-        metrics.gauge("outbox.partitions.premade", () -> premade);
-        metrics.gauge("outbox.partitions.overflow", () -> partitions.overflow() ? 1 : 0);
-        metrics.gauge("outbox.partitions.xids_left", () -> xidsLeft);
-        metrics.gauge("outbox.partitions.orphaned", () -> orphaned);
-        metrics.gauge("outbox.maintenance.transaction_pooling", () -> transactionPooling);
-        metrics.gauge("outbox.maintenance.since_success", () -> {
+        telemetry.gauge(OutboxGauge.SHARD_LAG, () -> lag);
+        telemetry.gauge(OutboxGauge.RETRY_SIZE, () -> retrySize);
+        telemetry.gauge(OutboxGauge.DEAD_SIZE, () -> deadSize);
+        telemetry.gauge(OutboxGauge.DEAD_PENDING, () -> deadPendingCount);
+        telemetry.gauge(OutboxGauge.DEAD_PENDING_OLDEST, () -> deadPendingOldest);
+        telemetry.gauge(OutboxGauge.PARKED_SIZE, () -> parkedSize);
+        telemetry.gauge(OutboxGauge.PARTITIONS_PREMADE, () -> premade);
+        telemetry.gauge(OutboxGauge.PARTITIONS_OVERFLOW, () -> partitions.overflow() ? 1 : 0);
+        telemetry.gauge(OutboxGauge.PARTITIONS_XIDS_LEFT, () -> xidsLeft);
+        telemetry.gauge(OutboxGauge.PARTITIONS_ORPHANED, () -> orphaned);
+        telemetry.gauge(OutboxGauge.MAINTENANCE_TRANSACTION_POOLING, () -> transactionPooling);
+        telemetry.gauge(OutboxGauge.MAINTENANCE_SINCE_SUCCESS, () -> {
             var at = lastSuccess;
             return at == null ? Double.NaN : (System.nanoTime() - at) / 1e9;
         });

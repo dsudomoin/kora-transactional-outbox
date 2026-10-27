@@ -1,4 +1,4 @@
-package io.github.dsudomoin.outbox.internal;
+package io.github.dsudomoin.outbox.kora;
 
 import static io.github.dsudomoin.outbox.testing.TestTracing.SPAN_ID;
 import static io.github.dsudomoin.outbox.testing.TestTracing.TRACEPARENT;

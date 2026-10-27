@@ -10,11 +10,13 @@ import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRelay;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -368,7 +370,7 @@ class ReshardIT {
     @Test
     void writersWaitDuringTheChecksAndThenGoOn() throws Exception {
         var old = start(config(4));
-        var writer = new PgOutbox(db, old.schema(), 8, () -> {}, new OutboxMetrics(null));
+        var writer = new PgOutbox(db, old.schema(), 8, () -> {}, TestTelemetry.kora());
         stopped();
         try (var holder = TestDb.connect()) {
             holder.setAutoCommit(false);
@@ -477,11 +479,11 @@ class ReshardIT {
         schema.init();
         var resolved = schema.config();
         var maintenance = new Maintenance(db, schema.names(), resolved, new OutboxMetrics(null));
-        var relay = new OutboxRelay(db, resolved, schema, recording, new OutboxMetrics(null), null, maintenance,
+        var relay = new OutboxRelay(db, resolved, schema, recording, TestTelemetry.kora(), maintenance,
                 new DeadLetterPass(db, schema.names(), resolved, hook, new OutboxMetrics(null)));
         relays.add(relay);
         return new Node(schema, maintenance, relay,
-                new PgOutbox(db, schema, resolved.shards(), relay::wake, new OutboxMetrics(null)));
+                new PgOutbox(db, schema, resolved.shards(), relay::wake, TestTelemetry.kora()));
     }
 
     private UUID send(Outbox outbox, String key, String payload) {

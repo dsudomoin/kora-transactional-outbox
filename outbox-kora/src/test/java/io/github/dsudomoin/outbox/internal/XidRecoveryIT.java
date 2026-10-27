@@ -13,10 +13,12 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
@@ -890,7 +892,7 @@ class XidRecoveryIT {
     }
 
     private OutboxRelay relay(OutboxHandler handler, Maintenance maintenance) {
-        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance,
+        var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(), maintenance,
                 new DeadLetterPass(db, schema.names(), config, null, new OutboxMetrics(null)));
         relays.add(relay);
         return relay;
@@ -898,7 +900,7 @@ class XidRecoveryIT {
 
     private PgOutbox outbox(OutboxRelay relay) {
         return new PgOutbox(db, schema, config.shards(), relay == null ? () -> {} : relay::wake,
-                new OutboxMetrics(null));
+                TestTelemetry.kora());
     }
 
     private List<UUID> send(PgOutbox outbox, OutboxMessage... messages) {

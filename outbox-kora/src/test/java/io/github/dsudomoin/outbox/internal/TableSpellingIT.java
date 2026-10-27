@@ -12,8 +12,10 @@ import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardResult;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
@@ -82,7 +84,7 @@ class TableSpellingIT {
     @Test
     void processorsOfBothSpellingsCannotHoldOneShardTogether() throws Exception {
         bootstrap();
-        var outbox = new PgOutbox(db, plain, 1, () -> {}, new OutboxMetrics(null));
+        var outbox = new PgOutbox(db, plain, 1, () -> {}, TestTelemetry.kora());
         db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "k", bytes("m"))));
         var ticks = new Ticks(plain.names(), plainConfig.shards());
         long latest;
@@ -97,8 +99,8 @@ class TableSpellingIT {
             assertThat(release.await(10, SECONDS)).isTrue();
         };
         OutboxHandler idle = r -> {};
-        try (var a = new ShardProcessor(plain.names(), plainConfig, blocking, new OutboxMetrics(null), null, false);
-                var b = new ShardProcessor(qualified.names(), qualifiedConfig, idle, new OutboxMetrics(null), null,
+        try (var a = new ShardProcessor(plain.names(), plainConfig, blocking, TestTelemetry.kora(), false);
+                var b = new ShardProcessor(qualified.names(), qualifiedConfig, idle, TestTelemetry.kora(),
                         false)) {
             var first = pool.submit(() -> step(a, latest));
             assertThat(inHandler.await(10, SECONDS)).as("A holds shard 0").isTrue();
@@ -114,8 +116,8 @@ class TableSpellingIT {
     @Test
     void writersOfBothSpellingsSerialiseOnAKey() throws Exception {
         bootstrap();
-        var viaPlain = new PgOutbox(db, plain, 1, () -> {}, new OutboxMetrics(null));
-        var viaQualified = new PgOutbox(db, qualified, 1, () -> {}, new OutboxMetrics(null));
+        var viaPlain = new PgOutbox(db, plain, 1, () -> {}, TestTelemetry.kora());
+        var viaQualified = new PgOutbox(db, qualified, 1, () -> {}, TestTelemetry.kora());
         var aLocked = new CountDownLatch(1);
         var aBeforeCommit = new AtomicLong();
         var a = pool.submit(() -> db.inTx((SqlFunction0<UUID>) () -> {

@@ -7,16 +7,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Maintenance;
-import io.github.dsudomoin.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PartitionDdl;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.XidPartitions;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -394,9 +395,9 @@ class TailSwapIT {
                 }
                 return recording.handleBatch(records);
             }
-        }, new OutboxMetrics(null), null, maintenance, new DeadLetterPass(db, names, config, null,
+        }, TestTelemetry.kora(), maintenance, new DeadLetterPass(db, names, config, null,
                 new OutboxMetrics(null)));
-        var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new OutboxMetrics(null));
+        var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, TestTelemetry.kora());
         for (int i = 0; i < WRITERS; i++) {
             run("tail-swap-writer-" + i, () -> {
                 while (!stopping.get()) {

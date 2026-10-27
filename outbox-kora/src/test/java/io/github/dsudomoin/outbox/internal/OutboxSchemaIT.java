@@ -8,10 +8,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 import io.github.dsudomoin.outbox.OutboxRelay;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -457,13 +459,13 @@ class OutboxSchemaIT {
             e.getValue().accept(invalid);
 
             assertThatThrownBy(() -> new OutboxRelay(db, invalid, schema, new RecordingHandler(),
-                    new OutboxMetrics(null), null, null, valid))
+                    TestTelemetry.kora(), null, valid))
                     .as(e.getKey())
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageStartingWith(e.getKey() + " ");
         }
         for (int shards : new int[] {0, Short.MAX_VALUE + 1}) {
-            assertThatThrownBy(() -> new PgOutbox(db, schema, shards, () -> {}, new OutboxMetrics(null)))
+            assertThatThrownBy(() -> new PgOutbox(db, schema, shards, () -> {}, TestTelemetry.kora()))
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageStartingWith("outbox.shards ");
         }

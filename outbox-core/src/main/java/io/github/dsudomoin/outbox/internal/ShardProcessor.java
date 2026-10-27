@@ -4,6 +4,7 @@ import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
+import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Action;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Dead;
@@ -16,10 +17,6 @@ import io.github.dsudomoin.outbox.internal.BatchClassifier.Unpark;
 import io.github.dsudomoin.outbox.internal.BatchReader.BatchRow;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.Ticks.Tick;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.api.trace.SpanKind;
-import io.opentelemetry.api.trace.StatusCode;
-import io.opentelemetry.api.trace.Tracer;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -118,9 +115,7 @@ public final class ShardProcessor implements AutoCloseable {
     private final OutboxConfig.RetryConfig retry;
     private final OutboxConfig.RequeueConfig requeue;
     private final OutboxHandler handler;
-    private final OutboxMetrics metrics;
-    @Nullable
-    private final Tracer tracer;
+    private final OutboxTelemetry telemetry;
     private final Ticks ticks;
     private final Cursors cursors;
     private final BatchReader reader;
@@ -168,16 +163,15 @@ public final class ShardProcessor implements AutoCloseable {
     private final AtomicInteger bugsSuppressed = new AtomicInteger();
 
     /** {@code deadLetterHook}: a dead-letter hook is active, so every dead row is written pending for it. */
-    public ShardProcessor(TableNames names, OutboxConfig config, OutboxHandler handler, OutboxMetrics metrics,
-            @Nullable Tracer tracer, boolean deadLetterHook) {
+    public ShardProcessor(TableNames names, OutboxConfig config, OutboxHandler handler, OutboxTelemetry telemetry,
+            boolean deadLetterHook) {
         OutboxSchema.validate(config);
         this.relay = config.relay();
         this.retry = relay.retry();
         this.requeue = relay.requeue();
         this.internalNamespace = names.internalNamespace();
         this.handler = handler;
-        this.metrics = metrics;
-        this.tracer = tracer;
+        this.telemetry = telemetry;
         this.ticks = new Ticks(names, config.shards());
         this.cursors = new Cursors(names, config.shards());
         this.reader = new BatchReader(names);
@@ -461,7 +455,7 @@ public final class ShardProcessor implements AutoCloseable {
                 busyUntil.set(shard, ChronoUnit.MICROS.between(Instant.EPOCH, skipUntil));
                 s.next = s.next.withPause(rejected.plus(retry.initialDelay()), s.cursor.failures());
                 s.status = ShardStatus.PAUSED;
-                metrics.shardPaused();
+                telemetry.shardPaused();
                 log.warn("outbox shard {}: every handler thread of this relay is still busy; skipped here until {}",
                         shard, skipUntil);
             } else if (s.called && busyPauses.get(shard) != 0) {
@@ -484,7 +478,7 @@ public final class ShardProcessor implements AutoCloseable {
         }
         cursors.appendAll(inTx, appends);
         if (!work.isEmpty()) {
-            metrics.batch(Duration.ofNanos(System.nanoTime() - started));
+            telemetry.stepFinished(Duration.ofNanos(System.nanoTime() - started));
         }
         return Arrays.asList(results);
     }
@@ -802,7 +796,7 @@ public final class ShardProcessor implements AutoCloseable {
                     .truncatedTo(ChronoUnit.MICROS); // from the decision, not from the start of a slow call
             next = next.withPause(until, cursor.failures() + 1);
             s.status = ShardStatus.PAUSED;
-            metrics.shardPaused();
+            telemetry.shardPaused();
             log.warn("outbox shard {} paused until {}: nothing delivered, {} consecutive failed attempts ({})",
                     shard, until, next.failures(), firstError(items));
         } else if (items.stream().anyMatch(item -> item.outcome() instanceof Outcome.Delivered)) {
@@ -1127,7 +1121,7 @@ public final class ShardProcessor implements AutoCloseable {
             }
         }
         for (var row : done) {
-            metrics.delivered(row.topic(), delay(row, now));
+            telemetry.delivered(row.topic(), delay(row, now));
         }
         pass.delivered += done.size();
         pass.settled |= !outcomes.isEmpty();
@@ -1162,7 +1156,7 @@ public final class ShardProcessor implements AutoCloseable {
                     dead(c, pass, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT);
                 } else {
                     parked.fromRetry(c, row, row.requeues() + 1, requeueDue(q.notBefore(), now));
-                    metrics.requeued(row.topic());
+                    telemetry.requeued(row.topic());
                     pass.fromRetry = true;
                 }
             } else if (outcome instanceof Outcome.Permanent p) {
@@ -1175,7 +1169,7 @@ public final class ShardProcessor implements AutoCloseable {
                 var due = now.plus(Backoff.delay(row.attempts(), retry.initialDelay(), retry.maxDelay()));
                 retries.reschedule(c, row, attempts, BatchClassifier.dueAt(due, r.notBefore(), now),
                         r.error().toString());
-                metrics.failed(row.topic(), "retry");
+                telemetry.retried(row.topic());
                 return false;
             } else if (outcome instanceof Outcome.NotAttempted n) { // attempts and last error stay
                 var due = BatchClassifier.dueAt(now.plus(retry.initialDelay()), n.notBefore(), now);
@@ -1214,7 +1208,7 @@ public final class ShardProcessor implements AutoCloseable {
                     deadFromParked(c, pass, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT);
                 } else {
                     pass.parkedWrites.add(new Park(row, row.requeues() + 1, requeueDue(q.notBefore(), now)));
-                    metrics.requeued(row.topic());
+                    telemetry.requeued(row.topic());
                 }
             } else if (outcome instanceof Outcome.Permanent p) {
                 deadFromParked(c, pass, row, attempts, p.error().toString());
@@ -1226,7 +1220,7 @@ public final class ShardProcessor implements AutoCloseable {
                 var due = now.plus(Backoff.delay(row.attempts(), retry.initialDelay(), retry.maxDelay()));
                 parked.toRetry(c, shard, row, attempts, BatchClassifier.dueAt(due, r.notBefore(), now),
                         r.error().toString());
-                metrics.failed(row.topic(), "retry");
+                telemetry.retried(row.topic());
                 pass.toRetry = true;
                 return;
             } else if (outcome instanceof Outcome.NotAttempted n) { // attempts and requeues stay
@@ -1249,7 +1243,7 @@ public final class ShardProcessor implements AutoCloseable {
             throws SQLException {
         retries.deadFromRetry(c, row, attempts, error);
         pass.deadLettered = true;
-        metrics.failed(row.topic(), "dead");
+        telemetry.deadLettered(row.topic());
         logDead(row, attempts, error != null ? error : "maxAttempts reached");
     }
 
@@ -1257,7 +1251,7 @@ public final class ShardProcessor implements AutoCloseable {
             throws SQLException {
         parked.toDead(c, row, attempts, error);
         pass.deadLettered = true;
-        metrics.failed(row.topic(), "dead");
+        telemetry.deadLettered(row.topic());
         logDead(row, attempts, error);
     }
 
@@ -1321,7 +1315,7 @@ public final class ShardProcessor implements AutoCloseable {
         int delivered = 0;
         for (var item : items) {
             if (item.outcome() instanceof Outcome.Delivered) {
-                metrics.delivered(item.record().topic(), delay(item.record(), now));
+                telemetry.delivered(item.record().topic(), delay(item.record(), now));
                 delivered++;
             }
         }
@@ -1329,14 +1323,14 @@ public final class ShardProcessor implements AutoCloseable {
         int heads = 0;
         for (var action : actions) {
             if (action instanceof Head h) {
-                metrics.failed(h.r().topic(), "retry");
+                telemetry.retried(h.r().topic());
                 firstHead = firstHead == null ? h : firstHead;
                 heads++;
             } else if (action instanceof Dead d) {
-                metrics.failed(d.r().topic(), "dead");
+                telemetry.deadLettered(d.r().topic());
                 logDead(d.r(), d.attempts(), d.error());
             } else if (action instanceof Park p) {
-                metrics.requeued(p.r().topic());
+                telemetry.requeued(p.r().topic());
             }
         }
         if (firstHead != null) {
@@ -1347,47 +1341,21 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /**
-     * Runs {@code handleBatch} on a handler thread, bounded by {@code batchTimeout} (see {@link #callHandler}). With a
-     * tracer each record gets a delivery span, parented by its stored trace, and reaches the handler carrying that
-     * span's trace headers; the stored record keeps its own.
+     * Runs {@code handleBatch} on a handler thread, bounded by {@code batchTimeout} (see {@link #callHandler}), as one
+     * delivery of the telemetry: it may hand the records with other trace headers (the stored records keep their
+     * own) and gives each one its scope on the handler thread.
      */
     private List<Outcome> deliver(List<OutboxRecord> records, Instant now) throws InterruptedException {
-        var spans = tracer == null ? null : new Span[records.size()];
-        var handed = records;
-        if (spans != null) {
-            handed = new ArrayList<>(records.size());
-            for (int i = 0; i < records.size(); i++) {
-                var r = records.get(i);
-                spans[i] = tracer.spanBuilder("outbox deliver " + r.topic())
-                        .setSpanKind(SpanKind.PRODUCER)
-                        .setParent(OutboxTracing.extract(r.headers()))
-                        .setAttribute("messaging.destination.name", r.topic())
-                        .setAttribute("outbox.message_id", r.messageId().toString())
-                        .setAttribute("outbox.attempt", r.attempts() + 1L)
-                        .setAttribute("outbox.delay_ms", delay(r, now).toMillis())
-                        .startSpan();
-                var ctx = io.opentelemetry.context.Context.root().with(spans[i]);
-                handed.add(r.withHeaders(OutboxTracing.replaceTraceHeaders(r.headers(), ctx)));
-            }
-        }
+        var delivery = telemetry.deliveryStarted(records, now);
+        var handed = delivery.handed(records);
         List<Outcome> outcomes;
         try {
-            outcomes = callHandler(handed);
+            outcomes = callHandler(handed, delivery);
         } catch (Throwable t) { // interrupted, or the processor is closed: the caller rolls back
-            if (spans != null) {
-                for (var span : spans) {
-                    span.recordException(t);
-                    span.setStatus(StatusCode.ERROR);
-                    span.end();
-                }
-            }
+            delivery.failed(t);
             throw t;
         }
-        if (spans != null) {
-            for (int i = 0; i < spans.length; i++) {
-                end(spans[i], outcomes.get(i));
-            }
-        }
+        delivery.finished(outcomes);
         return outcomes;
     }
 
@@ -1398,15 +1366,18 @@ public final class ShardProcessor implements AutoCloseable {
      * {@code batchTimeout} is cancelled: nothing is known about any of its records, each a transient failure. A call
      * that finds no free handler thread does not run: each record {@link #BUSY}.
      */
-    private List<Outcome> callHandler(List<OutboxRecord> records) throws InterruptedException {
+    private List<Outcome> callHandler(List<OutboxRecord> records, OutboxTelemetry.Delivery delivery)
+            throws InterruptedException {
         var readOnly = Collections.unmodifiableList(records);
         var task = new HandlerCall(() -> {
             try {
-                var outcomes = handler.handleBatch(readOnly);
-                // read here, inside the deadline: a lazy view runs handler code; nulls are checked on return
-                return outcomes == null ? null : Arrays.asList(outcomes.toArray(new Outcome[0]));
+                return RecordScope.bound(delivery, () -> {
+                    var outcomes = handler.handleBatch(readOnly);
+                    // read here, inside the deadline: a lazy view runs handler code; nulls are checked on return
+                    return outcomes == null ? null : Arrays.asList(outcomes.toArray(new Outcome[0]));
+                });
             } finally {
-                ru.tinkoff.kora.common.Context.clear(); // nothing leaks into the next batch on this thread
+                telemetry.releaseThread(); // nothing leaks into the next batch on this thread
             }
         });
         Future<List<Outcome>> call;
@@ -1592,30 +1563,6 @@ public final class ShardProcessor implements AutoCloseable {
                 thread.interrupt();
             }
         }
-    }
-
-    private static void end(Span span, Outcome outcome) {
-        Throwable error = null;
-        String name;
-        if (outcome instanceof Outcome.Retry r) {
-            name = "retry";
-            error = r.error();
-        } else if (outcome instanceof Outcome.Permanent p) {
-            name = "permanent";
-            error = p.error();
-        } else if (outcome instanceof Outcome.NotAttempted) {
-            name = "not_attempted";
-        } else if (outcome instanceof Outcome.Requeue) {
-            name = "requeued";
-        } else {
-            name = "delivered";
-        }
-        span.setAttribute("outbox.outcome", name);
-        if (error != null) {
-            span.recordException(error);
-            span.setStatus(StatusCode.ERROR);
-        }
-        span.end();
     }
 
     private static void logDead(OutboxRecord r, int attempts, String error) {

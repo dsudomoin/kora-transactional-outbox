@@ -18,10 +18,12 @@ import io.github.dsudomoin.outbox.OutboxStatus.DeadLetterCount;
 import io.github.dsudomoin.outbox.OutboxStatus.Orphan;
 import io.github.dsudomoin.outbox.OutboxStatus.OrphanKind;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import jakarta.annotation.Nullable;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -331,7 +333,7 @@ class OutboxAdminIT {
     void aLetterWhoseKeyIsHeldIsSkippedWithoutWaiting() throws Exception {
         long busy = letter("t", "busy");
         long free = letter("t", "free");
-        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
+        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
         UUID live;
         try (var business = TestDb.connect()) {
             business.setAutoCommit(false); // a business transaction that sent the key and goes on working

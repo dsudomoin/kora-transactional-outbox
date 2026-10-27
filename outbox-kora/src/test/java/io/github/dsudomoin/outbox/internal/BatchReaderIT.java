@@ -12,6 +12,7 @@ import io.github.dsudomoin.outbox.internal.BatchReader.BatchRow;
 import io.github.dsudomoin.outbox.internal.BatchReader.ShardRead;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -583,7 +584,7 @@ class BatchReaderIT {
         schema.init();
         names = schema.names();
         ticks = new Ticks(names, config.shards());
-        outbox = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
+        outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
         reader = new BatchReader(names);
     }
 

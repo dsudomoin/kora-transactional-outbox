@@ -1,5 +1,7 @@
-package io.github.dsudomoin.outbox.internal;
+package io.github.dsudomoin.outbox.micrometer;
 
+import io.github.dsudomoin.outbox.OutboxGauge;
+import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -8,10 +10,13 @@ import jakarta.annotation.Nullable;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Supplier;
+import java.util.function.DoubleSupplier;
 
-/** Micrometer facade; every method is a no-op without a registry. */
-public final class OutboxMetrics {
+/**
+ * The outbox's meters on a Micrometer {@link MeterRegistry} ({@code outbox.*}); every method is a no-op without a
+ * registry. Events and gauges only: traces need an implementation of the enqueue and delivery hooks on top.
+ */
+public final class OutboxMetrics implements OutboxTelemetry {
 
     @Nullable
     private final MeterRegistry registry;
@@ -22,12 +27,14 @@ public final class OutboxMetrics {
         this.registry = registry;
     }
 
+    @Override
     public void enqueued(String topic) {
         if (registry != null) {
             meters(topic).enqueued.increment();
         }
     }
 
+    @Override
     public void delivered(String topic, Duration delay) {
         if (registry != null) {
             var m = meters(topic);
@@ -36,64 +43,67 @@ public final class OutboxMetrics {
         }
     }
 
-    /** {@code outcome} is {@code retry} or {@code dead}. */
-    public void failed(String topic, String outcome) {
+    @Override
+    public void retried(String topic) {
         if (registry != null) {
-            switch (outcome) {
-                case "retry" -> meters(topic).failedRetry.increment();
-                case "dead" -> meters(topic).failedDead.increment();
-                default -> registry.counter("outbox.messages.failed", "topic", topic, "outcome", outcome).increment();
-            }
+            meters(topic).failedRetry.increment();
         }
     }
 
-    /** A record set aside with {@code Outcome.requeue()} and parked. */
+    @Override
+    public void deadLettered(String topic) {
+        if (registry != null) {
+            meters(topic).failedDead.increment();
+        }
+    }
+
+    @Override
     public void requeued(String topic) {
         if (registry != null) {
             meters(topic).requeued.increment();
         }
     }
 
-    public void batch(Duration duration) {
+    @Override
+    public void stepFinished(Duration duration) {
         if (registry != null) {
             Timer.builder("outbox.batch.duration").publishPercentileHistogram().register(registry).record(duration);
         }
     }
 
+    @Override
     public void shardPaused() {
         if (registry != null) {
             registry.counter("outbox.shard.paused").increment();
         }
     }
 
+    @Override
     public void inboxOutsideWindow() {
         if (registry != null) {
             registry.counter("outbox.inbox.outside_window").increment();
         }
     }
 
-    /** {@code decision} is {@code keep}, {@code discard}, {@code redrive} or {@code redrive_at}. */
-    public void deadDecision(String decision) {
+    @Override
+    public void deadLetterDecision(String decision) {
         if (registry != null) {
             registry.counter("outbox.dead.decisions", "decision", decision).increment();
         }
     }
 
-    public void deadHookFailure() {
+    @Override
+    public void deadLetterHookFailed() {
         if (registry != null) {
             registry.counter("outbox.dead.hook.failures").increment();
         }
     }
 
-    /**
-     * Registers the gauge once; later calls with the same name keep the first supplier. Names: {@code
-     * outbox.shard.lag}, {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.dead.pending},
-     * {@code outbox.dead.pending.oldest}, {@code outbox.parked.size}, {@code outbox.partitions.premade},
-     * {@code outbox.partitions.overflow}.
-     */
-    public void gauge(String name, Supplier<Number> value) {
+    /** Registers the gauge under {@link OutboxGauge#metricName()} once; later calls keep the first supplier. */
+    @Override
+    public void gauge(OutboxGauge gauge, DoubleSupplier value) {
         if (registry != null) {
-            Gauge.builder(name, value).register(registry);
+            Gauge.builder(gauge.metricName(), value::getAsDouble).register(registry);
         }
     }
 

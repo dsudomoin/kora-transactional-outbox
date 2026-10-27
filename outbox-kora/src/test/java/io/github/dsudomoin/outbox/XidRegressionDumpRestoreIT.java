@@ -7,14 +7,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Maintenance;
-import io.github.dsudomoin.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.XidRecovery;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -91,7 +92,7 @@ class XidRegressionDumpRestoreIT {
         var handlerA = new RecordingHandler();
         var relayA = relay(dbA, schemaA, handlerA);
         relayA.init();
-        var outboxA = new PgOutbox(dbA, schemaA, config.shards(), relayA::wake, new OutboxMetrics(null));
+        var outboxA = new PgOutbox(dbA, schemaA, config.shards(), relayA::wake, TestTelemetry.kora());
         var first = send(dbA, outboxA, "first", 1000);
         await(Duration.ofSeconds(10), () -> deliveries(handlerA).keySet().containsAll(first));
         relayA.release();
@@ -222,7 +223,7 @@ class XidRegressionDumpRestoreIT {
 
     private OutboxRelay relay(JdbcDatabase db, OutboxSchema schema, OutboxHandler handler) {
         var maintenance = new Maintenance(db, schema.names(), config, new OutboxMetrics(null));
-        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance,
+        var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(), maintenance,
                 new DeadLetterPass(db, schema.names(), config, null, new OutboxMetrics(null)));
         relays.add(relay);
         return relay;

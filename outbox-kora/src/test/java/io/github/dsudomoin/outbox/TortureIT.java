@@ -10,15 +10,16 @@ import io.github.dsudomoin.outbox.internal.Cursors;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Hashing;
 import io.github.dsudomoin.outbox.internal.Maintenance;
-import io.github.dsudomoin.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
-import io.github.dsudomoin.outbox.internal.PartitionDdl;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
+import io.github.dsudomoin.outbox.internal.PartitionDdl;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.Ticks;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -137,7 +138,7 @@ class TortureIT {
         Set<UUID> committed = ConcurrentHashMap.newKeySet();
         Set<UUID> rolledBack = ConcurrentHashMap.newKeySet();
         var holdsXid = new CompletableFuture<Long>();
-        var silent = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
+        var silent = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
         var longTransaction = CompletableFuture.runAsync(
                 () -> longTransaction(silent, longKeys, holdsXid, commitOrder, counter, committed), threads);
         long xidTaken = holdsXid.get(10, TimeUnit.SECONDS); // older than every write
@@ -146,7 +147,7 @@ class TortureIT {
         }
 
         for (int i = 0; i < 3; i++) {
-            var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null,
+            var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(),
                     new Maintenance(db, names, config, new OutboxMetrics(null)),
                     new DeadLetterPass(db, names, config, hook, new OutboxMetrics(null)));
             relays.add(relay);
@@ -156,7 +157,7 @@ class TortureIT {
         var writers = new ArrayList<CompletableFuture<Void>>();
         for (int w = 0; w < WRITERS; w++) {
             var outbox = new PgOutbox(db, schema, config.shards(), relays.get(w % relays.size())::wake,
-                    new OutboxMetrics(null));
+                    TestTelemetry.kora());
             var random = new SplittableRandom(seed + w);
             int writer = w;
             writers.add(CompletableFuture.runAsync(() -> {

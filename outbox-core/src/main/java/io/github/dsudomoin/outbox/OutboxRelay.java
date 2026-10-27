@@ -7,13 +7,11 @@ import io.github.dsudomoin.outbox.internal.Cursors.Position;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Heartbeat;
 import io.github.dsudomoin.outbox.internal.Maintenance;
-import io.github.dsudomoin.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.ShardProcessor;
 import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardResult;
 import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardStatus;
 import io.github.dsudomoin.outbox.internal.Ticks;
-import io.opentelemetry.api.trace.Tracer;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -157,7 +155,7 @@ public final class OutboxRelay implements Lifecycle {
      * fate of the dead letters.
      */
     public OutboxRelay(JdbcConnectionFactory db, OutboxConfig config, OutboxSchema schema, OutboxHandler handler,
-            OutboxMetrics metrics, @Nullable Tracer tracer, Maintenance maintenance, DeadLetterPass deadLetters) {
+            OutboxTelemetry telemetry, Maintenance maintenance, DeadLetterPass deadLetters) {
         OutboxSchema.validate(config);
         this.db = db;
         this.config = config;
@@ -166,7 +164,7 @@ public final class OutboxRelay implements Lifecycle {
         this.ticks = new Ticks(schema.names(), config.shards());
         this.cursors = new Cursors(schema.names(), config.shards());
         this.deadLetters = deadLetters;
-        this.processor = new ShardProcessor(schema.names(), config, handler, metrics, tracer, deadLetters.active());
+        this.processor = new ShardProcessor(schema.names(), config, handler, telemetry, deadLetters.active());
         // the pass runs only where the relay does
         this.heartbeat = new Heartbeat(db, schema, config, relay.enabled() && deadLetters.active());
         this.idleNanos = relay.idlePollInterval().toNanos();

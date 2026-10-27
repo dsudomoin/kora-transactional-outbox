@@ -5,6 +5,7 @@ plugins {
 // java-library, publishing and shared dependencies are configured by the root build.
 dependencies {
     api(project(":outbox-core"))
+    api(project(":outbox-micrometer"))
     api("ru.tinkoff.kora:database-jdbc")
     api("ru.tinkoff.kora:config-common")
     api("ru.tinkoff.kora:opentelemetry-common")

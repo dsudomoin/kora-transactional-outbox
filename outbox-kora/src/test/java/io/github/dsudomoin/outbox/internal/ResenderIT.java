@@ -9,6 +9,7 @@ import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
@@ -98,7 +99,7 @@ class ResenderIT {
 
     @Test
     void waitsForAConcurrentSendOfTheSameKey() throws Exception {
-        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
+        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
         var sent = new CountDownLatch(1);
         var commit = new CountDownLatch(1);
         var a = pool.submit(() -> db.inTx((SqlFunction0<UUID>) () -> {

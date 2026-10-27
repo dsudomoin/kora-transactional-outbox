@@ -2,6 +2,8 @@ package io.github.dsudomoin.outbox.internal;
 
 import io.github.dsudomoin.outbox.Inbox;
 import io.github.dsudomoin.outbox.OutboxConfig;
+import io.github.dsudomoin.outbox.OutboxGauge;
+import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.internal.InboxPartitions.Window;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
@@ -57,7 +59,7 @@ public final class PgInbox implements Inbox, Lifecycle {
 
     private final JdbcConnectionFactory db;
     private final OutboxConfig config;
-    private final OutboxMetrics metrics;
+    private final OutboxTelemetry telemetry;
     private final TableNames names;
     private final InboxPartitions partitions;
     private final String insert;
@@ -70,10 +72,10 @@ public final class PgInbox implements Inbox, Lifecycle {
     @Nullable
     private volatile ScheduledExecutorService scheduler;
 
-    public PgInbox(JdbcConnectionFactory db, OutboxConfig config, OutboxMetrics metrics) {
+    public PgInbox(JdbcConnectionFactory db, OutboxConfig config, OutboxTelemetry telemetry) {
         this.db = db;
         this.config = config;
-        this.metrics = metrics;
+        this.telemetry = telemetry;
         this.names = TableNames.of(config.inbox().table());
         this.partitions = new InboxPartitions(names.base(), config);
         this.insert = "insert into " + names.base() + " (message_id, consumer) values (?, ?)"
@@ -82,8 +84,8 @@ public final class PgInbox implements Inbox, Lifecycle {
         this.insertAll = "insert into " + names.base() + " (message_id, consumer) select u.id, ?"
                 + " from unnest(?::uuid[]) with ordinality u(id, ord) order by u.ord"
                 + " on conflict (message_id, consumer) do nothing returning message_id";
-        metrics.gauge("outbox.inbox.maintenance.transaction_pooling", () -> transactionPooling);
-        metrics.gauge("outbox.inbox.partitions.orphaned", () -> orphaned);
+        telemetry.gauge(OutboxGauge.INBOX_MAINTENANCE_TRANSACTION_POOLING, () -> transactionPooling);
+        telemetry.gauge(OutboxGauge.INBOX_PARTITIONS_ORPHANED, () -> orphaned);
     }
 
     @Override
@@ -421,7 +423,7 @@ public final class PgInbox implements Inbox, Lifecycle {
     }
 
     private void acceptedOutside(UUID id) {
-        metrics.inboxOutsideWindow();
+        telemetry.inboxOutsideWindow();
         long now = System.nanoTime();
         long last = lastWarn.get();
         if (now - last >= WARN_INTERVAL && lastWarn.compareAndSet(last, now)) {

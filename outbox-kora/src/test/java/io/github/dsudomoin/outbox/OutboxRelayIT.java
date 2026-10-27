@@ -7,21 +7,23 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import io.github.dsudomoin.outbox.internal.Cursors;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
+import io.github.dsudomoin.outbox.internal.Cursors;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Hashing;
 import io.github.dsudomoin.outbox.internal.Maintenance;
-import io.github.dsudomoin.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.ShardProcessor;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.Ticks;
+import io.github.dsudomoin.outbox.kora.KoraOutboxTelemetry;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.api.trace.TracerProvider;
 import java.lang.management.ManagementFactory;
@@ -60,8 +62,8 @@ import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
+import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 
 class OutboxRelayIT {
 
@@ -217,7 +219,7 @@ class OutboxRelayIT {
     void maintenanceRunsRightAfterStartOnlyWhenEnabled() throws Exception {
         bootstrap(); // maintenanceInterval is 1 h
         var runs = new AtomicInteger();
-        relays.add(new OutboxRelay(db, config, schema, new RecordingHandler(), new OutboxMetrics(null), null,
+        relays.add(new OutboxRelay(db, config, schema, new RecordingHandler(), TestTelemetry.kora(),
                 maintenance(observed(sql -> {
                     if (sql.contains("pg_try_advisory_lock(")) { // a maintenance run
                         runs.incrementAndGet();
@@ -228,7 +230,7 @@ class OutboxRelayIT {
 
         config.relayEnabled(false);
         var disabled = new AtomicInteger();
-        relays.add(new OutboxRelay(db, config, schema, new RecordingHandler(), new OutboxMetrics(null), null,
+        relays.add(new OutboxRelay(db, config, schema, new RecordingHandler(), TestTelemetry.kora(),
                 maintenance(observed(sql -> disabled.incrementAndGet())), noHook(db)));
         relays.get(1).init();
         relays.get(1).release();
@@ -264,7 +266,7 @@ class OutboxRelayIT {
             }
         };
         try (var err = new CapturedStderr()) {
-            relays.add(new OutboxRelay(db, config, schema, new RecordingHandler(), new OutboxMetrics(null), null,
+            relays.add(new OutboxRelay(db, config, schema, new RecordingHandler(), TestTelemetry.kora(),
                     maintenance(failing), noHook(db)));
             relays.get(0).init();
 
@@ -574,7 +576,8 @@ class OutboxRelayIT {
             }
             Thread.sleep(20);
         };
-        var relay = new OutboxRelay(factory, config, schema, slow, metrics, null, maintenance(db),
+        var relay = new OutboxRelay(factory, config, schema, slow, new KoraOutboxTelemetry(metrics, null),
+                maintenance(db),
                 new DeadLetterPass(factory, schema.names(), config, letters -> {
                     entered.countDown();
                     done.await(); // until the call is cut
@@ -931,7 +934,7 @@ class OutboxRelayIT {
         send(outbox(() -> {}), msg("boom", keyOnShard(0, "boom", "x"), "boom")); // every step of shard 0 fails
         var handler = new RecordingHandler();
         try (var err = new CapturedStderr()) {
-            var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), failing, maintenance(db),
+            var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(null, failing), maintenance(db),
                     noHook(db));
             relays.add(relay);
             relay.init();
@@ -1589,8 +1592,8 @@ class OutboxRelayIT {
     void aWorkerTickBelowTheNewestXmaxHaltsTheRelayBeforeMaintenanceRuns() throws Exception {
         bootstrap(); // maintenance runs at start, then not for an hour
         var maintenance = maintenance(db);
-        var relay = new OutboxRelay(db, config, schema, new RecordingHandler(), new OutboxMetrics(null), null,
-                maintenance, noHook(db));
+        var relay = new OutboxRelay(db, config, schema, new RecordingHandler(), TestTelemetry.kora(), maintenance,
+                noHook(db));
         relays.add(relay);
         relay.init();
         awaitParked();
@@ -1631,7 +1634,7 @@ class OutboxRelayIT {
         }
         var maintenance = maintenance(db);
         var handler = new RecordingHandler();
-        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance,
+        var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(), maintenance,
                 noHook(db));
         relays.add(relay);
         relay.init();
@@ -1981,7 +1984,7 @@ class OutboxRelayIT {
     }
 
     private OutboxRelay relay(JdbcConnectionFactory factory, OutboxHandler handler) {
-        var relay = new OutboxRelay(factory, config, schema, handler, new OutboxMetrics(null), null, maintenance(db),
+        var relay = new OutboxRelay(factory, config, schema, handler, TestTelemetry.kora(), maintenance(db),
                 noHook(factory));
         relays.add(relay);
         return relay;
@@ -2031,7 +2034,8 @@ class OutboxRelayIT {
 
     private OutboxRelay relay(OutboxHandler handler, OutboxDeadLetterHandler hook) {
         var metrics = new OutboxMetrics(null);
-        var relay = new OutboxRelay(db, config, schema, handler, metrics, null, maintenance(db),
+        var relay = new OutboxRelay(db, config, schema, handler, new KoraOutboxTelemetry(metrics, null),
+                maintenance(db),
                 new DeadLetterPass(db, schema.names(), config, hook, metrics));
         relays.add(relay);
         return relay;
@@ -2218,7 +2222,7 @@ class OutboxRelayIT {
     }
 
     private PgOutbox outbox(Runnable wake) {
-        return new PgOutbox(db, schema, config.shards(), wake, new OutboxMetrics(null));
+        return new PgOutbox(db, schema, config.shards(), wake, TestTelemetry.kora());
     }
 
     /**

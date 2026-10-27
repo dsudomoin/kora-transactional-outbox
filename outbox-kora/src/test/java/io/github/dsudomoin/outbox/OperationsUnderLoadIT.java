@@ -10,20 +10,21 @@ import io.github.dsudomoin.outbox.internal.Cursors;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.internal.OrphanRestore;
-import io.github.dsudomoin.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
-import io.github.dsudomoin.outbox.internal.PartitionDdl;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
+import io.github.dsudomoin.outbox.internal.PartitionDdl;
 import io.github.dsudomoin.outbox.internal.PgInbox;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.PgOutboxAdmin;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.internal.Ticks;
 import io.github.dsudomoin.outbox.internal.UuidV7;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
@@ -446,9 +447,9 @@ class OperationsUnderLoadIT {
         schema.init();
         names = schema.names();
         maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
-        relay = new OutboxRelay(db, config, schema, recording, new OutboxMetrics(null), null, maintenance,
+        relay = new OutboxRelay(db, config, schema, recording, TestTelemetry.kora(), maintenance,
                 new DeadLetterPass(db, names, config, null, new OutboxMetrics(null)));
-        outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new OutboxMetrics(null));
+        outbox = new PgOutbox(db, schema, config.shards(), relay::wake, TestTelemetry.kora());
         relay.init();
         for (int i = 0; i < WRITERS; i++) {
             run("writer-" + i, () -> {

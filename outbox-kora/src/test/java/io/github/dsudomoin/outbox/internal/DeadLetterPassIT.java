@@ -16,11 +16,13 @@ import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRelay;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import jakarta.annotation.Nullable;
 import java.lang.reflect.InvocationTargetException;
@@ -51,8 +53,8 @@ import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
-import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
+import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 class DeadLetterPassIT {
@@ -736,7 +738,7 @@ class DeadLetterPassIT {
 
     /** A transaction that has sent {@code payload} with {@code key} on topic t and stays open until {@code commit}. */
     private Future<UUID> openSend(String key, String payload, CountDownLatch commit) throws Exception {
-        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
+        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
         var sent = new CountDownLatch(1);
         var sender = pool.submit(() -> db.inTx((SqlFunction0<UUID>) () -> {
             var messageId = outbox.send(OutboxMessage.of("t", key, bytes(payload)));
@@ -820,7 +822,7 @@ class DeadLetterPassIT {
     }
 
     private OutboxRelay relay(RecordingHandler handler) {
-        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null,
+        var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(),
                 new Maintenance(db, names, config, new OutboxMetrics(null)), pass(null));
         relays.add(relay);
         return relay;

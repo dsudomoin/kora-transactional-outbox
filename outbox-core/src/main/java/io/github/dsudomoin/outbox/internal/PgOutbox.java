@@ -1,8 +1,8 @@
 package io.github.dsudomoin.outbox.internal;
 
 import io.github.dsudomoin.outbox.Outbox;
-import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
+import io.github.dsudomoin.outbox.OutboxTelemetry;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -28,7 +28,7 @@ public final class PgOutbox implements Outbox {
     private final JdbcConnectionFactory db;
     private final int keyNamespace;
     private final int shards;
-    private final OutboxMetrics metrics;
+    private final OutboxTelemetry telemetry;
     private final ConnectionContext.PostCommitAction wakeUpHook;
     private final String insertKeyed;
     private final String insertUnkeyed;
@@ -36,13 +36,13 @@ public final class PgOutbox implements Outbox {
     private final TableNames names;
     private final ShardGuard guard;
 
-    public PgOutbox(
-            JdbcConnectionFactory db, OutboxSchema schema, int shards, Runnable wakeUpRelay, OutboxMetrics metrics) {
+    public PgOutbox(JdbcConnectionFactory db, OutboxSchema schema, int shards, Runnable wakeUpRelay,
+            OutboxTelemetry telemetry) {
         OutboxSchema.validateShards(shards);
         this.db = db;
         this.keyNamespace = schema.names().keyNamespace();
         this.shards = shards;
-        this.metrics = metrics;
+        this.telemetry = telemetry;
         this.wakeUpHook = c -> {
             try {
                 wakeUpRelay.run();
@@ -85,29 +85,37 @@ public final class PgOutbox implements Outbox {
         if (n == 0) {
             return List.of();
         }
-        var trace = OutboxTracing.currentHeaders();
+        var enqueue = telemetry.enqueueStarted();
         var ids = new UUID[n];
-        var rows = new ArrayList<Resender.Row>(n);
-        for (int i = 0; i < n; i++) {
-            var m = messages.get(i);
-            ids[i] = UuidV7.next();
-            rows.add(new Resender.Row(
-                    ids[i], m.topic(), m.key(), m.payload(), HeaderCodec.encode(withTrace(m.headers(), trace))));
-        }
         try {
-            resender.insertAll(ctx.connection(), rows);
-        } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            var rows = new ArrayList<Resender.Row>(n);
+            for (int i = 0; i < n; i++) {
+                var m = messages.get(i);
+                ids[i] = UuidV7.next();
+                rows.add(new Resender.Row(
+                        ids[i], m.topic(), m.key(), m.payload(), HeaderCodec.encode(enqueue.headers(m.headers()))));
+            }
+            try {
+                resender.insertAll(ctx.connection(), rows);
+            } catch (SQLException e) {
+                throw new RuntimeSqlException(e);
+            }
+        } catch (RuntimeException | Error e) {
+            enqueue.failed(e);
+            throw e;
         }
         for (var m : messages) {
-            metrics.enqueued(m.topic());
+            telemetry.enqueued(m.topic());
         }
+        enqueue.finished();
         wakeUpAfterCommit(ctx);
         return List.of(ids);
     }
 
+    /** One message, one enqueue of the telemetry. */
     private UUID insert(Connection c, OutboxMessage m) {
         guard.require(names, shards);
+        var enqueue = telemetry.enqueueStarted();
         var id = UuidV7.next();
         boolean keyed = m.key() != null;
         int hash = keyed ? Hashing.keyHash(m.topic(), m.key()) : 0;
@@ -117,33 +125,23 @@ public final class PgOutbox implements Outbox {
             ps.setString(3, m.topic());
             ps.setBytes(4, m.key());
             ps.setBytes(5, m.payload());
-            ps.setBytes(6, HeaderCodec.encode(withTrace(m.headers(), OutboxTracing.currentHeaders())));
+            ps.setBytes(6, HeaderCodec.encode(enqueue.headers(m.headers())));
             if (keyed) {
                 ps.setInt(7, keyNamespace);
                 ps.setInt(8, hash);
             }
             ps.executeUpdate();
         } catch (SQLException e) {
-            throw new RuntimeSqlException(e);
+            var error = new RuntimeSqlException(e);
+            enqueue.failed(error);
+            throw error;
+        } catch (RuntimeException | Error e) {
+            enqueue.failed(e);
+            throw e;
         }
-        metrics.enqueued(m.topic());
+        telemetry.enqueued(m.topic());
+        enqueue.finished();
         return id;
-    }
-
-    /** Message headers plus the current trace, unless the message already carries a traceparent. */
-    private static List<OutboxHeader> withTrace(List<OutboxHeader> headers, List<OutboxHeader> trace) {
-        if (trace.isEmpty()) {
-            return headers;
-        }
-        for (var h : headers) {
-            if (h.name().equals(OutboxTracing.TRACEPARENT)) {
-                return headers;
-            }
-        }
-        var all = new ArrayList<OutboxHeader>(headers.size() + trace.size());
-        all.addAll(headers);
-        all.addAll(trace);
-        return all;
     }
 
     private ConnectionContext currentTransaction() {

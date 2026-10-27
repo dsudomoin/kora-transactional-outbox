@@ -8,10 +8,11 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Maintenance;
-import io.github.dsudomoin.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.kafka.kora.KafkaOutboxModule;
+import io.github.dsudomoin.outbox.kora.KoraOutboxTelemetry;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import java.time.Duration;
@@ -112,11 +113,11 @@ class KafkaDeadLetterIT {
         var hook = module.kafkaDeadLetterHandler(kafka, sender, config);
         schema = new OutboxSchema(db, config);
         schema.init();
-        relay = new OutboxRelay(db, config, schema, sender.handler(), metrics, null,
+        relay = new OutboxRelay(db, config, schema, sender.handler(), new KoraOutboxTelemetry(metrics, null),
                 new Maintenance(db, schema.names(), config, metrics),
                 new DeadLetterPass(db, schema.names(), config, hook, metrics));
         relay.init();
-        outbox = new PgOutbox(db, schema, config.shards(), relay::wake, metrics);
+        outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new KoraOutboxTelemetry(metrics, null));
     }
 
     private long deadRows(UUID messageId) throws Exception {

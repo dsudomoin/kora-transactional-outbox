@@ -6,15 +6,16 @@ import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Attachment;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
@@ -669,7 +670,7 @@ class XidPartitionsIT {
         var partitions = new XidPartitions(names, config.partitions());
         var handler = new RecordingHandler();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null));
-        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance,
+        var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(), maintenance,
                 new DeadLetterPass(db, schema.names(), config, null, new OutboxMetrics(null)));
 
         try (var c = TestDb.connect()) {

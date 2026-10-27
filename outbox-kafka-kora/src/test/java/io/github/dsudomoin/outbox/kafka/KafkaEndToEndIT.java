@@ -12,9 +12,10 @@ import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.Maintenance;
-import io.github.dsudomoin.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
+import io.github.dsudomoin.outbox.kora.KoraOutboxTelemetry;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTracing;
@@ -269,11 +270,11 @@ class KafkaEndToEndIT {
     private void start(OutboxHandler handler, @Nullable Tracer tracer) throws Exception {
         schema = new OutboxSchema(db, config);
         schema.init();
-        relay = new OutboxRelay(db, config, schema, handler, metrics, tracer,
+        relay = new OutboxRelay(db, config, schema, handler, new KoraOutboxTelemetry(metrics, tracer),
                 new Maintenance(db, schema.names(), config, metrics),
                 new DeadLetterPass(db, schema.names(), config, null, metrics));
         relay.init();
-        outbox = new PgOutbox(db, schema, config.shards(), relay::wake, metrics);
+        outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new KoraOutboxTelemetry(metrics, null));
     }
 
     private UUID send(OutboxMessage message) {

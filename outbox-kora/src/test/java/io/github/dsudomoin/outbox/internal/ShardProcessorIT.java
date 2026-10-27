@@ -18,10 +18,12 @@ import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardResult;
+import io.github.dsudomoin.outbox.kora.OutboxTracing;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.github.dsudomoin.outbox.testing.TestTracing;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.opentelemetry.api.common.AttributeKey;
@@ -1845,7 +1847,7 @@ class ShardProcessorIT {
                     // a handler that ignores cancellation keeps its thread
                 }
             }
-        }, new OutboxMetrics(null), null, false);
+        }, TestTelemetry.kora(), false);
         try {
             send(msg("t", "a", "a#1"));
             tick();
@@ -1905,7 +1907,7 @@ class ShardProcessorIT {
                     // a handler that ignores cancellation keeps its thread
                 }
             }
-        }, new OutboxMetrics(null), null, false);
+        }, TestTelemetry.kora(), false);
         try {
             send(msg("t", "a", "a#1"), msg("t", "b", "b#1"));
             tick();
@@ -2791,7 +2793,7 @@ class ShardProcessorIT {
             var invalid = new TestOutboxConfig();
             cases.get(i).accept(invalid);
             assertThatThrownBy(() -> new ShardProcessor(TableNames.of("outbox"), invalid, handler,
-                    new OutboxMetrics(null), null, false))
+                    TestTelemetry.kora(), false))
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageStartingWith(keys.get(i) + " ");
         }
@@ -3347,7 +3349,7 @@ class ShardProcessorIT {
         names = schema.names();
         ticks = new Ticks(names, config.shards());
         cursors = new Cursors(names, config.shards());
-        outbox = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
+        outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
         var scripted = new OutboxHandler() {
             @Override
             public void handle(OutboxRecord record) throws Exception {
@@ -3361,7 +3363,7 @@ class ShardProcessorIT {
                 return s == null ? handler.handleBatch(records) : s.apply(records);
             }
         };
-        processor = new ShardProcessor(names, config, scripted, new OutboxMetrics(meters), tracer, false);
+        processor = new ShardProcessor(names, config, scripted, TestTelemetry.kora(meters, tracer), false);
     }
 
     /** One worker {@code tryProcess} of shard 0 at the test clock in its own transaction, rolled back on failure. */

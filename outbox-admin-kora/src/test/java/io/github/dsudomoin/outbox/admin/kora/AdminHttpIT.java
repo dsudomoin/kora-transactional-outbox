@@ -12,23 +12,23 @@ import io.github.dsudomoin.outbox.DeadLetter;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.internal.HeaderCodec;
-import io.github.dsudomoin.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.TableNames;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestSql;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.ServerSocket;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
 import java.net.http.HttpRequest.BodyPublishers;
-import java.net.http.HttpResponse;
+import java.net.http.HttpRequest;
 import java.net.http.HttpResponse.BodyHandlers;
+import java.net.http.HttpResponse;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -338,7 +338,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         assertJson(none, 409);
         assertThat(none.body()).startsWith("{\"message\":\"no xid regression to recover");
 
-        var outbox = new PgOutbox(db, schema, 2, () -> {}, new OutboxMetrics(null));
+        var outbox = new PgOutbox(db, schema, 2, () -> {}, TestTelemetry.kora());
         var sent = db.inTx((SqlFunction0<List<UUID>>) () -> outbox.sendAll(List.of(
                 OutboxMessage.of("t", "a", bytes("1")), OutboxMessage.of("t", "b", bytes("2")),
                 OutboxMessage.of("t", "c", bytes("3")))));

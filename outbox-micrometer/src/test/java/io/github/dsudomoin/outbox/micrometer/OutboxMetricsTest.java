@@ -1,8 +1,9 @@
-package io.github.dsudomoin.outbox.internal;
+package io.github.dsudomoin.outbox.micrometer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 
+import io.github.dsudomoin.outbox.OutboxGauge;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.cumulative.CumulativeTimer;
@@ -26,14 +27,14 @@ class OutboxMetricsTest {
         assertThatCode(() -> {
             noop.enqueued("orders");
             noop.delivered("orders", Duration.ofMillis(5));
-            noop.failed("orders", "retry");
+            noop.retried("orders");
             noop.requeued("orders");
-            noop.batch(Duration.ofMillis(5));
+            noop.stepFinished(Duration.ofMillis(5));
             noop.shardPaused();
             noop.inboxOutsideWindow();
-            noop.deadDecision("keep");
-            noop.deadHookFailure();
-            noop.gauge("outbox.retry.size", () -> 1);
+            noop.deadLetterDecision("keep");
+            noop.deadLetterHookFailed();
+            noop.gauge(OutboxGauge.RETRY_SIZE, () -> 1);
         }).doesNotThrowAnyException();
     }
 
@@ -86,14 +87,14 @@ class OutboxMetricsTest {
     @Test
     void countersBatchAndGaugesUseSpecNames() {
         metrics.enqueued("orders");
-        metrics.failed("orders", "retry");
-        metrics.failed("orders", "dead");
-        metrics.failed("orders", "dead");
-        metrics.batch(Duration.ofMillis(7));
+        metrics.retried("orders");
+        metrics.deadLettered("orders");
+        metrics.deadLettered("orders");
+        metrics.stepFinished(Duration.ofMillis(7));
         metrics.shardPaused();
         metrics.inboxOutsideWindow();
-        metrics.gauge("outbox.retry.size", () -> 42);
-        metrics.gauge("outbox.retry.size", () -> 99);
+        metrics.gauge(OutboxGauge.RETRY_SIZE, () -> 42);
+        metrics.gauge(OutboxGauge.RETRY_SIZE, () -> 99);
 
         assertThat(registry.get("outbox.messages.enqueued").tag("topic", "orders").counter().count()).isEqualTo(1);
         assertThat(registry.get("outbox.messages.failed").tags("topic", "orders", "outcome", "retry").counter().count())

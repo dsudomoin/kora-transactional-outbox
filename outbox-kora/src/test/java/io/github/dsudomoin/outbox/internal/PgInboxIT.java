@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 import io.github.dsudomoin.outbox.Inbox;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;

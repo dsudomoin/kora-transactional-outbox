@@ -9,9 +9,11 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Types;
@@ -94,7 +96,7 @@ class RollbackCompatibilityIT {
         var handler = new RecordingHandler();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null));
         var relay = relay(handler, maintenance);
-        var outbox = new PgOutbox(db, schema, SHARDS, () -> {}, new OutboxMetrics(null));
+        var outbox = new PgOutbox(db, schema, SHARDS, () -> {}, TestTelemetry.kora());
         long started = System.nanoTime();
 
         // every shard busy once, then one shard alone: the others go idle, moved on by checkpoints only
@@ -411,7 +413,7 @@ class RollbackCompatibilityIT {
     }
 
     private OutboxRelay relay(RecordingHandler handler, Maintenance maintenance) {
-        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance,
+        var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(), maintenance,
                 new DeadLetterPass(db, names, config, null, new OutboxMetrics(null)));
         relays.add(relay);
         return relay;

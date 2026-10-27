@@ -15,10 +15,12 @@ import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Park;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -211,7 +213,7 @@ class MaintenanceIT {
         var maintenance = maintenance();
         var relay = relay(handler, maintenance);
         relay.init();
-        var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new OutboxMetrics(null));
+        var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, TestTelemetry.kora());
         send(outbox, msg("t", "k", "before"));
         await(Duration.ofSeconds(5), () -> handler.delivered().size() == 1);
 
@@ -327,7 +329,7 @@ class MaintenanceIT {
         relay.init();
 
         assertThat(restarted.halted()).as("halted before its workers start").isTrue();
-        var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new OutboxMetrics(null));
+        var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, TestTelemetry.kora());
         send(outbox, msg("t", "k", "written while halted")); // business writes go on
         Thread.sleep(500); // the wake-up would deliver within milliseconds
         assertThat(handler.delivered()).isEmpty();
@@ -1205,7 +1207,7 @@ class MaintenanceIT {
                     + "', 'UTF8')");
         }
         assertThat(busyRows).isEqualTo(50);
-        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
+        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
         var restore = maintenance().orphanRestore;
         try (var business = TestDb.connect()) {
             business.setAutoCommit(false); // a business transaction that sent the key and goes on working
@@ -1850,7 +1852,7 @@ class MaintenanceIT {
     }
 
     private OutboxRelay relay(OutboxHandler handler, Maintenance maintenance) {
-        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance,
+        var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(), maintenance,
                 new DeadLetterPass(db, schema.names(), config, null, new OutboxMetrics(null)));
         relays.add(relay);
         return relay;
@@ -1861,7 +1863,7 @@ class MaintenanceIT {
     }
 
     private List<UUID> send(OutboxMessage... messages) {
-        return send(new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null)), messages);
+        return send(new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora()), messages);
     }
 
     private List<UUID> send(PgOutbox outbox, OutboxMessage... messages) {

@@ -11,6 +11,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.github.dsudomoin.outbox.testing.TestTracing;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -60,7 +61,7 @@ class PgOutboxIT {
         schema = new OutboxSchema(db, config);
         schema.init();
         names = schema.names();
-        outbox = new PgOutbox(db, schema, config.shards(), wakeUps::incrementAndGet, new OutboxMetrics(null));
+        outbox = new PgOutbox(db, schema, config.shards(), wakeUps::incrementAndGet, TestTelemetry.kora());
     }
 
     @AfterEach
@@ -294,7 +295,7 @@ class PgOutboxIT {
         props.setProperty("defaultRowFetchSize", "2"); // pgjdbc then reads statements in portals of 2 rows
         var fetching = TestDb.newDatabase(2, props);
         try {
-            var bulk = new PgOutbox(fetching, schema, config.shards(), () -> {}, new OutboxMetrics(null));
+            var bulk = new PgOutbox(fetching, schema, config.shards(), () -> {}, TestTelemetry.kora());
             var keys = List.of("a", "b", "c", "d");
             var lastHash =
                     keys.stream().max(Comparator.comparingInt(k -> Hashing.keyHash("t", bytes(k)))).orElseThrow();
@@ -363,7 +364,7 @@ class PgOutboxIT {
         Runnable failing = () -> {
             throw new IllegalStateException("relay is down");
         };
-        var failingOutbox = new PgOutbox(db, schema, config.shards(), failing, new OutboxMetrics(null));
+        var failingOutbox = new PgOutbox(db, schema, config.shards(), failing, TestTelemetry.kora());
 
         var id = db.inTx((SqlFunction0<UUID>) () -> failingOutbox.send(OutboxMessage.of("t", "k", PAYLOAD)));
 

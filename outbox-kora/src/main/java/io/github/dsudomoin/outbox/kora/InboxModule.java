@@ -3,7 +3,7 @@ package io.github.dsudomoin.outbox.kora;
 import io.github.dsudomoin.outbox.Inbox;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxHandler;
-import io.github.dsudomoin.outbox.internal.OutboxMetrics;
+import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.internal.PgInbox;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 
@@ -18,7 +18,7 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  */
 public interface InboxModule extends OutboxCommonModule {
 
-    default Inbox inbox(JdbcConnectionFactory db, OutboxConfig config, OutboxMetrics metrics) {
-        return new PgInbox(db, config, metrics);
+    default Inbox inbox(JdbcConnectionFactory db, OutboxConfig config, OutboxTelemetry telemetry) {
+        return new PgInbox(db, config, telemetry);
     }
 }
