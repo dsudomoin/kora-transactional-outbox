@@ -416,7 +416,10 @@ class OutboxRelayIT {
 
         var ids = send(outbox(relay::wake), msg("t", "poison", "p"));
 
-        await(Duration.ofSeconds(2), () -> deadStatus(ids.get(0)) != null);
+        await(Duration.ofSeconds(2), () -> {
+            assertThat(handed).as("no hook call while the letter is written").isEmpty();
+            return deadStatus(ids.get(0)) != null;
+        });
         assertThat(deadStatus(ids.get(0))).as("written kept by the step").isEqualTo("kept");
         relay.drain(); // runs the dead-letter pass once more
         assertThat(handed).isEmpty();
@@ -1622,8 +1625,9 @@ class OutboxRelayIT {
     /** The status of the dead letter of {@code messageId}, null without one. */
     private String deadStatus(UUID messageId) throws Exception {
         try (var c = TestDb.connect()) {
-            return queryString(c, "select status from " + schema.names().dead() + " where message_id = '"
-                    + messageId + "'");
+            // a scalar subquery: one row, null while the relay has not written the letter yet
+            return queryString(c, "select (select status from " + schema.names().dead() + " where message_id = '"
+                    + messageId + "')");
         }
     }
 
