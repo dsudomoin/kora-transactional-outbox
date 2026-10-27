@@ -21,7 +21,8 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * for older transactions included) under {@code lockTimeout}, the session's own values given back. Any failure is a
  * WARN and backs the next try off by 1, 2, 4… maintenance intervals, at most {@link #MAX_BACKOFF}; a success resets
  * it. The backoff is in memory: a restart tries at its first run. {@link #close} cancels a statement in flight; the
- * INVALID leftover is dropped by the next build.
+ * thread then aborts its connection, which the pool evicts rather than reuse with the build's timeouts, and the next
+ * build drops the INVALID leftover. An {@link Error} is logged at ERROR and ends the thread.
  */
 final class DeadIndexBuilder {
 
@@ -90,8 +91,8 @@ final class DeadIndexBuilder {
             closed = true;
             t = thread;
             // under the monitor, so the thread cannot begin another DDL statement meanwhile
-            // ponytail: a cancel landing just after its DDL ends hits PartitionDdl's restore instead, leaving that
-            // connection's timeouts set at shutdown; track the statement itself if the pool outlives the relay
+            // ponytail: a cancel landing just after its DDL ends hits PartitionDdl's restore instead; the thread then
+            // aborts the connection (the pool evicts it), so a cancelled build may cost one pooled connection
             if (inDdl != 0) {
                 try (var c = db.newConnection(); var ps = c.prepareStatement("select pg_cancel_backend(?)")) {
                     ps.setInt(1, inDdl);
@@ -123,6 +124,7 @@ final class DeadIndexBuilder {
             if (!advisory(c, "pg_try_advisory_lock")) {
                 return; // another instance builds it
             }
+            boolean aborted = false;
             try {
                 var valid = state(c);
                 if (Boolean.TRUE.equals(valid)) {
@@ -139,17 +141,23 @@ final class DeadIndexBuilder {
                         + " on " + names.dead() + " (due_at) where due_at is not null")) {
                     return;
                 }
+            } catch (SQLException | RuntimeException e) {
+                if (isClosed()) { // its timeouts may still be set: the pool evicts it instead of reusing it
+                    aborted = abort(c, e);
+                }
+                throw e;
             } finally {
-                advisory(c, "pg_advisory_unlock");
+                if (!aborted) { // an aborted session took its lock with it
+                    advisory(c, "pg_advisory_unlock");
+                }
             }
             failures = 0;
             log.info("outbox built {} concurrently in {} ms", index, (System.nanoTime() - start) / 1_000_000);
+        } catch (Error e) {
+            log.error("outbox thread {} stopped by a fatal error", THREAD_NAME, e);
+            throw e;
         } catch (SQLException | RuntimeException e) {
-            boolean shutdown;
-            synchronized (monitor) {
-                shutdown = closed;
-            }
-            if (shutdown) {
+            if (isClosed()) {
                 log.info("outbox build of {} cancelled at shutdown; the next one drops what it left", index);
                 return;
             }
@@ -165,6 +173,23 @@ final class DeadIndexBuilder {
                     + " dead-letter pass scans all of {} on each claim; next try in {} s (failure {} in a row)", index,
                     (System.nanoTime() - start) / 1_000_000, state, e.getMessage(), lockTimeout.toMillis(),
                     names.dead(), backoff.toSeconds(), failed);
+        }
+    }
+
+    private boolean isClosed() {
+        synchronized (monitor) {
+            return closed;
+        }
+    }
+
+    /** Closes {@code c}'s session at once; false, with the failure added to {@code cause}, when that failed. */
+    private static boolean abort(Connection c, Exception cause) {
+        try {
+            c.abort(Runnable::run);
+            return true;
+        } catch (SQLException e) {
+            cause.addSuppressed(e);
+            return false;
         }
     }
 

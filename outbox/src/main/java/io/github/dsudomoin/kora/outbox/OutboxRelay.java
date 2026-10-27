@@ -189,8 +189,8 @@ public final class OutboxRelay implements Lifecycle {
             s.shutdown();
         }
         boolean interrupted = false;
+        long deadline = System.nanoTime() + relay.shutdownTimeout().toNanos();
         try {
-            long deadline = System.nanoTime() + relay.shutdownTimeout().toNanos();
             if (!awaitWorkers(deadline)) {
                 log.warn("outbox relay workers still busy after shutdownTimeout {}: interrupting them, their"
                         + " uncommitted batches are redelivered later", relay.shutdownTimeout());
@@ -209,8 +209,6 @@ public final class OutboxRelay implements Lifecycle {
             if (s != null && !s.awaitTermination(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
                 s.shutdownNow();
             }
-            // after the scheduler: no maintenance run starts a build any more
-            maintenance.close(Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
         } catch (InterruptedException e) {
             interrupted = true;
             for (var t : workers) {
@@ -220,6 +218,8 @@ public final class OutboxRelay implements Lifecycle {
                 s.shutdownNow();
             }
         } finally {
+            // after the scheduler, and on an interrupted release too: no maintenance run starts a build any more
+            maintenance.close(Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
             processor.close();
         }
         if (interrupted) {
