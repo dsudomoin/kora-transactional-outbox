@@ -20,10 +20,12 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlConsumer;
+import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction1;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
@@ -35,8 +37,9 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * {@code for update skip locked}, in a read-committed transaction of its own. A redrive chunk then tries their key
  * locks without waiting ({@link DeadLetters#tryKeyLocks}) and redrives the ready ones as the dead-letter pass does
  * ({@link DeadLetters#redrive}), so no writer waits for one of its key locks. Filters are bound parameters, never
- * interpolated; user text is logged with control characters escaped ({@link #printable}). {@code restoreOrphan} holds
- * the maintenance lock for its whole run, so maintenance's partition steps never run beside it.
+ * interpolated; user text is logged with control characters escaped ({@link #printable}). {@code restoreOrphan} and
+ * {@code recoverXidRegression} hold the maintenance lock for their whole run, so maintenance's steps never run beside
+ * them.
  */
 public final class PgOutboxAdmin implements OutboxAdmin {
 
@@ -53,9 +56,10 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private final DeadLetters rows;
     private final XidPartitions partitions;
     private final RetryStore retries;
+    private final XidRecovery recovery;
     final OrphanRestore orphanRestore; // for a test's seam
     private final String dead;
-    /** How long {@code restoreOrphan} waits for a maintenance run in progress; shorter in tests. */
+    /** How long a call under the maintenance lock waits for a maintenance run in progress; shorter in tests. */
     Duration maintenanceWait = Duration.ofSeconds(60);
     /** For tests: runs after each bulk chunk's commit. */
     @Nullable
@@ -79,6 +83,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         this.rows = new DeadLetters(names, config);
         this.partitions = new XidPartitions(names, config.partitions());
         this.retries = new RetryStore(names);
+        this.recovery = new XidRecovery(names, config);
         this.orphanRestore = new OrphanRestore(
                 names, new Resender(names, config.shards()), config.partitions().swapLockTimeout());
         this.dead = names.dead();
@@ -177,28 +182,19 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     }
 
     /**
-     * Under the maintenance lock, so the tail's lower bound, which tells an orphan from a range the extension made
-     * ahead of its swap, holds still: {@code table} must be one {@link XidPartitions#orphans} lists, then
-     * {@link OrphanRestore} validates it again and moves its rows. The session gets {@code idle_session_timeout = 60s}
-     * first, as {@link Maintenance} does, so Postgres ends the session of a frozen holder and frees the lock; reset,
-     * and the lock released, before the connection goes back to the pool.
+     * Under the maintenance lock ({@link #underMaintenanceLock}), so the tail's lower bound, which tells an orphan from
+     * a range the extension made ahead of its swap, holds still: {@code table} must be one {@link XidPartitions#orphans}
+     * lists, then {@link OrphanRestore} validates it again and moves its rows.
      */
     @Override
     public long restoreOrphan(String table, long fromXid) {
         requireOwnTransactions();
         var call = printable("restoreOrphan(" + table + ", " + fromXid + ")");
         long moved;
-        boolean restoring = false;
+        var restoring = new AtomicBoolean();
         try (var c = db.newConnection()) {
             c.setAutoCommit(true);
-            PartitionDdl.requireSessionStable(c, "outbox admin " + call + " on " + names.base());
-            // before the lock, so a holder frozen right after taking it loses it too
-            execute(c, "set idle_session_timeout = '60s'");
-            boolean locked = false;
-            Throwable failure = null;
-            try {
-                lockMaintenance(c);
-                locked = true;
+            moved = underMaintenanceLock(c, call, () -> {
                 var name = names.unqualified(table);
                 if (partitions.orphans(c).stream().noneMatch(o -> names.unqualified(o.table()).equals(name))) {
                     throw new IllegalArgumentException(table + " is not an orphan of the outbox " + names.base()
@@ -206,32 +202,18 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                             + " below the partition tail's lower bound, or " + names.setAsidePrefix() + "<digits>, in"
                             + " its schema and in no partition tree");
                 }
-                restoring = true;
-                moved = orphanRestore.restore(c, table, fromXid, PartitionDdl.DETACH_LOCK_TIMEOUT);
-            } catch (Throwable t) {
-                failure = t;
-                throw t;
-            } finally {
-                try {
-                    if (locked) {
-                        advisory(c, "pg_advisory_unlock");
-                    }
-                    execute(c, "reset idle_session_timeout");
-                } catch (SQLException e) { // the session died, and its lock and setting with it: keep the cause
-                    if (failure == null) {
-                        throw e;
-                    }
-                    failure.addSuppressed(e);
-                }
-            }
+                restoring.set(true);
+                return orphanRestore.restore(c, table, fromXid, PartitionDdl.DETACH_LOCK_TIMEOUT);
+            });
         } catch (SQLException | RuntimeException e) {
             // refused, nothing changed: OrphanRestore validates before any SQL that names the table
-            boolean refused = e instanceof IllegalArgumentException || e instanceof IllegalStateException && !restoring;
+            boolean refused = e instanceof IllegalArgumentException
+                    || e instanceof IllegalStateException && !restoring.get();
             if (!refused) {
                 log.warn("outbox admin {} on {} failed; rows moved so far stay moved, and calling again goes on: {}",
                         call, names.base(), printable(e.toString()));
             }
-            if (restoring && !(e instanceof IllegalArgumentException)) {
+            if (restoring.get() && !(e instanceof IllegalArgumentException)) {
                 wakeRelay.run(); // for the chunks it may have moved before it failed
             }
             throw e instanceof SQLException s ? new RuntimeSqlException(s) : (RuntimeException) e;
@@ -241,6 +223,76 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             wakeRelay.run();
         }
         return moved;
+    }
+
+    /**
+     * Under the maintenance lock ({@link #underMaintenanceLock}), the recovery maintenance runs
+     * ({@link XidRecovery#recover}), whatever {@code outbox.recovery} says. Then this instance's halt is refreshed
+     * ({@link Maintenance#checkHalt}), so the relay woken resumes at once; other instances resume at their next
+     * maintenance run.
+     */
+    @Override
+    public long recoverXidRegression() {
+        requireOwnTransactions();
+        long sent;
+        var recovering = new AtomicBoolean();
+        try (var c = db.newConnection()) {
+            c.setAutoCommit(true);
+            sent = underMaintenanceLock(c, "recoverXidRegression()", () -> {
+                var check = recovery.check(c);
+                if (check.current() >= check.tickXmax() && check.recorded() == null) {
+                    throw new IllegalStateException("no xid regression to recover: the xid counter of " + names.base()
+                            + " (" + check.current() + ") is at or above every tick's xmax (" + check.tickXmax()
+                            + ") and " + names.halt() + " holds no row");
+                }
+                recovering.set(true);
+                return recovery.recover(c);
+            });
+        } catch (SQLException | RuntimeException e) {
+            if (recovering.get()) {
+                log.warn("outbox admin recoverXidRegression() on {} failed, its transaction rolled back; calling again"
+                        + " retries: {}", names.base(), printable(e.toString()));
+            }
+            throw e instanceof SQLException s ? new RuntimeSqlException(s) : (RuntimeException) e;
+        }
+        log.info("outbox admin recoverXidRegression() on {} returned {}, the rows re-sent", names.base(), sent);
+        maintenance.checkHalt();
+        wakeRelay.run();
+        return sent;
+    }
+
+    /**
+     * {@code body} on {@code c} under the maintenance lock, waited for at most {@link #maintenanceWait}, so no
+     * maintenance run goes on beside it. The session gets {@code idle_session_timeout = 60s} first, as
+     * {@link Maintenance} does, so Postgres ends the session of a frozen holder and frees the lock; reset, and the lock
+     * released, before the connection goes back to the pool.
+     */
+    private <T> T underMaintenanceLock(Connection c, String call, SqlFunction0<T> body) throws SQLException {
+        PartitionDdl.requireSessionStable(c, "outbox admin " + call + " on " + names.base());
+        // before the lock, so a holder frozen right after taking it loses it too
+        execute(c, "set idle_session_timeout = '60s'");
+        boolean locked = false;
+        Throwable failure = null;
+        try {
+            lockMaintenance(c);
+            locked = true;
+            return body.apply();
+        } catch (Throwable t) {
+            failure = t;
+            throw t;
+        } finally {
+            try {
+                if (locked) {
+                    advisory(c, "pg_advisory_unlock");
+                }
+                execute(c, "reset idle_session_timeout");
+            } catch (SQLException e) { // the session died, and its lock and setting with it: keep the cause
+                if (failure == null) {
+                    throw e;
+                }
+                failure.addSuppressed(e);
+            }
+        }
     }
 
     /**

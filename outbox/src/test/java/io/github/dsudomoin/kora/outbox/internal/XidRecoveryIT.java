@@ -31,6 +31,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -42,6 +43,7 @@ class XidRecoveryIT {
     private final JdbcDatabase db = TestDb.newDatabase(10);
     private final TestOutboxConfig config = new TestOutboxConfig();
     private final List<OutboxRelay> relays = new ArrayList<>();
+    private final AtomicInteger wakes = new AtomicInteger();
     private OutboxSchema schema;
     private TableNames names;
 
@@ -342,6 +344,74 @@ class XidRecoveryIT {
             assertThat(queryString(c, "select current_setting('lock_timeout') || ' ' || current_setting("
                     + "'statement_timeout')")).isEqualTo("0 0");
         }
+    }
+
+    @Test
+    void adminRecoversAboveMaxRows() throws Exception {
+        config.maxRows(10);
+        bootstrap();
+        var sent = send(outbox(null), messages("m", 100));
+        long forged = forgeRegression();
+        var maintenance = maintenance();
+        assertThat(maintenance.runOnce()).isTrue();
+        assertThat(maintenance.halted()).as("above maxRows").isTrue();
+
+        try (var err = new CapturedStderr()) {
+            assertThat(admin(maintenance).recoverXidRegression()).isEqualTo(100);
+
+            assertThat(err.text()).contains("INFO")
+                    .contains("recoverXidRegression() on " + names.base() + " returned 100");
+        }
+        assertThat(maintenance.halted()).as("this instance resumes at once").isFalse();
+        assertThat(wakes).hasValue(1);
+        assertThat(haltRows()).isZero();
+        assertThat(tickExists(forged)).isFalse();
+        var handler = new RecordingHandler();
+        relay(handler, maintenance()).drain();
+        assertThat(delivered(handler)).containsAll(sent);
+    }
+
+    @Test
+    void adminRecoversInHaltMode() throws Exception {
+        config.xidRegression("halt");
+        bootstrap();
+        var sent = send(outbox(null), messages("m", 5));
+        forgeRegression();
+        var maintenance = maintenance();
+        assertThat(maintenance.runOnce()).isTrue();
+        assertThat(maintenance.halted()).isTrue();
+
+        assertThat(admin(maintenance).recoverXidRegression()).isEqualTo(5);
+
+        assertThat(maintenance.halted()).isFalse();
+        assertThat(haltRows()).isZero();
+        var handler = new RecordingHandler();
+        relay(handler, maintenance()).drain();
+        assertThat(delivered(handler)).containsAll(sent);
+    }
+
+    @Test
+    void adminRefusesWithoutARegression() throws Exception {
+        bootstrap();
+        send(outbox(null), messages("m", 3));
+        var admin = admin(maintenance());
+
+        assertThatThrownBy(admin::recoverXidRegression).isInstanceOf(IllegalStateException.class)
+                .hasMessageStartingWith("no xid regression to recover");
+
+        forgeRegression();
+        admin.maintenanceWait = Duration.ofMillis(200);
+        try (var other = TestDb.connect()) {
+            advisory(other, "pg_advisory_lock");
+            assertThatThrownBy(admin::recoverXidRegression).isInstanceOf(IllegalStateException.class)
+                    .hasMessageStartingWith("maintenance is running, retry");
+        }
+        assertThat(count(names.base())).as("nothing re-sent").isEqualTo(3);
+        assertThat(wakes).hasValue(0);
+    }
+
+    private PgOutboxAdmin admin(Maintenance maintenance) {
+        return new PgOutboxAdmin(db, names, config, maintenance, wakes::incrementAndGet);
     }
 
     private void bootstrap() throws Exception {

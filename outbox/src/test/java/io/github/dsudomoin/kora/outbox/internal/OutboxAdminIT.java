@@ -461,7 +461,8 @@ class OutboxAdminIT {
                 () -> admin.redriveDeadLetters(filter),
                 () -> admin.discardDeadLetters(List.of(id)),
                 () -> admin.discardDeadLetters(filter),
-                () -> admin.restoreOrphan(names.partitionPrefix() + "1000", 0));
+                () -> admin.restoreOrphan(names.partitionPrefix() + "1000", 0),
+                admin::recoverXidRegression);
 
         for (var call : calls) {
             db.inTx((SqlFunction0<Void>) () -> {
