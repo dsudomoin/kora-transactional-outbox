@@ -26,7 +26,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import ru.tinkoff.kora.application.graph.Lifecycle;
 
 /**
  * Postgres inbox: {@code <inbox>(message_id uuid, consumer text default '', received_at, primary key
@@ -34,18 +33,18 @@ import ru.tinkoff.kora.application.graph.Lifecycle;
  * partition key, so uniqueness holds across partitions. {@code consumer} is the {@link #scope}, {@code ''} for the
  * unscoped methods. {@link #tryAccept} (and {@link #tryAcceptAll}, one statement for many ids) inserts with
  * {@code ON CONFLICT DO NOTHING} only for ids inside the dedup window, which this instance takes from the partitions
- * that exist ({@link Window}, refreshed at {@link #init()} and after every maintenance run) and from the clock
+ * that exist ({@link Window}, refreshed at {@link #start()} and after every maintenance run) and from the clock
  * ({@link InboxPartitions#safeFrom}), so an insert never misses a partition.
  *
- * <p>{@link #init()} fails when its connection does not keep one server session (a transaction-pooling proxy,
+ * <p>{@link #start()} fails when its connection does not keep one server session (a transaction-pooling proxy,
  * {@link PartitionDdl#backendChanges}), then creates the table and its ranges under
  * {@code pg_advisory_lock(internalNs, LOCK_INBOX_MAINTENANCE)} with a 5 s {@code lock_timeout} and a 65 s
  * {@code statement_timeout}, {@code internalNs} from the table the name resolves to ({@link TableNames#resolve}), and
  * fails when an existing table has no {@code consumer} column (made by an earlier version, with dedup across
  * consumers). It then runs {@link #runMaintenance()} every {@code outbox.partitions.maintenanceInterval} on the daemon
- * thread {@code outbox-inbox-maintenance} until {@link #release()}.
+ * thread {@code outbox-inbox-maintenance} until {@link #close()}.
  */
-public final class PgInbox implements Inbox, Lifecycle {
+public final class PgInbox implements Inbox, AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(PgInbox.class);
     private static final Duration LOCK_TIMEOUT = Duration.ofSeconds(5);
@@ -178,8 +177,7 @@ public final class PgInbox implements Inbox, Lifecycle {
         }
     }
 
-    @Override
-    public void init() throws SQLException {
+    public void start() throws SQLException {
         try (var c = db.newConnection()) {
             c.setAutoCommit(true);
             PartitionDdl.requireSessionStable(c, "outbox inbox bootstrap of " + names.base());
@@ -216,7 +214,7 @@ public final class PgInbox implements Inbox, Lifecycle {
 
     /** Stops the maintenance schedule; a run in progress gets {@code outbox.relay.shutdownTimeout} to finish. */
     @Override
-    public void release() {
+    public void close() {
         var s = scheduler;
         if (s == null) {
             return;

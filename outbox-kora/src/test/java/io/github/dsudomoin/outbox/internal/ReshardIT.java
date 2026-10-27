@@ -59,7 +59,7 @@ class ReshardIT {
 
     @AfterEach
     void release() {
-        relays.forEach(OutboxRelay::release);
+        relays.forEach(OutboxRelay::close);
         pool.shutdownNow();
         db.release();
     }
@@ -67,12 +67,12 @@ class ReshardIT {
     @Test
     void drainedOutboxReshardsAtBootstrap() throws Exception {
         var old = start(config(4));
-        old.relay().init();
+        old.relay().start();
         for (int i = 0; i < 40; i++) {
             send(old.outbox(), "k" + i % 10, "a" + i);
         }
         old.relay().drain();
-        old.relay().release();
+        old.relay().close();
         quiet();
 
         Node next;
@@ -82,7 +82,7 @@ class ReshardIT {
         }
         assertThat(cursorShards()).isEqualTo(8);
         assertThat(queryLong("select count(*) from " + names.checkpoint())).isZero();
-        next.relay().init();
+        next.relay().start();
         for (int i = 0; i < 40; i++) {
             send(next.outbox(), "k" + i % 10, "b" + i);
         }
@@ -118,7 +118,7 @@ class ReshardIT {
         execute("create table " + names.partitionPrefix() + "123456 (like " + table + ")");
         stopped();
 
-        assertThatThrownBy(() -> schema(config(8)).init())
+        assertThatThrownBy(() -> schema(config(8)).start())
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("outbox.shards = 8 but " + names.cursor() + " holds cursors for 4 shards")
                 .hasMessageContaining("1 rows in " + names.retry())
@@ -138,14 +138,14 @@ class ReshardIT {
                 + " values ('host-a/42/0badcafe', 4, now() + interval '1 minute')");
         quiet();
 
-        assertThatThrownBy(() -> schema(config(8)).init())
+        assertThatThrownBy(() -> schema(config(8)).start())
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("host-a/42/0badcafe (4 shards")
                 .hasMessageContaining("outbox.shards");
         assertThat(cursorShards()).isEqualTo(4);
 
         execute("update " + names.instance() + " set expires_at = now() - interval '1 second'");
-        schema(config(8)).init();
+        schema(config(8)).start();
         assertThat(cursorShards()).as("its heartbeat expired").isEqualTo(8);
     }
 
@@ -154,7 +154,7 @@ class ReshardIT {
         var a = start(config(4)); // its relay, so its heartbeat, not started
         quiet();
 
-        assertThatThrownBy(() -> schema(config(8)).init())
+        assertThatThrownBy(() -> schema(config(8)).start())
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining(a.schema().instanceId() + " (4 shards");
         assertThat(cursorShards()).isEqualTo(4);
@@ -163,12 +163,12 @@ class ReshardIT {
     @Test
     void aTickingRelayRefusesTheReshard() throws Exception {
         var old = start(config(4));
-        old.relay().init();
+        old.relay().start();
         execute("delete from " + names.instance()); // the previous release writes no heartbeat
 
         var schema = schema(config(8));
         schema.tickWait = Duration.ofSeconds(1);
-        assertThatThrownBy(schema::init)
+        assertThatThrownBy(schema::start)
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageMatching("(?s).*a relay is still running \\(latest tick \\d+ ms ago\\).*");
         assertThat(cursorShards()).isEqualTo(4);
@@ -177,18 +177,18 @@ class ReshardIT {
     @Test
     void theTickGuardIsWaitedOutWhenTheRelayStops() throws Exception {
         var old = start(config(4));
-        old.relay().init();
+        old.relay().start();
         execute("delete from " + names.instance());
         var schema = schema(config(8));
         schema.tickFloor = Duration.ZERO; // the bound is then 2 × 20 ms + 5 s
 
         var resharding = pool.submit(() -> {
-            schema.init();
+            schema.start();
             return null;
         });
         Thread.sleep(500);
         assertThat(resharding.isDone()).as("it waits while the relay ticks").isFalse();
-        old.relay().release();
+        old.relay().close();
 
         resharding.get(30, SECONDS);
         assertThat(cursorShards()).isEqualTo(8);
@@ -208,7 +208,7 @@ class ReshardIT {
 
         long started = System.nanoTime();
         try (var err = new CapturedStderr()) {
-            schema.init();
+            schema.start();
             assertThat(err.text()).as("the cadence term counts, above the own 5 s bound, capped at the wait")
                     .contains("for the latest tick to be 8000 ms old").contains("resharded");
         }
@@ -224,7 +224,7 @@ class ReshardIT {
             TestSql.execute(holder, "select pg_advisory_lock(" + resolvedNames().internalNamespace() + ", "
                     + TableNames.LOCK_MAINTENANCE + ")");
 
-            assertThatThrownBy(() -> schema(config(8)).init())
+            assertThatThrownBy(() -> schema(config(8)).start())
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("waited 5 s for a lock")
                     .hasMessageContaining("stop all instances");
@@ -243,7 +243,7 @@ class ReshardIT {
             assertThat(err.text()).contains("ERROR").contains(names.cursor() + " holds cursors for 8 shards")
                     .contains("runs with outbox.shards = 4");
         }
-        node.relay().init();
+        node.relay().start();
         Thread.sleep(300);
         assertThat(recording.delivered()).as("the relay takes no shards").isEmpty();
         assertThatThrownBy(node.relay()::drain).isInstanceOf(IllegalStateException.class)
@@ -257,7 +257,7 @@ class ReshardIT {
     @Test
     void aMismatchedWriterIsRefusedWithinOneBeat() throws Exception {
         var node = start(config(4).relayEnabled(false).maintenanceInterval(Duration.ofMillis(200)));
-        node.relay().init();
+        node.relay().start();
         send(node.outbox(), "k", "before");
 
         reshardBehindItsBack(8);
@@ -289,9 +289,9 @@ class ReshardIT {
     @Test
     void hookActiveOnlyWhereTheRelayRuns() throws Exception {
         var writer = start(config(4).relayEnabled(false), HOOK);
-        writer.relay().init();
+        writer.relay().start();
         var relaying = start(config(4), HOOK);
-        relaying.relay().init();
+        relaying.relay().start();
 
         await(() -> queryLong("select count(*) from " + names.instance() + " where last_seen > now() - interval"
                 + " '10 seconds' and hook_active is not null") == 2);
@@ -305,7 +305,7 @@ class ReshardIT {
     @Test
     void heartbeatRowIsGoneAfterShutdown() throws Exception {
         var node = start(config(4).relayEnabled(false));
-        node.relay().init();
+        node.relay().start();
 
         await(() -> queryLong("select count(*) from " + names.instance()) == 1);
         assertThat(queryString("select instance_id from " + names.instance()))
@@ -314,7 +314,7 @@ class ReshardIT {
         assertThat(queryString("select shards || ' ' || hook_active || ' ' || (expires_at > now()) from "
                 + names.instance())).isEqualTo("4 false true");
 
-        node.relay().release();
+        node.relay().close();
         assertThat(queryLong("select count(*) from " + names.instance())).isZero();
     }
 
@@ -379,7 +379,7 @@ class ReshardIT {
             // holds the retry check, which runs under SHARE on the outbox
             TestSql.execute(holder, "lock table " + names.retry() + " in access exclusive mode");
             var resharding = pool.submit(() -> {
-                schema(config(8)).init();
+                schema(config(8)).start();
                 return null;
             });
             await(() -> queryLong("select count(*) from pg_locks where relation = '" + table + "'::regclass"
@@ -411,7 +411,7 @@ class ReshardIT {
             TestSql.execute(writer, "insert into " + table + " (shard, message_id, topic) values (3, gen_random_uuid(),"
                     + " 't')");
             var resharding = pool.submit(() -> {
-                new OutboxSchema(repeatableRead, config(8)).init();
+                new OutboxSchema(repeatableRead, config(8)).start();
                 return null;
             });
             await(() -> queryLong("select count(*) from pg_locks where relation = '" + table + "'::regclass"
@@ -441,7 +441,7 @@ class ReshardIT {
         assertThat(queryLong("select count(*) from " + names.tick())).as("no reshard").isEqualTo(ticks);
 
         var fresh = new OutboxSchema(db, new TestOutboxConfig().shards(null));
-        fresh.init();
+        fresh.start();
         assertThat(fresh.config().shards()).as("a new outbox").isEqualTo(OutboxConfig.DEFAULT_SHARDS);
     }
 
@@ -451,7 +451,7 @@ class ReshardIT {
         send(old.outbox(), "k", "x");
         stopped();
 
-        assertThatThrownBy(() -> schema(config(8)).init())
+        assertThatThrownBy(() -> schema(config(8)).start())
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("1 committed rows not relayed");
         assertThat(cursorShards()).isEqualTo(4);
 
@@ -478,7 +478,7 @@ class ReshardIT {
     /** Bootstrap with {@code config}, and a relay (not started), maintenance and an outbox over it. */
     private Node start(TestOutboxConfig config, OutboxDeadLetterHandler hook) throws SQLException {
         var schema = schema(config);
-        schema.init();
+        schema.start();
         var resolved = schema.config();
         var maintenance = new Maintenance(db, schema.names(), resolved, new OutboxMetrics(null));
         var relay = new OutboxRelay(db, resolved, schema, recording, TestTelemetry.kora(), maintenance,

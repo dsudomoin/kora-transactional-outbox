@@ -46,7 +46,7 @@ class OutboxSchemaIT {
     @Test
     void bootstrapCreatesAllObjects() throws Exception {
         var schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         var n = schema.names();
 
         try (var c = TestDb.connect()) {
@@ -80,7 +80,7 @@ class OutboxSchemaIT {
     void startupToleratesPendingRangeDetach() throws Exception {
         config.xidsPerPartition(1000).premake(10);
         var schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         var n = schema.names();
         var partitions = new XidPartitions(n, config.partitions());
         PartitionDdl.Bound lowest;
@@ -113,7 +113,7 @@ class OutboxSchemaIT {
             }
         }
 
-        new OutboxSchema(db, config).init();
+        new OutboxSchema(db, config).start();
 
         try (var c = TestDb.connect()) {
             assertThat(queryString(c, "select count(*)::text from pg_inherits where inhrelid = to_regclass(?)",
@@ -143,7 +143,7 @@ class OutboxSchemaIT {
                 futures.add(pool.submit(() -> {
                     var schema = new OutboxSchema(db, config);
                     barrier.await();
-                    schema.init();
+                    schema.start();
                     return null;
                 }));
             }
@@ -154,7 +154,7 @@ class OutboxSchemaIT {
             pool.shutdownNow();
         }
         var schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
 
         var n = schema.names();
         try (var c = TestDb.connect()) {
@@ -165,12 +165,12 @@ class OutboxSchemaIT {
 
     @Test
     void bootstrapAddsMaxIdToAnOlderTickTable() throws Exception {
-        new OutboxSchema(db, config).init();
+        new OutboxSchema(db, config).start();
         var n = TableNames.of(config.table());
         try (var c = TestDb.connect()) {
             execute(c, "alter table " + n.tick() + " drop column max_id"); // a tick table of an older version
 
-            new OutboxSchema(db, config).init();
+            new OutboxSchema(db, config).start();
 
             assertThat(queryString(c, "select count(*) || ':' || count(max_id) from " + n.tick())).isEqualTo("1:0");
         }
@@ -178,7 +178,7 @@ class OutboxSchemaIT {
 
     @Test
     void tickColumnIsMigrated() throws Exception {
-        new OutboxSchema(db, config).init();
+        new OutboxSchema(db, config).start();
         var n = TableNames.of(config.table());
         try (var c = TestDb.connect()) {
             // a tick table of an older version, with a tick whose shard set says no shard gained rows
@@ -186,8 +186,8 @@ class OutboxSchemaIT {
             long old = queryLong(c, "insert into " + n.tick() + " (snapshot, max_id, shards)"
                     + " select pg_current_snapshot(), 0, '{}' returning id");
 
-            new OutboxSchema(db, config).init();
-            new OutboxSchema(db, config).init(); // and once more, on the migrated table
+            new OutboxSchema(db, config).start();
+            new OutboxSchema(db, config).start(); // and once more, on the migrated table
 
             assertThat(OutboxSchema.columnExists(c, n.tick(), "shards")).as("kept for the previous release").isTrue();
             assertThat(queryString(c, "select count(*) || ':' || count(dirty) from " + n.tick())).isEqualTo("2:0");
@@ -201,7 +201,7 @@ class OutboxSchemaIT {
 
     @Test
     void tickShardsColumnIsKept() throws Exception {
-        new OutboxSchema(db, config).init();
+        new OutboxSchema(db, config).start();
         var n = TableNames.of(config.table());
         try (var c = TestDb.connect()) {
             assertThat(queryString(c, "select format_type(atttypid, atttypmod) || ':' || (not attnotnull)::text"
@@ -210,7 +210,7 @@ class OutboxSchemaIT {
             // as an earlier build of this branch left it
             execute(c, "alter table " + n.tick() + " drop column shards");
 
-            new OutboxSchema(db, config).init();
+            new OutboxSchema(db, config).start();
 
             assertThat(OutboxSchema.columnExists(c, n.tick(), "shards")).as("made again").isTrue();
             assertThat(new Ticks(n, config.shards()).make(c, Duration.ZERO)).isTrue();
@@ -221,7 +221,7 @@ class OutboxSchemaIT {
 
     @Test
     void bootstrapAddsParkedDueAtAndRequeuesToOlderTables() throws Exception {
-        new OutboxSchema(db, config).init();
+        new OutboxSchema(db, config).start();
         var n = TableNames.of(config.table());
         try (var c = TestDb.connect()) {
             // cursor and retry tables of the previous version, with a retry row
@@ -230,7 +230,7 @@ class OutboxSchemaIT {
             execute(c, "insert into " + n.retry() + " (id, shard, message_id, topic, created_at, attempts)"
                     + " values (1, 0, gen_random_uuid(), 't', now(), 2)");
 
-            new OutboxSchema(db, config).init();
+            new OutboxSchema(db, config).start();
 
             assertThat(queryString(c, "select count(*) || ':' || count(parked_due_at) from " + n.cursor()))
                     .isEqualTo(config.shards() + ":0");
@@ -268,7 +268,7 @@ class OutboxSchemaIT {
                     + " values (1, 0, gen_random_uuid(), 't', now(), 3, 'boom'),"
                     + " (2, 1, gen_random_uuid(), 't', now(), 5, null)");
 
-            new OutboxSchema(db, config).init();
+            new OutboxSchema(db, config).start();
 
             assertThat(queryString(c, letters)).isEqualTo("1:kept:null:0:null:0,2:kept:null:0:null:0");
             assertThat(queryString(c, check, n.dead(), checkName)).as("not valid: the old letters are not scanned")
@@ -284,7 +284,7 @@ class OutboxSchemaIT {
                 writer.setAutoCommit(false);
                 execute(writer, "update " + n.dead() + " set error = 'again' where id = 1");
                 // a no-op: no ALTER or CREATE INDEX queues behind the writer's lock on the dead table
-                assertTimeoutPreemptively(Duration.ofSeconds(2), () -> new OutboxSchema(db, config).init());
+                assertTimeoutPreemptively(Duration.ofSeconds(2), () -> new OutboxSchema(db, config).start());
                 writer.rollback();
             }
             assertThat(queryString(c, letters)).isEqualTo("1:kept:null:0:null:0,2:kept:null:0:null:0");
@@ -313,7 +313,7 @@ class OutboxSchemaIT {
             execute(c, "insert into " + n.dead() + " (id, shard, message_id, topic, created_at, attempts)"
                     + " select s, 0, gen_random_uuid(), 't', now(), 1 from generate_series(1, 200000) s");
 
-            assertTimeoutPreemptively(Duration.ofSeconds(5), () -> new OutboxSchema(db, config).init());
+            assertTimeoutPreemptively(Duration.ofSeconds(5), () -> new OutboxSchema(db, config).start());
 
             assertThat(queryString(c, "select (to_regclass(?) is null)::text", n.dead() + "_due")).isEqualTo("true");
             assertThat(err.text()).contains(n.dead() + "_due").contains("maintenance");
@@ -322,11 +322,11 @@ class OutboxSchemaIT {
 
     @Test
     void shardMismatchFailsFast() throws Exception {
-        new OutboxSchema(db, config.shards(4)).init();
+        new OutboxSchema(db, config.shards(4)).start();
 
         var resharded = new OutboxSchema(db, config.shards(8));
 
-        assertThatThrownBy(resharded::init)
+        assertThatThrownBy(resharded::start)
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("shards = 8")
                 .hasMessageContaining("4 shards");
@@ -335,7 +335,7 @@ class OutboxSchemaIT {
     @Test
     void insertLandsInXidPartition() throws Exception {
         var schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         var n = schema.names();
 
         try (var c = TestDb.connect()) {
@@ -349,7 +349,7 @@ class OutboxSchemaIT {
 
     @Test
     void bootstrapOnExistingSchemaDoesNotBlockWriters() throws Exception {
-        new OutboxSchema(db, config).init();
+        new OutboxSchema(db, config).start();
         var n = TableNames.of(config.table());
 
         try (var writer = TestDb.connect()) {
@@ -358,7 +358,7 @@ class OutboxSchemaIT {
                     "insert into " + n.base() + "(shard, message_id, topic) values (0, gen_random_uuid(), 't')");
             var second = CompletableFuture.runAsync(() -> {
                 try {
-                    new OutboxSchema(db, config).init();
+                    new OutboxSchema(db, config).start();
                 } catch (Exception e) {
                     throw new CompletionException(e);
                 }
@@ -375,7 +375,7 @@ class OutboxSchemaIT {
     @Test
     void bootstrapToleratesExtensionLockTimeout() throws Exception {
         config.xidsPerPartition(1000).premake(4);
-        new OutboxSchema(db, config).init();
+        new OutboxSchema(db, config).start();
         var n = TableNames.of(config.table());
         TestDb.burnXids(2500); // half of premake used: the next bootstrap wants to extend
 
@@ -383,7 +383,7 @@ class OutboxSchemaIT {
             holder.setAutoCommit(false);
             queryLong(holder, "select count(*) from " + n.base()); // a running reader the detach must wait for
 
-            new OutboxSchema(db, config).init();
+            new OutboxSchema(db, config).start();
 
             holder.commit();
             assertThat(queryString(c, "insert into " + n.base()
@@ -477,7 +477,7 @@ class OutboxSchemaIT {
             int ns = holdSchemaLock(holder); // an instance frozen in its bootstrap
             var schema = new OutboxSchema(db, config, 1);
 
-            assertTimeoutPreemptively(Duration.ofSeconds(30), () -> assertThatThrownBy(schema::init)
+            assertTimeoutPreemptively(Duration.ofSeconds(30), () -> assertThatThrownBy(schema::start)
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("pg_advisory_lock(" + ns + ", " + TableNames.LOCK_SCHEMA + ")")
                     .hasMessageContaining("classid = " + Integer.toUnsignedLong(ns)));
@@ -493,7 +493,7 @@ class OutboxSchemaIT {
         try (var holder = TestDb.connect()) {
             holdSchemaLock(holder);
             init = pool.submit(() -> {
-                schema.init();
+                schema.start();
                 return null;
             });
             Thread.sleep(6000); // past the first attempt's lock_timeout
@@ -516,7 +516,7 @@ class OutboxSchemaIT {
             int ns = holdSchemaLock(holder);
 
             assertTimeoutPreemptively(Duration.ofSeconds(30), () -> assertThatThrownBy(
-                            new OutboxSchema(shortDb, config, 1)::init)
+                            new OutboxSchema(shortDb, config, 1)::start)
                     .isInstanceOf(IllegalStateException.class) // the lock_timeout, not the 1 s statement_timeout
                     .hasMessageContaining("pg_advisory_lock(" + ns + ", " + TableNames.LOCK_SCHEMA + ")"));
         } finally {
@@ -526,14 +526,14 @@ class OutboxSchemaIT {
 
     @Test
     void identitySequenceCacheAboveOneFailsStartup() throws Exception {
-        new OutboxSchema(db, config).init();
+        new OutboxSchema(db, config).start();
         var n = TableNames.of(config.table());
 
         try (var c = TestDb.connect()) {
             for (var column : List.of(List.of(n.base(), "id"), List.of(n.tick(), "id"), List.of(n.cursor(), "seq"))) {
                 execute(c, "alter table " + column.get(0) + " alter column " + column.get(1) + " set cache 10");
 
-                assertThatThrownBy(new OutboxSchema(db, config)::init)
+                assertThatThrownBy(new OutboxSchema(db, config)::start)
                         .as(column.get(0))
                         .isInstanceOf(IllegalStateException.class)
                         .hasMessageContaining(column.get(0) + "_" + column.get(1) + "_seq")
@@ -542,7 +542,7 @@ class OutboxSchemaIT {
                 execute(c, "alter table " + column.get(0) + " alter column " + column.get(1) + " set cache 1");
             }
         }
-        new OutboxSchema(db, config).init();
+        new OutboxSchema(db, config).start();
     }
 
     private int holdSchemaLock(Connection holder) throws SQLException {

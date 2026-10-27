@@ -374,7 +374,7 @@ public final class PartitionDdl {
      * {@code transaction_timeout} off) for each of its statements, the session's own given back afterwards.
      */
     static <T> T withTimeouts(Connection c, Duration lockTimeout, Duration statementTimeout,
-            ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0<T> body) throws SQLException {
+            Sql.SqlFunction0<T> body) throws SQLException {
         String lock;
         String statement;
         String transaction;

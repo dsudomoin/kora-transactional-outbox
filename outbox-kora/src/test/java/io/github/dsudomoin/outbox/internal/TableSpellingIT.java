@@ -67,11 +67,11 @@ class TableSpellingIT {
         var appDb = TestDb.newDatabase(2, props);
         try {
             var inApp = new OutboxSchema(appDb, new TestOutboxConfig().table(table).shards(1));
-            inApp.init();
+            inApp.start();
             var explicit = new OutboxSchema(db, new TestOutboxConfig().table(schemaName + "." + table).shards(1));
-            explicit.init();
+            explicit.start();
             var inPublic = new OutboxSchema(db, plainConfig);
-            inPublic.init();
+            inPublic.start();
 
             assertThat(inApp.names().keyNamespace()).isEqualTo(explicit.names().keyNamespace());
             assertThat(inApp.names().internalNamespace()).isEqualTo(explicit.names().internalNamespace());
@@ -151,16 +151,16 @@ class TableSpellingIT {
 
             var plainInbox = new PgInbox(db, new TestOutboxConfig().inboxTable(inbox), new OutboxMetrics(null));
 
-            assertThatThrownBy(plainInbox::init)
+            assertThatThrownBy(plainInbox::start)
                     .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("55P03"));
         }
     }
 
     private void bootstrap() throws Exception {
         plain = new OutboxSchema(db, plainConfig);
-        plain.init();
+        plain.start();
         qualified = new OutboxSchema(db, qualifiedConfig);
-        qualified.init();
+        qualified.start();
     }
 
     private static ShardResult step(ShardProcessor processor, long latestTickId) throws Exception {

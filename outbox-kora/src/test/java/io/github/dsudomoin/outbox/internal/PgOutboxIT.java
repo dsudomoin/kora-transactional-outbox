@@ -59,7 +59,7 @@ class PgOutboxIT {
     @BeforeEach
     void bootstrap() throws Exception {
         schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         names = schema.names();
         outbox = new PgOutbox(db, schema, config.shards(), wakeUps::incrementAndGet, TestTelemetry.kora());
     }

@@ -2,10 +2,8 @@ package io.github.dsudomoin.outbox;
 
 import jakarta.annotation.Nullable;
 import java.time.Duration;
-import ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor;
 
-/** HOCON path {@code outbox}; every key is optional. */
-@ConfigValueExtractor
+/** The outbox's settings; every one has a default. With Kora, HOCON path {@code outbox}, keys named as here. */
 public interface OutboxConfig {
 
     default String table() {
@@ -45,7 +43,6 @@ public interface OutboxConfig {
         return new RecoveryConfig() {};
     }
 
-    @ConfigValueExtractor
     interface RelayConfig {
 
         default boolean enabled() {
@@ -113,7 +110,6 @@ public interface OutboxConfig {
         }
     }
 
-    @ConfigValueExtractor
     interface RetryConfig {
 
         default Duration initialDelay() {
@@ -131,7 +127,6 @@ public interface OutboxConfig {
     }
 
     /** Records the handler set aside with {@link Outcome#requeue()}. */
-    @ConfigValueExtractor
     interface RequeueConfig {
 
         /** A requeued record is due {@code delay} later, or at the handler's later {@code notBefore}. */
@@ -145,7 +140,6 @@ public interface OutboxConfig {
         }
     }
 
-    @ConfigValueExtractor
     interface PartitionsConfig {
 
         default long xidsPerPartition() {
@@ -192,7 +186,6 @@ public interface OutboxConfig {
     }
 
     /** When a hot tail over {@code maxTailScan} is turned into a range all the same: writers wait for its scan. */
-    @ConfigValueExtractor
     interface TailConversionConfig {
 
         /**
@@ -218,7 +211,6 @@ public interface OutboxConfig {
         }
     }
 
-    @ConfigValueExtractor
     interface InboxConfig {
 
         default String table() {
@@ -243,7 +235,6 @@ public interface OutboxConfig {
         }
     }
 
-    @ConfigValueExtractor
     interface DeadLettersConfig {
 
         /** Letters per call of the dead-letter hook, 1..1000 (a redrive batch holds a key lock each). Default 100. */
@@ -274,7 +265,6 @@ public interface OutboxConfig {
     }
 
     /** What happens when the xid counter is found below a tick's xmax (a logical restore or migration). */
-    @ConfigValueExtractor
     interface RecoveryConfig {
 
         /**

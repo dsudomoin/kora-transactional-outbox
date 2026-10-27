@@ -428,7 +428,7 @@ class CursorsIT {
 
     private TableNames bootstrap() throws Exception {
         var schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         return schema.names();
     }
 }

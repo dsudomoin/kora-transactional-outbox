@@ -45,7 +45,7 @@ class KafkaDeadLetterIT {
     @AfterEach
     void release() {
         if (relay != null) {
-            relay.release();
+            relay.close();
         }
         if (sender != null) {
             sender.release();
@@ -112,11 +112,11 @@ class KafkaDeadLetterIT {
         sender = module.kafkaOutboxSender(kafka, config);
         var hook = module.kafkaDeadLetterHandler(kafka, sender, config);
         schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         relay = new OutboxRelay(db, config, schema, sender.handler(), new KoraOutboxTelemetry(metrics, null),
                 new Maintenance(db, schema.names(), config, metrics),
                 new DeadLetterPass(db, schema.names(), config, hook, metrics));
-        relay.init();
+        relay.start();
         outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new KoraOutboxTelemetry(metrics, null));
     }
 

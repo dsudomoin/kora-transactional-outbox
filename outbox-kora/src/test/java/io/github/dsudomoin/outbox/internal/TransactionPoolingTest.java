@@ -30,7 +30,7 @@ class TransactionPoolingTest {
     void outboxBootstrapFailsBeforeAnySessionStatement() {
         var schema = new OutboxSchema(new KoraOutboxTransactions(pooled()), new TestOutboxConfig());
 
-        assertThatThrownBy(schema::init)
+        assertThatThrownBy(schema::start)
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("outbox bootstrap")
                 .hasMessageContaining(DETECTED);
@@ -41,7 +41,7 @@ class TransactionPoolingTest {
     void inboxBootstrapFailsBeforeAnySessionStatement() {
         var inbox = new PgInbox(new KoraOutboxTransactions(pooled()), new TestOutboxConfig(), new OutboxMetrics(null));
 
-        assertThatThrownBy(inbox::init)
+        assertThatThrownBy(inbox::start)
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("inbox bootstrap")
                 .hasMessageContaining(DETECTED);

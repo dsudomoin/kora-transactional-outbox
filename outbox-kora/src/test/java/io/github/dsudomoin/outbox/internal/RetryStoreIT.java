@@ -45,7 +45,7 @@ class RetryStoreIT {
     @BeforeEach
     void bootstrap() throws Exception {
         var schema = new OutboxSchema(db, new TestOutboxConfig().shards(2));
-        schema.init();
+        schema.start();
         names = schema.names();
         store = new RetryStore(names, false);
         c = TestDb.connect();

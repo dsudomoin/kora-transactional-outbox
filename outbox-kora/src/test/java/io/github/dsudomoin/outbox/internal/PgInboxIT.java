@@ -65,7 +65,7 @@ class PgInboxIT {
     @AfterEach
     void release() {
         if (inbox != null) {
-            inbox.release();
+            inbox.close();
         }
         pool.shutdownNow();
         db.release();
@@ -387,7 +387,7 @@ class PgInboxIT {
         }
         var old = new PgInbox(db, config, new OutboxMetrics(null));
 
-        assertThatThrownBy(old::init)
+        assertThatThrownBy(old::start)
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining(table())
                 .hasMessageContaining("consumer");
@@ -446,13 +446,13 @@ class PgInboxIT {
             release.start();
             inbox = new PgInbox(app, config, new OutboxMetrics(null));
 
-            inbox.init();
+            inbox.start();
 
             release.join();
             assertThat(errors).isEmpty();
             var id = UuidV7.next();
             assertThat(app.inTx((SqlFunction0<Boolean>) () -> inbox.tryAccept(id))).isTrue();
-            inbox.release();
+            inbox.close();
             inbox = null;
         } finally {
             app.release();
@@ -758,7 +758,7 @@ class PgInboxIT {
         }
         // a second instance starts before maintenance ran: its partitions span the expired ranges
         var second = new PgInbox(db, config, new OutboxMetrics(registry));
-        second.init();
+        second.start();
         var expiredId = v7(hour - 3 * HOUR + HOUR / 2);
         assertThat(accept(second, expiredId)).isTrue();
         assertThat(accept(second, expiredId)).as("not deduplicated: its range may go any moment").isTrue();
@@ -767,7 +767,7 @@ class PgInboxIT {
         inbox.runMaintenance(); // the first instance drops them; the second one's window is stale now
 
         assertThat(accept(second, expiredId)).isTrue(); // no insert, so no missing partition
-        second.release();
+        second.close();
     }
 
     @Test
@@ -778,7 +778,7 @@ class PgInboxIT {
         assertThat(accept(nextTop)).isTrue();
         assertThat(rows()).isZero();
         // premake grows (a config change on restart takes the same path): maintenance extends, the window follows
-        inbox.release();
+        inbox.close();
         config.inboxPremake(Duration.ofHours(4));
         inbox = new PgInbox(db, config, new OutboxMetrics(registry));
         long before = System.currentTimeMillis();
@@ -797,8 +797,8 @@ class PgInboxIT {
         assertThat(accept(id)).isTrue();
 
         var second = new PgInbox(db, config, new OutboxMetrics(null));
-        second.init();
-        second.release();
+        second.start();
+        second.close();
 
         assertThat(ranges()).containsAll(before);
         assertThat(accept(id)).isFalse();
@@ -860,7 +860,7 @@ class PgInboxIT {
 
     private void start() throws Exception {
         inbox = new PgInbox(db, config, new OutboxMetrics(registry));
-        inbox.init();
+        inbox.start();
     }
 
     private boolean accept(UUID id) throws SQLException {

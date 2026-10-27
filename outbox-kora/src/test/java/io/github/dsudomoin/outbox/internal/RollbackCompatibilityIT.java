@@ -55,7 +55,7 @@ class RollbackCompatibilityIT {
 
     @AfterEach
     void release() {
-        relays.forEach(OutboxRelay::release);
+        relays.forEach(OutboxRelay::close);
         db.release();
     }
 
@@ -91,7 +91,7 @@ class RollbackCompatibilityIT {
     @Test
     void thePreviousReleaseResumesFromTheCursorsThisOneLeaves() throws Exception {
         schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         names = schema.names();
         var handler = new RecordingHandler();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null));
@@ -214,7 +214,7 @@ class RollbackCompatibilityIT {
                     .maxTailScan(state.equals("hot over maxTailScan") ? 0 : 16L * 1024 * 1024)
                     .tailConversion("03:00-05:00", Duration.ofSeconds(5));
             schema = new OutboxSchema(db, cfg);
-            schema.init();
+            schema.start();
             names = schema.names();
             var partitions = new XidPartitions(names, cfg.partitions());
             partitions.clock = clockAt(12, 0); // outside the window

@@ -73,7 +73,7 @@ class XidRegressionDumpRestoreIT {
     @AfterEach
     void stop() {
         try {
-            relays.forEach(OutboxRelay::release);
+            relays.forEach(OutboxRelay::close);
         } finally {
             try {
                 databases.forEach(JdbcDatabase::release);
@@ -92,11 +92,11 @@ class XidRegressionDumpRestoreIT {
         var schemaA = bootstrap(dbA);
         var handlerA = new RecordingHandler();
         var relayA = relay(dbA, schemaA, handlerA);
-        relayA.init();
+        relayA.start();
         var outboxA = new PgOutbox(dbA, schemaA, config.shards(), relayA::wake, TestTelemetry.kora());
         var first = send(dbA, outboxA, "first", 1000);
         await(Duration.ofSeconds(10), () -> deliveries(handlerA).keySet().containsAll(first));
-        relayA.release();
+        relayA.close();
         var undelivered = send(dbA, outboxA, "undelivered", 500);
 
         dumpAndRestore();
@@ -115,7 +115,7 @@ class XidRegressionDumpRestoreIT {
                         .contains(" rows re-sent");
             }
             assertThat(haltRows(b, schemaB)).isZero();
-            relay(dbB, schemaB, handlerB).init();
+            relay(dbB, schemaB, handlerB).start();
             int before = writers.written.size();
             await(Duration.ofSeconds(10), () -> writers.written.size() >= before + 50);
         } finally {
@@ -218,7 +218,7 @@ class XidRegressionDumpRestoreIT {
 
     private OutboxSchema bootstrap(TestDatabase db) throws SQLException {
         var schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         return schema;
     }
 

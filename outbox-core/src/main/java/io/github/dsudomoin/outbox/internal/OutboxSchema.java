@@ -14,7 +14,6 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import ru.tinkoff.kora.application.graph.Lifecycle;
 
 /**
  * Idempotent startup bootstrap, on a connection that must keep one server session (no transaction-pooling
@@ -48,7 +47,7 @@ import ru.tinkoff.kora.application.graph.Lifecycle;
  * count as holding rows of every shard; dead letters older than {@code status} are kept and the hook sees new ones only: one ALTER adds the hook's
  * columns, and their check is not validated, so it scans no row of the dead table under that ALTER's lock.
  */
-public final class OutboxSchema implements Lifecycle {
+public final class OutboxSchema implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(OutboxSchema.class);
     private static final Duration LOCK_TIMEOUT = Duration.ofSeconds(5);
@@ -201,26 +200,26 @@ public final class OutboxSchema implements Lifecycle {
     }
 
     /**
-     * The table names with the lock namespaces of the table {@link #init()} resolved, which every component locks
+     * The table names with the lock namespaces of the table {@link #start()} resolved, which every component locks
      * with: an instance configured {@code outbox} and one configured {@code public.outbox} share all locks.
      */
     public TableNames names() {
         var n = names;
         if (n == null) {
-            throw new IllegalStateException("OutboxSchema.init() has not run: the lock namespaces of "
+            throw new IllegalStateException("OutboxSchema.start() has not run: the lock namespaces of "
                     + spelled.base() + " come from the table it resolves to");
         }
         return n;
     }
 
     /**
-     * The config every other component runs with: this one with {@code shards} as {@link #init()} resolved it, never
+     * The config every other component runs with: this one with {@code shards} as {@link #start()} resolved it, never
      * null.
      */
     public OutboxConfig config() {
         var r = resolved;
         if (r == null) {
-            throw new IllegalStateException("OutboxSchema.init() has not run: the shard count of " + spelled.base()
+            throw new IllegalStateException("OutboxSchema.start() has not run: the shard count of " + spelled.base()
                     + " comes from its cursors when outbox.shards is not set");
         }
         return r;
@@ -276,8 +275,7 @@ public final class OutboxSchema implements Lifecycle {
         }
     }
 
-    @Override
-    public void init() throws SQLException {
+    public void start() throws SQLException {
         try (var c = db.newConnection()) {
             boolean autoCommit = c.getAutoCommit();
             c.setAutoCommit(true);
@@ -312,7 +310,7 @@ public final class OutboxSchema implements Lifecycle {
 
     /** Deletes this instance's row; the relay's {@link Heartbeat} deletes it first when it ran. */
     @Override
-    public void release() {
+    public void close() {
         var n = names;
         if (n != null) {
             Heartbeat.delete(db, n, instanceId);

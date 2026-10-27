@@ -581,7 +581,7 @@ class BatchReaderIT {
 
     private void bootstrap() throws Exception {
         var schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         names = schema.names();
         ticks = new Ticks(names, config.shards());
         outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());

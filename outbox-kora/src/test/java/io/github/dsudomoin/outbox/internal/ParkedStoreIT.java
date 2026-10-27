@@ -48,7 +48,7 @@ class ParkedStoreIT {
     @BeforeEach
     void bootstrap() throws Exception {
         var schema = new OutboxSchema(db, new TestOutboxConfig().shards(2));
-        schema.init();
+        schema.start();
         names = schema.names();
         retries = new RetryStore(names, false);
         store = new ParkedStore(names, retries);

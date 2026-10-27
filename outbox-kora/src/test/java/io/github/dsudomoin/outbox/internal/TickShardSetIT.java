@@ -32,7 +32,7 @@ class TickShardSetIT {
     @Test
     void everyTickShardSetCoversTheShardsOfItsBatch() throws Exception {
         var schema = new OutboxSchema(db, new TestOutboxConfig().shards(SHARDS));
-        schema.init();
+        schema.start();
         var names = schema.names();
         var stop = new AtomicBoolean();
         var pool = Executors.newFixedThreadPool(15);

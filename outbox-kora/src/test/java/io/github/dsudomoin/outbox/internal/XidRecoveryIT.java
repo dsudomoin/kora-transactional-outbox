@@ -60,7 +60,7 @@ class XidRecoveryIT {
 
     @AfterEach
     void release() {
-        relays.forEach(OutboxRelay::release);
+        relays.forEach(OutboxRelay::close);
         db.release();
     }
 
@@ -70,7 +70,7 @@ class XidRecoveryIT {
         var handler = new RecordingHandler();
         var maintenance = maintenance();
         var relay = relay(handler, maintenance);
-        relay.init();
+        relay.start();
         var outbox = outbox(relay);
         var sent = new ArrayList<>(send(outbox, messages("before", 20)));
         await(Duration.ofSeconds(5), () -> handler.delivered().size() >= 20);
@@ -115,7 +115,7 @@ class XidRecoveryIT {
         assertThat(haltRows()).isZero();
         var handler = new RecordingHandler();
         var maintenance = maintenance();
-        relay(handler, maintenance).init();
+        relay(handler, maintenance).start();
         assertThat(maintenance.halted()).isFalse();
         await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 20);
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyInAnyOrderElementsOf(sent);
@@ -373,7 +373,7 @@ class XidRecoveryIT {
         var handler = new RecordingHandler();
         var maintenance = maintenance();
         var relay = relay(handler, maintenance);
-        relay.init();
+        relay.start();
         assertThat(maintenance.halted()).isTrue();
         Thread.sleep(300); // the workers would deliver within milliseconds
         assertThat(handler.delivered()).isEmpty();
@@ -466,7 +466,7 @@ class XidRecoveryIT {
         };
         var maintenance = maintenance();
         var relay = relay(handler, maintenance);
-        relay.init();
+        relay.start();
         var outbox = outbox(relay);
         var held = send(outbox, msg("t", "r", "head"), msg("t", "r", "follower"));
         var parked = send(outbox, msg("t", "p", "parked"));
@@ -867,7 +867,7 @@ class XidRecoveryIT {
 
     private void bootstrap() throws Exception {
         schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         names = schema.names();
     }
 

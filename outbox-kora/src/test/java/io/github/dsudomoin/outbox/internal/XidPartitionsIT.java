@@ -665,7 +665,7 @@ class XidPartitionsIT {
     void convertedTailRowsAreDelivered() throws Exception {
         var config = new TestOutboxConfig().relayEnabled(false).xidsPerPartition(1000).premake(4);
         var schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         var names = schema.names();
         var partitions = new XidPartitions(names, config.partitions());
         var handler = new RecordingHandler();
@@ -688,7 +688,7 @@ class XidPartitionsIT {
             assertThat(handler.delivered()).extracting(OutboxRecord::messageId)
                     .as("each once").containsExactlyInAnyOrderElementsOf(sent);
         } finally {
-            relay.release();
+            relay.close();
         }
     }
 
@@ -1285,7 +1285,7 @@ class XidPartitionsIT {
             try {
                 var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
                 var schema = new OutboxSchema(db17, config);
-                schema.init();
+                schema.start();
                 var names = schema.names();
                 var partitions = new XidPartitions(names, config.partitions());
                 try (var c = DriverManager.getConnection(pg17.getJdbcUrl(), pg17.getUsername(), pg17.getPassword())) {
@@ -1336,7 +1336,7 @@ class XidPartitionsIT {
                     var w = DriverManager.getConnection(pg.getJdbcUrl(), pg.getUsername(), pg.getPassword())) {
                 var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
                 var schema = new OutboxSchema(own, config);
-                schema.init();
+                schema.start();
                 var names = schema.names();
                 var partitions = new XidPartitions(names, config.partitions());
                 burn(c, 2500);
@@ -1558,7 +1558,7 @@ class XidPartitionsIT {
             String log;
             try (var err = new CapturedStderr()) {
                 var schema = new OutboxSchema(app, config);
-                schema.init();
+                schema.start();
                 names = schema.names();
                 log = err.text();
             }
@@ -1620,7 +1620,7 @@ class XidPartitionsIT {
             var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4)
                     .swapLockTimeout(Duration.ofSeconds(3)); // a lock wait longer than the role's statement_timeout
             var schema = new OutboxSchema(app, config);
-            schema.init();
+            schema.start();
             var names = schema.names();
             var partitions = new XidPartitions(names, config.partitions());
             var login = new Properties();
@@ -1910,7 +1910,7 @@ class XidPartitionsIT {
 
     private TableNames bootstrap(TestOutboxConfig config) throws Exception {
         var schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         return schema.names();
     }
 

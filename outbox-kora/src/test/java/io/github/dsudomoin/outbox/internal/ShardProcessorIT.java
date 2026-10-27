@@ -3345,7 +3345,7 @@ class ShardProcessorIT {
 
     private void bootstrap() throws Exception {
         var schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         names = schema.names();
         ticks = new Ticks(names, config.shards());
         cursors = new Cursors(names, config.shards());

@@ -17,6 +17,7 @@ import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.PgOutboxAdmin;
 import io.opentelemetry.api.trace.Tracer;
 import jakarta.annotation.Nullable;
+import ru.tinkoff.kora.application.graph.LifecycleWrapper;
 import ru.tinkoff.kora.common.annotation.Root;
 
 /**
@@ -37,8 +38,9 @@ import ru.tinkoff.kora.common.annotation.Root;
  */
 public interface OutboxModule extends OutboxCommonModule {
 
-    default OutboxSchema outboxSchema(OutboxTransactions db, OutboxConfig config) {
-        return new OutboxSchema(db, config);
+    /** Started before the components that use it: creates or checks the tables. */
+    default LifecycleWrapper<OutboxSchema> outboxSchema(OutboxTransactions db, OutboxConfig config) {
+        return new LifecycleWrapper<>(new OutboxSchema(db, config), OutboxSchema::start, OutboxSchema::close);
     }
 
     default Maintenance outboxMaintenance(OutboxTransactions db, OutboxSchema schema, OutboxTelemetry telemetry) {
@@ -53,9 +55,10 @@ public interface OutboxModule extends OutboxCommonModule {
     }
 
     @Root
-    default OutboxRelay outboxRelay(OutboxTransactions db, OutboxSchema schema, OutboxHandler handler,
+    default LifecycleWrapper<OutboxRelay> outboxRelay(OutboxTransactions db, OutboxSchema schema, OutboxHandler handler,
             OutboxTelemetry telemetry, Maintenance maintenance, DeadLetterPass deadLetters) {
-        return new OutboxRelay(db, schema.config(), schema, handler, telemetry, maintenance, deadLetters);
+        var relay = new OutboxRelay(db, schema.config(), schema, handler, telemetry, maintenance, deadLetters);
+        return new LifecycleWrapper<>(relay, OutboxRelay::start, OutboxRelay::close);
     }
 
     default Outbox outbox(OutboxTransactions db, OutboxSchema schema, OutboxRelay relay, OutboxTelemetry telemetry) {

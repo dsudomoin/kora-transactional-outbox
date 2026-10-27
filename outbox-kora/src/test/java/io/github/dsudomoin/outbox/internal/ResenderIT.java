@@ -38,7 +38,7 @@ class ResenderIT {
     @BeforeEach
     void bootstrap() throws Exception {
         schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         names = schema.names();
     }
 

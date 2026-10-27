@@ -5,6 +5,15 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.typesafe.config.ConfigFactory;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
+import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_ConfigValueExtractor;
+import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraDeadLettersConfig_ConfigValueExtractor;
+import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraInboxConfig_ConfigValueExtractor;
+import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraPartitionsConfig_ConfigValueExtractor;
+import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraRecoveryConfig_ConfigValueExtractor;
+import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraRelayConfig_ConfigValueExtractor;
+import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraRequeueConfig_ConfigValueExtractor;
+import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraRetryConfig_ConfigValueExtractor;
+import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraTailConversionConfig_ConfigValueExtractor;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.config.common.extractor.DurationConfigValueExtractor;
@@ -14,15 +23,15 @@ import ru.tinkoff.kora.config.hocon.HoconConfigFactory;
 class OutboxConfigTest {
 
     private static final DurationConfigValueExtractor DURATION = new DurationConfigValueExtractor();
-    private static final $OutboxConfig_ConfigValueExtractor EXTRACTOR = new $OutboxConfig_ConfigValueExtractor(
-            new $OutboxConfig_RelayConfig_ConfigValueExtractor(DURATION,
-                    new $OutboxConfig_RetryConfig_ConfigValueExtractor(DURATION),
-                    new $OutboxConfig_RequeueConfig_ConfigValueExtractor(DURATION)),
-            new $OutboxConfig_PartitionsConfig_ConfigValueExtractor(DURATION,
-                    new $OutboxConfig_TailConversionConfig_ConfigValueExtractor(DURATION)),
-            new $OutboxConfig_InboxConfig_ConfigValueExtractor(DURATION),
-            new $OutboxConfig_DeadLettersConfig_ConfigValueExtractor(DURATION),
-            new $OutboxConfig_RecoveryConfig_ConfigValueExtractor(DURATION));
+    private static final $KoraOutboxConfig_ConfigValueExtractor EXTRACTOR = new $KoraOutboxConfig_ConfigValueExtractor(
+            new $KoraOutboxConfig_KoraRelayConfig_ConfigValueExtractor(
+                    new $KoraOutboxConfig_KoraRetryConfig_ConfigValueExtractor(DURATION),
+                    new $KoraOutboxConfig_KoraRequeueConfig_ConfigValueExtractor(DURATION), DURATION),
+            new $KoraOutboxConfig_KoraPartitionsConfig_ConfigValueExtractor(
+                    new $KoraOutboxConfig_KoraTailConversionConfig_ConfigValueExtractor(DURATION), DURATION),
+            new $KoraOutboxConfig_KoraInboxConfig_ConfigValueExtractor(DURATION),
+            new $KoraOutboxConfig_KoraDeadLettersConfig_ConfigValueExtractor(DURATION),
+            new $KoraOutboxConfig_KoraRecoveryConfig_ConfigValueExtractor(DURATION));
 
     private static OutboxConfig parse(String hocon) {
         var config = HoconConfigFactory.fromHocon(

@@ -58,7 +58,7 @@ class MaintenanceIT {
 
     @AfterEach
     void release() {
-        relays.forEach(OutboxRelay::release);
+        relays.forEach(OutboxRelay::close);
         pools.forEach(JdbcDatabase::release);
         db.release();
     }
@@ -214,7 +214,7 @@ class MaintenanceIT {
         var handler = new RecordingHandler();
         var maintenance = maintenance();
         var relay = relay(handler, maintenance);
-        relay.init();
+        relay.start();
         var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, TestTelemetry.kora());
         send(outbox, msg("t", "k", "before"));
         await(Duration.ofSeconds(5), () -> handler.delivered().size() == 1);
@@ -322,13 +322,13 @@ class MaintenanceIT {
         assertThat(first.runOnce()).isTrue();
         assertThat(first.halted()).isTrue();
 
-        new OutboxSchema(db, config).init(); // a restart before the counter caught up: no failure, it comes up halted
+        new OutboxSchema(db, config).start(); // a restart before the counter caught up: no failure, it comes up halted
         TestDb.burnXids(3000); // a restart after the counter caught up: the persisted halt still holds
         config.relayEnabled(true);
         var handler = new RecordingHandler();
         var restarted = maintenance();
         var relay = relay(handler, restarted);
-        relay.init();
+        relay.start();
 
         assertThat(restarted.halted()).as("halted before its workers start").isTrue();
         var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, TestTelemetry.kora());
@@ -1733,7 +1733,7 @@ class MaintenanceIT {
             execute(run, "select pg_advisory_lock" + lock);
             var startup = CompletableFuture.runAsync(() -> {
                 try {
-                    new OutboxSchema(db, config).init();
+                    new OutboxSchema(db, config).start();
                 } catch (SQLException e) {
                     throw new RuntimeSqlException(e);
                 }
@@ -1831,7 +1831,7 @@ class MaintenanceIT {
 
     private void bootstrap() throws Exception {
         schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         names = schema.names();
     }
 

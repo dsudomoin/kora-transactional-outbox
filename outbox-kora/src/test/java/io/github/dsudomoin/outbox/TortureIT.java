@@ -105,7 +105,7 @@ class TortureIT {
         if (partitions != null) {
             partitions.close();
         }
-        relays.forEach(OutboxRelay::release);
+        relays.forEach(OutboxRelay::close);
         db.release();
     }
 
@@ -114,7 +114,7 @@ class TortureIT {
         System.out.println("TortureIT seed " + seed + " (replay with TORTURE_SEED=" + seed + ")");
         long started = System.nanoTime();
         var schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         var names = schema.names();
         String commitOrder = names.base() + "_commit_order";
         String counter = names.base() + "_counter";
@@ -151,7 +151,7 @@ class TortureIT {
                     new Maintenance(db, names, config, new OutboxMetrics(null)),
                     new DeadLetterPass(db, names, config, hook, new OutboxMetrics(null)));
             relays.add(relay);
-            relay.init();
+            relay.start();
         }
 
         var writers = new ArrayList<CompletableFuture<Void>>();
@@ -176,7 +176,7 @@ class TortureIT {
         handler.reliable = true;
         drainEverything(names, hook);
         int droppedWhileRunning = partitions.dropped();
-        relays.forEach(OutboxRelay::release);
+        relays.forEach(OutboxRelay::close);
         assertThat(new Maintenance(db, names, config, new OutboxMetrics(null)).runOnce()).isTrue();
         partitions.close();
         partitions.poll();

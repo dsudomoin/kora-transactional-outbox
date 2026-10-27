@@ -141,10 +141,10 @@ class OperationsUnderLoadIT {
         release.countDown();
         stopLoad();
         if (relay != null) {
-            relay.release();
+            relay.close();
         }
         if (inbox != null) {
-            inbox.release();
+            inbox.close();
         }
         db.release();
         log.close();
@@ -283,7 +283,7 @@ class OperationsUnderLoadIT {
     @Test
     void inboxOrphanIsAttachedBackUnderLoad() throws Exception {
         inbox = new PgInbox(db, config, new OutboxMetrics(registry));
-        inbox.init(); // its maintenance runs every 50 ms
+        inbox.start(); // its maintenance runs every 50 ms
         var table = TableNames.of(config.inbox().table()).base();
         long now = System.currentTimeMillis();
         var current = inboxRange(table, now);
@@ -444,13 +444,13 @@ class OperationsUnderLoadIT {
     /** Bootstraps the outbox, starts the relay with its maintenance and the writers, and waits for 1000 commits. */
     private void start() throws Exception {
         var schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         names = schema.names();
         maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
         relay = new OutboxRelay(db, config, schema, recording, TestTelemetry.kora(), maintenance,
                 new DeadLetterPass(db, names, config, null, new OutboxMetrics(null)));
         outbox = new PgOutbox(db, schema, config.shards(), relay::wake, TestTelemetry.kora());
-        relay.init();
+        relay.start();
         for (int i = 0; i < WRITERS; i++) {
             run("writer-" + i, () -> {
                 while (!stopping.get()) {

@@ -40,7 +40,7 @@ class TicksIT {
     @BeforeEach
     void bootstrap() throws Exception {
         var schema = new OutboxSchema(db, new TestOutboxConfig().shards(SHARDS));
-        schema.init();
+        schema.start();
         names = schema.names();
         ticks = new Ticks(names, SHARDS);
     }

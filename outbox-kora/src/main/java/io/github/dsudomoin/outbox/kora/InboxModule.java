@@ -6,6 +6,7 @@ import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.OutboxTransactions;
 import io.github.dsudomoin.outbox.internal.PgInbox;
+import ru.tinkoff.kora.application.graph.LifecycleWrapper;
 
 /**
  * Consumer-side dedup ({@link Inbox}) without the outbox: no {@link OutboxHandler}, no relay.
@@ -18,7 +19,8 @@ import io.github.dsudomoin.outbox.internal.PgInbox;
  */
 public interface InboxModule extends OutboxCommonModule {
 
-    default Inbox inbox(OutboxTransactions db, OutboxConfig config, OutboxTelemetry telemetry) {
-        return new PgInbox(db, config, telemetry);
+    default LifecycleWrapper<Inbox> inbox(OutboxTransactions db, OutboxConfig config, OutboxTelemetry telemetry) {
+        var inbox = new PgInbox(db, config, telemetry);
+        return new LifecycleWrapper<>(inbox, i -> inbox.start(), i -> inbox.close());
     }
 }

@@ -38,7 +38,6 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import ru.tinkoff.kora.application.graph.Lifecycle;
 
 /**
  * The background relay: {@code relay.workers} daemon threads {@code outbox-relay-N}, each repeatedly making a tick when
@@ -60,7 +59,7 @@ import ru.tinkoff.kora.application.graph.Lifecycle;
  * to the dead table, when the earliest letter is due, and at least every {@code maintenanceInterval}; so a slow or
  * failing hook never holds up a shard step.
  */
-public final class OutboxRelay implements Lifecycle {
+public final class OutboxRelay implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(OutboxRelay.class);
     private static final AtomicInteger THREADS = new AtomicInteger();
@@ -149,7 +148,7 @@ public final class OutboxRelay implements Lifecycle {
     private volatile boolean stopping;
 
     /**
-     * {@code deadLetters}: the pass this relay runs, and closes on {@link #release()}; its hook, or none, decides the
+     * {@code deadLetters}: the pass this relay runs, and closes on {@link #close()}; its hook, or none, decides the
      * fate of the dead letters.
      */
     public OutboxRelay(OutboxTransactions db, OutboxConfig config, OutboxSchema schema, OutboxHandler handler,
@@ -183,8 +182,7 @@ public final class OutboxRelay implements Lifecycle {
     }
 
     /** Starts the workers, the dead-letter thread and maintenance, unless {@code relay.enabled} is false. */
-    @Override
-    public void init() {
+    public void start() {
         heartbeat.start(); // with the relay disabled too: the reshard guard counts writers
         if (!relay.enabled()) {
             log.info("outbox relay disabled (outbox.relay.enabled = false); messages are delivered only by drain()");
@@ -224,7 +222,7 @@ public final class OutboxRelay implements Lifecycle {
      * ({@link Maintenance#close}); the next one drops what it left.
      */
     @Override
-    public void release() {
+    public void close() {
         stopping = true;
         wakeAll();
         deadLetters.close();
@@ -285,7 +283,7 @@ public final class OutboxRelay implements Lifecycle {
         wakeAll();
     }
 
-    /** Started by {@link #init()} with {@code relay.enabled} and not yet released. */
+    /** Started by {@link #start()} with {@code relay.enabled} and not yet released. */
     public boolean running() {
         return started && !stopping;
     }
@@ -589,7 +587,7 @@ public final class OutboxRelay implements Lifecycle {
                 return;
             }
             LockSupport.parkNanos(this, left);
-            Thread.interrupted(); // a stray interrupt must not turn parking into a spin; release() sets stopping
+            Thread.interrupted(); // a stray interrupt must not turn parking into a spin; close() sets stopping
         }
     }
 

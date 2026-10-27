@@ -67,7 +67,7 @@ class KafkaEndToEndIT {
     @AfterEach
     void release() {
         if (relay != null) {
-            relay.release();
+            relay.close();
         }
         senders.forEach(KafkaOutboxSender::release);
         tracing.close();
@@ -269,11 +269,11 @@ class KafkaEndToEndIT {
 
     private void start(OutboxHandler handler, @Nullable Tracer tracer) throws Exception {
         schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         relay = new OutboxRelay(db, config, schema, handler, new KoraOutboxTelemetry(metrics, tracer),
                 new Maintenance(db, schema.names(), config, metrics),
                 new DeadLetterPass(db, schema.names(), config, null, metrics));
-        relay.init();
+        relay.start();
         outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new KoraOutboxTelemetry(metrics, null));
     }
 

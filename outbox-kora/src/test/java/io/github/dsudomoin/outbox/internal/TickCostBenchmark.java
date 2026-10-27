@@ -101,7 +101,7 @@ class TickCostBenchmark {
         var partitions = new OutboxConfig.PartitionsConfig() {};
         var schema = new OutboxSchema(db, new TestOutboxConfig().shards(shards)
                 .xidsPerPartition(partitions.xidsPerPartition()).premake(partitions.premake()));
-        schema.init();
+        schema.start();
         var names = schema.names();
         try {
             for (int t = 0; t < SEED_TRANSACTIONS; t++) {

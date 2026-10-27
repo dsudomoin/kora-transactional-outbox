@@ -30,7 +30,7 @@ class TelemetryFailureIT {
     @AfterEach
     void release() {
         if (relay != null) {
-            relay.release();
+            relay.close();
         }
         db.release();
     }
@@ -39,12 +39,12 @@ class TelemetryFailureIT {
     void throwingTelemetryBreaksNeitherSendNorRelay() throws Exception {
         var telemetry = GuardedTelemetry.of(throwing(OutboxTelemetry.class));
         var schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         var maintenance = new Maintenance(db, schema.names(), config, telemetry);
         var deadLetters = new DeadLetterPass(db, schema.names(), config, OutboxDeadLetterHandler.NONE, telemetry);
         var handler = new RecordingHandler();
         relay = new OutboxRelay(db, config, schema, handler, telemetry, maintenance, deadLetters);
-        relay.init();
+        relay.start();
         var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, telemetry);
         var headers = List.of(new OutboxHeader("a", "1".getBytes(UTF_8)));
         var message = new OutboxMessage("t", "k".getBytes(UTF_8), "p".getBytes(UTF_8), headers);

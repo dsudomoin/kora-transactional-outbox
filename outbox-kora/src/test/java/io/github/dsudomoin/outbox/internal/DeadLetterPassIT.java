@@ -73,14 +73,14 @@ class DeadLetterPassIT {
     @BeforeEach
     void bootstrap() throws Exception {
         schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         names = schema.names();
     }
 
     @AfterEach
     void release() {
         passes.forEach(DeadLetterPass::close);
-        relays.forEach(OutboxRelay::release);
+        relays.forEach(OutboxRelay::close);
         pool.shutdownNow();
         db.release();
     }

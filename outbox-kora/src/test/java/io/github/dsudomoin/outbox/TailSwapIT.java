@@ -103,7 +103,7 @@ class TailSwapIT {
     void release() throws InterruptedException {
         stopLoad();
         if (relay != null) {
-            relay.release();
+            relay.close();
         }
         db.release();
         log.close();
@@ -370,7 +370,7 @@ class TailSwapIT {
 
     private void bootstrap() throws Exception {
         schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
         names = schema.names();
     }
 
@@ -445,7 +445,7 @@ class TailSwapIT {
             }
         });
         loadStarted = System.nanoTime();
-        relay.init();
+        relay.start();
     }
 
     /**

@@ -19,7 +19,7 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  */
 public interface OutboxCommonModule {
 
-    default OutboxConfig outboxConfig(Config config, ConfigValueExtractor<OutboxConfig> extractor) {
+    default OutboxConfig outboxConfig(Config config, ConfigValueExtractor<KoraOutboxConfig> extractor) {
         return extractor.extract(config.get("outbox")); // a missing block yields the defaults
     }
 

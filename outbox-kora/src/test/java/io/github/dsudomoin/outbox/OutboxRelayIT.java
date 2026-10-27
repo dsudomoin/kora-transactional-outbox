@@ -83,7 +83,7 @@ class OutboxRelayIT {
     @AfterEach
     void release() {
         for (var relay : relays) {
-            relay.release();
+            relay.close();
         }
         db.release();
     }
@@ -151,7 +151,7 @@ class OutboxRelayIT {
                 delivered.incrementAndGet();
             }
         });
-        relay.init();
+        relay.start();
         var outbox = outbox(relay::wake);
         awaitParked();
         long ticksBefore = ticksMade();
@@ -197,7 +197,7 @@ class OutboxRelayIT {
                 attempts.incrementAndGet();
             }
         }), handler);
-        relay.init();
+        relay.start();
         var outbox = outbox(relay::wake);
         awaitParked();
 
@@ -227,15 +227,15 @@ class OutboxRelayIT {
                         runs.incrementAndGet();
                     }
                 })), noHook(db)));
-        relays.get(0).init();
+        relays.get(0).start();
         await(Duration.ofSeconds(5), () -> runs.get() == 1);
 
         config.relayEnabled(false);
         var disabled = new AtomicInteger();
         relays.add(new OutboxRelay(db, config, schema, new RecordingHandler(), TestTelemetry.kora(),
                 maintenance(observed(sql -> disabled.incrementAndGet())), noHook(db)));
-        relays.get(1).init();
-        relays.get(1).release();
+        relays.get(1).start();
+        relays.get(1).close();
         assertThat(disabled).hasValue(0);
     }
 
@@ -270,7 +270,7 @@ class OutboxRelayIT {
         try (var err = new CapturedStderr()) {
             relays.add(new OutboxRelay(db, config, schema, new RecordingHandler(), TestTelemetry.kora(),
                     maintenance(failing), noHook(db)));
-            relays.get(0).init();
+            relays.get(0).start();
 
             // the scheduler swallows what a run throws and silently cancels all later runs: only the log tells
             await(Duration.ofSeconds(5), () -> err.text().contains("maintenance out of memory (test)"));
@@ -292,7 +292,7 @@ class OutboxRelayIT {
                 reads.incrementAndGet();
             }
         }), handler);
-        relay.init();
+        relay.start();
         var outbox = outbox(relay::wake);
         awaitParked();
 
@@ -336,7 +336,7 @@ class OutboxRelayIT {
         bootstrap();
         var handler = new RecordingHandler();
         var relay = relay(handler);
-        relay.init();
+        relay.start();
         var outbox = outbox(relay::wake);
         var ids = new ArrayList<UUID>();
         for (int tx = 0; tx < 10; tx++) {
@@ -390,7 +390,7 @@ class OutboxRelayIT {
         bootstrap(); // maintenanceInterval is 1 h: only the wake-up of the step that wrote the letter is in time
         var handed = new CopyOnWriteArrayList<DeadLetter>();
         var relay = relay(poisonous(), keeping(handed));
-        relay.init();
+        relay.start();
         awaitParked();
 
         var ids = send(outbox(relay::wake), msg("t", "poison", "p"));
@@ -417,7 +417,7 @@ class OutboxRelayIT {
                 return false;
             }
         });
-        relay.init();
+        relay.start();
         awaitParked();
 
         var ids = send(outbox(relay::wake), msg("t", "poison", "p"));
@@ -443,11 +443,11 @@ class OutboxRelayIT {
             delivered.get().put(payload(record), System.nanoTime());
         };
         var plain = relay(handler);
-        plain.init();
+        plain.start();
         awaitParked();
         deliveryDelays(outbox(plain::wake), delivered, "warm-up");
         var baseline = p99(deliveryDelays(outbox(plain::wake), delivered, "baseline"));
-        plain.release();
+        plain.close();
 
         var entered = new CountDownLatch(1);
         var never = new CountDownLatch(1);
@@ -457,7 +457,7 @@ class OutboxRelayIT {
             never.await(); // until release() interrupts it
             return List.of();
         });
-        relay.init();
+        relay.start();
         assertThat(entered.await(5, TimeUnit.SECONDS)).as("the hook hangs").isTrue();
         awaitParked();
         var hanging = p99(deliveryDelays(outbox(relay::wake), delivered, "hanging"));
@@ -475,7 +475,7 @@ class OutboxRelayIT {
         bootstrap();
         var handed = new CopyOnWriteArrayList<DeadLetter>();
         var relay = relay(poisonous(), keeping(handed));
-        relay.init();
+        relay.start();
         var ids = send(outbox(relay::wake), msg("t", "poison", "p"), msg("t", "ok", "q"));
 
         assertThat(relay.drain()).isOne();
@@ -503,7 +503,7 @@ class OutboxRelayIT {
             calls.incrementAndGet();
             return keeping.handle(letters);
         });
-        relay.init();
+        relay.start();
 
         Thread.sleep(3000);
         // initialDelay is 50 ms: about 60 calls in 3 s without a growing backoff, 7 with one doubling from it
@@ -544,11 +544,11 @@ class OutboxRelayIT {
             }
         });
         try {
-            relay.init();
+            relay.start();
             assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
 
             long releasing = System.nanoTime();
-            relay.release();
+            relay.close();
 
             assertThat(Duration.ofNanos(System.nanoTime() - releasing)).isLessThan(Duration.ofSeconds(2));
             assertThat(deadLetterThreads()).isEmpty();
@@ -588,7 +588,7 @@ class OutboxRelayIT {
         relays.add(relay);
         // stand-ins for an outbox and an inbox maintenance run, at the same time
         try (var outboxMaintenance = tight.newConnection(); var inboxMaintenance = tight.newConnection()) {
-            relay.init();
+            relay.start();
             var outbox = outbox(relay::wake);
             send(outbox, msg("t", "poison", "p"));
             assertThat(entered.await(10, TimeUnit.SECONDS)).as("the hook hangs, holding a connection").isTrue();
@@ -606,7 +606,7 @@ class OutboxRelayIT {
             assertThat(peaks.values()).as("no thread of the relay holds two").allMatch(n -> n == 1);
         } finally {
             done.countDown();
-            relay.release();
+            relay.close();
             tight.release();
         }
     }
@@ -939,7 +939,7 @@ class OutboxRelayIT {
             var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(null, failing), maintenance(db),
                     noHook(db));
             relays.add(relay);
-            relay.init();
+            relay.start();
 
             var ids = send(outbox(relay::wake), messagesOnShards(100, 1, 3).toArray(OutboxMessage[]::new));
             await(Duration.ofSeconds(10), () -> handler.delivered().size() >= 100);
@@ -1126,7 +1126,7 @@ class OutboxRelayIT {
         var steps = new ConcurrentHashMap<Integer, AtomicInteger>();
         var handler = new RecordingHandler();
         var relay = relay(countingSteps(steps), handler);
-        relay.init();
+        relay.start();
         var outbox = outbox(relay::wake);
         var keys = List.of(keyOnShard(5, "a"), keyOnShard(5, "b"), keyOnShard(5, "c"));
         awaitParked();
@@ -1168,7 +1168,7 @@ class OutboxRelayIT {
                 reads.incrementAndGet();
             }
         }), handler);
-        relay.init();
+        relay.start();
         awaitParked();
         int readsBefore = reads.get();
         long ticks = ticksMade();
@@ -1230,7 +1230,7 @@ class OutboxRelayIT {
                         + " where shard = 0 order by seq desc limit 1");
             }
         }
-        first.release();
+        first.close();
         int before = handler.delivered().size();
         try (var c = TestDb.connect()) { // by hand: the tick shard 0's cursor stands at
             execute(c, "delete from " + schema.names().tick() + " where id = " + stuckAt);
@@ -1241,7 +1241,7 @@ class OutboxRelayIT {
             var outbox = outbox(relay::wake);
             send(outbox, IntStream.range(0, 4).mapToObj(shard -> msg("t", keyOnShard(shard, "b"), "b" + shard))
                     .toArray(OutboxMessage[]::new));
-            relay.init();
+            relay.start();
 
             await(Duration.ofSeconds(10), () -> handler.delivered().size() == before + 3);
             assertThat(handler.delivered().subList(before, before + 3)).extracting(OutboxRelayIT::payload)
@@ -1299,7 +1299,7 @@ class OutboxRelayIT {
         var handler = new RecordingHandler();
         var groups = new CopyOnWriteArrayList<List<Integer>>();
         var relay = relay(steppedGroups(groups::add), handler);
-        relay.init();
+        relay.start();
         var outbox = outbox(relay::wake);
         awaitParked();
         int sent = 0;
@@ -1367,7 +1367,7 @@ class OutboxRelayIT {
         var steps = new ConcurrentHashMap<Integer, AtomicInteger>();
         var handler = new RecordingHandler();
         var relay = relay(countingSteps(steps), handler);
-        relay.init();
+        relay.start();
         var outbox = outbox(relay::wake);
         awaitParked();
         steps.clear();
@@ -1597,7 +1597,7 @@ class OutboxRelayIT {
         var relay = new OutboxRelay(db, config, schema, new RecordingHandler(), TestTelemetry.kora(), maintenance,
                 noHook(db));
         relays.add(relay);
-        relay.init();
+        relay.start();
         awaitParked();
         assertThat(maintenance.halted()).isFalse();
         try (var c = TestDb.connect()) {
@@ -1639,7 +1639,7 @@ class OutboxRelayIT {
         var relay = new OutboxRelay(db, config, schema, handler, TestTelemetry.kora(), maintenance,
                 noHook(db));
         relays.add(relay);
-        relay.init();
+        relay.start();
         // then maintenance's checkpoint moves every idle shard on, past the ids the restore goes back to
         await(Duration.ofSeconds(10), () -> checkpointTick() > dumped + 900);
         awaitParked();
@@ -1751,7 +1751,7 @@ class OutboxRelayIT {
         config.shards(8).relayEnabled(false);
         bootstrap();
         var relay = relay(new RecordingHandler());
-        relay.init();
+        relay.start();
         assertThat(relay.drain()).isZero(); // the cursors are on its tick
 
         long started = System.nanoTime();
@@ -1764,7 +1764,7 @@ class OutboxRelayIT {
         config.shards(64).relayEnabled(false);
         bootstrap();
         var relay = relay(new RecordingHandler());
-        relay.init();
+        relay.start();
         long seq = maxCursorSeq();
         send(outbox(relay::wake), msg("t", keyOnShard(7, "k"), "m"));
 
@@ -1846,7 +1846,7 @@ class OutboxRelayIT {
                 .mapToObj(i -> msg("t", a.get(i % 2), "a" + i))
                 .toArray(OutboxMessage[]::new)));
         await(Duration.ofSeconds(10), () -> cursor(0).failures() >= 1);
-        first.release();
+        first.close();
         assertThat(cursor(0).failures()).isPositive();
         assertThat(cursor(0).targetTickId()).isNull();
         assertThat(down.delivered()).isEmpty();
@@ -1875,7 +1875,7 @@ class OutboxRelayIT {
             }
         });
         await(Duration.ofSeconds(10), () -> cursor(1).targetTickId() != null);
-        second.release();
+        second.close();
         assertThat(chunk.delivered()).hasSize(5);
         assertThat(cursor(1).lastId()).isEqualTo(chunk.delivered().get(4).id());
         assertThat(cursor(1).targetTickId()).isNotNull();
@@ -1919,7 +1919,7 @@ class OutboxRelayIT {
         assertThat(inFlight.await(5, TimeUnit.SECONDS)).isTrue();
 
         long releasing = System.nanoTime();
-        relay.release();
+        relay.close();
 
         assertThat(Duration.ofNanos(System.nanoTime() - releasing)).isLessThan(Duration.ofSeconds(5)); // not interrupted
         assertThat(relay.running()).isFalse();
@@ -1956,7 +1956,7 @@ class OutboxRelayIT {
         assertThat(inFlight.await(5, TimeUnit.SECONDS)).isTrue();
 
         long releasing = System.nanoTime();
-        relay.release();
+        relay.close();
 
         assertThat(Duration.ofNanos(System.nanoTime() - releasing)).isLessThan(Duration.ofSeconds(3));
         assertThat(relayThreads()).isEmpty();
@@ -1970,15 +1970,15 @@ class OutboxRelayIT {
         bootstrap();
         var relay = relay(new RecordingHandler());
         relay.wake(); // before init
-        relay.init();
-        relay.release();
+        relay.start();
+        relay.close();
         relay.wake(); // after release
         assertThat(relay.running()).isFalse();
     }
 
     private void bootstrap() throws Exception {
         schema = new OutboxSchema(db, config);
-        schema.init();
+        schema.start();
     }
 
     private OutboxRelay relay(OutboxHandler handler) {
@@ -2219,7 +2219,7 @@ class OutboxRelayIT {
 
     private OutboxRelay start(OutboxHandler handler) {
         var relay = relay(handler);
-        relay.init();
+        relay.start();
         assertThat(relay.running()).isTrue();
         return relay;
     }
