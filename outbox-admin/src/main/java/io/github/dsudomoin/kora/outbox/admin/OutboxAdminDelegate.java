@@ -164,8 +164,9 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
     }
 
     /**
-     * A bulk call's filter: a blank {@code topic} or {@code error} is refused, not dropped as {@link DeadLetterFilter}
-     * drops it, since dropped it would widen the call to every topic or error the rest of the filter matches.
+     * A bulk call's filter: a blank {@code topic} or {@code error} is refused, as dropped it would widen the call to
+     * every letter the rest of the filter matches; here, so the 400 names the contract's field ({@link OutboxAdmin}
+     * refuses it too).
      */
     private static DeadLetterFilter filter(Filter f) {
         return filter(notBlank("topic", f.topic()), f.key(), notBlank("error", f._error()), f.failedFrom(),

@@ -517,12 +517,22 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         }
     }
 
+    /** A bulk call's filter: one that names something, with no blank string, which would widen it. */
     private static DeadLetterFilter nonEmpty(DeadLetterFilter filter) {
+        notBlank("topic", filter.topic());
+        notBlank("errorContains", filter.errorContains());
         if (filter.isEmpty()) {
             throw new IllegalArgumentException("an empty DeadLetterFilter matches every dead letter: name what to"
                     + " act on (topic, key, errorContains, failedFrom, failedTo or status), or pass the ids");
         }
         return filter;
+    }
+
+    private static void notBlank(String field, @Nullable String value) {
+        if (value != null && value.isBlank()) {
+            throw new IllegalArgumentException("a blank " + field + " in a filter matches every " + field
+                    + ": leave it out, or name one");
+        }
     }
 
     private static boolean queryBoolean(Connection c, String sql) throws SQLException {
@@ -538,9 +548,11 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         static Where of(DeadLetterFilter f) {
             var sql = new ArrayList<String>();
             var params = new ArrayList<Object>();
-            add(sql, params, "topic = ?", f.topic());
+            // a blank string counts as absent: reads take it so, bulk calls refuse it first (nonEmpty)
+            add(sql, params, "topic = ?", absentIfBlank(f.topic()));
             add(sql, params, "key = ?", f.key());
-            add(sql, params, "position(? in error) > 0", f.errorContains()); // a substring: no pattern, no escapes
+            // a substring: no pattern, no escapes
+            add(sql, params, "position(? in error) > 0", absentIfBlank(f.errorContains()));
             add(sql, params, "failed_at >= ?", f.failedFrom() == null ? null : f.failedFrom().atOffset(ZoneOffset.UTC));
             add(sql, params, "failed_at < ?", f.failedTo() == null ? null : f.failedTo().atOffset(ZoneOffset.UTC));
             add(sql, params, "status = ?", f.status() == null ? null : f.status().name().toLowerCase(Locale.ROOT));
@@ -556,6 +568,11 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         static Where ids(Collection<Long> ids) {
             // every chunk binds all the ids: quadratic for huge lists, fine for a page of them (a filter serves bulk)
             return new Where("id = any(?)", List.of(ids.stream().mapToLong(Long::longValue).toArray()));
+        }
+
+        @Nullable
+        private static String absentIfBlank(@Nullable String s) {
+            return s == null || s.isBlank() ? null : s;
         }
 
         private static void add(List<String> sql, List<Object> params, String condition, @Nullable Object value) {

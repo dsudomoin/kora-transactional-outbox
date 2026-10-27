@@ -223,6 +223,27 @@ class OutboxAdminIT {
         assertThat(outboxMessageIds()).isEmpty();
     }
 
+    /** With another field set, a blank one dropped would widen the call to every letter that field matches. */
+    @Test
+    void blankFilterStringsAreRefusedByBulkCalls() throws Exception {
+        long id = letter("t", "k");
+        long other = letter("u", "k");
+
+        for (var blank : List.of("", "  ")) {
+            assertThatThrownBy(() -> admin.discardDeadLetters(filter(blank, null, null, null, null, KEPT)))
+                    .as("topic '%s'", blank).isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageStartingWith("a blank topic");
+            assertThatThrownBy(() -> admin.redriveDeadLetters(filter("t", null, blank, null, null, null)))
+                    .as("errorContains '%s'", blank).isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageStartingWith("a blank errorContains");
+        }
+
+        assertThat(deadIds()).containsExactly(id, other);
+        assertThat(outboxMessageIds()).isEmpty();
+        assertThat(find(filter(" ", null, null, null, null, KEPT))).as("reads take it as absent")
+                .containsExactly(id, other);
+    }
+
     @Test
     void aFilterCallLeavesLettersThatDieDuringIt() throws Exception {
         deadLetters(1000); // a full chunk and one more letter: the call claims a second chunk after the two below

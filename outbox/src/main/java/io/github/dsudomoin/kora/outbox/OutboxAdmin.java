@@ -41,7 +41,7 @@ public interface OutboxAdmin {
     /**
      * {@link #redriveDeadLetters(Collection)} for the letters matching {@code filter}.
      *
-     * @throws IllegalArgumentException for an empty filter: name what to redrive
+     * @throws IllegalArgumentException for an empty filter, or a blank topic or errorContains: name what to redrive
      */
     long redriveDeadLetters(DeadLetterFilter filter);
 
@@ -51,7 +51,7 @@ public interface OutboxAdmin {
     /**
      * Deletes the letters matching {@code filter}; returns how many.
      *
-     * @throws IllegalArgumentException for an empty filter: name what to discard
+     * @throws IllegalArgumentException for an empty filter, or a blank topic or errorContains: name what to discard
      */
     long discardDeadLetters(DeadLetterFilter filter);
 
