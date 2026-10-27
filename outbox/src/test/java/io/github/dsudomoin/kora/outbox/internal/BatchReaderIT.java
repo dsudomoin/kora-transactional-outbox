@@ -313,7 +313,16 @@ class BatchReaderIT {
         assertThat(all).hasSizeGreaterThan(4);
         var one = List.of(new ShardRead(shard, p, c, 0, 1000, true));
 
-        var whole = readMany(one, 1000);
+        var prepared = new ArrayList<String>();
+        BatchReader.Batch whole;
+        try (var conn = recording(TestDb.connect(), prepared)) {
+            conn.setAutoCommit(false);
+            execute(conn, "set local plan_cache_mode = force_custom_plan");
+            whole = reader.readMany(conn, one, 1000);
+            conn.commit();
+        }
+        assertThat(prepared).as("read's own statement, not the group one").contains(reader.sql(true))
+                .doesNotContain(reader.manySql());
         assertThat(rowKeys(whole.rows().get(shard))).isEqualTo(rowKeys(all));
         assertThat(whole.cut()).isFalse();
         assertThat(readMany(one, all.size()).cut()).as("exactly the limit counts as cut").isTrue();
@@ -521,6 +530,21 @@ class BatchReaderIT {
             c.rollback();
         }
         return planned;
+    }
+
+    /** {@code c}, adding the SQL of each statement it prepares to {@code prepared}. */
+    private static Connection recording(Connection c, List<String> prepared) {
+        return (Connection) java.lang.reflect.Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("prepareStatement")) {
+                        prepared.add((String) args[0]);
+                    }
+                    try {
+                        return method.invoke(c, args);
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
     }
 
     private BatchReader.Batch readMany(List<ShardRead> reads, int totalLimit) throws SQLException {
