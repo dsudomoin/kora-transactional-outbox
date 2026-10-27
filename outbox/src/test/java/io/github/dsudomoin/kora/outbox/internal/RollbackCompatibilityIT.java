@@ -229,6 +229,10 @@ class RollbackCompatibilityIT {
                     }
                     holder.commit();
                     assertThat(queryLong(c, "select count(*) from " + names.tail())).as(state).isOne();
+                    if (state.equals("hot")) { // over maxTailScan, no swap is tried outside the window
+                        assertThat(PartitionDdl.standalone(c, names.base(), "_x[0-9]+"))
+                                .as("the failed swap's ranges made ahead").isNotEmpty();
+                    }
                 }
                 long tail = tailLower(c);
 
@@ -240,10 +244,14 @@ class RollbackCompatibilityIT {
                     } catch (SQLException e) {
                         failed.add(e);
                     }
+                    previousFinishPendingDetach(c);
                     previousExtension(c, cfg.xidsPerPartition(), cfg.premake());
+                    previousDropOrphans(c);
                 }
 
                 assertThat(failed).as("%s: failed inserts", state).isEmpty();
+                assertThat(PartitionDdl.standalone(c, names.base(), "_x[0-9]+")).as("%s: 5fc60dd dropped the empty"
+                        + " ranges made ahead, as anyone else's", state).isEmpty();
                 assertThat(queryLong(c, "select count(*) from pg_constraint where contype = 'c' and conrelid in"
                         + " (select inhrelid from pg_inherits where inhparent = '" + names.base() + "'::regclass)"))
                         .as("%s: checks", state).isZero();
@@ -252,10 +260,13 @@ class RollbackCompatibilityIT {
                             .isEqualTo(tail);
                 }
                 partitions.clock = clockAt(4, 0); // upgraded again; an oversized tail waits for the window
-                partitions.ensurePremade(c);
+                for (int run = 0; run < 5; run++) { // maintenance runs: four ranges a swap until premake are ahead
+                    partitions.ensurePremade(c);
+                }
 
                 assertThat(queryLong(c, "select count(*) from " + names.tail())).as("%s: healed", state).isZero();
-                assertThat(partitions.premadeAhead(c)).as(state).isGreaterThanOrEqualTo(cfg.premake());
+                // its own xids moved the counter on meanwhile, over these 1000-xid ranges: no longer due is the point
+                assertThat(partitions.premadeAhead(c)).as(state).isGreaterThan(cfg.premake() / 2);
                 insert(c);
             }
         }
@@ -296,6 +307,33 @@ class RollbackCompatibilityIT {
         }
         PartitionDdl.createAndAttach(c, names.base(), names.tail(), Long.toString(from), null,
                 PartitionDdl.CREATE_LOCK_TIMEOUT);
+    }
+
+    /** 5fc60dd XidPartitions#finishPendingDetach, its statements verbatim: nothing pending after this version. */
+    private void previousFinishPendingDetach(Connection c) throws SQLException {
+        var pending = PartitionDdl.pendingDetach(c, names.base());
+        if (pending != null) {
+            PartitionDdl.detach(c, names.base(), pending, PartitionDdl.DETACH_LOCK_TIMEOUT);
+        }
+    }
+
+    /**
+     * 5fc60dd XidPartitions#dropOrphans, its statements verbatim: every standalone {@code <base>_x<digits>}, so also
+     * the ranges this version made ahead of its tail, is dropped when empty unless recorded as relayed.
+     */
+    private void previousDropOrphans(Connection c) throws SQLException {
+        var marked = new HashSet<String>();
+        try (var st = c.createStatement(); var rs = st.executeQuery("select table_name from " + names.dropping())) {
+            while (rs.next()) {
+                marked.add(rs.getString(1));
+            }
+        }
+        for (var table : PartitionDdl.standalone(c, names.base(), "_x[0-9]+")) {
+            if (!marked.contains(names.unqualified(table))) {
+                PartitionDdl.dropUnlessFound(c, table, "select 1 from {table} limit 1", null,
+                        PartitionDdl.DETACH_LOCK_TIMEOUT);
+            }
+        }
     }
 
     private void insert(Connection c) throws SQLException {

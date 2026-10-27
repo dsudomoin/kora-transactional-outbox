@@ -560,10 +560,13 @@ class XidPartitionsIT {
         var done = new AtomicBoolean();
         var errors = new ConcurrentLinkedQueue<Throwable>();
         var inserts = new AtomicLong();
+        var slowest = new AtomicLong();
         var writer = new Thread(() -> {
             try (var w = TestDb.connect()) {
                 while (!done.get()) {
+                    long start = System.nanoTime();
                     send(w, names, 1);
+                    slowest.accumulateAndGet(System.nanoTime() - start, Math::max);
                     inserts.incrementAndGet();
                 }
             } catch (Throwable e) {
@@ -590,6 +593,9 @@ class XidPartitionsIT {
 
             assertThat(errors).as("failed inserts").isEmpty();
             assertThat(inserts.get()).isPositive();
+            // the statement was cut at maxStall past its try; the margin covers a loaded machine
+            assertThat(Duration.ofNanos(slowest.get())).as("the slowest insert, against maxStall + the hold")
+                    .isLessThan(Duration.ofMillis(1).plusMillis(250));
             assertThat(log).contains("WARN").contains(names.tail()).contains(" MB").contains("maxStall 1 ms");
             assertThat(tail(c, names)).isEqualTo(lower);
             assertThat(PartitionDdl.listRanges(c, names.base())).as("the same partitions attached")
@@ -637,7 +643,7 @@ class XidPartitionsIT {
             }
 
             assertThat(failed).as("failed inserts").isEmpty();
-            assertThat(Duration.ofNanos(slowest)).as("the slowest insert").isLessThan(Duration.ofSeconds(1));
+            assertThat(Duration.ofNanos(slowest)).as("the slowest insert").isLessThan(Duration.ofMillis(200));
             assertThat(tail(c, names)).as("never swapped").isEqualTo(lower);
             assertThat(queryLong(c, "select count(*) from " + names.tail())).isPositive();
             assertThat(partitions.overflow()).isTrue();
@@ -1260,6 +1266,50 @@ class XidPartitionsIT {
                 .contains("maxStall 800 ms");
     }
 
+    /** The swap's statement as Postgres 17 runs it: an empty tail swapped, then a hot one turned into a range. */
+    @Test
+    void theSwapRunsOnPostgres17() throws Exception {
+        try (var pg17 = new PostgreSQLContainer("postgres:17-alpine")) {
+            pg17.start();
+            var db17 = TestDb.newDatabase(pg17.getJdbcUrl(), pg17.getUsername(), pg17.getPassword(), 4);
+            try {
+                var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
+                var schema = new OutboxSchema(db17, config);
+                schema.init();
+                var names = schema.names();
+                var partitions = new XidPartitions(names, config.partitions());
+                try (var c = DriverManager.getConnection(pg17.getJdbcUrl(), pg17.getUsername(), pg17.getPassword())) {
+                    burn(c, 2500);
+                    if (currentXid(c) % 1000 > 600) { // its own xids must not carry the counter into the next range
+                        burn(c, 500);
+                    }
+                    long empty = tail(c, names);
+                    partitions.ensurePremade(c);
+                    assertThat(tail(c, names)).as("the empty tail swapped").isGreaterThan(empty);
+                    long hot = tail(c, names);
+                    burn(c, (int) (hot - currentXid(c)) + 10);
+                    send(c, names, 10);
+                    assertThat(queryLong(c, "select count(*) from " + names.tail())).isEqualTo(10);
+
+                    partitions.ensurePremade(c);
+
+                    assertThat(queryLong(c, "select count(*) from " + formerTail(c, names, hot).name())).isEqualTo(10);
+                    assertThat(queryLong(c, "select count(*) from " + names.tail())).isZero();
+                    assertTailAboveLastRange(c, names);
+                    assertNoCheck(c, names);
+                }
+            } finally {
+                db17.release();
+            }
+        }
+    }
+
+    private static void burn(Connection c, int xids) throws SQLException {
+        for (int i = 0; i < xids; i++) {
+            queryLong(c, "select pg_current_xact_id()::text::bigint");
+        }
+    }
+
     @Test
     void quiesceWaitsForARelayStepAndTimesOutWithoutALock() throws Exception {
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
@@ -1648,12 +1698,18 @@ class XidPartitionsIT {
         return Clock.fixed(LocalDate.now(zone).atTime(hour, minute).atZone(zone).toInstant(), zone);
     }
 
-    /** No check on the outbox or any of its partitions: none of the library's, so none that refuses a row. */
+    /**
+     * No check on the outbox, any of its partitions, or the tables made ahead to become one (ranges, the next tail):
+     * none of the library's, so none that refuses a row.
+     */
     private static void assertNoCheck(Connection c, TableNames names) throws SQLException {
         assertThat(queryString(c, "select string_agg(conrelid::regclass || ' ' || pg_get_constraintdef(oid), ', ')"
                 + " from pg_constraint where contype = 'c' and (conrelid = to_regclass(?)"
-                + " or conrelid in (select inhrelid from pg_inherits where inhparent = to_regclass(?)))",
-                names.base(), names.base())).as("checks").isNull();
+                + " or conrelid in (select inhrelid from pg_inherits where inhparent = to_regclass(?))"
+                + " or conrelid in (select oid from pg_class where relkind = 'r'"
+                + " and relnamespace = (select relnamespace from pg_class where oid = to_regclass(?))"
+                + " and relname ~ ('^' || ? || '_(x[0-9]+|tail|tail_next)$')))",
+                names.base(), names.base(), names.base(), names.unqualified(names.base()))).as("checks").isNull();
     }
 
     /** {@code n} messages over the shards, each in its own autocommit transaction; their ids. */
