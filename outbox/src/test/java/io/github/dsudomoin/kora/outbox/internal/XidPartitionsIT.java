@@ -15,7 +15,6 @@ import io.github.dsudomoin.kora.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
-import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
@@ -346,21 +345,23 @@ class XidPartitionsIT {
             assertThat(log).contains("WARN").contains("rows went to the partition tail " + names.tail())
                     .contains("the next extension turns it into a range");
             assertThat(queryLong(c, "select count(*) from " + names.tail())).isEqualTo(1);
-            assertThat(tail(c, names)).isEqualTo(tailBefore);
-            assertThat(boundCheck(c, names, names.tail())).as("its validate scan is left to maintenance").isNull();
+            assertThat(tail(c, names)).as("its scan is left to maintenance").isEqualTo(tailBefore);
+            assertNoCheck(c, names);
         }
     }
 
+    /**
+     * A tail holding rows, within maxTailScan, becomes the range [H, U) in one swap, U two ranges above the current
+     * xid's: Postgres scans it under the swap's lock, as no check on it may ever refuse a row, and keeps its indexes.
+     */
     @Test
-    void hotTailIsConvertedIntoARange() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
-        var names = bootstrap(config); // premake 4: the tail is near
-        int premake = new OutboxConfig.PartitionsConfig() {}.premake(); // the library default, for the conversion
-        var partitions = new XidPartitions(names, new TestOutboxConfig().xidsPerPartition(1000).premake(premake)
-                .swapLockTimeout(SWAP_LOCK_TIMEOUT).partitions());
+    void hotTailIsConvertedIntoARangeByTheAttachScan() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
 
         try (var c = TestDb.connect()) {
-            long lower = overflowTail(c, names, 200_000);
+            long lower = overflowTail(c, names, 20_000);
             long current = currentXid(c);
             var attach = new ArrayList<String>();
             partitions.attachWarnings = w -> {
@@ -378,17 +379,17 @@ class XidPartitionsIT {
 
             execute(c, "reset client_min_messages");
             var former = formerTail(c, names, lower);
-            assertThat(Long.parseLong(former.to())).as("U, premake / 2 ranges above the current xid's")
-                    .isEqualTo((current / 1000 + premake / 2) * 1000);
-            assertThat(queryLong(c, "select count(*) from " + former.name())).isEqualTo(200_000);
+            assertThat(Long.parseLong(former.to())).as("U, two ranges above the current xid's")
+                    .isEqualTo((current / 1000 + 2) * 1000);
+            assertThat(queryLong(c, "select count(*) from " + former.name())).isEqualTo(20_000);
             assertThat(queryLong(c, "select count(*) from " + names.tail())).isZero();
-            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(premake);
+            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(config.premake());
             assertThat(partitions.overflow()).isFalse();
             assertTailAboveLastRange(c, names);
-            // under ACCESS EXCLUSIVE on the parent: no scan of the rows, no index built on them
-            assertThat(attach).contains("partition constraint for table \"" + names.unqualified(former.name())
-                            + "\" is implied by existing constraints")
-                    .noneMatch(m -> m.startsWith("verifying table") || m.startsWith("building index"));
+            assertNoCheck(c, names);
+            // scanned under the lock, but no index built on the rows: the tail keeps its own
+            assertThat(attach).contains("verifying table \"" + names.unqualified(former.name()) + "\"")
+                    .noneMatch(m -> m.startsWith("building index"));
             assertThat(log).contains("swapped the partition tail of " + names.base() + ": attached it with its rows as "
                     + former.name() + " [" + lower + ", " + former.to() + ")");
         }
@@ -396,8 +397,7 @@ class XidPartitionsIT {
 
     @Test
     void hotTailOfASchemaQualifiedOutboxIsConverted() throws Exception {
-        var config = new TestOutboxConfig().table("public." + TestDb.uniqueTable()).xidsPerPartition(1000).premake(4)
-                .swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().table("public." + TestDb.uniqueTable()).xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions());
 
@@ -408,55 +408,153 @@ class XidPartitionsIT {
 
             var former = formerTail(c, names, lower);
             assertThat(queryLong(c, "select count(*) from " + former.name())).isEqualTo(10);
-            // a constraint name takes no schema: "public.<tail>_bounded" would fail to parse
-            assertThat(boundCheck(c, names, former.name())).as("the check, by its unqualified name").isNotNull();
             assertThat(partitions.overflow()).isFalse();
             assertTailAboveLastRange(c, names);
+            assertNoCheck(c, names);
         }
     }
 
+    /**
+     * No path of the extension leaves a check on a partition, so none can refuse a business insert: an empty tail
+     * extended, a hot empty one, a hot one with rows, one over maxTailScan, a swap that fails on a young lock holder
+     * and one deferred by it once old. Then, with every swap failing, xids are burnt far past any bound a check could
+     * have had, and every insert succeeds.
+     */
     @Test
-    void swapThatFindsTheXidAtTheBoundDropsTheCheckWithAnError() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(Duration.ofSeconds(10));
+    void noPathLeavesACheckThatCouldRefuseAnInsert() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
+        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
+        var small = new XidPartitions(names, new TestOutboxConfig().xidsPerPartition(1000).premake(4).maxTailScan(0)
+                .partitions());
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
-            long lower = overflowTail(c, names, 10);
-            holder.setAutoCommit(false); // a young lock on the parent alone: the swap waits for it, the check goes on
+            TestDb.burnXids(2500); // cold: the empty tail swapped for ranges
+            ensurePremadeAsMaintenance(partitions, c);
+            assertNoCheck(c, names);
+            TestDb.burnXids((int) (tail(c, names) - currentXid(c)) - 500); // hot, empty: within a range of the tail
+            ensurePremadeAsMaintenance(partitions, c);
+            assertNoCheck(c, names);
+            overflowTail(c, names, 10); // hot with rows
+            ensurePremadeAsMaintenance(partitions, c);
+            assertNoCheck(c, names);
+            long lower = overflowTail(c, names, 10); // over maxTailScan
+            ensurePremadeAsMaintenance(small, c);
+            assertThat(tail(c, names)).isEqualTo(lower);
+            assertNoCheck(c, names);
+            holder.setAutoCommit(false); // a young lock on the parent: the swap fails on it
             execute(holder, "lock table only " + names.base() + " in access share mode");
-            var errors = new ConcurrentLinkedQueue<Throwable>();
-            var meanwhile = new Thread(() -> { // while the swap waits, the xid passes U, 2 ranges above the current one
-                try (var w = TestDb.connect()) {
-                    while (queryLong(w, "select count(*) from pg_locks where relation = to_regclass('" + names.base()
-                            + "') and mode = 'AccessExclusiveLock' and not granted") == 0) {
-                        Thread.sleep(5);
-                    }
-                    TestDb.burnXids(2000);
-                    holder.commit();
-                } catch (Throwable e) {
-                    errors.add(e);
+            ensurePremadeAsMaintenance(partitions, c);
+            assertNoCheck(c, names);
+            Thread.sleep(1100); // now old: the swap is deferred
+            ensurePremadeAsMaintenance(partitions, c);
+            assertNoCheck(c, names);
+
+            var failed = new ArrayList<SQLException>();
+            for (int i = 0; i < 20; i++) { // 10 ranges past the tail, no swap all along
+                TestDb.burnXids(500);
+                try {
+                    send(c, names, 1);
+                } catch (SQLException e) {
+                    failed.add(e);
                 }
-            });
-            meanwhile.start();
+                ensurePremadeAsMaintenance(partitions, c);
+                assertNoCheck(c, names);
+            }
+
+            assertThat(failed).as("failed inserts").isEmpty();
+            assertThat(tail(c, names)).as("never swapped").isEqualTo(lower);
+            holder.commit();
+        }
+    }
+
+    /**
+     * A tail over maxTailScan stays hot: no lock is asked for (a writer routed to the tail stays open across the run,
+     * which a lock on the tail would wait for), writes go on into it, and an ERROR at most once an hour names the size
+     * and the admin call that converts it.
+     */
+    @Test
+    void tailOverMaxTailScanStaysHotWithAnErrorAndWritesGoOn() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(Duration.ofSeconds(5));
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, new TestOutboxConfig().xidsPerPartition(1000).premake(4)
+                .swapLockTimeout(Duration.ofSeconds(5)).maxTailScan(64 * 1024).partitions());
+
+        try (var writer = TestDb.connect(); var c = TestDb.connect()) {
+            long lower = overflowTail(c, names, 10_000);
+            writer.setAutoCommit(false);
+            insertIntoTail(writer, names);
 
             String log;
+            long start = System.nanoTime();
             try (var err = new CapturedStderr()) {
+                partitions.ensurePremade(c);
                 partitions.ensurePremade(c);
                 log = err.text();
             }
 
-            meanwhile.join();
-            assertThat(errors).isEmpty();
-            assertThat(log).contains("ERROR").contains("was not swapped").contains("may have failed");
-            assertThat(boundCheck(c, names, names.tail())).as("dropped").isNull();
+            assertThat(Duration.ofNanos(System.nanoTime() - start)).as("no lock waited for")
+                    .isLessThan(Duration.ofSeconds(2));
+            writer.commit();
+            assertThat(log.split("over outbox.partitions.maxTailScan", -1)).as("one ERROR an hour").hasSize(2);
+            assertThat(log).contains("ERROR").contains(names.tail());
             assertThat(tail(c, names)).isEqualTo(lower);
             assertThat(partitions.overflow()).isTrue();
-            assertThat(swapLocks(c, names)).as("the quiesce lock released").isZero();
+            assertNoCheck(c, names);
+            send(c, names, 10);
+            assertThat(queryLong(c, "select count(*) from " + names.tail())).isEqualTo(10_011);
+        }
+    }
 
-            partitions.ensurePremade(c); // a check higher up, then the swap
+    /**
+     * A session left idle in transaction after its insert, for the whole test: every swap is deferred, the ranges
+     * run out and rows go to the tail; no insert fails or waits on the library, and the ERROR names the holder. Once it
+     * ends, the next run turns the tail into a range.
+     */
+    @Test
+    void aLeakedHolderNeverFailsAnInsertAndTheTailHealsAfterIt() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
 
-            assertThat(queryLong(c, "select count(*) from " + formerTail(c, names, lower).name())).isEqualTo(10);
+        try (var holder = TestDb.connect(); var c = TestDb.connect()) {
+            holder.setAutoCommit(false);
+            send(holder, names, 1);
+            Thread.sleep(1100);
+            long lower = tail(c, names);
+            long slowest = 0;
+            var failed = new ArrayList<SQLException>();
+
+            String log;
+            try (var err = new CapturedStderr()) {
+                for (int i = 0; i < 12; i++) {
+                    TestDb.burnXids(1000);
+                    long start = System.nanoTime();
+                    try {
+                        send(c, names, 1);
+                    } catch (SQLException e) {
+                        failed.add(e);
+                    }
+                    slowest = Math.max(slowest, System.nanoTime() - start);
+                    ensurePremadeAsMaintenance(partitions, c);
+                }
+                log = err.text();
+            }
+
+            assertThat(failed).as("failed inserts").isEmpty();
+            assertThat(Duration.ofNanos(slowest)).as("the slowest insert").isLessThan(Duration.ofSeconds(1));
+            assertThat(tail(c, names)).as("never swapped").isEqualTo(lower);
+            assertThat(queryLong(c, "select count(*) from " + names.tail())).isPositive();
+            assertThat(partitions.overflow()).isTrue();
+            assertThat(log).contains("ERROR").contains("outbox partition tail swap of " + names.base())
+                    .contains("holds RowExclusiveLock on " + names.base());
+            holder.commit();
+
+            partitions.ensurePremade(c);
+
+            assertThat(queryLong(c, "select count(*) from " + formerTail(c, names, lower).name())).isPositive();
+            assertThat(queryLong(c, "select count(*) from " + names.tail())).isZero();
+            assertThat(partitions.overflow()).isFalse();
             assertTailAboveLastRange(c, names);
         }
     }
@@ -493,51 +591,8 @@ class XidPartitionsIT {
     }
 
     @Test
-    void staleBoundIsReplaced() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
-        var names = bootstrap(config);
-        var partitions = new XidPartitions(names, config.partitions());
-        var done = new AtomicBoolean();
-        var errors = new ConcurrentLinkedQueue<Throwable>();
-        var writer = new Thread(() -> { // routed to the tail: one at or above a check's U would fail
-            try (var c = TestDb.connect()) {
-                while (!done.get()) {
-                    execute(c, "insert into " + names.base()
-                            + " (shard, message_id, topic) values (0, gen_random_uuid(), 't')");
-                    Thread.sleep(1);
-                }
-            } catch (Throwable e) {
-                errors.add(e);
-            }
-        });
-
-        try (var c = TestDb.connect()) {
-            long lower = overflowTail(c, names, 10);
-            long stale = (currentXid(c) / 1000 + 1) * 1000; // one range above the current xid
-            execute(c, "alter table " + names.tail() + " add constraint " + names.unqualified(names.tail())
-                    + "_bounded check (xid >= '" + lower + "' and xid < '" + stale + "') not valid");
-            TestDb.burnXids((int) Math.max(0, stale - 500 - currentXid(c)) + 1); // within half a range of it
-            writer.start();
-
-            String log;
-            try (var err = new CapturedStderr()) {
-                partitions.ensurePremade(c);
-                log = err.text();
-            } finally {
-                done.set(true);
-                writer.join();
-            }
-
-            assertThat(errors).isEmpty();
-            assertThat(log).contains("replaced check");
-            assertThat(Long.parseLong(formerTail(c, names, lower).to())).isEqualTo(stale + 1000);
-            assertTailAboveLastRange(c, names);
-        }
-    }
-
-    @Test
     void swapRollsBackWhenTheXidPassedTheBound() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions());
 
@@ -545,55 +600,44 @@ class XidPartitionsIT {
             long lower = overflowTail(c, names, 10);
             long passed = lower + 1000; // above every row, below the current xid: all the swap needs but that
             TestDb.burnXids((int) (passed - currentXid(c)) + 10);
-            String check = names.unqualified(names.tail()) + "_bounded";
-            execute(c, "alter table " + names.tail() + " add constraint " + check
-                    + " check (xid >= '" + lower + "' and xid < '" + passed + "') not valid");
-            execute(c, "alter table " + names.tail() + " validate constraint " + check);
             for (long from = passed; from < passed + 4000; from += 1000) {
                 PartitionDdl.create(c, names.base(), names.partitionPrefix() + from, PartitionDdl.CREATE_LOCK_TIMEOUT);
             }
             PartitionDdl.create(c, names.base(), names.tailNext(), PartitionDdl.CREATE_LOCK_TIMEOUT);
             var before = PartitionDdl.listRanges(c, names.base());
 
-            assertThat(partitions.swap(c, lower, passed, passed + 4000)).isFalse();
+            assertThat(partitions.swap(c, lower, passed, passed + 4000, Duration.ofSeconds(5))).isFalse();
 
             assertThat(c.getAutoCommit()).isTrue();
             assertThat(PartitionDdl.listRanges(c, names.base())).containsExactlyInAnyOrderElementsOf(before);
             assertThat(detachPending(c, names.tail())).as("still attached").isEqualTo("false");
             assertThat(queryLong(c, "select count(*) from " + names.tail())).isEqualTo(10);
-            assertThat(boundCheck(c, names, names.tail())).isNotNull();
             assertThat(PartitionDdl.attachment(c, names.base(), names.tailNext())).isEqualTo(Attachment.STANDALONE);
         }
     }
 
     @Test
-    void failedConversionKeepsItsCheckForTheNextRun() throws Exception {
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(SWAP_LOCK_TIMEOUT);
+    void failedConversionLeavesNoCheckAndTheNextRunConverts() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
         var names = bootstrap(config);
         var partitions = new XidPartitions(names, config.partitions());
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             long lower = overflowTail(c, names, 10);
-            holder.setAutoCommit(false); // a young lock on the parent alone: the check goes on, the swap gives up
+            holder.setAutoCommit(false); // a young lock on the parent alone: the swap gives up on it
             execute(holder, "lock table only " + names.base() + " in access share mode");
 
             assertThatThrownBy(() -> partitions.ensurePremade(c))
                     .isInstanceOfSatisfying(SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("55P03"));
 
             holder.commit();
-            var check = boundCheck(c, names, names.tail());
-            assertThat(check).isNotNull();
+            assertNoCheck(c, names);
             assertThat(tail(c, names)).isEqualTo(lower);
             assertThat(partitions.overflow()).isTrue();
-            String log;
-            try (var err = new CapturedStderr()) {
-                partitions.ensurePremade(c);
-                log = err.text();
-            }
 
-            var former = formerTail(c, names, lower);
-            assertThat(boundCheck(c, names, former.name())).as("the same check, kept").isEqualTo(check);
-            assertThat(log).doesNotContain("added check").doesNotContain("replaced check");
+            partitions.ensurePremade(c);
+
+            assertThat(queryLong(c, "select count(*) from " + formerTail(c, names, lower).name())).isEqualTo(10);
             assertThat(partitions.overflow()).isFalse();
             assertTailAboveLastRange(c, names);
         }
@@ -1237,17 +1281,12 @@ class XidPartitionsIT {
                 .orElseThrow(() -> new AssertionError("no range " + names.partitionPrefix() + lower));
     }
 
-    /** The oid and definition of {@code table}'s bound check, or null. */
-    @Nullable
-    private static String boundCheck(Connection c, TableNames names, String table) throws SQLException {
-        try (var ps = c.prepareStatement("select oid || ' ' || pg_get_constraintdef(oid) from pg_constraint"
-                + " where conrelid = to_regclass(?) and conname = ?")) {
-            ps.setString(1, table);
-            ps.setString(2, names.unqualified(names.tail()) + "_bounded");
-            try (var rs = ps.executeQuery()) {
-                return rs.next() ? rs.getString(1) : null;
-            }
-        }
+    /** No check on the outbox or any of its partitions: none of the library's, so none that refuses a row. */
+    private static void assertNoCheck(Connection c, TableNames names) throws SQLException {
+        assertThat(queryString(c, "select string_agg(conrelid::regclass || ' ' || pg_get_constraintdef(oid), ', ')"
+                + " from pg_constraint where contype = 'c' and (conrelid = to_regclass(?)"
+                + " or conrelid in (select inhrelid from pg_inherits where inhparent = to_regclass(?)))",
+                names.base(), names.base())).as("checks").isNull();
     }
 
     /** {@code n} messages over the shards, each in its own autocommit transaction; their ids. */

@@ -250,10 +250,9 @@ class TailSwapIT {
                 maintenanceLock(pause, "pg_advisory_unlock");
             }
             var stuck = Pattern.compile("ERROR .*outbox partition tail swap of " + Pattern.quote(names.base())
-                    + " timed out waiting for writers' locks on (\\S+) on (\\d+) due runs in a row, (\\d+) ranges"
-                    + " ahead of the current xid: .*\\.swapLockTimeout (\\d+) ms after their send, and overlap, so the"
-                    + " swap never gets its gap \\((\\d+) transactions hold a lock on (\\S+) right after, the oldest:"
-                    + " (pid \\d+ \\(.*?\\) in a transaction open [\\d.]+ s)");
+                    + " has not run on (\\d+) due runs in a row, (\\d+) ranges ahead of the current xid: .*?(\\d+)"
+                    + " transactions hold a lock on (\\S+) right after, the oldest: (pid \\d+ \\(.*?\\) in a"
+                    + " transaction open [\\d.]+ s)");
             await(Duration.ofSeconds(60), () -> stuck.matcher(log.text()).find());
 
             var text = log.text();
@@ -261,18 +260,16 @@ class TailSwapIT {
                     + names.base() + " right after, the oldest: pid ").contains("in a transaction open ");
             var error = stuck.matcher(text);
             assertThat(error.find()).isTrue();
-            assertThat(List.of(names.base(), names.tail())).as("the table waited on").contains(error.group(1));
-            assertThat(error.group(6)).as("the holders' table").isEqualTo(error.group(1));
-            int runs = Integer.parseInt(error.group(2));
-            int ahead = Integer.parseInt(error.group(3));
+            int runs = Integer.parseInt(error.group(1));
+            int ahead = Integer.parseInt(error.group(2));
             assertThat(ahead).as("ranges ahead, the extension due").isLessThanOrEqualTo(config.premake() / 2);
             assertThat(runs >= 10 || ahead < config.premake() / 2) // XidPartitions.STUCK_SWAPS
                     .as("%d runs in a row, %d ahead: the ERROR's condition", runs, ahead).isTrue();
-            assertThat(Long.parseLong(error.group(4))).isEqualTo(SWAP_LOCK_TIMEOUT.toMillis());
-            assertThat(Integer.parseInt(error.group(5))).as("holders").isPositive();
+            assertThat(Integer.parseInt(error.group(3))).as("holders").isPositive();
+            assertThat(error.group(4)).as("the holders' table").isEqualTo(names.base());
             int end = text.indexOf('\n', error.end());
             assertThat(text.substring(error.start(), end < 0 ? text.length() : end)).as("the whole ERROR line")
-                    .contains("Send last in the transaction, or raise swapLockTimeout");
+                    .contains("Send last in the transaction");
             stopLoad();
             assertThat(errors).as("writer failures").isEmpty();
             relay.drain();

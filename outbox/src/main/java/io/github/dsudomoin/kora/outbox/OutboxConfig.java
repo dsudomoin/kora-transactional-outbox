@@ -166,6 +166,15 @@ public interface OutboxConfig {
         }
 
         /**
+         * Largest tail, in bytes ({@code pg_relation_size}), that the swap turns into a range when rows went to it,
+         * which scans it under the swap's lock: writers wait for the scan. A larger tail stays hot, writes going on
+         * into it, until {@code OutboxAdmin.convertTail}. Default 16 MB.
+         */
+        default long maxTailScan() {
+            return 16L * 1024 * 1024;
+        }
+
+        /**
          * Move rows at or above the horizon in a range marked for drop back to the outbox; false only logs. Default
          * true.
          */

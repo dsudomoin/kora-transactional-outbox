@@ -34,6 +34,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private int premake = 4;
     private Duration maintenanceInterval = Duration.ofHours(1); // tests call maintenance directly
     private Duration swapLockTimeout = Duration.ofMillis(200);
+    private long maxTailScan = new PartitionsConfig() {}.maxTailScan();
     private boolean restoreOrphans = true;
     private String inboxTable = TestDb.uniqueTable();
     private Duration inboxPartitionInterval = Duration.ofHours(1);
@@ -339,6 +340,16 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
 
     public TestOutboxConfig swapLockTimeout(Duration swapLockTimeout) {
         this.swapLockTimeout = swapLockTimeout;
+        return this;
+    }
+
+    @Override
+    public long maxTailScan() {
+        return maxTailScan;
+    }
+
+    public TestOutboxConfig maxTailScan(long maxTailScan) {
+        this.maxTailScan = maxTailScan;
         return this;
     }
 

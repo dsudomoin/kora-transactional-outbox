@@ -85,7 +85,7 @@ public final class XidPartitions {
     private static final long LOG_INTERVAL = TimeUnit.MINUTES.toNanos(1);
     private static final String LOCK_NOT_AVAILABLE = "55P03";
     private static final long STUCK_LOG_INTERVAL = TimeUnit.HOURS.toNanos(1);
-    /** Due extensions in a row whose swap timed out waiting for writers, after which the ERROR says so. */
+    /** Due extensions in a row whose swap did not get its lock or was deferred, after which the ERROR says so. */
     static final int STUCK_SWAPS = 10;
     /**
      * The transactions holding a lock on a table, oldest first: how many, and the first five with their age. The
@@ -103,8 +103,11 @@ public final class XidPartitions {
                                              coalesce(round(extract(epoch from now() - xact_start)::numeric, 1)
                                                       || ' s', 'for a time hidden from this role')), ', ')
                       from (select * from h order by xact_start nulls last limit 5) o)""";
-    /** The tail's bound check as Postgres prints it, its bounds [H, U) captured; any other form is not ours. */
-    private static final String BOUND = "^\\(\\(xid >= '(\\d+)'::xid8\\) AND \\(xid < '(\\d+)'::xid8\\)\\)$";
+    /**
+     * Bytes of a tail scanned per millisecond at the least, cold (about 100 MB/s): its attach's statement limit past
+     * {@link #SWAP_MARGIN}, so a scan within maxTailScan is never cut short.
+     */
+    private static final long SCAN_BYTES_PER_MS = 100_000;
     /** A row of a standalone range at or above the bound, shard by shard through the (shard, xid) index it keeps. */
     private static final String ROW_AT_OR_ABOVE = """
             with recursive s(shard) as (
@@ -130,18 +133,18 @@ public final class XidPartitions {
     private final long size;
     private final int premake;
     private final Duration swapLockTimeout;
+    private final long maxTailScan;
     private final String quiesce;
     private final String unquiesce;
     private final Duration longTransaction;
     private final boolean bootstrap;
-    /** The check a hot tail gets before its swap, {@link #convert}; not schema-qualified, as constraint names are. */
-    private final String bounded;
     private final AtomicLong deferLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong overflowLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong strangersLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong stuckLogged = new AtomicLong(System.nanoTime() - STUCK_LOG_INTERVAL);
-    /** Due extensions in a row whose swap (or bound check) timed out waiting for writers; 0 after a swap. */
-    private volatile int swapTimeouts;
+    private final AtomicLong largeLogged = new AtomicLong(System.nanoTime() - STUCK_LOG_INTERVAL);
+    /** Due extensions in a row whose swap did not get its lock or was deferred; 0 after a swap. */
+    private volatile int missedSwaps;
     private volatile boolean overflow;
     /** For tests: runs inside the swap transaction right after the tail's detach, to fail the swap there. */
     @Nullable
@@ -162,7 +165,7 @@ public final class XidPartitions {
     /**
      * For bootstrap: a lock holder whose age is hidden defers the extension to maintenance at once, rather than after a
      * second sample, which would hold the schema lock, and every other instance's startup, for the threshold; and a
-     * hot tail is left to maintenance, as turning it into a range scans it ({@link #convert}).
+     * hot tail is left to maintenance, as turning it into a range scans it ({@link #heal}).
      */
     static XidPartitions forBootstrap(TableNames names, OutboxConfig.PartitionsConfig cfg) {
         return new XidPartitions(names, cfg, LONG_TRANSACTION, true);
@@ -179,6 +182,7 @@ public final class XidPartitions {
         this.size = cfg.xidsPerPartition();
         this.premake = cfg.premake();
         this.swapLockTimeout = cfg.swapLockTimeout();
+        this.maxTailScan = cfg.maxTailScan();
         this.quiesce = "select pg_advisory_lock(" + names.internalNamespace() + ", " + TableNames.LOCK_SWAP + ")";
         // only when held, so a quiesce that timed out costs no "you don't own a lock" WARNING in the server log
         this.unquiesce = "select pg_advisory_unlock(" + names.internalNamespace() + ", " + TableNames.LOCK_SWAP + ")"
@@ -187,7 +191,6 @@ public final class XidPartitions {
                 + TableNames.LOCK_SWAP + " and objsubid = 2";
         this.longTransaction = longTransaction;
         this.bootstrap = bootstrap;
-        this.bounded = names.unqualified(names.tail()) + "_bounded";
     }
 
     /**
@@ -207,10 +210,12 @@ public final class XidPartitions {
      * times the wait out, and the swap is left to the next run. Writers stall while the swap waits for its lock, at
      * most {@code swapLockTimeout}, and the milliseconds it holds it. A hot tail (it holds rows, which sets
      * {@link #overflow()}, or the current xid is within one range of its lower bound) becomes a range itself, rows and
-     * all ({@link #convert}); bootstrap leaves that to maintenance. A tail left detached, detach-pending (an operator's
-     * {@code DETACH CONCURRENTLY}) or missing is finished first: dropped when empty, attached back when it holds rows;
-     * ranges and a new tail are then attached without a swap, nothing being attached above the last range. Lock
-     * timeouts surface as {@link SQLException} (SQLState 55P03), the tail still attached; the next run retries.
+     * all, scanned under the swap's lock while within {@code maxTailScan} ({@link #heal}); bootstrap leaves that to
+     * maintenance. A due extension that did not swap, deferred or without its lock, counts towards the hourly ERROR
+     * ({@link #missed}). A tail left detached, detach-pending (an operator's {@code DETACH CONCURRENTLY}) or missing is
+     * finished first: dropped when empty, attached back when it holds rows; ranges and a new tail are then attached
+     * without a swap, nothing being attached above the last range. Lock timeouts surface as {@link SQLException}
+     * (SQLState 55P03), the tail still attached; the next run retries.
      */
     public void ensurePremade(Connection autocommit) throws SQLException {
         ensurePremade(autocommit, PartitionDdl.DETACH_LOCK_TIMEOUT, PartitionDdl.DETACH_LOCK_TIMEOUT);
@@ -231,14 +236,25 @@ public final class XidPartitions {
             } else {
                 overflow = false;
             }
+            String blocker;
             try {
                 if (!rows && s.current + size <= s.tailLower) {
-                    extend(c, s, target, quiesceTimeout);
+                    blocker = extend(c, s, target, quiesceTimeout);
                 } else if (!bootstrap) { // rows may reach the tail any moment: it becomes a range, holding them
-                    convert(c, s, floor + Math.max(2, premake / 2) * size, quiesceTimeout);
-                } // bootstrap leaves that to maintenance: the validate's scan would hold the schema lock and others
-            } catch (WritersHeldTheLock e) {
-                throw writersHeldTheLock(c, s, e);
+                    blocker = heal(c, s, floor + 2 * size, quiesceTimeout);
+                } else { // bootstrap leaves that to maintenance: the scan would hold the schema lock and others
+                    return;
+                }
+            } catch (SQLException e) {
+                if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                    throw e;
+                }
+                var failed = e instanceof WritersHeldTheLock w ? writersHeldTheLock(c, w) : e;
+                missed(s, failed.getMessage());
+                throw failed;
+            }
+            if (blocker != null) {
+                missed(s, blocker);
             }
             return;
         }
@@ -258,130 +274,108 @@ public final class XidPartitions {
                 c, names.base(), names.tail(), Long.toString(from), null, PartitionDdl.CREATE_LOCK_TIMEOUT);
     }
 
-    /** The swap path of {@link #ensurePremade} for a tail that is not hot: ranges from its lower bound until target. */
-    private void extend(Connection c, State s, long target, Duration quiesceTimeout) throws SQLException {
+    /**
+     * The swap path of {@link #ensurePremade} for a tail that is not hot: ranges from its lower bound until target. The
+     * blocker that deferred it, else null.
+     */
+    @Nullable
+    private String extend(Connection c, State s, long target, Duration quiesceTimeout) throws SQLException {
         long lower = s.tailLower;
         long top = precreate(c, lower, target);
-        // none to add, as after xidsPerPartition shrank: the swap would only replace the tail by one alike
-        if (top == lower || deferred(c, s)) {
-            return;
+        if (top == lower) { // none to add, as after xidsPerPartition shrank: the swap would only replace the tail alike
+            return null;
+        }
+        var blocker = deferred(c, s);
+        if (blocker != null) {
+            return blocker;
         }
         nextTail(c);
-        if (!quiesced(c, quiesceTimeout, () -> swap(c, lower, null, top))) {
+        if (!quiesced(c, quiesceTimeout, () -> swap(c, lower, null, top, Duration.ZERO))) {
             overflowed();
         }
+        return null;
     }
 
     /**
      * The hot path of {@link #ensurePremade}: the tail {@code [H, MAXVALUE)} becomes the range {@code [H, U)} with its
-     * rows, and ranges from U and a new tail are attached as for an empty tail. So that the swap does not scan the tail
-     * under its ACCESS EXCLUSIVE, the tail first gets the check {@code <tail>_bounded (xid >= 'H' and xid < 'U')},
-     * which Postgres takes as proof that the rows fit the range: added {@code not valid} ({@link #addBound}), then
-     * validated, a scan under SHARE UPDATE EXCLUSIVE on the tail, which writers pass. The check applies to new rows at
-     * once, so an insert routed to the tail at or above U fails until the swap: U is {@code bound}, k = max(2,
-     * premake / 2) ranges above the current xid's lower bound. That margin must outlast the longest lock holder on the
-     * tail: a pg_dump that starts after the check is added holds back both the swap and the check's drop, so it is the
-     * sizing rule premake already follows for long snapshots (README: premake / 2 × xidsPerPartition ≥ peak xid/s ×
-     * longest snapshot). The cost: {@code [H, U)} spans up to premake / 2 ranges and is dropped only once the horizon
-     * passes U. A check already there is replaced once the current xid comes within half a range of its U, even while
-     * a blocker defers the swap, and kept otherwise, for the next attempt after a failed swap.
-     * Ranges a failed empty-tail swap pre-created below U are dropped: {@code [H, U)} covers them, and the first would
-     * take its name. A swap that finds the current xid at or above U drops the check with an ERROR, as inserts routed
-     * to the tail at or above U may have failed, and the next run adds one higher up.
+     * rows, and ranges from U and a new tail are attached as for an empty tail, all in one swap. No check ever goes on
+     * the tail: one that spared the attach its scan would refuse every row routed to the tail at or above U from the
+     * moment it was added, and a swap that then failed could leave it there. So Postgres scans the tail under the
+     * swap's ACCESS EXCLUSIVE on the parent, and writers wait for the scan: only while
+     * {@code pg_relation_size(tail)} is at most {@code maxTailScan}. A larger tail stays hot, writes going on into it,
+     * with an ERROR at most once an hour. U is {@code bound}, two ranges above the current xid's lower bound: room for
+     * the run until its swap. Standalone empty ranges a failed swap pre-created below U are dropped first: {@code [H,
+     * U)} covers them, and the first would take its name. The blocker that deferred it, else null.
      */
-    private void convert(Connection c, State s, long bound, Duration quiesceTimeout) throws SQLException {
-        long lower = s.tailLower;
-        Long kept = boundOf(c, lower);
-        if (kept != null && s.current + size / 2 >= kept) {
-            addBound(c, lower, bound, true, quiesceTimeout);
-            kept = bound;
+    @Nullable
+    private String heal(Connection c, State s, long bound, Duration quiesceTimeout) throws SQLException {
+        long bytes = relationSize(c, names.tail());
+        if (bytes > maxTailScan) {
+            if (due(largeLogged, STUCK_LOG_INTERVAL)) {
+                log.error("outbox partition tail {} holds {} MB, over outbox.partitions.maxTailScan {} MB: turning it"
+                        + " into a range scans it under ACCESS EXCLUSIVE on {}, writers waiting for the scan, so"
+                        + " maintenance leaves it hot. Writes go on into it and nothing is lost; the disk grows until"
+                        + " it is converted. This ERROR repeats at most once an hour", names.tail(), mb(bytes),
+                        mb(maxTailScan), names.base());
+            }
+            return null;
         }
-        long from = kept != null ? kept : bound;
-        for (long l = lower; l < from; l += size) {
+        long lower = s.tailLower;
+        for (long l = lower; l < bound; l += size) {
             var range = names.partitionPrefix() + l;
             if (PartitionDdl.attachment(c, names.base(), range) == Attachment.STANDALONE
                     && !PartitionDdl.hasRows(c, range)) {
                 PartitionDdl.drop(c, range, PartitionDdl.CREATE_LOCK_TIMEOUT);
             }
         }
-        long top = precreate(c, from, from + premake * size); // premake whole ranges above [H, U)
-        if (deferred(c, s)) {
-            return;
+        long top = precreate(c, bound, bound + premake * size); // premake whole ranges above [H, U)
+        var blocker = deferred(c, s);
+        if (blocker != null) {
+            return blocker;
         }
-        if (kept == null) {
-            addBound(c, lower, bound, false, quiesceTimeout);
-        }
-        PartitionDdl.validate(c, names.tail(), bounded);
         nextTail(c);
-        boolean swapped = quiesced(c, quiesceTimeout, () -> {
-            if (swap(c, lower, from, top)) {
-                return true;
-            }
-            PartitionDdl.execute(c, swapLockTimeout, "alter table " + names.tail() + " drop constraint " + bounded);
-            // the next xid reached U; one at U may not have been assigned yet, so "may"
-            log.error("outbox partition tail {} was not swapped: the current xid reached {}, the upper bound of its"
-                    + " check {}, so inserts routed to it with an xid at or above that may have failed meanwhile"
-                    + " (SQLState 23514). The check is dropped; the next run adds one higher up", names.tail(), from,
-                    bounded);
-            return false;
-        });
-        if (swapped) {
+        var scanLimit = SWAP_MARGIN.plusMillis(maxTailScan / SCAN_BYTES_PER_MS);
+        if (quiesced(c, quiesceTimeout, () -> swap(c, lower, bound, top, scanLimit))) {
             overflow = false;
         }
+        return null;
     }
 
-    /**
-     * U of the tail's bound check, or null when it has none; 0, so that it is replaced, when the check is not
-     * {@code [lower, U)} in the form {@link #addBound} gives it.
-     */
-    @Nullable
-    private Long boundOf(Connection c, long lower) throws SQLException {
-        try (var ps = c.prepareStatement("select regexp_match(pg_get_expr(conbin, conrelid), ?) from pg_constraint"
-                + " where conrelid = to_regclass(?) and conname = ?")) {
-            ps.setString(1, BOUND);
-            ps.setString(2, names.tail());
-            ps.setString(3, bounded);
+    private static long relationSize(Connection c, String table) throws SQLException {
+        try (var ps = c.prepareStatement("select pg_relation_size(to_regclass(?))")) {
+            ps.setString(1, table);
             try (var rs = ps.executeQuery()) {
-                if (!rs.next()) {
-                    return null;
-                }
-                var bounds = strings(rs.getArray(1));
-                return bounds.size() == 2 && Long.parseLong(bounds.get(0)) == lower ? Long.parseLong(bounds.get(1)) : 0;
+                rs.next();
+                return rs.getLong(1);
             }
         }
     }
 
-    /**
-     * Adds the tail's bound check {@code [lower, u)} not valid, in place of the one there when {@code replace}: ACCESS
-     * EXCLUSIVE on the tail alone, waited for at most {@code swapLockTimeout} (as long as writers routed to the tail
-     * wait) under the quiesce, so that no relay step reading the tail holds it back.
-     */
-    private void addBound(Connection c, long lower, long u, boolean replace, Duration quiesceTimeout)
-            throws SQLException {
-        quiesced(c, quiesceTimeout, () -> {
-            try {
-                PartitionDdl.execute(c, swapLockTimeout, "alter table " + names.tail()
-                        + (replace ? " drop constraint " + bounded + "," : "") + " add constraint " + bounded
-                        + " check (xid >= '" + lower + "' and xid < '" + u + "') not valid");
-            } catch (SQLException e) {
-                throw LOCK_NOT_AVAILABLE.equals(e.getSQLState()) ? new WritersHeldTheLock(names.tail(), e) : e;
-            }
-            return null;
-        });
-        log.info("{} check {} (xid >= {} and xid < {}) on the partition tail {}, so that the swap attaches it as a"
-                + " range without a scan; inserts routed to it at or above {} fail until then",
-                replace ? "replaced" : "added", bounded, lower, u, names.tail(), u);
+    private static String mb(long bytes) {
+        return String.format(java.util.Locale.ROOT, "%.1f", bytes / 1048576.0);
     }
 
     /**
-     * The swap (or the hot tail's bound check) timed out waiting for writers' locks: the 55P03 again, naming the
-     * transactions holding a lock on {@code e}'s table and their age. Once {@link #STUCK_SWAPS} due runs in a row did,
-     * or the ranges ahead fell below {@code premake / 2} (one used up since the extension was due), an ERROR at most
-     * once an hour names the cause and the remedies: transactions that hold the outbox's lock longer than
-     * {@code swapLockTimeout} after their send, overlapping all the time, never leave the swap that gap.
+     * A due extension did not swap: deferred by {@code cause}, or its swap did not get its lock. Once
+     * {@link #STUCK_SWAPS} due runs in a row missed, or the ranges ahead fell below {@code premake / 2} (one used up
+     * since the extension was due), an ERROR at most once an hour names the cause and the remedies.
      */
-    private SQLException writersHeldTheLock(Connection c, State s, WritersHeldTheLock e) {
-        int failed = ++swapTimeouts;
+    private void missed(State s, String cause) {
+        int missed = ++missedSwaps;
+        if ((missed >= STUCK_SWAPS || s.ahead < premake / 2) && due(stuckLogged, STUCK_LOG_INTERVAL)) {
+            log.error("outbox partition tail swap of {} has not run on {} due runs in a row, {} ranges ahead of the"
+                    + " current xid: {}. The swap needs a moment in which no transaction holds a lock on the outbox"
+                    + " (outbox.partitions.swapLockTimeout {} ms); writer transactions that keep their lock long after"
+                    + " their send and overlap, or a transaction left open, never leave one. Writes go on and nothing"
+                    + " is lost: once the ranges run out rows go to the tail, which becomes a range at the first swap"
+                    + " that runs. Send last in the transaction, end the holders by the pids above (an"
+                    + " idle_in_transaction_session_timeout ends a leaked one). This ERROR repeats at most once an"
+                    + " hour", names.base(), missed, s.ahead, cause, swapLockTimeout.toMillis());
+        }
+    }
+
+    /** The swap's lock wait timed out (55P03): the 55P03 again, naming who held a lock on its table, and their age. */
+    private SQLException writersHeldTheLock(Connection c, WritersHeldTheLock e) {
         String holders;
         try (var ps = c.prepareStatement(LOCK_HOLDERS)) {
             ps.setString(1, e.table);
@@ -393,20 +387,10 @@ public final class XidPartitions {
         } catch (SQLException | RuntimeException read) {
             holders = "who held it could not be read: " + read;
         }
-        if ((failed >= STUCK_SWAPS || s.ahead < premake / 2) && due(stuckLogged, STUCK_LOG_INTERVAL)) {
-            log.error("outbox partition tail swap of {} timed out waiting for writers' locks on {} on {} due runs in"
-                    + " a row, {} ranges ahead of the current xid: writer transactions hold their lock on the outbox"
-                    + " longer than outbox.partitions.swapLockTimeout {} ms after their send, and overlap, so the swap"
-                    + " never gets its gap ({}). Each attempt stalls writers for swapLockTimeout; once the ranges run"
-                    + " out, rows go to the tail and it is not turned into a range either. Send last in the"
-                    + " transaction, or raise swapLockTimeout to those transactions' p99 duration, or find them by the"
-                    + " pids above. This ERROR repeats at most once an hour", names.base(), e.table, failed, s.ahead,
-                    swapLockTimeout.toMillis(), holders);
-        }
         return new SQLException(e.getMessage() + "; " + holders, e.getSQLState(), e);
     }
 
-    /** A lock wait of the swap or of the bound check on writers' locks timed out (55P03) on {@code table}. */
+    /** A lock wait of the swap on writers' locks timed out (55P03) on {@code table}. */
     private static final class WritersHeldTheLock extends SQLException {
         final String table;
 
@@ -430,8 +414,9 @@ public final class XidPartitions {
         PartitionDdl.create(c, names.base(), names.tailNext(), PartitionDdl.CREATE_LOCK_TIMEOUT);
     }
 
-    /** True when {@link #swapBlocker} finds who would hold the swap back, with a WARN at most once a minute. */
-    private boolean deferred(Connection c, State s) throws SQLException {
+    /** Who {@link #swapBlocker} finds would hold the swap back, with a WARN at most once a minute; else null. */
+    @Nullable
+    private String deferred(Connection c, State s) throws SQLException {
         var blocker = swapBlocker(c);
         if (blocker != null && due(deferLogged)) { // never forced: the swap would stall writers and time out
             log.warn("outbox partition extension of {} deferred to the next run, {} ranges ahead: {}, so the tail swap"
@@ -441,7 +426,7 @@ public final class XidPartitions {
                     + " once a minute",
                     names.base(), s.ahead, blocker);
         }
-        return blocker != null;
+        return blocker;
     }
 
     /**
@@ -480,13 +465,14 @@ public final class XidPartitions {
      * it waits for no snapshot and is never left pending). An empty tail ({@code bound} null): if it holds a row, roll
      * back and return false (the hot path); else drop it and attach the pre-created ranges {@code [lower, top)}. A hot
      * one: unless the current xid is still below {@code bound}, roll back first and return false; else rename it to
-     * {@code <base>_x<lower>} and attach it as {@code [lower, bound)}, which its validated bound check lets Postgres do
-     * without a scan, keeping its indexes, then the pre-created ranges {@code [bound, top)}. Then rename
+     * {@code <base>_x<lower>} and attach it as {@code [lower, bound)}, which Postgres does by scanning it under the
+     * lock, that statement limited to {@code scanLimit}, keeping its indexes, then the pre-created ranges
+     * {@code [bound, top)}. Then rename
      * {@code <base>_tail_next} to the tail and attach it at {@code top}. The pre-created ranges are empty, so their
      * attach has nothing to scan and builds the indexes on empty tables. Read committed whatever the session default:
      * the row check takes its snapshot under the lock. One INFO says how long the lock was waited for and held.
      */
-    boolean swap(Connection c, long lower, @Nullable Long bound, long top) throws SQLException {
+    boolean swap(Connection c, long lower, @Nullable Long bound, long top, Duration scanLimit) throws SQLException {
         String base = names.base();
         String former = names.partitionPrefix() + lower;
         long first = bound == null ? lower : bound;
@@ -505,7 +491,7 @@ public final class XidPartitions {
                 throw LOCK_NOT_AVAILABLE.equals(e.getSQLState()) ? new WritersHeldTheLock(base, e) : e;
             }
             locked = System.nanoTime();
-            if (bound != null) { // at or above the bound, the check has been refusing rows routed to the tail
+            if (bound != null) { // rows at or above the bound may be in the tail: the attach's scan would fail
                 try (var rs = st.executeQuery(
                         "select pg_snapshot_xmax(pg_current_snapshot()) < '" + bound + "'::xid8")) {
                     rs.next();
@@ -521,6 +507,7 @@ public final class XidPartitions {
             }
             if (bound != null) {
                 st.execute("alter table " + names.tail() + " rename to " + names.unqualified(former));
+                st.execute("set local statement_timeout = " + scanLimit.toMillis());
                 st.execute("alter table " + base + " attach partition " + former + " "
                         + PartitionDdl.bounds(Long.toString(lower), Long.toString(bound)));
                 if (attachWarnings != null) {
@@ -543,7 +530,7 @@ public final class XidPartitions {
             st.execute("alter table " + base + " attach partition " + names.tail() + " "
                     + PartitionDdl.bounds(Long.toString(top), null));
             c.commit();
-            swapTimeouts = 0;
+            missedSwaps = 0;
         } catch (Throwable e) { // an Error too: setAutoCommit(true) below would commit the DDL run so far
             try {
                 c.rollback();
@@ -573,7 +560,7 @@ public final class XidPartitions {
 
     /**
      * True while the tail holds rows, until a swap turns it into a range: informational, they are relayed as any, and
-     * the next extension heals it ({@link #convert}). Also set while an unattached tail holds rows, which are
+     * the next extension heals it within maxTailScan ({@link #heal}). Also set while an unattached tail holds rows, which are
      * invisible to the relay until it is attached back.
      */
     public boolean overflow() {

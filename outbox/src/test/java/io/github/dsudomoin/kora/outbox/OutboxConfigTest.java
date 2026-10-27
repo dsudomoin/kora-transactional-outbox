@@ -101,6 +101,15 @@ class OutboxConfigTest {
     }
 
     @Test
+    void negativeMaxTailScanIsRejected() {
+        var config = parse("outbox.partitions.maxTailScan = -1");
+
+        assertThatThrownBy(() -> OutboxSchema.validate(config))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("outbox.partitions.maxTailScan must not be negative: -1");
+    }
+
+    @Test
     void requeueKeysAreReadAndValidated() {
         var requeue = parse("outbox.relay.requeue { delay = 250ms, maxRequeues = 5 }").relay().requeue();
 
@@ -174,6 +183,7 @@ class OutboxConfigTest {
         assertThat(partitions.premake()).isEqualTo(64);
         assertThat(partitions.maintenanceInterval()).isEqualTo(Duration.ofSeconds(30));
         assertThat(partitions.swapLockTimeout()).isEqualTo(Duration.ofMillis(200));
+        assertThat(partitions.maxTailScan()).isEqualTo(16L * 1024 * 1024);
         assertThat(partitions.restoreOrphans()).isTrue();
 
         var inbox = config.inbox();

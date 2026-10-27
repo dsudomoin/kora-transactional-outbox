@@ -418,6 +418,7 @@ class OutboxSchemaIT {
                 Map.entry("outbox.partitions.premake", c -> c.premake(1)),
                 Map.entry("outbox.partitions.maintenanceInterval", c -> c.maintenanceInterval(Duration.ZERO)),
                 Map.entry("outbox.partitions.swapLockTimeout", c -> c.swapLockTimeout(Duration.ZERO)),
+                Map.entry("outbox.partitions.maxTailScan", c -> c.maxTailScan(-1)),
                 Map.entry("outbox.deadLetters.batchSize", c -> c.deadLettersBatchSize(0)),
                 Map.entry("outbox.deadLetters.timeout", c -> c.deadLettersTimeout(Duration.ZERO)),
                 Map.entry("outbox.deadLetters.retention", c -> c.deadLettersRetention(Duration.ofMillis(-1))),
