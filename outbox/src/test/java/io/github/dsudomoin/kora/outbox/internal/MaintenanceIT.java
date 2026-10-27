@@ -782,7 +782,7 @@ class MaintenanceIT {
     }
 
     @Test
-    void oneRunExtendsWhenHalfOfPremadeIsUsed() throws Exception {
+    void runsExtendWhenHalfOfPremakeIsUsed() throws Exception {
         bootstrap();
         try (var c = TestDb.connect()) {
             var partitions = new XidPartitions(names, config.partitions());
@@ -803,7 +803,9 @@ class MaintenanceIT {
             log = err.text();
         }
 
-        assertThat(log).contains("swapped the partition tail of " + names.base());
+        assertThat(log).contains("swapped the partition tail of " + names.base()).contains("attached 4 ranges");
+        assertThat(gauge(registry, "outbox.partitions.premade")).as("no longer due").isGreaterThan(config.premake() / 2);
+        assertThat(maintenance.runOnce()).isTrue(); // the next run attaches the rest, four ranges a swap at most
         assertThat(gauge(registry, "outbox.partitions.premade")).isGreaterThanOrEqualTo(config.premake());
         assertThat(gauge(registry, "outbox.partitions.overflow")).isZero();
         long top = ranges().stream().filter(b -> b.to() != null).mapToLong(b -> Long.parseLong(b.to())).max()
@@ -842,7 +844,9 @@ class MaintenanceIT {
 
         String log;
         try (var err = new CapturedStderr()) {
-            assertThat(maintenance.runOnce()).isTrue();
+            for (int run = 0; run < 3; run++) { // four ranges a swap
+                assertThat(maintenance.runOnce()).isTrue();
+            }
             log = err.text();
         }
 
@@ -883,6 +887,7 @@ class MaintenanceIT {
         }
 
         assertThat(maintenance.runOnce()).isTrue();
+        assertThat(maintenance.runOnce()).isTrue(); // the rest of the ranges, four a swap
 
         assertThat(exists(pending.name())).isFalse();
         assertThat(gauge(registry, "outbox.partitions.premade")).isGreaterThanOrEqualTo(config.premake());

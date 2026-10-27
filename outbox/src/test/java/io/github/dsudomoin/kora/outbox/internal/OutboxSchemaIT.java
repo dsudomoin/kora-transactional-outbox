@@ -118,7 +118,8 @@ class OutboxSchemaIT {
                             lowest.name()))
                     .as("finalized: no longer in the way of the extension")
                     .isEqualTo("0");
-            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(config.premake());
+            // extended, four ranges a swap: no longer due; maintenance attaches the rest
+            assertThat(partitions.premadeAhead(c)).isGreaterThan(config.premake() / 2);
             assertThat(PartitionDdl.listRanges(c, n.base()))
                     .filteredOn(b -> b.to() == null)
                     .singleElement()
