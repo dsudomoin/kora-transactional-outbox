@@ -21,7 +21,7 @@ name (`outbox_shard_lag`, `outbox_dead_size`).
 | `outbox.dead.decisions` | counter | `decision` = `keep` / `discard` / `redrive` / `redrive_at` | Committed hook decisions. Admin API calls are not counted. |
 | `outbox.dead.hook.failures` | counter | | Failed hook calls (exception, invalid answer, `deadLetters.timeout`): one per call, not per letter. |
 | `outbox.partitions.premade` | gauge | | xid ranges above the current xid. |
-| `outbox.partitions.overflow` | gauge | | 1 while the tail partition is in use. |
+| `outbox.partitions.overflow` | gauge | | 1 while the tail partition holds rows: writes go on into it; the next swap turns it into a range (over `maxTailScan`: inside `tailConversion.window`). |
 | `outbox.partitions.xids_left` | gauge | | xids left before inserts fail while the tail is detached; NaN while attached. |
 | `outbox.partitions.orphaned` | gauge | | Detached ranges kept because they hold rows. |
 | `outbox.maintenance.transaction_pooling` | gauge | | 1 when the last maintenance run detected a transaction pooler. |
@@ -46,11 +46,13 @@ shows only here; `outbox.messages.requeued{topic}` shows which topic requeues. B
 Kafka producer client metrics of the outbox are not bound to Micrometer (JMX only).
 
 Logs: logger `io.github.dsudomoin.kora.outbox`, repeated lines rate-limited. INFO for start, stop, partition DDL and
-each changing admin call; WARN for diverted keys, shard pauses, deferred partition extensions, tail overflow, stale
+each changing admin call; WARN for diverted keys, shard pauses, deferred partition extensions, tail swaps without
+their lock (55P03), a window tail conversion that did not fit `maxStall`, tail overflow, stale
 maintenance, dead-letter hook failures, letters the Kafka DLQ kept and failed heartbeats («outbox heartbeat of instance
 ... failed»); ERROR for dead letters, handler errors, stranded shards, the shard-count mismatch after a reshard («...
 holds cursors for N shards, but this instance runs with outbox.shards = M ...»), the xid regression, `premade < 2`, a
-detached tail, orphans and transaction pooling. WARN «outbox tick made without its shard set» (at most once a minute): a
+detached tail, a swap not run on 10 due runs or with ranges running out (hourly, names the cause), a hot tail over
+`maxTailScan` outside the window (hourly), orphans and transaction pooling. WARN «outbox tick made without its shard set» (at most once a minute): a
 partition is held by an `ACCESS EXCLUSIVE` lock (`ALTER TABLE`, `VACUUM FULL`, `TRUNCATE`, a manual `LOCK`), so ticks
 step every shard and lag grows while it lasts.
 

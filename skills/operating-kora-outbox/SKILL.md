@@ -8,19 +8,19 @@ description: Use when monitoring, alerting on, sizing or troubleshooting kora-tr
 ## Overview
 
 Procedures: the library README (https://github.com/dsudomoin/kora-transactional-outbox#readme). Act through the admin
-API: `OutboxAdmin` in code or `kora-outbox-admin` over HTTP ([admin-api.md](admin-api.md)). **Never improvise SQL
-against the library's tables**; run only SQL the README prints, on a staging copy first.
+API ([admin-api.md](admin-api.md)). **Never improvise SQL against the library's tables**; run only SQL the README
+prints, on a staging copy first.
 
 ## Wake someone: delivery stopped or soon stops
 
 | Signal | Meaning | README section |
 |---|---|---|
-| `outbox.shard.lag` growing | Target down, slow handler, too few workers; with ERROR «outbox shards [...] start from ticks [...] that no longer exist»: stranded shards | «Обработка сбоев», «Застрявшие шарды» |
+| `outbox.shard.lag` growing | Target down, slow handler, too few workers; ERROR «outbox shards [...] start from ticks [...] that no longer exist»: stranded | «Обработка сбоев», «Застрявшие шарды» |
 | `outbox.maintenance.since_success` > 5 × `maintenanceInterval` | No maintenance anywhere; `transaction_pooling` = 1: a pooler | «Обслуживание работает там же, где relay» |
 | `outbox.partitions.xids_left` not NaN | Tail detached: inserts fail at 0 | «Партиции» |
 | `outbox.dead.pending.oldest` > X (X > `relay.retry.maxDelay`) and `outbox.dead.hook.failures` growing | Hook failing: letters wait, no alerts sent | «Dead letters» |
 | ERROR «outbox xid regression detected» | «recovered»: done; «relay halted»: reason at line end, maybe `POST /recovery/xid-regression` | «Восстановление после регрессии xid (xid regression recovery)» |
-| ERROR «... holds cursors for N shards, but this instance runs with outbox.shards = M ...» or «... refuses this write ...» | Old-count instance after a reshard: restart with the new count or unset | «Решардинг» |
+| ERROR «... holds cursors for N shards, but this instance runs with outbox.shards = M ...», «... refuses this write ...» | Old-count instance after a reshard: restart with the new count | «Решардинг» |
 
 ## Morning: nothing lost, waits for a human
 
@@ -28,35 +28,34 @@ against the library's tables**; run only SQL the README prints, on a staging cop
 |---|---|
 | `outbox.dead.size` grows, `outbox.dead.pending` does not (kept letters) | «Dead letters» |
 | `outbox.partitions.orphaned` or `outbox.inbox.partitions.orphaned` > 0 | «Осиротевшие партиции» |
-| `outbox.partitions.overflow` = 1 past one extension cycle, `outbox.partitions.premade` < 2 | «Переполнение хвоста (tail overflow)» |
-| ERROR «outbox partition tail swap of ... timed out waiting for writers» | «Партиции», «Транзакции, которые держат outbox после `send`» |
+| `outbox.partitions.overflow` = 1 past one extension cycle, `premade` < 2, ERROR «... over outbox.partitions.maxTailScan» | «Переполнение хвоста (tail overflow)» |
+| ERROR «outbox partition tail swap of ... has not run on N due runs» (names the holder) | «Партиции» |
 | `outbox.parked.size` not back to its level | «Алерты» |
 
 Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dashboards/outbox.json`.
 
 ## Never
 
-- Change rows of `<table>_retry`, `_parked`, `_dead`, `_cursor`, `_instance` or `_halt` by hand; use the admin API.
+- Change library tables' rows by hand; use the admin API.
 - Detach outbox partitions by hand, or drop or truncate library tables while instances run.
-- Disable the relay everywhere: maintenance and the dead-letter pass run only with it.
+- Disable the relay everywhere: maintenance and dead-letter passes need it.
 
 ## Shards and pool
 
-- **`outbox.shards`: leave it unset** (256 for a new outbox; an existing one keeps its count). A differing set value
-  is the **emergency reshard**: stop writers, wait for `outbox.shard.lag` 0, stop all instances (old release too), start
-  one with the new value, then the rest; startup refuses while another instance with a different count runs
-  («Решардинг», [config-reference.md](../using-kora-outbox/config-reference.md)).
+- **`outbox.shards`: leave it unset** (256 for a new outbox). A differing value is the **emergency reshard**: stop
+  writers, wait for `outbox.shard.lag` 0, stop all instances (old release too), start one with the new value, then the
+  rest («Решардинг», [config-reference.md](../using-kora-outbox/config-reference.md)).
 - **Pool:** `db.maxPoolSize` ≥ own peak + `relay.workers` + 3, + 1 while `drain()` runs. Profiles:
   [sizing-examples.md](../using-kora-outbox/sizing-examples.md).
 
 ## Deploys and incidents
 
-- «Rolling-деплои»: same schema-qualified `outbox.table` and `outbox.inbox.table` everywhere; inbox `retention` /
-  `partitionInterval` on all instances at once.
-- **Rollback to the previous release** (5fc60dd): «Rolling-деплои», item «Обновление с предыдущего релиза (5fc60dd),
-  смешанный парк и откат». The old release writes dead letters `kept`: list the window's kept letters afterwards.
-  Once no new instance runs, drop the hot tail's bound check the README gives (`<table>_tail_bounded`). The old
-  release refuses to start unless its `outbox.shards` equals the cursors' count: set it after a reshard and for an
-  outbox this release created (256 by default).
-- «Репликация, failover и PITR»: async failover can deliver events whose data is gone; PITR redelivers.
-- `relay.retry.maxAttempts = 0` (default): a key stuck on a broken target shows only as lag.
+- «Rolling-деплои»: the same schema-qualified table names and inbox `retention` / `partitionInterval` everywhere.
+- **Rollback to 5fc60dd**: «Rolling-деплои», «Обновление с предыдущего релиза». The old release writes dead letters
+  `kept`: list the window's kept letters afterwards. No tail step: any tail state rolls back and heals on re-upgrade.
+  The old release starts only with `outbox.shards` equal to the cursors' count: set it (256 for an outbox this
+  release created, or the new count after a reshard).
+- The night tail conversion stalls writers ≤ `tailConversion.maxStall`: keep it below their
+  `lock_timeout`/`statement_timeout`.
+- «Репликация, failover и PITR»: async failover may deliver events whose data is gone; PITR redelivers.
+- `relay.retry.maxAttempts = 0` (default): a key stuck on a broken target shows as lag only.
