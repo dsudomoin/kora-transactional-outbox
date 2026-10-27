@@ -1,5 +1,6 @@
 package io.github.dsudomoin.kora.outbox.admin;
 
+import java.util.Objects;
 import ru.tinkoff.kora.http.server.common.HttpServerRequest;
 
 /**
@@ -14,9 +15,23 @@ public interface OutboxAdminAuthorizer {
     sealed interface Decision permits Allow, Deny {}
 
     /** {@code identity} goes into the audit log line of the call. */
-    record Allow(String identity) implements Decision {}
+    record Allow(String identity) implements Decision {
 
-    record Deny(int status, String message) implements Decision {}
+        public Allow {
+            Objects.requireNonNull(identity, "identity");
+        }
+    }
+
+    /** {@code status} 401 or 403; {@code message} goes into the {@code Error} body. */
+    record Deny(int status, String message) implements Decision {
+
+        public Deny {
+            if (status != 401 && status != 403) {
+                throw new IllegalArgumentException("a denial is a 401 or a 403, not " + status);
+            }
+            Objects.requireNonNull(message, "message");
+        }
+    }
 
     static Decision allow(String identity) {
         return new Allow(identity);

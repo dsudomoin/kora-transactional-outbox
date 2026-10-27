@@ -2,11 +2,18 @@ openapi: 3.0.3
 info:
   title: kora-outbox admin
   version: v1
+  description: >-
+    The kora-outbox admin API: status, dead letters, orphans and the xid-regression recovery, each call acting on the
+    shared database, so any instance answers the same. No security scheme is declared: access is decided by the
+    service's OutboxAdminAuthorizer, which runs before every operation and answers 401 or 403 with an Error. A call
+    refused for its input answers 400; one that cannot run in the outbox's current state (maintenance running, no xid
+    regression to recover) answers 409.
 paths:
   /kora-outbox/admin/v1/status:
     get:
       operationId: getStatus
       tags: [OutboxAdmin]
+      summary: The outbox at a glance, read from the database now
       responses:
         '200':
           description: Outbox status
@@ -14,27 +21,460 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Status'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
-          description: No credentials
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/Unauthorized'
         '403':
-          description: Credentials not allowed
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /kora-outbox/admin/v1/dead-letters:
+    get:
+      operationId: findDeadLetters
+      tags: [OutboxAdmin]
+      summary: Dead letters matching the filter, in id order, one page
+      parameters:
+        - $ref: '#/components/parameters/Topic'
+        - $ref: '#/components/parameters/Key'
+        - $ref: '#/components/parameters/ErrorContains'
+        - $ref: '#/components/parameters/FailedFrom'
+        - $ref: '#/components/parameters/FailedTo'
+        - $ref: '#/components/parameters/LetterStatus'
+        - name: afterId
+          in: query
+          description: Letters with an id above this one; the nextAfterId of the previous page. Absent, from the first.
+          schema:
+            type: integer
+            format: int64
+        - name: limit
+          in: query
+          description: Letters per page, 1..1000.
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: One page
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                $ref: '#/components/schemas/DeadLetterPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /kora-outbox/admin/v1/dead-letters/count:
+    get:
+      operationId: countDeadLetters
+      tags: [OutboxAdmin]
+      summary: How many dead letters match the filter
+      parameters:
+        - $ref: '#/components/parameters/Topic'
+        - $ref: '#/components/parameters/Key'
+        - $ref: '#/components/parameters/ErrorContains'
+        - $ref: '#/components/parameters/FailedFrom'
+        - $ref: '#/components/parameters/FailedTo'
+        - $ref: '#/components/parameters/LetterStatus'
+      responses:
+        '200':
+          description: The count
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Count'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /kora-outbox/admin/v1/dead-letters/redrive:
+    post:
+      operationId: redriveDeadLetters
+      tags: [OutboxAdmin]
+      summary: Sends the selected letters back into the outbox, whatever their status
+      description: >-
+        Each becomes a new message after the later messages of its (topic, key), with the same message id. Works in
+        chunks of 1 000 letters, skipping those the dead-letter hook or an open transaction holds: call again for them.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Selection'
+      responses:
+        '200':
+          description: How many were redriven
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Count'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /kora-outbox/admin/v1/dead-letters/discard:
+    post:
+      operationId: discardDeadLetters
+      tags: [OutboxAdmin]
+      summary: Deletes the selected letters
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Selection'
+      responses:
+        '200':
+          description: How many were deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Count'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /kora-outbox/admin/v1/orphans/{table}/restore:
+    post:
+      operationId: restoreOrphan
+      tags: [OutboxAdmin]
+      summary: Moves an orphan's rows from an xid on back into the outbox, then drops it
+      description: >-
+        The table must be one of the status's orphans. Its rows below fromXid are dropped with it. Waits up to 60 s for
+        a maintenance run in progress, then answers 409: retry.
+      parameters:
+        - name: table
+          in: path
+          required: true
+          description: The orphan's table, as the status lists it
+          schema:
+            type: string
+        - name: fromXid
+          in: query
+          required: true
+          description: Rows with an xid at or above this one are moved
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: How many rows were moved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Count'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /kora-outbox/admin/v1/recovery/xid-regression:
+    post:
+      operationId: recoverXidRegression
+      tags: [OutboxAdmin]
+      summary: Runs the xid-regression recovery now, whatever outbox.recovery says
+      description: >-
+        Re-sends the rows the relay may not have delivered, in one transaction, as new messages with the same message
+        ids. Answers 409 when there is no regression to recover, or when a maintenance run held the lock for 60 s.
+      responses:
+        '200':
+          description: How many rows were re-sent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Count'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
 components:
+  parameters:
+    Topic:
+      name: topic
+      in: query
+      description: Letters of this topic
+      schema:
+        type: string
+    Key:
+      name: key
+      in: query
+      description: Letters of this key, as its UTF-8 bytes
+      schema:
+        type: string
+    ErrorContains:
+      name: error
+      in: query
+      description: Letters whose error text contains this, a plain substring
+      schema:
+        type: string
+    FailedFrom:
+      name: failedFrom
+      in: query
+      description: Letters that failed at or after this time
+      schema:
+        type: string
+        format: date-time
+    FailedTo:
+      name: failedTo
+      in: query
+      description: Letters that failed before this time
+      schema:
+        type: string
+        format: date-time
+    LetterStatus:
+      name: status
+      in: query
+      description: Letters in this status
+      schema:
+        $ref: '#/components/schemas/DeadLetterStatus'
+  responses:
+    BadRequest:
+      description: The input is refused
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: No credentials, or unknown ones (OutboxAdminAuthorizer)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Known credentials without access (OutboxAdminAuthorizer)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: Cannot run in the outbox's current state
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
   schemas:
     Status:
       type: object
-      required: [halted]
+      required: [halted, lagSeconds, retrySize, parkedSize, deadLetters, orphans, tailOverflow, premade, shards]
       properties:
         halted:
           type: boolean
-          description: Delivery stopped by the xid-regression check
+          description: An xid-regression halt is recorded, and no relay delivers
+        lagSeconds:
+          type: number
+          format: double
+          description: From the slowest shard's tick to the latest
+        retrySize:
+          type: integer
+          format: int64
+          description: Rows of blocked keys waiting for a retry
+        parkedSize:
+          type: integer
+          format: int64
+          description: Rows in <base>_parked, 0 without that table
+        deadLetters:
+          type: array
+          description: Dead letters by topic and status
+          items:
+            $ref: '#/components/schemas/DeadLetterCount'
+        orphans:
+          type: array
+          description: Standalone ranges whose rows lie outside the outbox, which the relay cannot deliver
+          items:
+            $ref: '#/components/schemas/Orphan'
+        tailOverflow:
+          type: boolean
+          description: Rows went to the partition tail
+        premade:
+          type: integer
+          format: int32
+          description: Ranges ahead of the current xid
+        xidsLeft:
+          type: integer
+          format: int64
+          description: Xids before inserts fail; absent while the tail is attached
+        maintenanceSinceSuccessSeconds:
+          type: number
+          format: double
+          description: Since a maintenance run last completed on any instance; absent without that record
+        shards:
+          type: integer
+          format: int32
+          description: outbox.shards
+    DeadLetterCount:
+      type: object
+      required: [topic, status, count]
+      properties:
+        topic:
+          type: string
+        status:
+          $ref: '#/components/schemas/DeadLetterStatus'
+        count:
+          type: integer
+          format: int64
+    Orphan:
+      type: object
+      required: [table, kind]
+      properties:
+        table:
+          type: string
+          description: As Postgres prints it, unqualified when its schema is on the search_path
+        kind:
+          $ref: '#/components/schemas/OrphanKind'
+    OrphanKind:
+      type: string
+      description: >-
+        DETACHED_BY_LIBRARY: detached by maintenance as relayed but not dropped, which moves its rows back itself;
+        FOREIGN: detached by someone else, perhaps before the relay reached its rows, restore it after comparing them
+        with what was delivered; SET_ASIDE: set aside by the xid-regression recovery, restore it.
+      enum: [DETACHED_BY_LIBRARY, FOREIGN, SET_ASIDE]
+    DeadLetterStatus:
+      type: string
+      description: >-
+        pending: waiting for the dead-letter hook's decision; kept: kept for humans; scheduled: redriven automatically
+        at dueAt.
+      enum: [pending, kept, scheduled]
+    DeadLetterPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeadLetter'
+        nextAfterId:
+          type: integer
+          format: int64
+          description: The afterId of the next page; absent once a page comes back short of its limit
+    DeadLetter:
+      type: object
+      required: [id, messageId, topic, headers, createdAt, attempts, failedAt, status, redrives, handlerAttempts]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: The dead row's id, its id in the outbox
+        messageId:
+          type: string
+          format: uuid
+        topic:
+          type: string
+        key:
+          type: string
+          format: byte
+          description: Base64; absent for a null key
+        payload:
+          type: string
+          format: byte
+          description: Base64; absent for a null payload
+        headers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Header'
+        createdAt:
+          type: string
+          format: date-time
+        attempts:
+          type: integer
+          format: int32
+          description: Failed deliveries
+        failedAt:
+          type: string
+          format: date-time
+        error:
+          type: string
+          description: The last failed delivery's error text
+        status:
+          $ref: '#/components/schemas/DeadLetterStatus'
+        redrives:
+          type: integer
+          format: int32
+          description: Times this message was redriven before it died this time
+        handlerAttempts:
+          type: integer
+          format: int32
+          description: Failed calls of the dead-letter hook for it
+        dueAt:
+          type: string
+          format: date-time
+          description: >-
+            The next hook call of a pending letter or the redrive time of a scheduled one; absent for a kept one
+    Header:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        value:
+          type: string
+          format: byte
+          description: Base64; absent for a null value
+    Selection:
+      type: object
+      description: Exactly one of ids and filter
+      properties:
+        ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+        filter:
+          $ref: '#/components/schemas/Filter'
+    Filter:
+      type: object
+      description: A letter matches when every given field does; an empty filter is refused
+      properties:
+        topic:
+          type: string
+        key:
+          type: string
+          description: The key's UTF-8 bytes
+        error:
+          type: string
+          description: A plain substring of the error text
+        failedFrom:
+          type: string
+          format: date-time
+          description: Inclusive
+        failedTo:
+          type: string
+          format: date-time
+          description: Exclusive
+        status:
+          $ref: '#/components/schemas/DeadLetterStatus'
+    Count:
+      type: object
+      required: [count]
+      properties:
+        count:
+          type: integer
+          format: int64
     Error:
       type: object
       required: [message]

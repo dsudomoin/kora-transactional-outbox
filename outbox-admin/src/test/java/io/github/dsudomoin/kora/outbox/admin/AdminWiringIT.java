@@ -79,10 +79,10 @@ class AdminWiringIT implements KoraAppTestConfigModifier {
         assertThat(wrongKey.statusCode()).isEqualTo(403);
         assertThat(wrongKey.body()).isEqualTo("{\"message\":\"unknown key\"}");
         assertThat(allowed.statusCode()).isEqualTo(200);
-        assertThat(allowed.body()).isEqualTo("{\"halted\":false}");
-        assertThat(allowed.headers().firstValue("Content-Type")).hasValueSatisfying(
-                t -> assertThat(t).startsWith("application/json"));
+        assertThat(allowed.body()).startsWith("{\"halted\":false,");
         for (var response : new HttpResponse<?>[] {noKey, wrongKey, allowed}) {
+            assertThat(response.headers().firstValue("Content-Type")).hasValueSatisfying(
+                    t -> assertThat(t).startsWith("application/json"));
             assertThat(response.headers().firstValue("X-Test-Global")).hasValue("1");
         }
         assertThat(log.lines().filter(l -> l.contains("outbox admin ")).map(l -> l.substring(l.indexOf("outbox admin "))))
@@ -90,6 +90,40 @@ class AdminWiringIT implements KoraAppTestConfigModifier {
                         "outbox admin GET " + STATUS + " denied: 401",
                         "outbox admin GET " + STATUS + " denied: 403",
                         "outbox admin GET " + STATUS + " by tester: 200");
+    }
+
+    /** The audit line is written before the response leaves, so a client that got the 500 finds it in the log. */
+    @Test
+    void authorizerFailureIsAuditedBeforeTheResponse() throws Exception {
+        for (int i = 0; i < 20; i++) {
+            HttpResponse<String> failed;
+            String log;
+            try (var stderr = new CapturedStderr()) {
+                failed = get(STATUS, "boom");
+                log = stderr.text();
+            }
+
+            assertThat(failed.statusCode()).isEqualTo(500);
+            assertThat(log).contains("outbox admin GET " + STATUS + " denied: 500");
+        }
+    }
+
+    /** {@code {table}} puts caller text into the path, so into the audit line, before any authorization. */
+    @Test
+    void auditLineEscapesThePath() throws Exception {
+        var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port
+                + "/kora-outbox/admin/v1/orphans/x%0D%0AINFO%20forged%09%07/restore?fromXid=0"))
+                .POST(HttpRequest.BodyPublishers.noBody()).build();
+        HttpResponse<String> response;
+        String log;
+        try (var stderr = new CapturedStderr()) {
+            response = client.send(request, BodyHandlers.ofString());
+            log = stderr.text();
+        }
+
+        assertThat(response.statusCode()).isEqualTo(401);
+        assertThat(log).contains("orphans/x\\r\\nINFO forged\\t\\u0007/restore denied: 401")
+                .doesNotContain("\nINFO forged");
     }
 
     /** XNIO names its I/O threads {@code kora-undertow I/O-<n>}, the blocking pool {@code kora-undertow task-<n>}. */

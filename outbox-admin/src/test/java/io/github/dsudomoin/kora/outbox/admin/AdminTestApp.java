@@ -50,7 +50,7 @@ public interface AdminTestApp extends HoconConfigModule, JdbcDatabaseModule, Out
         return new KeyAuthorizer();
     }
 
-    /** Allows the key {@code secret} as {@code tester}; records the threads it runs on. */
+    /** Allows the key {@code secret} as {@code tester}, fails on {@code boom}; records the threads it runs on. */
     final class KeyAuthorizer implements OutboxAdminAuthorizer {
 
         final List<String> threads = new CopyOnWriteArrayList<>();
@@ -61,6 +61,9 @@ public interface AdminTestApp extends HoconConfigModule, JdbcDatabaseModule, Out
             var key = request.headers().getFirst("X-Api-Key");
             if (key == null) {
                 return OutboxAdminAuthorizer.unauthorized("X-Api-Key required");
+            }
+            if (key.equals("boom")) {
+                throw new IllegalStateException("key store down");
             }
             return key.equals("secret") ? OutboxAdminAuthorizer.allow("tester")
                     : OutboxAdminAuthorizer.forbidden("unknown key");
