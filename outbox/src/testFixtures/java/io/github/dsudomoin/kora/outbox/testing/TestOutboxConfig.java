@@ -33,7 +33,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private long xidsPerPartition = 1_000_000L;
     private int premake = 4;
     private Duration maintenanceInterval = Duration.ofHours(1); // tests call maintenance directly
-    private Duration swapLockTimeout = Duration.ofMillis(200);
+    private Duration swapLockTimeout = Duration.ZERO;
     private long maxTailScan = new PartitionsConfig() {}.maxTailScan();
     private boolean restoreOrphans = true;
     private String inboxTable = TestDb.uniqueTable();

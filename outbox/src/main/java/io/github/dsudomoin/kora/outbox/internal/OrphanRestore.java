@@ -38,8 +38,7 @@ public final class OrphanRestore {
 
     /**
      * {@code keyLockTimeout} bounds each lock wait of a chunk's insert (key locks are only tried, never waited for), so
-     * a chunk stalls a writer of a key it holds no longer than the tail swap may stall one: pass
-     * {@code outbox.partitions.swapLockTimeout}.
+     * a chunk stalls a writer of a key it holds no longer than that: pass {@link XidPartitions#lockWait}.
      */
     public OrphanRestore(TableNames names, Resender resender, Duration keyLockTimeout) {
         this.names = names;

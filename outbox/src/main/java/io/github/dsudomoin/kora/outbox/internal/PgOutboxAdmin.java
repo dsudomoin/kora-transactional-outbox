@@ -90,7 +90,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         this.parked = new ParkedStore(names, retries);
         this.recovery = new XidRecovery(names, config);
         this.orphanRestore = new OrphanRestore(
-                names, new Resender(names, config), config.partitions().swapLockTimeout());
+                names, new Resender(names, config), XidPartitions.lockWait(config.partitions()));
         this.dead = names.dead();
     }
 

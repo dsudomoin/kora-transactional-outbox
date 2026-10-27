@@ -149,9 +149,10 @@ public final class OutboxSchema implements Lifecycle {
         require(relay.cursorAnchorInterval().compareTo(partitions.maintenanceInterval()) >= 0,
                 "outbox.relay.cursorAnchorInterval must be at least outbox.partitions.maintenanceInterval: "
                         + relay.cursorAnchorInterval());
-        // sent as whole milliseconds, and lock_timeout = 0 is no limit at all
-        require(partitions.swapLockTimeout().toMillis() > 0,
-                "outbox.partitions.swapLockTimeout must be positive: " + partitions.swapLockTimeout());
+        // 0 is no wait; a wait is sent as whole milliseconds, and lock_timeout = 0 is no limit at all
+        var swapWait = partitions.swapLockTimeout();
+        require(swapWait.isZero() || swapWait.toMillis() > 0,
+                "outbox.partitions.swapLockTimeout must be 0 or at least 1ms: " + swapWait);
         require(partitions.maxTailScan() >= 0,
                 "outbox.partitions.maxTailScan must not be negative: " + partitions.maxTailScan());
         require(deadLetters.batchSize() >= 1,
@@ -756,9 +757,9 @@ public final class OutboxSchema implements Lifecycle {
     /**
      * Fresh table: creates {@code premake} ranges and the tail. Existing table: first finishes a detach left pending
      * (an interrupted range drop's, which would fail the next one with 55000, or an operator's tail detach), then the
-     * same extension maintenance runs: the tail swap, the one ACCESS EXCLUSIVE on the parent, under
-     * {@code outbox.partitions.swapLockTimeout}, after waiting up to {@code LOCK_TIMEOUT} for relay steps in flight. A
-     * lock timeout there (the swap waiting for running transactions in a rolling deploy) is logged and left to
+     * same extension maintenance runs: the tail swap, the one ACCESS EXCLUSIVE on the parent, taken without waiting
+     * (and {@code outbox.partitions.swapLockTimeout}), after waiting up to {@code LOCK_TIMEOUT} for relay steps in
+     * flight. A lock failure there (running transactions in a rolling deploy) is logged and left to
      * maintenance while inserts at the current xid still find a partition. A hot tail is left to maintenance too:
      * turning it into a range scans it, which would hold the schema lock and every other instance's startup.
      * Partition DDL is serialised by {@code LOCK_MAINTENANCE}, taken here after {@code LOCK_SCHEMA};

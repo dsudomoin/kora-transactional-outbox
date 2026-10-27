@@ -38,8 +38,8 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * lock is the recovery ({@link XidRecovery#autoRecover}), with {@code outbox.recovery.xidRegression = auto}; with
  * {@code halt} the run takes no lock. Otherwise the steps, each on its own (a failure is logged and the next step
  * still runs): finish a pending detach, premade partitions (the extension swaps the tail in one transaction, a tail
- * with rows becoming a range in it, the library's one ACCESS EXCLUSIVE on the parent besides the recovery's: writers
- * stall for its lock wait, at most {@code outbox.partitions.swapLockTimeout}, and the milliseconds it holds the lock;
+ * with rows becoming a range in it, the library's one ACCESS EXCLUSIVE on the parent besides the recovery's, taken
+ * without waiting unless {@code outbox.partitions.swapLockTimeout} asks for a wait: writers wait for its hold;
  * before it, a wait of up to {@code batchTimeout} + 5 s for relay steps in flight, which blocks no writer but pauses
  * every shard; a step running longer, as one may, defers the swap to the next run), the checkpoint ({@link Cursors}:
  * the latest tick and the shards busy at it, by which a shard without new rows moves on without a cursor row; the
@@ -160,7 +160,7 @@ public final class Maintenance {
         this.retries = new RetryStore(names, false); // counts rows only, writes no dead row
         this.parked = new ParkedStore(names, retries);
         this.orphanRestore = new OrphanRestore(
-                names, new Resender(names, config), config.partitions().swapLockTimeout());
+                names, new Resender(names, config), XidPartitions.lockWait(config.partitions()));
         this.restoreOrphans = config.partitions().restoreOrphans();
         this.recovery = new XidRecovery(names, config);
         this.autoRecovery = config.recovery().xidRegression().equals("auto");

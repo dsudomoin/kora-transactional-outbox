@@ -34,7 +34,7 @@ import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 
 class XidPartitionsIT {
 
-    private static final Duration SWAP_LOCK_TIMEOUT = Duration.ofMillis(200);
+    private static final Duration SWAP_LOCK_TIMEOUT = Duration.ZERO; // the default: no wait
 
     private final JdbcDatabase db = TestDb.newDatabase(4);
 
@@ -904,6 +904,66 @@ class XidPartitionsIT {
 
             release.join();
             assertThat(errors).isEmpty();
+            partitions.ensurePremade(c);
+
+            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
+            assertTailAboveLastRange(c, names);
+        }
+    }
+
+    /**
+     * A session holding a lock on a range the extension pre-created fails the swap before it takes the parent's lock:
+     * every table the swap attaches is locked first, without waiting, so no writer waits behind a lock wait of the
+     * swap's while it holds the parent.
+     */
+    @Test
+    void aLockOnAPreCreatedRangeFailsTheSwapBeforeItHoldsTheParent() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4).swapLockTimeout(Duration.ofSeconds(1));
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+        var done = new AtomicBoolean();
+        var slowest = new AtomicLong();
+        var errors = new ConcurrentLinkedQueue<Throwable>();
+        var writer = new Thread(() -> {
+            try (var w = TestDb.connect()) {
+                while (!done.get()) {
+                    long start = System.nanoTime();
+                    send(w, names, 1);
+                    slowest.accumulateAndGet(System.nanoTime() - start, Math::max);
+                    Thread.sleep(2);
+                }
+            } catch (Throwable e) {
+                errors.add(e);
+            }
+        });
+
+        try (var holder = TestDb.connect(); var c = TestDb.connect()) {
+            long lower = tail(c, names);
+            TestDb.burnXids(2500);
+            long offset = currentXid(c) % 1000;
+            if (offset > 900) { // ensurePremade's own DDL xids must not carry the counter into the next range
+                TestDb.burnXids((int) (1000 - offset) + 10);
+            }
+            String range = names.partitionPrefix() + lower;
+            PartitionDdl.create(c, names.base(), range, PartitionDdl.CREATE_LOCK_TIMEOUT);
+            holder.setAutoCommit(false); // a stray reader of the range, as pg_dump or a query by hand
+            execute(holder, "lock table " + range + " in access share mode");
+            writer.start();
+            Thread.sleep(100);
+
+            try {
+                assertThatThrownBy(() -> partitions.ensurePremade(c)).isInstanceOfSatisfying(SQLException.class,
+                        e -> assertThat(e.getSQLState()).isEqualTo("55P03"));
+                Thread.sleep(100);
+            } finally {
+                done.set(true);
+                writer.join();
+            }
+
+            assertThat(errors).isEmpty();
+            assertThat(Duration.ofNanos(slowest.get())).as("the slowest insert").isLessThan(Duration.ofMillis(500));
+            assertThat(tail(c, names)).isEqualTo(lower);
+            holder.commit();
             partitions.ensurePremade(c);
 
             assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);

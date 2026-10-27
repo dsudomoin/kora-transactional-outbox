@@ -32,7 +32,7 @@ final class DeadLetters {
 
     DeadLetters(TableNames names, OutboxConfig config) {
         this.resender = new Resender(names, config);
-        this.lockTimeout = "set local lock_timeout = '" + config.partitions().swapLockTimeout().toMillis() + "ms'";
+        this.lockTimeout = "set local lock_timeout = '" + XidPartitions.lockWait(config.partitions()).toMillis() + "ms'";
         // one row per message, should two of its letters be redriven together
         this.remember = "insert into " + names.redriven() + " (message_id, redrives)"
                 + " select m, max(r) from unnest(?::uuid[], ?::int[]) u(m, r) group by m"
@@ -82,7 +82,7 @@ final class DeadLetters {
     /**
      * Back into the outbox ({@link Resender}), the redrive counted in {@code <redriven>}, the dead rows deleted. Their
      * key locks are {@code tx}'s already ({@link #tryKeyLocks}), so taken again without waiting; any other lock the
-     * insert waits for is waited for at most {@code partitions.swapLockTimeout} each.
+     * insert waits for is waited for at most {@link XidPartitions#lockWait} each.
      */
     void redrive(Connection tx, List<Claimed> letters) throws SQLException {
         if (letters.isEmpty()) {
@@ -99,7 +99,7 @@ final class DeadLetters {
         delete(tx, letters.stream().map(c -> c.letter().id()).toList());
     }
 
-    /** Each lock wait of the rest of {@code tx} at most {@code partitions.swapLockTimeout}, as a writer's at a swap. */
+    /** Each lock wait of the rest of {@code tx} at most {@link XidPartitions#lockWait}, past a swap's hold. */
     void limitLockWaits(Connection tx) throws SQLException {
         try (var st = tx.createStatement()) {
             st.execute(lockTimeout);

@@ -54,20 +54,14 @@ class TailSwapIT {
 
     private static final int WRITERS = 8;
     private static final int KEYS = 200;
-    private static final Duration SWAP_LOCK_TIMEOUT = Duration.ofMillis(200);
     /**
-     * A writer stalls behind a swap for at most its wait for ACCESS EXCLUSIVE on the parent, {@code swapLockTimeout},
-     * plus the milliseconds it holds it; the margin covers the hold and a loaded machine. Not the edge: a session that
-     * holds a lock on the tail itself (it queried {@code <base>_tail} directly, not through the parent) makes the
-     * swap's detach wait a second {@code swapLockTimeout} while the parent's ACCESS EXCLUSIVE is already held, since
-     * {@code lock_timeout} bounds each lock wait and {@code statement_timeout} each statement, not the transaction: a
-     * stall of up to 2 × {@code swapLockTimeout} + the hold. These writers reach the tail only through the parent, and
-     * the test queries the tail only while maintenance is paused, so one wait bounds them.
+     * A writer waits behind a swap only for the milliseconds it holds ACCESS EXCLUSIVE on the parent, which it takes
+     * without waiting (the default {@code swapLockTimeout} 0); the bound covers the hold and a loaded machine.
      */
-    private static final Duration WRITER_BOUND = SWAP_LOCK_TIMEOUT.plusMillis(500);
+    private static final Duration WRITER_BOUND = Duration.ofMillis(500);
     /** {@link XidPartitions}'s INFO line of a swap: table, whether the tail kept its rows, hold and wait in ms. */
     private static final Pattern SWAPPED = Pattern.compile("swapped the partition tail of (\\S+): (attached it with"
-            + " its rows as )?.*?held ACCESS EXCLUSIVE on \\S+ for ([\\d.]+) ms, after waiting ([\\d.]+) ms for it");
+            + " its rows as )?.*?held ACCESS EXCLUSIVE on \\S+ for ([\\d.]+) ms, after trying ([\\d.]+) ms for it");
     private static final Duration SLOW_CALL = Duration.ofSeconds(3);
     /** Business transactions open 1 s after their send, at once: about this many a second. */
     private static final int LONG_WRITERS = 24;
@@ -76,7 +70,6 @@ class TailSwapIT {
     private final TestOutboxConfig config = new TestOutboxConfig()
             .xidsPerPartition(2000)
             .premake(4)
-            .swapLockTimeout(SWAP_LOCK_TIMEOUT)
             .maintenanceInterval(Duration.ofMillis(50));
     private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
     private final RecordingHandler recording = new RecordingHandler();
@@ -95,6 +88,8 @@ class TailSwapIT {
     private volatile boolean burning;
     /** Xids the burner burns every 10 ms while {@link #burning}. */
     private int burnBatch = 100;
+    /** Each writer transaction's own {@code lock_timeout}, as a service sets it; null: none. */
+    private Duration writerLockTimeout;
     /** How long each writer sleeps between its transactions; zero: they run flat out. */
     private Duration writerPause = Duration.ZERO;
     private long loadStarted;
@@ -208,8 +203,48 @@ class TailSwapIT {
     }
 
     /**
+     * Writers whose own {@code lock_timeout} is 50 ms, as payment services set it, never fail while swaps run under
+     * load with the library's default {@code swapLockTimeout}: the swap never queues for its lock, so they wait only
+     * for its hold. One more writer keeps each transaction open 150 ms after its send, half of the time, which a
+     * queued lock request would wait behind, and the writers behind it.
+     */
+    @Test
+    void writersWithAShortLockTimeoutNeverFailDuringSwaps() throws Exception {
+        writerLockTimeout = Duration.ofMillis(50);
+        writerPause = Duration.ofMillis(20);
+        burnBatch = 10;
+        bootstrap();
+        start();
+        var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new OutboxMetrics(null));
+        run("slow-writer", () -> {
+            while (!stopping.get()) {
+                try {
+                    committed.add(db.inTx((SqlFunction0<UUID>) () -> {
+                        var id = outbox.send(OutboxMessage.of("t", "slow", "slow".getBytes(UTF_8)));
+                        try {
+                            Thread.sleep(150);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new IllegalStateException(e);
+                        }
+                        return id;
+                    }));
+                } catch (RuntimeException e) {
+                    errors.add(e);
+                }
+                Thread.sleep(150);
+            }
+        });
+        burning = true;
+        await(Duration.ofSeconds(90), () -> swaps().size() >= 3);
+        burning = false;
+
+        finish("writersWithAShortLockTimeoutNeverFailDuringSwaps");
+    }
+
+    /**
      * Business transactions that stay open 1 s after their send, 24 at a time, so they overlap all the time: the swap
-     * never gets swapLockTimeout without one of them, and fails on every due run. Not a promise of a swap: the signals
+     * never gets a moment without one of them, and fails on every due run. Not a promise of a swap: the signals
      * (each 55P03 WARN naming the holders and their age, then the ERROR naming the cause and the remedies) and that
      * nothing is lost.
      */
@@ -352,8 +387,14 @@ class TailSwapIT {
                     var key = "k" + ThreadLocalRandom.current().nextInt(KEYS);
                     long started = System.nanoTime();
                     try {
-                        var id = db.inTx((SqlFunction0<UUID>) () ->
-                                outbox.send(OutboxMessage.of("t", key, key.getBytes(UTF_8))));
+                        var id = db.inTx((SqlFunction0<UUID>) () -> {
+                            if (writerLockTimeout != null) {
+                                try (var st = db.currentConnectionContext().connection().createStatement()) {
+                                    st.execute("set local lock_timeout = " + writerLockTimeout.toMillis());
+                                }
+                            }
+                            return outbox.send(OutboxMessage.of("t", key, key.getBytes(UTF_8)));
+                        });
                         maxLatency.accumulateAndGet(System.nanoTime() - started, Math::max);
                         committed.add(id);
                         commits.incrementAndGet();
@@ -399,7 +440,7 @@ class TailSwapIT {
         long loadMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - loadStarted);
         long xids = currentXid() - xidAtStart;
         var swaps = swaps();
-        System.out.printf("TailSwapIT %s: %d swaps, ACCESS EXCLUSIVE held %s ms after waiting %s ms for it; %d writer"
+        System.out.printf("TailSwapIT %s: %d swaps, ACCESS EXCLUSIVE held %s ms after trying %s ms for it; %d writer"
                         + " commits in %d ms, %d xids/s, the slowest %.1f ms (bound %d ms)%n", test, swaps.size(),
                 swaps.stream().map(swap -> swap.group(3)).toList(), swaps.stream().map(swap -> swap.group(4)).toList(),
                 commits.get(), loadMillis, xids * 1000 / Math.max(1, loadMillis), maxLatency.get() / 1e6,

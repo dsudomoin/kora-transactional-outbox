@@ -83,12 +83,20 @@ class OutboxConfigTest {
     }
 
     @Test
-    void zeroSwapLockTimeoutIsRejected() {
+    void zeroSwapLockTimeoutIsNoWait() {
         var config = parse("outbox.partitions.swapLockTimeout = 0ms");
+
+        OutboxSchema.validate(config);
+        assertThat(config.partitions().swapLockTimeout()).isZero();
+    }
+
+    @Test
+    void negativeSwapLockTimeoutIsRejected() {
+        var config = parse("outbox.partitions.swapLockTimeout = -1ms");
 
         assertThatThrownBy(() -> OutboxSchema.validate(config))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("outbox.partitions.swapLockTimeout must be positive: PT0S");
+                .hasMessage("outbox.partitions.swapLockTimeout must be 0 or at least 1ms: PT-0.001S");
     }
 
     @Test
@@ -97,7 +105,7 @@ class OutboxConfigTest {
 
         assertThatThrownBy(() -> OutboxSchema.validate(config))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("outbox.partitions.swapLockTimeout must be positive: PT0.0005S");
+                .hasMessage("outbox.partitions.swapLockTimeout must be 0 or at least 1ms: PT0.0005S");
     }
 
     @Test
@@ -182,7 +190,7 @@ class OutboxConfigTest {
         assertThat(partitions.xidsPerPartition()).isEqualTo(16_777_216L);
         assertThat(partitions.premake()).isEqualTo(64);
         assertThat(partitions.maintenanceInterval()).isEqualTo(Duration.ofSeconds(30));
-        assertThat(partitions.swapLockTimeout()).isEqualTo(Duration.ofMillis(200));
+        assertThat(partitions.swapLockTimeout()).isZero();
         assertThat(partitions.maxTailScan()).isEqualTo(16L * 1024 * 1024);
         assertThat(partitions.restoreOrphans()).isTrue();
 

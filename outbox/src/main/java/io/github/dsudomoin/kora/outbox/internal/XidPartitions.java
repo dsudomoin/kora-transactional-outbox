@@ -27,20 +27,32 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
  * only creates and attaches), and callers serialise them under {@code LOCK_MAINTENANCE}: bootstrap takes it after
  * {@code LOCK_SCHEMA}; {@link Maintenance} takes it with {@code pg_try_advisory_lock} and never takes
  * {@code LOCK_SCHEMA}. Besides the xid-regression recovery, the extension's tail swap ({@link #ensurePremade}) is the
- * one place the library takes ACCESS EXCLUSIVE on the parent, for milliseconds after a wait of at most
- * {@code outbox.partitions.swapLockTimeout}; range drops detach concurrently.
+ * one place the library takes ACCESS EXCLUSIVE on the parent, for milliseconds, taken without waiting unless
+ * {@code outbox.partitions.swapLockTimeout} asks for a wait; range drops detach concurrently.
  */
 public final class XidPartitions {
 
     private static final Logger log = LoggerFactory.getLogger(XidPartitions.class);
 
     /**
-     * A transaction open this long with a lock on the parent is taken as one that may outlast the swap's lock wait:
-     * the swap would stall writers for {@code swapLockTimeout} and time out.
+     * A transaction open this long with a lock on the parent is taken as one that may outlast the swap's lock tries:
+     * the swap would not get its lock.
      */
     private static final Duration LONG_TRANSACTION = Duration.ofSeconds(20);
-    /** A swap statement's {@code statement_timeout} past {@code swapLockTimeout}: room for its own work. */
+    /** A swap statement's {@code statement_timeout} past its lock tries and wait: room for its own work. */
     private static final Duration SWAP_MARGIN = Duration.ofSeconds(2);
+    /**
+     * How long the swap tries for ACCESS EXCLUSIVE on the parent without waiting ({@code NOWAIT}, every millisecond,
+     * in one statement), under the quiesce: a try never queues, so no writer waits behind it.
+     */
+    static final Duration NOWAIT_WINDOW = Duration.ofMillis(200);
+    /**
+     * Every other lock wait while the swap holds the parent: none is expected, as the tables it attaches are locked
+     * before and the tail is locked only through the parent, but by a session that reads it directly.
+     */
+    private static final Duration HOLD_LOCK_TIMEOUT = Duration.ofMillis(10);
+    /** {@link #lockWait} when {@code swapLockTimeout} is 0: past the swap's hold, which writers wait for. */
+    private static final Duration DEFAULT_LOCK_WAIT = Duration.ofMillis(200);
     /**
      * Who would hold the swap's ACCESS EXCLUSIVE back: a description of the first, else null; and the virtual
      * transactions of lock holders whose age is hidden. Snapshots do not count: a detach that is not concurrent waits
@@ -135,6 +147,8 @@ public final class XidPartitions {
     private final Duration swapLockTimeout;
     private final long maxTailScan;
     private final String quiesce;
+    /** ACCESS EXCLUSIVE on the parent: NOWAIT tries for {@link #NOWAIT_WINDOW}, then the configured wait, if any. */
+    private final String lockParent;
     private final String unquiesce;
     private final Duration longTransaction;
     private final boolean bootstrap;
@@ -191,6 +205,26 @@ public final class XidPartitions {
                 + TableNames.LOCK_SWAP + " and objsubid = 2";
         this.longTransaction = longTransaction;
         this.bootstrap = bootstrap;
+        // a lock that a try took in the block's subtransaction stays with the transaction; a failed try logs nothing
+        this.lockParent = "do $$ declare deadline timestamptz := clock_timestamp() + interval '"
+                + NOWAIT_WINDOW.toMillis() + " milliseconds'; begin loop begin lock table only " + names.base()
+                + " in access exclusive mode nowait; return; exception when lock_not_available then null; end;"
+                + " exit when clock_timestamp() >= deadline; perform pg_sleep(0.001); end loop; "
+                + (swapLockTimeout.isZero()
+                        ? "raise exception using errcode = 'lock_not_available', message = 'could not take ACCESS"
+                                + " EXCLUSIVE on " + names.base() + " in " + NOWAIT_WINDOW.toMillis() + " ms of tries"
+                                + " without waiting: a transaction held a lock on it at every try';"
+                        : "lock table only " + names.base() + " in access exclusive mode;")
+                + " end $$";
+    }
+
+    /**
+     * How long the library's other waits for a table lock that hold key locks meanwhile (a dead-letter redrive's or an
+     * orphan restore's insert) may last, so how long the writers of those keys may wait: {@code swapLockTimeout}, or
+     * 200 ms when it is 0, past the swap's hold that the insert may meet.
+     */
+    public static Duration lockWait(OutboxConfig.PartitionsConfig cfg) {
+        return cfg.swapLockTimeout().isZero() ? DEFAULT_LOCK_WAIT : cfg.swapLockTimeout();
     }
 
     /**
@@ -200,15 +234,15 @@ public final class XidPartitions {
      * detach-pending. First, under no lock that writers wait for, it creates the new ranges as standalone tables (each
      * skipped when it exists: a failed swap leaves them for the next attempt, and {@link #dropOrphans} leaves them be).
      * Not while ({@link #swapBlocker}) a transaction open for 20 s holds a lock on the parent, or a lock on the parent
-     * is awaited: the swap would stall writers for {@code swapLockTimeout} and time out. The run then leaves the
+     * is awaited: the swap would not get its lock. The run then leaves the
      * extension to the next one with a WARN; if the margin runs out first, rows go to the attached tail. Otherwise it
      * makes {@code <base>_tail_next} anew and waits up to {@code quiesceTimeout} ({@code batchTimeout} + 5 s from
      * maintenance) for relay steps in flight, which hold {@code LOCK_SWAP} shared, by taking it exclusively
      * ({@code pg_advisory_lock(internalNs, LOCK_SWAP)}, released after the swap). Writers go on meanwhile, but every
      * shard pauses: no step starts while the request is queued. That is no bound on a step (its retry pass may run
      * about 2 × {@code batchTimeout} and its main pass's call another {@code batchTimeout}): a step running longer
-     * times the wait out, and the swap is left to the next run. Writers stall while the swap waits for its lock, at
-     * most {@code swapLockTimeout}, and the milliseconds it holds it. A hot tail (it holds rows, which sets
+     * times the wait out, and the swap is left to the next run. The swap takes its lock without waiting, so writers
+     * wait only for the milliseconds it holds it (and for a configured {@code swapLockTimeout}). A hot tail (it holds rows, which sets
      * {@link #overflow()}, or the current xid is within one range of its lower bound) becomes a range itself, rows and
      * all, scanned under the swap's lock while within {@code maxTailScan} ({@link #heal}); bootstrap leaves that to
      * maintenance. A due extension that did not swap, deferred or without its lock, counts towards the hourly ERROR
@@ -387,7 +421,9 @@ public final class XidPartitions {
         } catch (SQLException | RuntimeException read) {
             holders = "who held it could not be read: " + read;
         }
-        return new SQLException(e.getMessage() + "; " + holders, e.getSQLState(), e);
+        // its first line: the rest is the DO block's context ("Where: PL/pgSQL function ..."), which splits log lines
+        var message = e.getMessage() == null ? "" : e.getMessage().lines().findFirst().orElse("");
+        return new SQLException(message + "; " + holders, e.getSQLState(), e);
     }
 
     /** A lock wait of the swap on writers' locks timed out (55P03) on {@code table}. */
@@ -418,9 +454,9 @@ public final class XidPartitions {
     @Nullable
     private String deferred(Connection c, State s) throws SQLException {
         var blocker = swapBlocker(c);
-        if (blocker != null && due(deferLogged)) { // never forced: the swap would stall writers and time out
+        if (blocker != null && due(deferLogged)) { // never forced: the swap would not get its lock
             log.warn("outbox partition extension of {} deferred to the next run, {} ranges ahead: {}, so the tail swap"
-                    + " would wait for it, stalling writers for outbox.partitions.swapLockTimeout, and time out."
+                    + " would not get its lock on the outbox while it lasts."
                     + " Long transactions on the outbox table (pg_dump of it, long reports or batch jobs) hold the"
                     + " extension back; outbox.partitions.premake must outlast the longest. This WARN repeats at most"
                     + " once a minute",
@@ -458,10 +494,14 @@ public final class XidPartitions {
     }
 
     /**
-     * The swap, in one transaction under {@code swapLockTimeout} (a statement's {@code statement_timeout}
-     * {@link #SWAP_MARGIN} longer, so a shorter role default cannot cut the lock wait short; both {@code SET LOCAL},
-     * so the session's own come back at its end): ACCESS EXCLUSIVE on the parent, which waits for every writer's
-     * transaction to end, so a row routed to the tail before is committed or gone; detach the tail (not concurrently:
+     * The swap, in one transaction (its timeouts {@code SET LOCAL}, so the session's own come back at its end). First
+     * ACCESS EXCLUSIVE on every table it attaches, {@code NOWAIT}: a session holding one (a stray reader, pg_dump)
+     * fails it before the parent is held. Then ACCESS EXCLUSIVE on the parent, tried without waiting for
+     * {@link #NOWAIT_WINDOW}, so no writer ever queues behind the request; with {@code swapLockTimeout} above 0, then
+     * one queued wait of at most that, which writers do queue behind (a statement's {@code statement_timeout}
+     * {@link #SWAP_MARGIN} longer, so a shorter role default cannot cut it short). Either fails with 55P03. Holding the
+     * parent, no writer's transaction is open on the outbox, so a row routed to the tail before is committed or gone;
+     * every further lock wait is cut at {@link #HOLD_LOCK_TIMEOUT}. Detach the tail (not concurrently:
      * it waits for no snapshot and is never left pending). An empty tail ({@code bound} null): if it holds a row, roll
      * back and return false (the hot path); else drop it and attach the pre-created ranges {@code [lower, top)}. A hot
      * one: unless the current xid is still below {@code bound}, roll back first and return false; else rename it to
@@ -470,7 +510,7 @@ public final class XidPartitions {
      * {@code [bound, top)}. Then rename
      * {@code <base>_tail_next} to the tail and attach it at {@code top}. The pre-created ranges are empty, so their
      * attach has nothing to scan and builds the indexes on empty tables. Read committed whatever the session default:
-     * the row check takes its snapshot under the lock. One INFO says how long the lock was waited for and held.
+     * the row check takes its snapshot under the lock. One INFO says how long the lock was tried for and held.
      */
     boolean swap(Connection c, long lower, @Nullable Long bound, long top, Duration scanLimit) throws SQLException {
         String base = names.base();
@@ -481,16 +521,24 @@ public final class XidPartitions {
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
             st.execute("set transaction isolation level read committed"); // first: before any statement of the tx
-            st.execute("set local lock_timeout = " + swapLockTimeout.toMillis());
-            st.execute("set local statement_timeout = " + swapLockTimeout.plus(SWAP_MARGIN).toMillis());
+            var attached = new StringBuilder(names.tailNext());
+            for (long from = first; from < top; from += size) {
+                attached.append(", ").append(names.partitionPrefix()).append(from);
+            }
+            st.execute("lock table " + attached + " in access exclusive mode nowait");
+            st.execute("set local statement_timeout = "
+                    + NOWAIT_WINDOW.plus(swapLockTimeout).plus(SWAP_MARGIN).toMillis()
+                    + (swapLockTimeout.isZero() ? "" : "; set local lock_timeout = " + swapLockTimeout.toMillis()));
             asked = System.nanoTime();
-            // as the detach would take it, but its own statement: the wait and the hold are timed apart
+            // as the detach would take it, but its own statement: the tries and the hold are timed apart
             try {
-                st.execute("lock table only " + base + " in access exclusive mode");
+                st.execute(lockParent);
             } catch (SQLException e) {
                 throw LOCK_NOT_AVAILABLE.equals(e.getSQLState()) ? new WritersHeldTheLock(base, e) : e;
             }
             locked = System.nanoTime();
+            st.execute("set local lock_timeout = " + HOLD_LOCK_TIMEOUT.toMillis() + "; set local statement_timeout = "
+                    + SWAP_MARGIN.toMillis());
             if (bound != null) { // rows at or above the bound may be in the tail: the attach's scan would fail
                 try (var rs = st.executeQuery(
                         "select pg_snapshot_xmax(pg_current_snapshot()) < '" + bound + "'::xid8")) {
@@ -543,7 +591,7 @@ public final class XidPartitions {
         }
         long done = System.nanoTime();
         log.info("swapped the partition tail of {}: {}attached {} ranges [{}, {}) and the tail at {}; held ACCESS"
-                + " EXCLUSIVE on {} for {} ms, after waiting {} ms for it", base,
+                + " EXCLUSIVE on {} for {} ms, after trying {} ms for it", base,
                 bound == null ? "" : "attached it with its rows as " + former + " [" + lower + ", " + bound + "), ",
                 (top - first) / size, first, top, top, base, (done - locked) / 100_000 / 10.0,
                 (locked - asked) / 100_000 / 10.0);

@@ -44,7 +44,7 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * the dead rows deleted). Their key locks are taken without waiting ({@code pg_try_advisory_xact_lock}): a letter
  * whose key is held, by an open {@code send} of it, is due again after {@code relay.retry.initialDelay} while the
  * others of its batch go on, and the phase ends with that batch. Right after the claim the batch's
- * {@code lock_timeout} becomes {@code partitions.swapLockTimeout}: it bounds each lock wait of the batch, not their
+ * {@code lock_timeout} becomes {@link XidPartitions#lockWait}: it bounds each lock wait of the batch, not their
  * sum, and while one lasts the writers of the keys the batch holds wait too, so a batch that meets several held
  * table locks stalls them for that many waits. A batch that fails after its claim rolls back, and those of its
  * letters still due are then due again after {@code initialDelay} (none another pass decided meanwhile), so they hold
@@ -321,7 +321,7 @@ public final class DeadLetterPass {
 
     /**
      * One batch of due scheduled letters, but those whose key is held, which are deferred; {@code ids} as claimed.
-     * Its waits are bounded by {@code swapLockTimeout} from right after the claim: from the key locks on, writers of
+     * Its waits are bounded by {@link XidPartitions#lockWait} from right after the claim: from the key locks on, writers of
      * those keys wait with it.
      */
     private DeadLetters.Split redriveBatch(Connection tx, List<Long> ids) throws SQLException {

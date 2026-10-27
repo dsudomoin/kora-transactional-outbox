@@ -160,9 +160,13 @@ public interface OutboxConfig {
             return Duration.ofSeconds(30);
         }
 
-        /** Lock wait bound of the short tail-swap transaction, so of a writer's stall per attempt. Default 200 ms. */
+        /**
+         * How long the tail swap waits in the queue for its lock on the outbox once its tries without waiting failed,
+         * writers queueing behind it meanwhile: keep it below their own {@code lock_timeout} and
+         * {@code statement_timeout}. 0 (default): no wait, so writers wait only for the swap's hold.
+         */
         default Duration swapLockTimeout() {
-            return Duration.ofMillis(200);
+            return Duration.ZERO;
         }
 
         /**
