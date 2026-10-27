@@ -209,17 +209,15 @@ public final class KafkaOutboxSender implements Lifecycle {
     }
 
     /**
-     * Logs a WARN when a call's own budget exceeds the relay's {@code batchTimeout}. Such calls are not lost: the relay
-     * interrupts them at 80 % of {@code batchTimeout} and the sender returns their real outcomes at once, but slow sends
-     * then end as retries.
+     * Logs a WARN when a call's own budget exceeds {@code limit}, the value of {@code setting} that bounds a caller's
+     * calls; {@code effect} says what then becomes of slow ones. Such calls are not lost: the caller interrupts them
+     * and the sender returns their real outcomes at once, but slow sends then end as retries.
      */
-    void warnIfLongerThan(Duration batchTimeout) {
-        if (longestCall.compareTo(batchTimeout) > 0) {
+    void warnIfLongerThan(String setting, Duration limit, String effect) {
+        if (longestCall.compareTo(limit) > 0) {
             log.warn("A Kafka outbox call can take up to {} (delivery.timeout.ms + 5 s + max.block.ms), longer than "
-                    + "outbox.relay.batchTimeout ({}). The relay interrupts a call at 80% of batchTimeout; the sender "
-                    + "then stops at once, keeps acked records as delivered and retries the rest, so slow sends end as "
-                    + "retries. Raise batchTimeout or lower the producer timeouts in outbox.kafka.driverProperties",
-                    longestCall, batchTimeout);
+                    + "{} ({}). {}. Raise {} or lower the producer timeouts in outbox.kafka.driverProperties",
+                    longestCall, setting, limit, effect, setting);
         }
     }
 

@@ -108,7 +108,7 @@ class KafkaDeadLetterIT {
         };
         var module = new KafkaOutboxModule() {};
         sender = module.kafkaOutboxSender(kafka, config);
-        var hook = module.kafkaDeadLetterHandler(kafka, sender);
+        var hook = module.kafkaDeadLetterHandler(kafka, sender, config);
         schema = new OutboxSchema(db, config);
         schema.init();
         relay = new OutboxRelay(db, config, schema, sender.handler(), metrics, null,

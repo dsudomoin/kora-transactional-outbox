@@ -21,17 +21,19 @@ import org.slf4j.LoggerFactory;
  * letter through the relay's {@link KafkaOutboxSender} to the topic that template names, {@code {topic}} replaced by
  * the letter's topic: the letter's key, payload and headers, then {@link #DEAD_TOPIC}, {@link #DEAD_ERROR},
  * {@link #DEAD_ATTEMPTS}, {@link #DEAD_FAILED_AT} and the sender's {@link KafkaOutboxHeaders#MESSAGE_ID}. Letters Kafka
- * acknowledged are discarded. A letter whose dead-letter topic is no valid topic name (longer than 249 characters) and
- * one Kafka refuses for good (too large) are kept for humans, with a WARN. Any other failure (not acknowledged in
- * time, a cooling or missing topic) throws a {@link KafkaException} naming how many failed: the dead-letter pass hands
- * every letter of the call again after a backoff, so letters acknowledged in that call may appear twice on their
- * dead-letter topic. Where brokers do not create topics on first use, create the dead-letter topics beforehand; until
- * then their letters wait. Without the key, it keeps every letter it is handed.
+ * acknowledged are discarded. Kept for humans, with a WARN: a letter whose dead-letter topic is no valid topic name
+ * (longer than 249 characters) or is the letter's own topic, and one Kafka refuses for good (too large). A refusal
+ * after the append closes the producer and fails the letter's batch-mates too: those are sent again in the same call,
+ * once per refusal. Any other failure (not acknowledged in time, a cooling or missing topic) throws a
+ * {@link KafkaException} naming how many failed, and the dead-letter pass hands every letter of the call again after a
+ * backoff: letters acknowledged in a call that throws repeat on their dead-letter topic, once per failed call for as
+ * long as a batch-mate keeps failing. Where brokers do not create topics on first use, create the dead-letter topics
+ * beforehand; until then their letters wait.
  *
- * <p>A type of its own, so that an app's hook component replaces it: Kora 1.2.23 takes a default declared as exactly
+ * <p>Without the key it is not {@link #active()}: dead letters are written kept, with no call. A type of its own, so
+ * that an app's hook component replaces it: Kora 1.2.23 takes a default declared as exactly
  * {@code OutboxDeadLetterHandler} over an app component of a subtype ({@code @Component class Hook implements
- * OutboxDeadLetterHandler}). Hence, off, it is no {@link OutboxDeadLetterHandler#NONE}: the pass still hands it the
- * letters, which end kept all the same.
+ * OutboxDeadLetterHandler}).
  */
 public final class KafkaDeadLetterHandler implements OutboxDeadLetterHandler {
 
@@ -64,6 +66,12 @@ public final class KafkaDeadLetterHandler implements OutboxDeadLetterHandler {
         this.template = template;
     }
 
+    /** Whether {@code outbox.kafka.deadLetterTopic} is set. */
+    @Override
+    public boolean active() {
+        return template != null;
+    }
+
     @Override
     public List<DeadLetterDecision> handle(List<DeadLetter> letters) {
         var decisions = new DeadLetterDecision[letters.size()];
@@ -71,40 +79,53 @@ public final class KafkaDeadLetterHandler implements OutboxDeadLetterHandler {
         if (template == null) {
             return List.of(decisions);
         }
-        var sent = new ArrayList<Integer>(letters.size()); // index in letters of each record
-        var records = new ArrayList<OutboxRecord>(letters.size());
+        var records = new OutboxRecord[letters.size()];
+        var unsent = new ArrayList<Integer>(letters.size()); // index in letters
         for (int i = 0; i < letters.size(); i++) {
             var letter = letters.get(i);
             var topic = template.replace(TOPIC, letter.topic());
-            if (KafkaOutboxPublisher.validTopic(topic)) {
-                sent.add(i);
-                records.add(record(letter, topic));
-            } else {
+            if (!KafkaOutboxPublisher.validTopic(topic)) {
                 log.warn("Outbox dead letter {} (message {}) is kept: its dead-letter topic '{}' is not a Kafka topic"
                         + " name (at most 249 of [a-zA-Z0-9._-])", letter.id(), letter.messageId(), topic);
+            } else if (topic.equals(letter.topic())) {
+                log.warn("Outbox dead letter {} (message {}) is kept: outbox.kafka.deadLetterTopic names its own topic"
+                        + " {}", letter.id(), letter.messageId(), topic);
+            } else {
+                records[i] = record(letter, topic);
+                unsent.add(i);
             }
         }
-        var outcomes = sender.send(records);
-        int failed = 0;
+        int published = unsent.size();
         Throwable cause = null;
-        for (int j = 0; j < records.size(); j++) {
-            int i = sent.get(j);
-            var letter = letters.get(i);
-            var outcome = outcomes.get(j);
-            if (outcome == Outcome.delivered()) {
-                decisions[i] = DeadLetterDecision.discard();
-            } else if (outcome instanceof Outcome.Permanent p) { // as the relay does: retrying cannot help
-                log.warn("Outbox dead letter {} (message {}) is kept: Kafka refused it for good on its dead-letter"
-                        + " topic {}", letter.id(), letter.messageId(), records.get(j).topic(), p.error());
-            } else {
-                failed++;
-                if (cause == null && outcome instanceof Outcome.Retry r) {
-                    cause = r.error();
+        boolean refused = true;
+        // a refusal after the append closed the producer and failed the records still in flight, so those go again;
+        // each round sets at least one letter aside, so there are at most as many rounds as letters
+        while (refused && !unsent.isEmpty()) {
+            var outcomes = sender.send(unsent.stream().map(i -> records[i]).toList());
+            var failed = new ArrayList<Integer>();
+            refused = false;
+            cause = null;
+            for (int j = 0; j < unsent.size(); j++) {
+                int i = unsent.get(j);
+                var outcome = outcomes.get(j);
+                if (outcome == Outcome.delivered()) {
+                    decisions[i] = DeadLetterDecision.discard();
+                } else if (outcome instanceof Outcome.Permanent p) { // as the relay does: retrying cannot help
+                    refused = true;
+                    log.warn("Outbox dead letter {} (message {}) is kept: Kafka refused it for good on its dead-letter"
+                            + " topic {}", letters.get(i).id(), letters.get(i).messageId(), records[i].topic(),
+                            p.error());
+                } else {
+                    failed.add(i);
+                    if (cause == null && outcome instanceof Outcome.Retry r) {
+                        cause = r.error();
+                    }
                 }
             }
+            unsent = failed;
         }
-        if (failed > 0) {
-            throw new KafkaException(failed + " of " + records.size() + " dead letters were not published to their"
+        if (!unsent.isEmpty()) {
+            throw new KafkaException(unsent.size() + " of " + published + " dead letters were not published to their"
                     + " dead-letter topics; all " + letters.size() + " are handed again after a backoff", cause);
         }
         return List.of(decisions);

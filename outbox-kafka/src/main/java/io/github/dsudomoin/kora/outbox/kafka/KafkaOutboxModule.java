@@ -52,7 +52,9 @@ public interface KafkaOutboxModule {
     default KafkaOutboxSender kafkaOutboxSender(KafkaOutboxConfig config, @Nullable OutboxConfig outbox) {
         var sender = new KafkaOutboxSender(config);
         if (outbox != null) {
-            sender.warnIfLongerThan(outbox.relay().batchTimeout());
+            sender.warnIfLongerThan("outbox.relay.batchTimeout", outbox.relay().batchTimeout(), "The relay interrupts"
+                    + " a call at 80% of batchTimeout; the sender then stops at once, keeps acked records as delivered"
+                    + " and retries the rest, so slow sends end as retries");
         }
         return sender;
     }
@@ -62,9 +64,20 @@ public interface KafkaOutboxModule {
         return sender.handler();
     }
 
-    /** Publishes dead letters with {@code outbox.kafka.deadLetterTopic} set, keeps them without. */
+    /**
+     * Publishes dead letters with {@code outbox.kafka.deadLetterTopic} set, is inactive without; {@code outbox} as for
+     * {@link #kafkaOutboxSender}.
+     */
     @DefaultComponent
-    default KafkaDeadLetterHandler kafkaDeadLetterHandler(KafkaOutboxConfig config, KafkaOutboxSender sender) {
-        return new KafkaDeadLetterHandler(sender, config.deadLetterTopic());
+    default KafkaDeadLetterHandler kafkaDeadLetterHandler(KafkaOutboxConfig config, KafkaOutboxSender sender,
+            @Nullable OutboxConfig outbox) {
+        var hook = new KafkaDeadLetterHandler(sender, config.deadLetterTopic());
+        if (hook.active() && outbox != null) {
+            sender.warnIfLongerThan("outbox.deadLetters.timeout", outbox.deadLetters().timeout(), "The dead-letter"
+                    + " pass abandons a hook call at its timeout and hands its letters again after a backoff, so slow"
+                    + " dead-letter sends end as retries and letters acked meanwhile repeat on their dead-letter"
+                    + " topic");
+        }
+        return hook;
     }
 }
