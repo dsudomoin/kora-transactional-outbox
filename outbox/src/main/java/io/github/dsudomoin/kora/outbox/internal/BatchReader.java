@@ -45,6 +45,7 @@ public final class BatchReader {
     private final String select;
     private final String selectUnchecked;
     private final String selectMany;
+    private final String selectManyUnchecked;
 
     public BatchReader(TableNames names) {
         var blocked = BLOCKED.formatted(names.retry());
@@ -53,8 +54,14 @@ public final class BatchReader {
         // the per-shard parameters arrive as rows of unnest, so the partition bounds are known only as each shard's
         // lateral runs: pruned at run time on every rescan (the xip branch through its lo/hi bounds, as xid = any of a
         // non-constant array prunes nothing). Each array is cast once, here, not per row
-        this.selectMany = "select u.i, o.id, o.message_id, o.topic, o.key, o.payload, o.headers, o.created_at,"
-                + " case when u.chk then " + blocked + " else false end from unnest(?::int[], ?::text[]::xid8[],"
+        this.selectMany = manySql(names, "case when u.chk then " + blocked + " else false end");
+        // no read checks: the statement does not name the retry table at all
+        this.selectManyUnchecked = manySql(names, "false");
+    }
+
+    private static String manySql(TableNames names, String blocked) {
+        return "select u.i, o.id, o.message_id, o.topic, o.key, o.payload, o.headers, o.created_at, " + blocked
+                + " from unnest(?::int[], ?::text[]::xid8[],"
                 + " ?::text[]::xid8[], ?::text[]::xid8[], ?::text[]::xid8[], ?::text[], ?::text[]::pg_snapshot[],"
                 + " ?::int8[], ?::int[], ?::bool[]) with ordinality u(shard, pmax, tmax, lo, hi, xip, snap, last_id, lim,"
                 + " chk, i)"
@@ -174,7 +181,8 @@ public final class BatchReader {
         }
         record Positioned(long position, BatchRow row) {}
         var read = new ArrayList<Positioned>();
-        try (var ps = inTx.prepareStatement(selectMany)) {
+        boolean check = reads.stream().anyMatch(ShardRead::checkBlocked);
+        try (var ps = inTx.prepareStatement(check ? selectMany : selectManyUnchecked)) {
             ps.setFetchSize(Math.min(totalLimit, MAX_FETCH));
             bindMany(ps, reads, totalLimit);
             try (var rs = ps.executeQuery()) {

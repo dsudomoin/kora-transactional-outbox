@@ -1749,9 +1749,11 @@ class OutboxRelayIT {
                                 var ps = (PreparedStatement) result;
                                 return Proxy.newProxyInstance(PreparedStatement.class.getClassLoader(),
                                         new Class<?>[] {PreparedStatement.class}, (p, m, a) -> {
-                                            if (m.getName().equals("setInt") && (int) a[0] == 4) { // the shard key
-                                                steps.computeIfAbsent((int) a[1] - TableNames.LOCK_SHARD_BASE,
-                                                        shard -> new AtomicInteger()).incrementAndGet();
+                                            if (m.getName().equals("setArray") && (int) a[0] == 5) { // the shards
+                                                for (var shard : (Object[]) ((java.sql.Array) a[1]).getArray()) {
+                                                    steps.computeIfAbsent((Integer) shard, s -> new AtomicInteger())
+                                                            .incrementAndGet();
+                                                }
                                             }
                                             return invoke(m, ps, a);
                                         });

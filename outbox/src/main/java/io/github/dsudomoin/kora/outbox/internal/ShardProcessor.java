@@ -56,21 +56,25 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * One relay step for one shard, inside the caller's transaction: take the shard lock and the tail swap's lock shared
- * ({@link #tryLock}), re-read the cursor, deliver due retry heads and due parked rows, then the next chunk of the batch
- * {@code (tickId, target]} with the parked rows of its keys first in its call, classify and append the new cursor. The
- * batch starts from the shard's effective tick ({@link Cursors}); a fresh one skips the leading ticks that do not mark
- * the shard ({@link Ticks#lastUnmarked}), which hold none of its rows, so its {@code maxTicksPerBatch} ticks start at
+ * One relay step for a group of shards, inside the caller's transaction (see {@link #tryProcess(Connection, List, long,
+ * Instant)} for what the shards share): take the shard locks and the tail swap's lock shared ({@link #tryLock}),
+ * re-read the cursors, deliver each shard's due retry heads and due parked rows, then the next chunk of each batch
+ * {@code (tickId, target]} with the parked rows of its keys first in its part of the call, classify each shard and
+ * append the new cursors. Each rule below holds per shard. A shard's batch starts from the shard's effective tick
+ * ({@link Cursors}); a fresh one skips the leading ticks that do not mark the shard ({@link Ticks#lastUnmarked}),
+ * which hold none of its rows, so its {@code maxTicksPerBatch} ticks start at
  * the first that may: an idle shard far behind the latest tick (an effective tick a maintenance interval old, or a
  * cursor's) reaches its first row, or the latest tick, in one step, not one step per {@code maxTicksPerBatch} ticks. A
  * failed attempt halves the rows the shard's next step reads and a delivery doubles them (up to {@code batchSize}), so
  * a record that fails its whole call deep in a chunk is soon read alone; a requeue is neither. After
- * {@code headFailuresBeforeDivert} failed attempts in a row the shard probes: it reads the head row alone and merges no
- * parked row into its call, so a slow or poison head is diverted as a single failing key, and a down target loses at
+ * {@code headFailuresBeforeDivert} failed attempts in a row the shard probes: it reads the head row alone, in a call
+ * of its own, and merges no parked row into it, so a slow or poison head is diverted as a single failing key, and a
+ * down target loses at
  * most one row to the retry table per (backed-off) probe. Handler calls run on this processor's own bounded pool of
  * daemon threads, each bounded by {@code batchTimeout}. A call that throws (an Error included) or returns an invalid
- * outcome list fails each of its records transiently, so a poison record takes that same path and no handler failure
- * reaches the caller. The caller commits on return and rolls back on an exception (SQL), so a failed step is
+ * outcome list fails each of its records transiently (a call shared by several shards fails none of them: each is
+ * called alone next), so a poison record takes that same path and no handler failure reaches the caller. The caller
+ * commits on return and rolls back on an exception (SQL), so a failed step is
  * redelivered, and a record it parked stays where it was.
  */
 public final class ShardProcessor implements AutoCloseable {
@@ -136,6 +140,12 @@ public final class ShardProcessor implements AutoCloseable {
      */
     private final AtomicIntegerArray probing;
     /**
+     * Per shard, 1 while its main pass is called alone, not in its step's shared call: set when a shared call of
+     * several shards failed as a whole, which says nothing about any one of them, and cleared by a call of its own that
+     * does not. In memory, per relay instance, as {@link #probing}.
+     */
+    private final AtomicIntegerArray solo;
+    /**
      * Per shard, the steps in a row that found no free handler thread of this processor (calls that outlived
      * {@code batchTimeout} hold them all), and until when (epoch microseconds of the callers' clock) this processor
      * skips the shard for it: {@code initialDelay} doubled that many times, up to {@code maxDelay}. A fact about this
@@ -174,6 +184,7 @@ public final class ShardProcessor implements AutoCloseable {
         this.fullCheckInterval = config.partitions().maintenanceInterval().toNanos();
         this.fullChecked = new AtomicLongArray(config.shards());
         this.probing = new AtomicIntegerArray(config.shards());
+        this.solo = new AtomicIntegerArray(config.shards());
         this.busyPauses = new AtomicIntegerArray(config.shards());
         this.busyUntil = new AtomicLongArray(config.shards());
         long created = System.nanoTime();
@@ -209,173 +220,432 @@ public final class ShardProcessor implements AutoCloseable {
         }
     }
 
+    /** {@link #tryProcess(Connection, List, long, Instant)} of the one shard. */
+    public ShardResult tryProcess(Connection inTx, int shard, long latestTickId, Instant now)
+            throws SQLException, InterruptedException {
+        return tryProcess(inTx, List.of(shard), latestTickId, now).get(0);
+    }
+
     /**
-     * {@code inTx} is prepared by {@link #prepareTransaction}; {@code latestTickId} is the relay's latest tick. The
-     * step starts from the shard's effective tick ({@link Cursors}), its cursor's tick or above, and every step with a
-     * target appends a cursor row, an empty read included; a shard without new rows needs no step, as maintenance's
+     * One step of the distinct {@code shards}, all in {@code inTx}, prepared by {@link #prepareTransaction};
+     * {@code latestTickId} is the relay's latest tick. Returns one result per shard, in their order. A shard's step
+     * starts from its effective tick ({@link Cursors}), its cursor's tick or above, and every step that reads its batch
+     * appends a cursor row, an empty read included; a shard without new rows needs no step, as maintenance's
      * checkpoint moves it on. {@code NO_WORK}: no target (the effective tick is the latest) and nothing due, or the
      * shard is skipped here, without its lock or cursor: every handler thread of this processor was busy at a recent
-     * step (see {@link #busyPauses}), and other relay instances go on with it.
+     * step (see {@link #busyPauses}), and other relay instances go on with it. {@code NOT_LOCKED}: another worker holds
+     * the shard, or the tail swap holds or awaits its lock (then every shard).
+     *
+     * <p>The shards share one statement for each of their locks, cursors, target ticks, batch read and cursor append,
+     * and one handler call: the rows of each shard (its parked rows of the chunk's keys first, see
+     * {@link ParkedStore#ofKeys}), shard by shard, in id order inside. Due retry heads and parked rows go first, a
+     * shard at a time ({@link #retryPass}); no shard's retry pass starts once the step has spent {@code batchTimeout}.
+     * Each shard is classified on its own, with these rules across shards:
+     * <ul>
+     *   <li>The read takes at most {@code batchSize} rows in all; when it is cut there, a shard with rows is mid-batch
+     *   at its last row, and a shard without is untouched (it may simply be unread).</li>
+     *   <li>When the call attempted any record, a shard whose handed rows all came back NotAttempted without
+     *   {@code notBefore} (the default handler stopping after other shards' failing keys, a wind-down) is untouched.
+     *   </li>
+     *   <li>A call of several shards that fails as a whole ({@link FailedCall}) says nothing about any of them: each is
+     *   untouched and called alone ({@link #solo}) until a call of its own does not fail as a whole. A shard that
+     *   probes is called alone too, so the head it isolates is the only record of its call. Such calls follow the
+     *   shared one; none starts once the step has spent {@code batchTimeout}, and a shard not called is untouched.
+     *   </li>
+     *   <li>A call that finds every handler thread busy pauses every shard of it, as {@link #busyPauses} says.</li>
+     * </ul>
+     * Untouched: no progress, pause or failure, the limit unchanged, a fresh target not stored, and no cursor row
+     * unless its retry pass changed the cursor; it reports {@code PROGRESS}.
      */
-    public ShardResult tryProcess(Connection inTx, int shard, long latestTickId, Instant now)
+    public List<ShardResult> tryProcess(Connection inTx, List<Integer> shards, long latestTickId, Instant now)
             throws SQLException, InterruptedException {
         long started = System.nanoTime();
         now = now.truncatedTo(ChronoUnit.MICROS); // as Postgres stores it: due times compare exactly
-        if (ChronoUnit.MICROS.between(Instant.EPOCH, now) < busyUntil.get(shard)) {
-            return new ShardResult(ShardStatus.NO_WORK, 0, false); // no free handler thread here a moment ago
-        }
-        if (!tryLock(inTx, shard)) {
-            return new ShardResult(ShardStatus.NOT_LOCKED, 0, false);
-        }
-        var current = cursors.latest(inTx, shard); // a statement after the lock: sees the previous holder's commit
-        var cursor = current.cursor();
-        if (cursor.pausedUntil() != null && now.isBefore(cursor.pausedUntil())) {
-            return new ShardResult(ShardStatus.NO_WORK, 0, cursor.targetTickId() == null);
-        }
-        if (current.effectiveTickId() > cursor.tickId()) {
-            // the shard has no row between its cursor's tick and the effective one, whose snapshot then reads the same
-            // batch, mid-batch too (it lies below the target); the cursor's tick may be gone
-            cursor = cursor.withProgress(current.effectiveTickId(), cursor.targetTickId(), cursor.lastId());
-        }
-        Tick prev = null;
-        Tick target = null;
-        if (cursor.targetTickId() != null) {
-            prev = effectiveTick(current);
-            // never re-chosen mid-batch: rows of a long transaction below lastId committing after the old target
-            // would be skipped
-            target = ticks.get(inTx, cursor.targetTickId());
-        } else if (latestTickId > cursor.tickId()) {
-            prev = effectiveTick(current);
-            var skipped = ticks.lastUnmarked(inTx, shard, cursor.tickId(), latestTickId);
-            if (skipped != null) { // the ticks up to it hold no row of the shard: the position moves there too
-                prev = skipped;
-                cursor = cursor.withProgress(skipped.id(), null, 0);
+        var results = new ShardResult[shards.size()];
+        long nowMicros = ChronoUnit.MICROS.between(Instant.EPOCH, now);
+        var lockable = new ArrayList<Integer>(shards.size());
+        for (int i = 0; i < shards.size(); i++) {
+            if (nowMicros < busyUntil.get(shards.get(i))) {
+                results[i] = new ShardResult(ShardStatus.NO_WORK, 0, false); // no free handler thread here a moment ago
+            } else {
+                lockable.add(i);
             }
-            var candidates = ticks.between(inTx, cursor.tickId(),
-                    Math.min(latestTickId, cursor.tickId() + relay.maxTicksPerBatch()));
-            // a gap in tick ids (e.g. a rolled-back tick insert) must not stop the shard; the candidates come without
-            // snapshots, so the chosen one's is read (below the latest tick, above the effective one: it exists)
-            target = candidates.isEmpty()
-                    ? ticks.oldestAfter(inTx, cursor.tickId())
-                    : ticks.get(inTx, chooseTarget(prev.maxId(), candidates, batchIds).id());
         }
-        // Retry rows of a shard are written only under its lock (divert, retry pass), and each (topic, key) group in
-        // the retry table always has exactly one head, the only rows with next_attempt_at; every step that writes
-        // there stores min(next_attempt_at) as the cursor's retry_due_at. So retry_due_at == null means no retry rows,
-        // and the table is read only when it is due or the step wrote to it, not on every step: under a held xmin
-        // horizon each probe walks every dead version a mass divert left. Once per maintenanceInterval the step
-        // checks in full, for rows changed outside the relay: only hand edits change those tables outside a step, and
-        // a shard with no new rows and nothing due is not stepped, so such an edit waits for its next row or due time.
-        boolean full = fullCheckDue(shard);
-        var retryDue = cursor.retryDueAt();
-        var heads = full || retryDue != null && !retryDue.isAfter(now)
-                ? retries.dueHeads(inTx, shard, now, relay.batchSize())
-                : List.<OutboxRecord>of();
-        // parked_due_at works as retry_due_at: every step that writes to the parked table stores min(due_at), so
-        // null means no parked rows, and a step looks up parked rows only then or on its full check
-        var parkedDue = full ? parked.minDue(inTx, shard) : cursor.parkedDueAt();
-        var dueParked = parkedDue != null && !parkedDue.isAfter(now)
-                ? parked.due(inTx, shard, now, relay.batchSize() - heads.size())
-                : List.<OutboxRecord>of();
-        if (target == null && heads.isEmpty() && dueParked.isEmpty()) {
-            var checked = cursor.withRetryDueAt(full ? retries.minDue(inTx, shard) : retryDue)
-                    .withParkedDueAt(parkedDue);
-            if (!checked.equals(cursor)) {
-                cursors.append(inTx, checked);
+        var locked = tryLock(inTx, lockable.stream().map(shards::get).toList());
+        var steps = new ArrayList<Step>(lockable.size());
+        var lockedShards = new ArrayList<Integer>(lockable.size());
+        for (int k = 0; k < lockable.size(); k++) {
+            if (locked[k]) {
+                lockedShards.add(shards.get(lockable.get(k)));
+            } else {
+                results[lockable.get(k)] = new ShardResult(ShardStatus.NOT_LOCKED, 0, false);
             }
-            return new ShardResult(ShardStatus.NO_WORK, 0, true);
+        }
+        // a statement after the locks: sees the previous holders' commits
+        var currents = cursors.latest(inTx, lockedShards);
+        for (var i : lockable) {
+            if (results[i] != null) {
+                continue;
+            }
+            var current = currents.get(shards.get(i));
+            var cursor = current.cursor();
+            if (cursor.pausedUntil() != null && now.isBefore(cursor.pausedUntil())) {
+                results[i] = new ShardResult(ShardStatus.NO_WORK, 0, cursor.targetTickId() == null);
+                continue;
+            }
+            if (current.effectiveTickId() > cursor.tickId()) {
+                // the shard has no row between its cursor's tick and the effective one, whose snapshot then reads the
+                // same batch, mid-batch too (it lies below the target); the cursor's tick may be gone
+                cursor = cursor.withProgress(current.effectiveTickId(), cursor.targetTickId(), cursor.lastId());
+            }
+            steps.add(new Step(i, current, cursor));
+        }
+        chooseTargets(inTx, steps, latestTickId);
+
+        var appends = new ArrayList<Cursor>(steps.size());
+        var work = new ArrayList<Step>(steps.size());
+        boolean anyCall = false; // a handler call was attempted in this step
+        for (var s : steps) {
+            int shard = s.shard;
+            var cursor = s.cursor;
+            // the step's time is spent: this shard's retry pass waits for its next step, its full check too
+            boolean deferred = anyCall && System.nanoTime() - started >= relay.batchTimeout().toNanos();
+            // Retry rows of a shard are written only under its lock (divert, retry pass), and each (topic, key) group
+            // in the retry table always has exactly one head, the only rows with next_attempt_at; every step that
+            // writes there stores min(next_attempt_at) as the cursor's retry_due_at. So retry_due_at == null means no
+            // retry rows, and the table is read only when it is due or the step wrote to it, not on every step: under
+            // a held xmin horizon each probe walks every dead version a mass divert left. Once per maintenanceInterval
+            // the step checks in full, for rows changed outside the relay: only hand edits change those tables outside
+            // a step, and a shard with no new rows and nothing due is not stepped, so such an edit waits for its next
+            // row or due time.
+            s.full = !deferred && fullCheckDue(shard);
+            s.retryDue = cursor.retryDueAt();
+            var heads = !deferred && (s.full || s.retryDue != null && !s.retryDue.isAfter(now))
+                    ? retries.dueHeads(inTx, shard, now, relay.batchSize())
+                    : List.<OutboxRecord>of();
+            // parked_due_at works as retry_due_at: every step that writes to the parked table stores min(due_at), so
+            // null means no parked rows, and a step looks up parked rows only then or on its full check
+            s.parkedDue = s.full ? parked.minDue(inTx, shard) : cursor.parkedDueAt();
+            var dueParked = !deferred && s.parkedDue != null && !s.parkedDue.isAfter(now)
+                    ? parked.due(inTx, shard, now, relay.batchSize() - heads.size())
+                    : List.<OutboxRecord>of();
+            if (s.target == null && heads.isEmpty() && dueParked.isEmpty()) {
+                var checked = cursor.withRetryDueAt(s.full ? retries.minDue(inTx, shard) : s.retryDue)
+                        .withParkedDueAt(s.parkedDue);
+                if (!checked.equals(cursor)) {
+                    appends.add(checked);
+                }
+                boolean waits = deferred && (due(s.retryDue, now) || due(s.parkedDue, now));
+                results[s.index] = waits ? new ShardResult(ShardStatus.PROGRESS, 0, cursor.targetTickId() == null)
+                        : new ShardResult(ShardStatus.NO_WORK, 0, true);
+                continue;
+            }
+            anyCall |= !heads.isEmpty() || !dueParked.isEmpty();
+            var pass = retryPass(inTx, shard, heads, dueParked, now);
+            s.delivered = pass.delivered;
+            s.deadLettered = pass.deadLettered;
+            // the retry pass writes to the table of the rows it hands, and moves rows between the two
+            s.wroteRetry = !heads.isEmpty() || pass.toRetry;
+            s.wroteParked = !dueParked.isEmpty() || pass.fromRetry;
+            s.busy = pass.busy; // no handler thread free: the main pass would find none either
+            s.called = pass.called; // a handler thread was free
+            s.next = cursor;
+            work.add(s);
         }
 
-        var pass = retryPass(inTx, shard, heads, dueParked, now);
-        int delivered = pass.delivered;
-        boolean deadLettered = pass.deadLettered;
-        // the retry pass writes to the table of the rows it hands, and moves rows between the two
-        boolean wroteRetry = !heads.isEmpty() || pass.toRetry;
-        boolean wroteParked = !dueParked.isEmpty() || pass.fromRetry;
-        boolean busy = pass.busy; // no handler thread free: the main pass would find none either
-        boolean called = pass.called; // a handler thread was free
-        var status = ShardStatus.PROGRESS;
-        var next = cursor;
-        if (target != null && !busy) {
-            // probe mode: after headFailuresBeforeDivert failed attempts in a row, the head row alone
-            boolean probe = cursor.failures() >= relay.headFailuresBeforeDivert();
-            int limit = probe ? 1 : limits.get(shard);
-            // a parked row the retry pass made a retry head blocks its key here too
-            var rows = reader.read(inTx, shard, prev.snapshot(), target.snapshot(), cursor.lastId(), limit,
-                    full ? hasRetryRows(inTx, shard) : retryDue != null || wroteRetry);
-            // a parked record comes back right before the next record of its key: the oldest limit parked rows of
-            // the chunk's keys go first in its call (a key blocked in the retry table hands no record, so none); a
-            // probe merges none, so the head it isolates is the only record of its call
-            var parkedRows = probe || parkedDue == null && !wroteParked ? List.<OutboxRecord>of()
-                    : parked.ofKeys(inTx, shard, rows.stream()
-                            .filter(row -> !row.blocked() && row.record().key() != null).map(BatchRow::record)
-                            .toList(), limit);
-            var items = deliverBatch(parkedRows, rows, now);
-            busy = items.stream().anyMatch(item -> item.outcome() == BUSY); // nothing handed: nothing read, no items
-            called |= !busy && items.stream().anyMatch(item -> !item.dbBlocked());
-            var chunk = items.subList(parkedRows.size(), items.size());
-            int read = busy ? 0
-                    : read(chunk, items.subList(0, parkedRows.size()).stream().anyMatch(this::leavesParked));
-            items = items.subList(0, busy ? 0 : parkedRows.size() + read);
-            // the shard's failures may stem from other rows than a probed head: it is diverted with divertAt attempts
-            var decision = BatchClassifier.classify(items, Math.min(cursor.failures(), divertAt - 1), divertAt, now,
-                    retry.initialDelay(), retry.maxDelay(), requeue.delay(), requeue.maxRequeues());
-            if (!decision.pause() && !busy) {
-                var parkedIds = new HashSet<Long>();
-                parkedRows.forEach(row -> parkedIds.add(row.id()));
-                wroteParked |= apply(inTx, shard, decision.actions(), parkedIds);
-                wroteRetry |= decision.actions().stream()
-                        .anyMatch(action -> action instanceof Head || action instanceof Follower);
-                deadLettered |= decision.actions().stream().anyMatch(action -> action instanceof Dead);
-                delivered += recordOutcomes(items, decision.actions(), shard, now);
-                if (read == rows.size() && rows.size() < limit) {
-                    next = cursor.withProgress(target.id(), null, 0);
-                } else if (read > 0) {
-                    next = cursor.withProgress(cursor.tickId(), target.id(), rows.get(read - 1).record().id());
-                } // else only parked rows read: the position stays, as on a pause
-            } // else no progress: a batch in progress keeps its target, a fresh one is not stored (lastId is still 0)
-            if (failedAttempt(items)) { // paused, or a single failing key diverted: either way back off
-                limits.set(shard, Math.max(1, limit / 2));
-                var backoff = Backoff.delay(cursor.failures(), retry.initialDelay(), retry.maxDelay());
-                var until = now.plus(Duration.ofNanos(System.nanoTime() - started)).plus(backoff)
-                        .truncatedTo(ChronoUnit.MICROS); // from the decision, not from the start of a slow call
-                next = next.withPause(until, cursor.failures() + 1);
-                status = ShardStatus.PAUSED;
+        var reads = new ArrayList<Step>(work.size());
+        for (var s : work) {
+            if (s.target != null && !s.busy) {
+                // probe mode: after headFailuresBeforeDivert failed attempts in a row, the head row alone
+                s.probe = s.cursor.failures() >= relay.headFailuresBeforeDivert();
+                s.limit = s.probe ? 1 : limits.get(s.shard);
+                reads.add(s);
+            }
+        }
+        if (!reads.isEmpty()) {
+            var shardReads = new ArrayList<BatchReader.ShardRead>(reads.size());
+            for (var s : reads) {
+                // a parked row the retry pass made a retry head blocks its key here too
+                shardReads.add(new BatchReader.ShardRead(s.shard, s.prev.snapshot(), s.target.snapshot(),
+                        s.cursor.lastId(), s.limit,
+                        s.full ? hasRetryRows(inTx, s.shard) : s.retryDue != null || s.wroteRetry));
+            }
+            var batch = reader.readMany(inTx, shardReads, relay.batchSize());
+            var shared = new ArrayList<Step>(reads.size());
+            var alone = new ArrayList<Step>();
+            for (var s : reads) {
+                s.rows = batch.rows().get(s.shard);
+                s.cut = batch.cut();
+                if (s.cut && s.rows.isEmpty()) {
+                    s.untouched = true; // maybe unread: the shards after the cut have no rows they would have had
+                    continue;
+                }
+                // a parked record comes back right before the next record of its key: the oldest limit parked rows
+                // of the chunk's keys go first in its call (a key blocked in the retry table hands no record, so
+                // none); a probe merges none, so the head it isolates is the only record of its call
+                s.parkedRows = s.probe || s.parkedDue == null && !s.wroteParked ? List.<OutboxRecord>of()
+                        : parked.ofKeys(inTx, s.shard, s.rows.stream()
+                                .filter(row -> !row.blocked() && row.record().key() != null).map(BatchRow::record)
+                                .toList(), s.limit);
+                (s.probe || solo.get(s.shard) == 1 ? alone : shared).add(s);
+            }
+            boolean called = deliverBatch(shared, now);
+            anyCall |= called;
+            var handed = shared.stream().filter(Step::handed).toList();
+            if (handed.size() > 1) {
+                if (handed.get(0).whole) { // says nothing about any one shard
+                    for (var s : handed) {
+                        s.untouched = true;
+                        solo.set(s.shard, 1);
+                    }
+                } else if (handed.stream().anyMatch(Step::attempted)) {
+                    for (var s : handed) {
+                        s.untouched = !s.attempted(); // stopped behind other shards' records
+                    }
+                }
+            }
+            boolean mainCalls = called;
+            for (var s : alone) {
+                if (anyCall && System.nanoTime() - started >= relay.batchTimeout().toNanos()) {
+                    s.untouched = true; // the step's time is spent: called in a later step
+                    continue;
+                }
+                if (mainCalls) {
+                    keepAlive(inTx); // a statement between two handler calls
+                }
+                boolean ran = deliverBatch(List.of(s), now);
+                anyCall |= ran;
+                mainCalls |= ran;
+                if (ran && !s.whole && !s.items.stream().anyMatch(item -> item.outcome() == BUSY)) {
+                    solo.set(s.shard, 0);
+                }
+            }
+            for (var s : reads) {
+                if (!s.untouched) {
+                    classify(inTx, s, now, started);
+                }
+            }
+        }
+
+        for (var s : work) {
+            int shard = s.shard;
+            if (s.busy) { // calls that outlived batchTimeout hold every handler thread: no attempt and no failure (so
+                // no probe, no divert); from the rejection, the shard pauses initialDelay for all relay instances, and
+                // this one, whose threads are held, skips it for longer each step in a row (busyUntil)
+                var rejected = now.plus(Duration.ofNanos(System.nanoTime() - started))
+                        .truncatedTo(ChronoUnit.MICROS);
+                var skipUntil = rejected.plus(Backoff.delay(busyPauses.getAndIncrement(shard), retry.initialDelay(),
+                        retry.maxDelay()));
+                busyUntil.set(shard, ChronoUnit.MICROS.between(Instant.EPOCH, skipUntil));
+                s.next = s.next.withPause(rejected.plus(retry.initialDelay()), s.cursor.failures());
+                s.status = ShardStatus.PAUSED;
                 metrics.shardPaused();
-                log.warn("outbox shard {} paused until {}: nothing delivered, {} consecutive failed attempts ({})",
-                        shard, until, next.failures(), firstError(items));
-            } else if (items.stream().anyMatch(item -> item.outcome() instanceof Outcome.Delivered)) {
-                limits.set(shard, limit > relay.batchSize() / 2 ? relay.batchSize() : 2 * limit); // no int overflow
-                next = next.cleared();
-            } // else only blocked, dead or requeued rows (a requeue is no failure): nothing about the target, the
-            // backoff and the limit stay as they are
+                log.warn("outbox shard {}: every handler thread of this relay is still busy; skipped here until {}",
+                        shard, skipUntil);
+            } else if (s.called && busyPauses.get(shard) != 0) {
+                busyPauses.set(shard, 0);
+                busyUntil.set(shard, 0); // a wall clock stepping back would meet the old skip again
+            }
+            if (s.full || s.wroteRetry) {
+                s.next = s.next.withRetryDueAt(retries.minDue(inTx, shard));
+            }
+            if (s.full || s.wroteParked) {
+                s.next = s.next.withParkedDueAt(s.wroteParked ? parked.minDue(inTx, shard) : s.parkedDue);
+            }
+            if (!s.untouched || !s.next.equals(s.cursor)) {
+                appends.add(s.next);
+            }
+            results[s.index] = new ShardResult(s.status, s.delivered,
+                    s.status == ShardStatus.PROGRESS && s.next.targetTickId() == null, s.deadLettered);
         }
-        if (busy) { // calls that outlived batchTimeout hold every handler thread: no attempt and no failure (so no
-            // probe, no divert); from the rejection, the shard pauses initialDelay for all relay instances, and this
-            // one, whose threads are held, skips it for longer each step in a row (busyUntil)
-            var rejected = now.plus(Duration.ofNanos(System.nanoTime() - started)).truncatedTo(ChronoUnit.MICROS);
-            var skipUntil = rejected.plus(Backoff.delay(busyPauses.getAndIncrement(shard), retry.initialDelay(),
-                    retry.maxDelay()));
-            busyUntil.set(shard, ChronoUnit.MICROS.between(Instant.EPOCH, skipUntil));
-            next = next.withPause(rejected.plus(retry.initialDelay()), cursor.failures());
-            status = ShardStatus.PAUSED;
+        cursors.appendAll(inTx, appends);
+        if (!work.isEmpty()) {
+            metrics.batch(Duration.ofNanos(System.nanoTime() - started));
+        }
+        return Arrays.asList(results);
+    }
+
+    private static boolean due(@Nullable Instant at, Instant now) {
+        return at != null && !at.isAfter(now);
+    }
+
+    /** One shard's part of a step. */
+    private static final class Step {
+
+        /** Its position in the step's shards. */
+        final int index;
+        final int shard;
+        final Cursors.Current current;
+        /** The cursor the step starts from: at the effective tick, and past the ticks skipped for a fresh batch. */
+        Cursor cursor;
+        @Nullable
+        Tick prev;
+        @Nullable
+        Tick target;
+        boolean full;
+        @Nullable
+        Instant retryDue;
+        @Nullable
+        Instant parkedDue;
+        int delivered;
+        boolean deadLettered;
+        boolean wroteRetry;
+        boolean wroteParked;
+        boolean busy;
+        boolean called;
+        boolean probe;
+        int limit;
+        List<BatchRow> rows = List.of();
+        /** The read was cut at {@code batchSize} rows. */
+        boolean cut;
+        List<OutboxRecord> parkedRows = List.of();
+        /** Its parked rows, then its chunk's rows, as handed (blocked ones without an outcome). */
+        List<Item> items = List.of();
+        /** Its call failed as a whole ({@link FailedCall}). */
+        boolean whole;
+        boolean untouched;
+        Cursor next;
+        ShardStatus status = ShardStatus.PROGRESS;
+
+        Step(int index, Cursors.Current current, Cursor cursor) {
+            this.index = index;
+            this.shard = cursor.shard();
+            this.current = current;
+            this.cursor = cursor;
+            this.next = cursor;
+        }
+
+        /** Some of its records went to the handler. */
+        boolean handed() {
+            return items.stream().anyMatch(item -> !item.dbBlocked());
+        }
+
+        boolean attempted() {
+            return items.stream().anyMatch(ShardProcessor::attempted);
+        }
+    }
+
+    /**
+     * The target of each step that has one, from statements shared by all: the batch in progress keeps its target,
+     * never re-chosen mid-batch (rows of a long transaction below lastId committing after the old target would be
+     * skipped); a fresh batch skips the leading ticks that do not mark its shard ({@link Ticks#lastUnmarked}), then
+     * {@link #chooseTarget} picks among its next {@code maxTicksPerBatch} ticks. The snapshots of the targets and of
+     * the skipped-to ticks come in one read; the effective tick's came with the cursor.
+     */
+    private void chooseTargets(Connection c, List<Step> steps, long latestTickId) throws SQLException {
+        var fresh = new ArrayList<Step>();
+        var afterIds = new HashMap<Integer, Long>();
+        var wanted = new HashSet<Long>();
+        var targetIds = new HashMap<Step, Long>();
+        for (var s : steps) {
+            if (s.cursor.targetTickId() != null) {
+                s.prev = effectiveTick(s.current);
+                targetIds.put(s, s.cursor.targetTickId());
+            } else if (latestTickId > s.cursor.tickId()) {
+                s.prev = effectiveTick(s.current);
+                fresh.add(s);
+                afterIds.put(s.shard, s.cursor.tickId());
+            }
+        }
+        if (!fresh.isEmpty()) {
+            var skipped = ticks.lastUnmarked(c, afterIds, latestTickId);
+            var lo = new long[fresh.size()];
+            var hi = new long[fresh.size()];
+            for (int i = 0; i < fresh.size(); i++) {
+                var s = fresh.get(i);
+                var skip = skipped.get(s.shard);
+                if (skip != null) { // the ticks up to it hold no row of the shard: the position moves there too
+                    s.prev = skip; // its snapshot is read below
+                    s.cursor = s.cursor.withProgress(skip.id(), null, 0);
+                    s.next = s.cursor;
+                    wanted.add(skip.id());
+                }
+                lo[i] = s.cursor.tickId();
+                hi[i] = Math.min(latestTickId, s.cursor.tickId() + relay.maxTicksPerBatch());
+            }
+            var between = ticks.between(c, lo, hi);
+            for (int i = 0; i < fresh.size(); i++) {
+                var s = fresh.get(i);
+                var candidates = List.copyOf(between.subMap(lo[i], false, hi[i], true).values());
+                if (candidates.isEmpty()) {
+                    // a gap in tick ids (e.g. a rolled-back tick insert) must not stop the shard
+                    s.target = ticks.oldestAfter(c, s.cursor.tickId());
+                } else { // below the latest tick, above the effective one: it exists
+                    targetIds.put(s, chooseTarget(s.prev.maxId(), candidates, batchIds).id());
+                }
+            }
+        }
+        wanted.addAll(targetIds.values());
+        var read = ticks.get(c, wanted);
+        for (var s : steps) {
+            var id = targetIds.get(s);
+            if (id != null) {
+                s.target = tick(read, id);
+            }
+            if (s.prev != null && s.prev.snapshot() == null) {
+                s.prev = tick(read, s.prev.id());
+            }
+        }
+    }
+
+    private static Tick tick(Map<Long, Tick> read, long id) {
+        var tick = read.get(id);
+        if (tick == null) {
+            throw new IllegalStateException("no tick " + id + ": it was deleted");
+        }
+        return tick;
+    }
+
+    /**
+     * The main pass of one shard after its call, as a step of the shard alone settles it: its trailing unattempted
+     * rows read again, the classifier's actions applied, the cursor moved, AIMD and the pause.
+     */
+    private void classify(Connection inTx, Step s, Instant now, long started) throws SQLException {
+        int shard = s.shard;
+        var cursor = s.cursor;
+        var items = s.items;
+        boolean busy = items.stream().anyMatch(item -> item.outcome() == BUSY); // nothing handed: nothing read
+        s.called |= !busy && items.stream().anyMatch(item -> !item.dbBlocked());
+        int parkedCount = s.parkedRows.size();
+        var chunk = items.subList(parkedCount, items.size());
+        int read = busy ? 0 : read(chunk, items.subList(0, parkedCount).stream().anyMatch(this::leavesParked));
+        items = items.subList(0, busy ? 0 : parkedCount + read);
+        // the shard's failures may stem from other rows than a probed head: it is diverted with divertAt attempts
+        var decision = BatchClassifier.classify(items, Math.min(cursor.failures(), divertAt - 1), divertAt, now,
+                retry.initialDelay(), retry.maxDelay(), requeue.delay(), requeue.maxRequeues());
+        var next = s.next;
+        if (!decision.pause() && !busy) {
+            var parkedIds = new HashSet<Long>();
+            s.parkedRows.forEach(row -> parkedIds.add(row.id()));
+            s.wroteParked |= apply(inTx, shard, decision.actions(), parkedIds);
+            s.wroteRetry |= decision.actions().stream()
+                    .anyMatch(action -> action instanceof Head || action instanceof Follower);
+            s.deadLettered |= decision.actions().stream().anyMatch(action -> action instanceof Dead);
+            s.delivered += recordOutcomes(items, decision.actions(), shard, now);
+            var rows = s.rows;
+            if (read == rows.size() && rows.size() < s.limit && !s.cut) {
+                next = cursor.withProgress(s.target.id(), null, 0);
+            } else if (read > 0) { // a cut read: what the shard has read so far, maybe all
+                next = cursor.withProgress(cursor.tickId(), s.target.id(), rows.get(read - 1).record().id());
+            } // else only parked rows read: the position stays, as on a pause
+        } // else no progress: a batch in progress keeps its target, a fresh one is not stored (lastId is still 0)
+        if (failedAttempt(items)) { // paused, or a single failing key diverted: either way back off
+            limits.set(shard, Math.max(1, s.limit / 2));
+            var backoff = Backoff.delay(cursor.failures(), retry.initialDelay(), retry.maxDelay());
+            var until = now.plus(Duration.ofNanos(System.nanoTime() - started)).plus(backoff)
+                    .truncatedTo(ChronoUnit.MICROS); // from the decision, not from the start of a slow call
+            next = next.withPause(until, cursor.failures() + 1);
+            s.status = ShardStatus.PAUSED;
             metrics.shardPaused();
-            log.warn("outbox shard {}: every handler thread of this relay is still busy; skipped here until {}",
-                    shard, skipUntil);
-        } else if (called && busyPauses.get(shard) != 0) {
-            busyPauses.set(shard, 0);
-            busyUntil.set(shard, 0); // a wall clock stepping back would meet the old skip again
-        }
-        if (full || wroteRetry) {
-            next = next.withRetryDueAt(retries.minDue(inTx, shard));
-        }
-        if (full || wroteParked) {
-            next = next.withParkedDueAt(wroteParked ? parked.minDue(inTx, shard) : parkedDue);
-        }
-        cursors.append(inTx, next);
-        metrics.batch(Duration.ofNanos(System.nanoTime() - started));
-        return new ShardResult(status, delivered, status == ShardStatus.PROGRESS && next.targetTickId() == null,
-                deadLettered);
+            log.warn("outbox shard {} paused until {}: nothing delivered, {} consecutive failed attempts ({})",
+                    shard, until, next.failures(), firstError(items));
+        } else if (items.stream().anyMatch(item -> item.outcome() instanceof Outcome.Delivered)) {
+            limits.set(shard, s.limit > relay.batchSize() / 2 ? relay.batchSize() : 2 * s.limit); // no int overflow
+            next = next.cleared();
+        } // else only blocked, dead or requeued rows (a requeue is no failure): nothing about the target, the
+        // backoff and the limit stay as they are
+        s.busy |= busy;
+        s.next = next;
     }
 
     /** The row of the shard's effective tick, read with its cursor; a tick deleted by hand stops the shard. */
@@ -421,23 +691,35 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /**
-     * {@code LOCK_SWAP} shared and the shard's lock, both until the step's commit, or the step does not run: the tail
-     * swap ({@link XidPartitions#ensurePremade}) takes {@code LOCK_SWAP} exclusively, so it waits for the steps in
-     * flight, and steps skip while it holds or awaits it. Every step of every caller (workers, {@code drain()}) starts
-     * here, before its first read. Either lock taken alone is released at the step's commit, which is immediate.
+     * {@code LOCK_SWAP} shared and each shard's lock, all until the step's commit, in one statement; a shard is locked
+     * only with {@code LOCK_SWAP}, so none is while the tail swap ({@link XidPartitions#ensurePremade}) holds or awaits
+     * it: the swap takes {@code LOCK_SWAP} exclusively, so it waits for the steps in flight, and steps skip while it
+     * holds or awaits it. Every step of every caller (workers, {@code drain()}) starts here, before its first read. A
+     * lock taken without the others is released at the step's commit, which is immediate.
      */
-    private boolean tryLock(Connection c, int shard) throws SQLException {
-        try (var ps = c.prepareStatement(
-                "select pg_try_advisory_xact_lock_shared(?, ?), pg_try_advisory_xact_lock(?, ?)")) {
+    private boolean[] tryLock(Connection c, List<Integer> shards) throws SQLException {
+        var locked = new boolean[shards.size()];
+        if (shards.isEmpty()) {
+            return locked;
+        }
+        try (var ps = c.prepareStatement("select pg_try_advisory_xact_lock_shared(?, ?), array(select"
+                + " pg_try_advisory_xact_lock(?, ? + u.s) from unnest(?::int[]) with ordinality u(s, i)"
+                + " order by u.i)")) {
             ps.setInt(1, internalNamespace);
             ps.setInt(2, TableNames.LOCK_SWAP);
             ps.setInt(3, internalNamespace);
-            ps.setInt(4, TableNames.LOCK_SHARD_BASE + shard);
+            ps.setInt(4, TableNames.LOCK_SHARD_BASE);
+            ps.setArray(5, c.createArrayOf("int4", shards.toArray()));
             try (var rs = ps.executeQuery()) {
                 rs.next();
-                return rs.getBoolean(1) & rs.getBoolean(2);
+                boolean swap = rs.getBoolean(1);
+                var each = (Boolean[]) rs.getArray(2).getArray();
+                for (int i = 0; i < locked.length; i++) {
+                    locked[i] = swap && each[i];
+                }
             }
         }
+        return locked;
     }
 
     private boolean hasRetryRows(Connection c, int shard) throws SQLException {
@@ -814,30 +1096,36 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /**
-     * Hands {@code parkedRows}, then the non-blocked rows, to the handler in one call: the items of both, in that
-     * order; blocked rows get no outcome.
+     * Hands each step's parked rows, then its non-blocked rows, step by step, to the handler in one call, and gives
+     * each step its items, in that order (blocked rows without an outcome) and whether the call failed as a whole.
+     * Returns whether the handler was called: not when there is no record to hand.
      */
-    private List<Item> deliverBatch(List<OutboxRecord> parkedRows, List<BatchRow> rows, Instant now)
-            throws InterruptedException {
-        var records = new ArrayList<OutboxRecord>(parkedRows.size() + rows.size());
-        records.addAll(parkedRows);
-        for (var row : rows) {
-            if (!row.blocked()) {
-                records.add(row.record());
+    private boolean deliverBatch(List<Step> steps, Instant now) throws InterruptedException {
+        var records = new ArrayList<OutboxRecord>();
+        for (var s : steps) {
+            records.addAll(s.parkedRows);
+            for (var row : s.rows) {
+                if (!row.blocked()) {
+                    records.add(row.record());
+                }
             }
         }
         var outcomes = records.isEmpty() ? List.<Outcome>of() : deliver(records, now);
-        var items = new ArrayList<Item>(parkedRows.size() + rows.size());
         int i = 0;
-        for (var row : parkedRows) {
-            items.add(new Item(row, false, outcomes.get(i++), true));
+        for (var s : steps) {
+            var items = new ArrayList<Item>(s.parkedRows.size() + s.rows.size());
+            for (var row : s.parkedRows) {
+                items.add(new Item(row, false, outcomes.get(i++), true));
+            }
+            for (var row : s.rows) {
+                items.add(row.blocked()
+                        ? new Item(row.record(), true, null)
+                        : new Item(row.record(), false, outcomes.get(i++)));
+            }
+            s.items = items;
+            s.whole = outcomes instanceof FailedCall;
         }
-        for (var row : rows) {
-            items.add(row.blocked()
-                    ? new Item(row.record(), true, null)
-                    : new Item(row.record(), false, outcomes.get(i++)));
-        }
-        return items;
+        return !records.isEmpty();
     }
 
     /**

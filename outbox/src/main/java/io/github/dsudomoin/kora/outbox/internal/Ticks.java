@@ -10,8 +10,11 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -413,25 +416,44 @@ public final class Ticks {
      * shard when its {@code dirty} has the shard's bit or is null (or of another non-zero length), when it follows a
      * gap in tick ids, or when it is the latest. The ticks skipped mark nothing of the shard and chain (see the class
      * comment), so the shard has no row visible in the tick returned and not in {@code afterId}: its batch can start
-     * there, read the same rows and cover its {@code maxTicksPerBatch} ticks from the first that may hold them. One
-     * statement, an index scan from {@code afterId} that stops at the first marking tick.
+     * there, read the same rows and cover its {@code maxTicksPerBatch} ticks from the first that may hold them. The
+     * tick comes without its snapshot ({@link Tick#snapshot()} null), as {@link #between}'s.
      */
     @Nullable
     public Tick lastUnmarked(Connection c, int shard, long afterId, long latestId) throws SQLException {
-        try (var ps = c.prepareStatement(SELECT + names.tick() + " where id = (select max(m.id) from " + names.tick()
-                + " m where m.id > ? and m.id < (select n.id from " + names.tick() + " n where n.id > ? and n.id <= ?"
-                + " and (n.id = ? or n.dirty is null or not exists (select 1 from " + names.tick() + " g where g.id"
-                + " = n.id - 1) or case when length(n.dirty) = 0 then false when length(n.dirty) <> " + shards
-                + " then true else get_bit(n.dirty, ?) = 1 end) order by n.id limit 1))")) {
-            ps.setLong(1, afterId);
-            ps.setLong(2, afterId);
+        return lastUnmarked(c, Map.of(shard, afterId), latestId).get(shard);
+    }
+
+    /**
+     * {@link #lastUnmarked(Connection, int, long, long)} of each shard from its tick in {@code afterIds}, keyed by
+     * shard (a shard with none is absent), in one statement: per shard an index scan from its tick that stops at the
+     * first tick marking it.
+     */
+    public Map<Integer, Tick> lastUnmarked(Connection c, Map<Integer, Long> afterIds, long latestId)
+            throws SQLException {
+        var result = new HashMap<Integer, Tick>();
+        if (afterIds.isEmpty()) {
+            return result;
+        }
+        try (var ps = c.prepareStatement("select u.shard, t.id, t.created_at, t.max_id from unnest(?::int[],"
+                + " ?::int8[]) u(shard, after_id) join " + names.tick() + " t on t.id = (select max(m.id) from "
+                + names.tick() + " m where m.id > u.after_id and m.id < (select n.id from " + names.tick()
+                + " n where n.id > u.after_id and n.id <= ? and (n.id = ? or n.dirty is null or not exists (select 1"
+                + " from " + names.tick() + " g where g.id = n.id - 1) or case when length(n.dirty) = 0 then false"
+                + " when length(n.dirty) <> " + shards + " then true else get_bit(n.dirty, u.shard) = 1 end)"
+                + " order by n.id limit 1))")) {
+            ps.setArray(1, c.createArrayOf("int4", afterIds.keySet().toArray()));
+            ps.setArray(2, c.createArrayOf("int8", afterIds.values().toArray()));
             ps.setLong(3, latestId);
             ps.setLong(4, latestId);
-            ps.setInt(5, shard);
             try (var rs = ps.executeQuery()) {
-                return rs.next() ? tick(rs) : null;
+                while (rs.next()) {
+                    result.put(rs.getInt(1), new Tick(rs.getLong(2), null,
+                            rs.getObject(3, OffsetDateTime.class).toInstant(), rs.getObject(4, Long.class)));
+                }
             }
         }
+        return result;
     }
 
     /** The ticks with these ids, keyed by id; an id without a tick is absent. One statement. */
@@ -471,6 +493,34 @@ public final class Ticks {
                 return ticks;
             }
         }
+    }
+
+    /**
+     * The ticks of every range {@code (afterIds[i], upToIds[i]]}, each once, keyed by id, without their snapshots as
+     * {@link #between(Connection, long, long)}'s: one statement, one index range scan per distinct range.
+     */
+    public NavigableMap<Long, Tick> between(Connection c, long[] afterIds, long[] upToIds) throws SQLException {
+        var ranges = new LinkedHashSet<List<Long>>();
+        for (int i = 0; i < afterIds.length; i++) {
+            ranges.add(List.of(afterIds[i], upToIds[i]));
+        }
+        var result = new TreeMap<Long, Tick>();
+        if (ranges.isEmpty()) {
+            return result;
+        }
+        try (var ps = c.prepareStatement("select distinct t.id, t.created_at, t.max_id from unnest(?::int8[],"
+                + " ?::int8[]) r(after_id, up_to_id) cross join lateral (select id, created_at, max_id from "
+                + names.tick() + " where id > r.after_id and id <= r.up_to_id) t")) {
+            ps.setArray(1, c.createArrayOf("int8", ranges.stream().map(r -> r.get(0)).toArray()));
+            ps.setArray(2, c.createArrayOf("int8", ranges.stream().map(r -> r.get(1)).toArray()));
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    result.put(rs.getLong(1), new Tick(rs.getLong(1), null,
+                            rs.getObject(2, OffsetDateTime.class).toInstant(), rs.getObject(3, Long.class)));
+                }
+            }
+        }
+        return result;
     }
 
     /** The oldest tick with {@code id > afterId}: bridges gaps in tick ids. */

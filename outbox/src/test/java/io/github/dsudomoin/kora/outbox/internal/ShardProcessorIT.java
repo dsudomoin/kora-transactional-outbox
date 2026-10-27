@@ -2809,6 +2809,287 @@ class ShardProcessorIT {
         }
     }
 
+    @Test
+    void groupStepDeliversEveryShardInKeyOrder() throws Exception {
+        config.shards(4);
+        bootstrap();
+        var a = keyOnShard(0);
+        var b = keyOnShard(1);
+        var c = keyOnShard(2);
+        var d = keyOnShard(3);
+        send(msg("t", c, "c#1"), msg("t", a, "a#1"), msg("t", d, "d#1"), msg("t", c, "c#2"), msg("t", a, "a#2"),
+                msg("t", b, "b#1"));
+        long t = tick();
+
+        assertThat(processGroup(2, 0, 3, 1)).containsExactly(new ShardResult(PROGRESS, 2, true),
+                new ShardResult(PROGRESS, 2, true), new ShardResult(PROGRESS, 1, true),
+                new ShardResult(PROGRESS, 1, true));
+
+        assertThat(calls).as("one call: shard by shard in group order, id order inside")
+                .extracting(ShardProcessorIT::payloads)
+                .containsExactly(List.of("c#1", "c#2", "a#1", "a#2", "d#1", "b#1"));
+        for (int s = 0; s < 4; s++) {
+            assertThat(cursor(s)).isEqualTo(new Cursor(s, t, null, 0, null, 0, null, null));
+        }
+        assertThat(processGroup(0, 1, 2, 3)).containsOnly(new ShardResult(NO_WORK, 0, true));
+    }
+
+    @Test
+    void groupStepCommitsAsOneTransaction() throws Exception {
+        config.shards(3);
+        bootstrap();
+        send(msg("t", keyOnShard(0), "a#1"), msg("t", keyOnShard(1), "b#1"), msg("t", keyOnShard(2), "c#1"));
+        tick();
+        long seq;
+        try (var c = TestDb.connect()) {
+            seq = queryLong(c, "select max(seq) from " + names.cursor());
+        }
+        statements.clear();
+
+        assertThat(processGroup(0, 1, 2)).containsOnly(new ShardResult(PROGRESS, 1, true));
+
+        assertThat(rows("select count(*) || ':' || count(distinct xmin::text) from " + names.cursor()
+                + " where seq > " + seq, rs -> rs.getString(1))).as("three rows of one transaction")
+                .containsExactly("3:1");
+        assertThat(statements).as("one cursor append")
+                .filteredOn(sql -> sql.startsWith("insert into " + names.cursor())).hasSize(1);
+        assertThat(statements).as("one lock statement").filteredOn(sql -> sql.contains("advisory")).hasSize(1);
+    }
+
+    @Test
+    void aFailingShardDoesNotPauseItsNeighbours() throws Exception {
+        config.shards(2);
+        bootstrap();
+        var down = keysOnShard(0, 3);
+        var b = keyOnShard(1);
+        handler.failAlways(r -> new String(r.payload(), UTF_8).startsWith("f"), () -> new RuntimeException("down"));
+        send(msg("t", down.get(0), "f1"), msg("t", down.get(1), "f2"), msg("t", down.get(2), "f3"),
+                msg("t", b, "b#1"), msg("t", b, "b#2"));
+        long t = tick();
+        var before = cursor(1);
+        long rows = cursorRows(1);
+
+        var results = processGroup(0, 1);
+
+        // the default handler stops after three failing keys: shard 1's rows are not attempted
+        assertThat(calls).extracting(ShardProcessorIT::payloads)
+                .containsExactly(List.of("f1", "f2", "f3", "b#1", "b#2"));
+        assertThat(results.get(0)).isEqualTo(new ShardResult(PAUSED, 0, false));
+        assertThat(cursor(0).failures()).isEqualTo(1);
+        assertThat(results.get(1)).as("untouched").isEqualTo(new ShardResult(PROGRESS, 0, true));
+        assertThat(cursorRows(1)).as("no cursor row").isEqualTo(rows);
+        assertThat(cursor(1)).isEqualTo(before);
+
+        var next = processGroup(0, 1);
+        assertThat(next.get(0).status()).as("paused").isEqualTo(NO_WORK);
+        assertThat(next.get(1)).as("its limit unchanged: both rows").isEqualTo(new ShardResult(PROGRESS, 2, true));
+        assertThat(delivered()).containsExactly("b#1", "b#2");
+        assertThat(cursor(1)).isEqualTo(new Cursor(1, t, null, 0, null, 0, null, null));
+    }
+
+    @Test
+    void cutReadLeavesLaterShardsUntouched() throws Exception {
+        config.shards(5).batchSize(10);
+        bootstrap();
+        long t0 = cursor(0).tickId();
+        for (int s = 0; s < 5; s++) {
+            var key = keyOnShard(s);
+            int shard = s;
+            send(IntStream.range(1, 6).mapToObj(i -> msg("t", key, "s" + shard + "#" + i))
+                    .toArray(OutboxMessage[]::new));
+        }
+        long t = tick();
+
+        // 10 rows in all: shards 0 and 1 fill the read; 2..4 are not read, or read empty, and stay as they were
+        assertThat(processGroup(0, 1, 2, 3, 4)).containsExactly(new ShardResult(PROGRESS, 5, false),
+                new ShardResult(PROGRESS, 5, false), new ShardResult(PROGRESS, 0, true),
+                new ShardResult(PROGRESS, 0, true), new ShardResult(PROGRESS, 0, true));
+        var ids = handler.delivered().stream().map(OutboxRecord::id).toList();
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, t0, t, ids.get(4), null, 0, null, null));
+        assertThat(cursor(1)).isEqualTo(new Cursor(1, t0, t, ids.get(9), null, 0, null, null));
+        for (int s = 2; s < 5; s++) {
+            assertThat(cursorRows(s)).as("shard %d untouched", s).isEqualTo(1);
+        }
+
+        // shards 0 and 1 read nothing more, but the read is cut again by 2 and 3: they stay mid-batch
+        assertThat(processGroup(0, 1, 2, 3, 4)).containsExactly(new ShardResult(PROGRESS, 0, false),
+                new ShardResult(PROGRESS, 0, false), new ShardResult(PROGRESS, 5, false),
+                new ShardResult(PROGRESS, 5, false), new ShardResult(PROGRESS, 0, true));
+        assertThat(cursor(0)).isEqualTo(new Cursor(0, t0, t, ids.get(4), null, 0, null, null));
+
+        assertThat(processGroup(0, 1, 2, 3, 4)).containsExactly(new ShardResult(PROGRESS, 0, true),
+                new ShardResult(PROGRESS, 0, true), new ShardResult(PROGRESS, 0, true),
+                new ShardResult(PROGRESS, 0, true), new ShardResult(PROGRESS, 5, true));
+        for (int s = 0; s < 5; s++) {
+            assertThat(cursor(s)).isEqualTo(new Cursor(s, t, null, 0, null, 0, null, null));
+        }
+        assertThat(delivered()).hasSize(25).isSortedAccordingTo((x, y) -> {
+            int shard = Integer.compare(x.charAt(1), y.charAt(1));
+            return shard != 0 ? shard : Integer.compare(x.charAt(3), y.charAt(3));
+        });
+    }
+
+    @Test
+    void probeModeShardInAGroup() throws Exception {
+        config.shards(2);
+        bootstrap();
+        var keys = keysOnShard(0, 2);
+        script = records -> records.stream().anyMatch(payload("bad#1")) ? List.of() : handler.handleBatch(records);
+        send(msg("t", keys.get(0), "bad#1"), msg("t", keys.get(1), "a#1"));
+        tick();
+        for (int failures = 1; failures <= 3; failures++) {
+            assertThat(process(processor, 0)).isEqualTo(new ShardResult(PAUSED, 0, false));
+            now = cursor(0).pausedUntil();
+        }
+        send(msg("t", keyOnShard(1), "b#1"));
+        tick();
+        calls.clear();
+
+        // shard 0 probes: its head alone, in a call of its own; shard 1 in the group's call
+        assertThat(processGroup(0, 1)).containsExactly(new ShardResult(PAUSED, 0, false),
+                new ShardResult(PROGRESS, 1, true));
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("b#1"), List.of("bad#1"));
+        assertThat(retryRows()).containsExactly("bad#1:3:" + now.plus(Backoff.delay(2, INITIAL, config.maxDelay())));
+        now = cursor(0).pausedUntil();
+        script = null;
+        for (int i = 0; i < 100 && processGroup(0, 1).get(0).status() != NO_WORK; i++) {
+            now = now.plusSeconds(1);
+        }
+        assertThat(delivered()).startsWith("b#1").containsExactlyInAnyOrder("b#1", "a#1", "bad#1");
+    }
+
+    @Test
+    void retryHeadsOfOneShardInAGroup() throws Exception {
+        config.shards(2);
+        bootstrap();
+        var keys = keysOnShard(0, 2);
+        script = answering(Map.of("a#1", Outcome.retry(new RuntimeException("once"))));
+        send(msg("t", keys.get(0), "a#1"), msg("t", keys.get(1), "c#1"));
+        tick();
+        assertThat(process(processor, 0)).isEqualTo(new ShardResult(PROGRESS, 1, true)); // a#1 diverted
+        assertThat(retryRows()).containsExactly("a#1:1:" + now.plus(INITIAL));
+        script = null;
+        send(msg("t", keyOnShard(1), "b#1"));
+        tick();
+        now = now.plus(INITIAL);
+        calls.clear();
+
+        assertThat(processGroup(0, 1)).containsExactly(new ShardResult(PROGRESS, 1, true),
+                new ShardResult(PROGRESS, 1, true));
+
+        assertThat(calls).as("shard 0's retry pass, then the group's call")
+                .extracting(ShardProcessorIT::payloads).containsExactly(List.of("a#1"), List.of("b#1"));
+        assertThat(retryRows()).isEmpty();
+        assertThat(cursor(0).retryDueAt()).isNull();
+        assertThat(delivered()).containsExactly("c#1", "a#1", "b#1");
+    }
+
+    @Test
+    void busyPoolPausesTheWholeGroup() throws Exception {
+        // pool of max(4, 2 * workers) = 4 threads; no probe or divert while shard 2's calls fill it
+        config.shards(3).workers(1).batchTimeout(Duration.ofMillis(100)).headFailuresBeforeDivert(1000);
+        bootstrap();
+        var release = new CountDownLatch(1);
+        script = records -> {
+            if (payloads(records).contains("h#1")) {
+                while (release.getCount() > 0) {
+                    try {
+                        release.await();
+                    } catch (InterruptedException ignored) {
+                        // a handler that ignores cancellation keeps its thread
+                    }
+                }
+            }
+            return records.stream().map(r -> Outcome.delivered()).toList();
+        };
+        send(msg("t", keyOnShard(2), "h#1"), msg("t", keyOnShard(0), "a#1"), msg("t", keyOnShard(1), "b#1"));
+        tick();
+        try {
+            for (int i = 1; i <= 4; i++) { // four calls of shard 2 hold the four threads
+                assertThat(process(processor, 2).status()).isEqualTo(PAUSED);
+                now = cursor(2).pausedUntil();
+            }
+            int held = calls.size();
+
+            assertThat(processGroup(0, 1)).containsExactly(new ShardResult(PAUSED, 0, false),
+                    new ShardResult(PAUSED, 0, false));
+
+            assertThat(calls).as("no call ran").hasSize(held);
+            for (int s = 0; s < 2; s++) {
+                assertPausedFor(cursor(s), INITIAL);
+                assertThat(cursor(s).failures()).isZero();
+                assertThat(cursor(s).targetTickId()).isNull();
+            }
+        } finally {
+            release.countDown();
+        }
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        var together = List.of("a#1", "b#1");
+        while (calls.stream().map(ShardProcessorIT::payloads).noneMatch(together::equals)
+                && System.nanoTime() < deadline) {
+            now = now.plus(Duration.ofSeconds(1)); // past any pause or skip, once the threads come back
+            processGroup(0, 1);
+        }
+        assertThat(calls).as("the group is called once threads are free").extracting(ShardProcessorIT::payloads)
+                .contains(together);
+    }
+
+    @Test
+    void swapLockStopsTheWholeGroup() throws Exception {
+        config.shards(3);
+        bootstrap();
+        send(msg("t", keyOnShard(0), "a#1"), msg("t", keyOnShard(1), "b#1"), msg("t", keyOnShard(2), "c#1"));
+        tick();
+        var swap = TestDb.connect();
+        open.add(swap);
+        swapLock(swap, "pg_advisory_lock");
+
+        assertThat(processGroup(0, 1, 2)).hasSize(3).containsOnly(new ShardResult(NOT_LOCKED, 0, false));
+        assertThat(calls).isEmpty();
+
+        swapLock(swap, "pg_advisory_unlock");
+        var holder = begin(); // another worker holds shard 1
+        try (var ps = holder.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
+            ps.setInt(1, names.internalNamespace());
+            ps.setInt(2, TableNames.LOCK_SHARD_BASE + 1);
+            ps.execute();
+        }
+        assertThat(processGroup(0, 1, 2)).containsExactly(new ShardResult(PROGRESS, 1, true),
+                new ShardResult(NOT_LOCKED, 0, false), new ShardResult(PROGRESS, 1, true));
+        holder.commit();
+        assertThat(processGroup(0, 1, 2)).containsExactly(new ShardResult(NO_WORK, 0, true),
+                new ShardResult(PROGRESS, 1, true), new ShardResult(NO_WORK, 0, true));
+        assertThat(delivered()).containsExactly("a#1", "c#1", "b#1");
+    }
+
+    @Test
+    void aGroupCallFailingAsAWholeChargesNoShard() throws Exception {
+        config.shards(2);
+        bootstrap();
+        script = records -> {
+            if (payloads(records).contains("bad#1")) {
+                throw new IllegalStateException("poison");
+            }
+            return handler.handleBatch(records);
+        };
+        send(msg("t", keyOnShard(0), "bad#1"), msg("t", keyOnShard(1), "b#1"));
+        tick();
+        long rows = cursorRows(0) + cursorRows(1);
+
+        assertThat(processGroup(0, 1)).as("says nothing about either shard")
+                .containsOnly(new ShardResult(PROGRESS, 0, true));
+        assertThat(cursorRows(0) + cursorRows(1)).isEqualTo(rows);
+
+        // each shard is called alone now: the failure is shard 0's own
+        assertThat(processGroup(0, 1)).containsExactly(new ShardResult(PAUSED, 0, false),
+                new ShardResult(PROGRESS, 1, true));
+        assertThat(calls).extracting(ShardProcessorIT::payloads)
+                .containsExactly(List.of("bad#1", "b#1"), List.of("bad#1"), List.of("b#1"));
+        assertThat(cursor(0).failures()).isEqualTo(1);
+        assertThat(cursor(1).failures()).isZero();
+    }
+
     private void bootstrap() throws Exception {
         var schema = new OutboxSchema(db, config);
         schema.init();
@@ -2857,6 +3138,49 @@ class ShardProcessorIT {
                 throw t;
             }
         }
+    }
+
+    /** One worker group step of {@code shards} at the test clock in its own transaction, rolled back on failure. */
+    private List<ShardResult> processGroup(Integer... shards) throws Exception {
+        long latest;
+        try (var c = TestDb.connect()) {
+            latest = ticks.latest(c).id();
+        }
+        try (var c = recording(TestDb.connect())) {
+            ShardProcessor.prepareTransaction(c, config.batchTimeout());
+            try {
+                var results = processor.tryProcess(c, List.of(shards), latest, now);
+                c.commit();
+                return results;
+            } catch (Throwable t) {
+                c.rollback();
+                throw t;
+            }
+        }
+    }
+
+    private Cursor cursor(int shard) throws SQLException {
+        try (var c = TestDb.connect()) {
+            return cursors.latest(c, shard).cursor();
+        }
+    }
+
+    /** Cursor rows of {@code shard} ever appended. */
+    private long cursorRows(int shard) throws SQLException {
+        return Long.parseLong(rows("select count(*) from " + names.cursor() + " where shard = " + shard,
+                rs -> rs.getString(1)).get(0));
+    }
+
+    /** {@code n} keys of topic {@code t} on {@code shard}. */
+    private List<String> keysOnShard(int shard, int n) {
+        var keys = new ArrayList<String>();
+        for (int i = 0; keys.size() < n; i++) {
+            var key = "k" + i;
+            if (Hashing.shard(Hashing.keyHash("t", key.getBytes(UTF_8)), config.shards()) == shard) {
+                keys.add(key);
+            }
+        }
+        return keys;
     }
 
     /** {@code c}, adding the SQL of each statement it prepares to {@link #statements}. */
