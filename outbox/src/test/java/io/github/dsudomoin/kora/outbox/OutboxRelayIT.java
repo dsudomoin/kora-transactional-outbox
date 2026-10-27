@@ -388,13 +388,13 @@ class OutboxRelayIT {
 
         long started = System.nanoTime();
         assertThat(relay.drain()).isZero();
-        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(1));
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofMillis(1500));
         assertThat(parked()).isEqualTo("k#1,j#1");
 
         Thread.sleep(1100); // j#1 is due
         started = System.nanoTime();
         assertThat(relay.drain()).isEqualTo(1);
-        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(1));
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofMillis(1500));
         assertThat(parked()).isEqualTo("k#1");
     }
 

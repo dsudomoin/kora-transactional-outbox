@@ -59,6 +59,7 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -2135,17 +2136,21 @@ class ShardProcessorIT {
         tick();
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
         assertThat(statements).as("a shard's first step checks in full").anyMatch(sql -> sql.contains(names.parked()));
-        send(msg("t", "b", "b#1"));
+        handler.failNext(payload("k#1"), () -> new RuntimeException("k busy"));
+        send(msg("t", "b", "b#1"), msg("t", "k", "k#1"));
         tick();
         statements.clear();
 
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true)); // k#1 diverted
+        now = now.plus(INITIAL);
+        assertThat(process()).as("a retry pass").isEqualTo(new ShardResult(PROGRESS, 1, true));
         send(msg("t", "c", "c#1"));
         tick();
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
 
-        assertThat(statements).isNotEmpty().noneMatch(sql -> sql.contains(names.parked()));
-        assertThat(delivered()).containsExactly("a#1", "b#1", "c#1");
+        assertThat(statements).anyMatch(sql -> sql.contains(names.retry()))
+                .noneMatch(sql -> sql.contains(names.parked()));
+        assertThat(delivered()).containsExactly("a#1", "b#1", "k#1", "c#1");
     }
 
     @Test
@@ -2522,6 +2527,29 @@ class ShardProcessorIT {
         assertThat(delivered()).containsExactly("p2");
         assertThat(retryRows()).containsExactly("p1:1:" + now.plus(INITIAL));
         assertThat(parkedRows()).isEmpty();
+    }
+
+    @Test
+    void theRetryPassWritesItsParkedRowsInBatches() throws Exception {
+        bootstrap();
+        script = records -> records.stream().map(r -> Outcome.requeue()).toList();
+        send(Stream.of("a", "b", "c", "d", "e", "f").map(key -> msg("t", key, key)).toArray(OutboxMessage[]::new));
+        tick();
+        process();
+        now = now.plus(REQUEUE_DELAY);
+        script = answering(Map.of("a", Outcome.requeue(), "b", Outcome.requeue(), "c", Outcome.requeue(),
+                "d", Outcome.notAttempted(), "e", Outcome.notAttempted()));
+        statements.clear();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+
+        var due = now.plus(REQUEUE_DELAY);
+        assertThat(parkedRows()).containsExactly("a:2:" + due, "b:2:" + due, "c:2:" + due, "d:1:" + due,
+                "e:1:" + due);
+        assertThat(delivered()).containsExactly("f");
+        assertThat(statements).as("one re-park and one keep statement, each a JDBC batch")
+                .filteredOn(sql -> sql.startsWith("update " + names.parked())).hasSize(2);
+        assertThat(statements).filteredOn(sql -> sql.startsWith("delete from " + names.parked())).hasSize(1);
     }
 
     @Test

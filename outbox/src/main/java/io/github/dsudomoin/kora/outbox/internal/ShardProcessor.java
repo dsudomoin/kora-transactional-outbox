@@ -12,6 +12,7 @@ import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Head;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Item;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Keep;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Park;
+import io.github.dsudomoin.kora.outbox.internal.BatchClassifier.Unpark;
 import io.github.dsudomoin.kora.outbox.internal.BatchReader.BatchRow;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.kora.outbox.internal.Ticks.Tick;
@@ -496,6 +497,10 @@ public final class ShardProcessor implements AutoCloseable {
             }
             heads = retries.dueHeads(c, shard, now, budget); // promoted rows are due at now
         }
+        // in the step's transaction, before the main pass reads the parked table
+        var parkedIds = new HashSet<Long>();
+        dueParked.forEach(row -> parkedIds.add(row.id()));
+        parked.apply(c, shard, pass.parkedWrites, parkedIds);
         return pass;
     }
 
@@ -533,6 +538,8 @@ public final class ShardProcessor implements AutoCloseable {
         boolean toRetry;
         /** A retry row was parked. */
         boolean fromRetry;
+        /** Re-parks, keeps and unparks of handed parked rows, written as JDBC batches when the pass ends. */
+        final List<Action> parkedWrites = new ArrayList<>();
 
         Pass(long deadline) {
             this.deadline = deadline;
@@ -644,14 +651,11 @@ public final class ShardProcessor implements AutoCloseable {
         for (var head : goOn) {
             promoted |= retries.promote(c, shard, head, now);
         }
-        var unparked = new ArrayList<OutboxRecord>();
         for (var group : groups) {
             if (group.parked()) {
-                resolveParked(c, shard, group, outcomes, unparked, now, pass);
+                resolveParked(c, shard, group, outcomes, done, now, pass);
             }
         }
-        parked.unpark(c, unparked);
-        done.addAll(unparked);
         for (var row : done) {
             metrics.delivered(row.topic(), delay(row, now));
         }
@@ -714,28 +718,30 @@ public final class ShardProcessor implements AutoCloseable {
 
     /**
      * Applies the outcomes of one key's parked rows in id order, as the main pass settles parked rows: delivered rows
-     * join {@code unparked}; a requeued row is parked again ({@code requeues + 1}; past {@code maxRequeues} dead,
-     * attempts kept); a permanent failure, or a transient one out of attempts, goes to dead; a not-attempted row (a
-     * call that found no free handler thread included) stays parked, due no earlier than after the requeue delay. None
-     * of these blocks the rows after it. The first other transient failure becomes the retry head of the key and takes
-     * its newer parked rows along as followers ({@link ParkedStore#toRetry}), which ends the group, as does a row not
-     * handed. Never promotes.
+     * join {@code delivered} and leave the table; a requeued row is parked again ({@code requeues + 1}; past
+     * {@code maxRequeues} dead, attempts kept); a permanent failure, or a transient one out of attempts, goes to dead;
+     * a not-attempted row (a call that found no free handler thread included) stays parked, due no earlier than after
+     * the requeue delay. None of these blocks the rows after it. The first other transient failure becomes the retry
+     * head of the key and takes its newer parked rows along as followers ({@link ParkedStore#toRetry}), which ends the
+     * group, as does a row not handed. Never promotes. Unparks, re-parks and keeps go to {@link Pass#parkedWrites}:
+     * such a row precedes the group's row that moves, if any, and a move carries only the key's newer parked rows,
+     * while no other group of the pass has its key, so the row is still parked when the pass writes it.
      */
     private void resolveParked(Connection c, int shard, Group group, Map<Long, Outcome> outcomes,
-            List<OutboxRecord> unparked, Instant now, Pass pass) throws SQLException {
+            List<OutboxRecord> delivered, Instant now, Pass pass) throws SQLException {
         for (var row : group.rows()) {
             var outcome = outcomes.get(row.id());
             int attempts = row.attempts() + 1;
             if (outcome == null) {
                 return;
             } else if (outcome instanceof Outcome.Delivered) {
-                unparked.add(row);
+                delivered.add(row);
+                pass.parkedWrites.add(new Unpark(row));
             } else if (outcome instanceof Outcome.Requeue q) {
                 if (BatchClassifier.requeueLimitReached(row, requeue.maxRequeues())) {
                     deadFromParked(c, row, row.attempts(), BatchClassifier.REQUEUE_LIMIT);
                 } else {
-                    var park = new Park(row, row.requeues() + 1, requeueDue(q.notBefore(), now));
-                    parked.apply(c, shard, List.of(park), Set.of(row.id()));
+                    pass.parkedWrites.add(new Park(row, row.requeues() + 1, requeueDue(q.notBefore(), now)));
                     metrics.requeued(row.topic());
                 }
             } else if (outcome instanceof Outcome.Permanent p) {
@@ -752,7 +758,7 @@ public final class ShardProcessor implements AutoCloseable {
                 pass.toRetry = true;
                 return;
             } else if (outcome instanceof Outcome.NotAttempted n) { // attempts and requeues stay
-                parked.apply(c, shard, List.of(new Keep(row, requeueDue(n.notBefore(), now))), Set.of(row.id()));
+                pass.parkedWrites.add(new Keep(row, requeueDue(n.notBefore(), now)));
             }
         }
     }
