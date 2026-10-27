@@ -158,8 +158,8 @@ public final class OrphanRestore {
             }
         }
         if (left > 0) {
-            throw new SQLException("moved " + moved + " rows of " + table + " back into the outbox; " + left + " rows of"
-                    + " " + busy.size() + " keys another transaction held (an open send of the key) stay in it, so"
+            throw new SQLException("moved " + moved + " rows of " + table + " back into the outbox; " + left
+                    + " rows of " + busy.size() + " keys another transaction held (an open send of the key) stay in it, so"
                     + " that each key's rows go back in order behind that send: the next run or call moves them",
                     "55P03");
         }

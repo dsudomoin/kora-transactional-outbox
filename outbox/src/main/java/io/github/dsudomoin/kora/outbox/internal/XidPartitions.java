@@ -392,8 +392,8 @@ public final class XidPartitions {
             holders = "who held it could not be read: " + read;
         }
         if ((failed >= STUCK_SWAPS || s.ahead < premake / 2) && due(stuckLogged, STUCK_LOG_INTERVAL)) {
-            log.error("outbox partition tail swap of {} timed out waiting for writers on {} due runs in a row, {} ranges"
-                    + " ahead of the current xid: writer transactions hold their lock on the outbox longer than"
+            log.error("outbox partition tail swap of {} timed out waiting for writers on {} due runs in a row, {}"
+                    + " ranges ahead of the current xid: writer transactions hold their lock on the outbox longer than"
                     + " outbox.partitions.swapLockTimeout {} ms after their send, and overlap, so the swap never gets"
                     + " its gap ({}). Each attempt stalls writers for swapLockTimeout; once the ranges run out, rows go"
                     + " to the tail and it is not turned into a range either. Send last in the transaction, or raise"
