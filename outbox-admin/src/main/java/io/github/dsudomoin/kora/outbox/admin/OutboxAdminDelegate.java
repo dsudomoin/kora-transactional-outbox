@@ -57,8 +57,9 @@ import java.util.function.Supplier;
 
 /**
  * The admin API over {@link OutboxAdmin}: an {@link IllegalArgumentException} of a call answers 400, an
- * {@link IllegalStateException} 409, both with its message; anything else is the HTTP server's 500. Enums are mapped
- * by exhaustive {@code switch}, so a constant added on either side fails the build instead of a request.
+ * {@link IllegalStateException} 409, both with its message; anything else propagates, and the interceptor answers it
+ * with a 500 {@code Error}. Enums are mapped by exhaustive {@code switch}, so a constant added on either side fails the
+ * build instead of a request.
  */
 public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
 

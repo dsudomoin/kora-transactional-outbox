@@ -79,6 +79,28 @@ class OutboxAdminInterceptorTest {
         }
     }
 
+    /** A failure without a message is named by its class; the WARN has the route and the identity, escaped. */
+    @Test
+    void aRouteFailureIsA500Error() {
+        var authorization = new AtomicReference<Runnable>();
+        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops\n"),
+                deferred(authorization), new $ModelError_JsonWriter());
+
+        try (var stderr = new CapturedStderr()) {
+            var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"),
+                    (context, request) -> CompletableFuture.failedFuture(new IllegalMonitorStateException()));
+            authorization.get().run();
+
+            var answered = response.toCompletableFuture().join();
+            assertThat(answered.code()).isEqualTo(500);
+            assertThat(body(answered)).isEqualTo("{\"message\":\"java.lang.IllegalMonitorStateException\"}");
+            var call = "outbox admin GET \"/kora-outbox/admin/v1/status\" by \"ops\\n\"";
+            assertThat(stderr.text()).contains("WARN " + OutboxAdminInterceptor.class.getName() + " - " + call
+                    + " failed, answered 500").contains("INFO " + OutboxAdminInterceptor.class.getName() + " - "
+                    + call + ": 500");
+        }
+    }
+
     /** Undertow leaves {@code %5C} encoded, so a backslash in a path is tested here. */
     @Test
     void auditLinePathIsOneQuotedToken() {

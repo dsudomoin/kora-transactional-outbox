@@ -353,9 +353,12 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         assertThat(deadIds()).containsExactly(id);
     }
 
-    /** Neither bad input nor a refusal of the outbox's state: Kora's 500, and the audit line says so. */
+    /**
+     * Neither bad input nor a refusal of the outbox's state: a 500 whose {@code Error} has the failure's message, for
+     * the authenticated operator; one WARN with the exception; the audit line says 500.
+     */
     @Test
-    void otherFailuresAreTheServers500() throws Exception {
+    void otherFailuresAreA500Error() throws Exception {
         execute("drop table " + names().dead() + " cascade");
 
         HttpResponse<String> response;
@@ -365,8 +368,14 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
             log = stderr.text();
         }
 
-        assertThat(response.statusCode()).isEqualTo(500);
-        assertThat(log).contains("outbox admin GET \"" + API + "/dead-letters/count\" by \"tester\": 500");
+        assertJson(response, 500);
+        assertThat(response.body()).startsWith("{\"message\":\"").contains(names().dead() + "\\\" does not exist");
+        assertThat(response.headers().firstValue("X-Test-Global")).as("the global interceptor saw a response")
+                .hasValue("1");
+        var call = "outbox admin GET \"" + API + "/dead-letters/count\" by \"tester\"";
+        assertThat(log.lines().filter(l -> l.contains(" WARN ") && l.contains(call + " failed, answered 500")))
+                .as("one WARN").hasSize(1);
+        assertThat(log).contains("PSQLException").contains(call + ": 500");
     }
 
     // ---------------------------------------------------------------------------------------------------- fixtures

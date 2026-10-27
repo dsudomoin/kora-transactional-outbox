@@ -24,8 +24,9 @@ import ru.tinkoff.kora.json.common.JsonWriter;
  * Guards every admin route with the {@link OutboxAdminAuthorizer}, called on the server's blocking executor, never on
  * an I/O thread. A denied call gets a JSON {@code Error} with the decision's status and never reaches the route; an
  * authorizer that fails gets a WARN with its exception and the caller a 500 {@code Error} "authorization failed",
- * nothing of why. A 4xx the server raises for an allowed call before the route runs (a malformed parameter or body)
- * is answered as an {@code Error} too.
+ * nothing of why. For an allowed call, a 4xx the server raises before the route runs (a malformed parameter or body)
+ * is answered as an {@code Error} too, and any other failure as a 500 {@code Error} with the failure's message (its
+ * class name when it has none), for the authenticated operator, after one WARN with the exception.
  *
  * <p>Every call leaves one INFO audit line, written before its response completes:
  * {@code outbox admin <method> "<path>" by "<identity>": <status>} when allowed, {@code outbox admin <method>
@@ -67,23 +68,29 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
             return CompletableFuture.completedFuture(error(context, 500, null, "authorization failed"));
         }
         if (decision instanceof OutboxAdminAuthorizer.Allow allow) {
+            var caller = call + " by \"" + printable(allow.identity()) + "\"";
             return process(context, request, chain)
-                    .exceptionallyCompose(e -> clientError(context, e))
-                    .whenComplete((response, e) -> log.info("outbox admin {} by \"{}\": {}", call,
-                            printable(allow.identity()), response != null ? response.code() : status(e)));
+                    .exceptionallyCompose(e -> CompletableFuture.completedFuture(failure(context, caller, e)))
+                    .whenComplete((response, e) -> log.info("outbox admin {}: {}", caller,
+                            response != null ? response.code() : status(e)));
         }
         var deny = (OutboxAdminAuthorizer.Deny) decision;
         log.info("outbox admin {} denied: {}", call, deny.status());
         return CompletableFuture.completedFuture(error(context, deny.status(), null, deny.message()));
     }
 
-    /** A 4xx the server raised (a malformed parameter or body) as an {@code Error}; anything else as it failed. */
-    private CompletionStage<HttpServerResponse> clientError(Context context, Throwable failure) {
-        if (unwrap(failure) instanceof HttpServerResponseException e && e.code() >= 400 && e.code() < 500) {
+    /**
+     * A 4xx the server raised (a malformed parameter or body) as an {@code Error} of its code; anything else, after a
+     * WARN, as a 500 {@code Error} with its message.
+     */
+    private HttpServerResponse failure(Context context, String caller, Throwable failure) {
+        var cause = unwrap(failure);
+        if (cause instanceof HttpServerResponseException e && e.code() >= 400 && e.code() < 500) {
             var message = Objects.requireNonNullElse(e.getMessage(), "HTTP " + e.code());
-            return CompletableFuture.completedFuture(error(context, e.code(), e.headers(), message));
+            return error(context, e.code(), e.headers(), message);
         }
-        return CompletableFuture.failedFuture(failure);
+        log.warn("outbox admin {} failed, answered 500", caller, cause);
+        return error(context, 500, null, Objects.requireNonNullElse(cause.getMessage(), cause.getClass().getName()));
     }
 
     private HttpServerResponse error(Context context, int code, @Nullable MutableHttpHeaders headers,

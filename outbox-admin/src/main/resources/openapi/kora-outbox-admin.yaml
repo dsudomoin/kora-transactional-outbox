@@ -8,7 +8,8 @@ info:
     service's OutboxAdminAuthorizer, which runs before every operation and answers 401 or 403 with an Error (500,
     "authorization failed", when it fails). A call refused for its input answers 400, a request body with a field
     this contract does not name included; one that cannot run in the outbox's current state (maintenance running, no
-    xid regression to recover) answers 409. Every one of them carries an Error.
+    xid regression to recover) answers 409; any other failure of an allowed call answers 500 with the failure's
+    message. Every one of them carries an Error.
 paths:
   /kora-outbox/admin/v1/status:
     get:
@@ -30,6 +31,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/ServerError'
   /kora-outbox/admin/v1/dead-letters:
     get:
       operationId: findDeadLetters
@@ -72,6 +75,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/ServerError'
   /kora-outbox/admin/v1/dead-letters/count:
     get:
       operationId: countDeadLetters
@@ -99,6 +104,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/ServerError'
   /kora-outbox/admin/v1/dead-letters/redrive:
     post:
       operationId: redriveDeadLetters
@@ -128,6 +135,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/ServerError'
   /kora-outbox/admin/v1/dead-letters/discard:
     post:
       operationId: discardDeadLetters
@@ -154,6 +163,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/ServerError'
   /kora-outbox/admin/v1/orphans/{table}/restore:
     post:
       operationId: restoreOrphan
@@ -191,6 +202,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/ServerError'
   /kora-outbox/admin/v1/recovery/xid-regression:
     post:
       operationId: recoverXidRegression
@@ -214,6 +227,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '409':
           $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/ServerError'
 components:
   parameters:
     Topic:
@@ -275,6 +290,14 @@ components:
             $ref: '#/components/schemas/Error'
     Conflict:
       description: Cannot run in the outbox's current state
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServerError:
+      description: >-
+        The call failed for another reason (the database, say): the message is the failure's, for the authenticated
+        operator; "authorization failed" when the OutboxAdminAuthorizer did
       content:
         application/json:
           schema:
