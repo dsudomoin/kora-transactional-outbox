@@ -261,8 +261,9 @@ public final class XidPartitions {
 
     /**
      * Extends once half of the premade ranges are used up ({@link #premadeAhead} ≤ {@code premake / 2}), until {@code
-     * premake} whole ranges lie above the one holding the current xid, by swapping the attached tail for those ranges
-     * and a new tail above them in one short transaction ({@link #swap}), so the tail is never left detach-pending.
+     * premake} whole ranges lie above the one holding the current xid, by swapping the attached tail for the first
+     * {@link #RANGES_PER_SWAP} of those ranges and a new tail above them in one short statement ({@link #swap}), so the
+     * tail is never left detach-pending; the runs after go on while the next range waits made ahead of the tail.
      * First, under no lock that writers wait for, it creates the new ranges as standalone tables (each skipped when it
      * exists: a failed swap leaves them for the next attempt, and {@link #dropOrphans} leaves them be). Not while
      * ({@link #swapBlocker}) a transaction open for 20 s holds a lock on the parent, or a lock on the parent is
@@ -543,7 +544,8 @@ public final class XidPartitions {
     /** Creates the ranges from {@code from} until {@code target} standalone, each skipped when it exists; their top. */
     private long precreate(Connection c, long from, long target) throws SQLException {
         for (; from < target; from += size) {
-            PartitionDdl.create(c, names.base(), names.partitionPrefix() + from, PartitionDdl.CREATE_LOCK_TIMEOUT, true);
+            PartitionDdl.create(c, names.base(), names.partitionPrefix() + from, PartitionDdl.CREATE_LOCK_TIMEOUT,
+                    true); // with the indexes: the swap's attach then builds none
         }
         return from;
     }
