@@ -17,10 +17,12 @@ public sealed interface DeadLetterDecision {
     }
 
     /**
-     * The letter goes back into the outbox now, as a new message after the later messages of its (topic, key): same
-     * message id, topic, key, payload and headers, attempts reset. Should it die again within
-     * {@code outbox.deadLetters.redriveHistory}, its {@link DeadLetter#redrives()} is one higher, so a hook can stop a
-     * redrive loop. The dead row is deleted in the same transaction.
+     * The letter goes back into the outbox right after the decision commits, as by {@code redriveAt(now)}: a new
+     * message after the later messages of its (topic, key), with the same message id, topic, key, payload and headers,
+     * attempts reset; the dead row is deleted in the same transaction. While a transaction sending its key is open, it
+     * waits {@link DeadLetter.Status#SCHEDULED}, tried again every {@code outbox.relay.retry.initialDelay}. Should it
+     * die again within {@code outbox.deadLetters.redriveHistory}, its {@link DeadLetter#redrives()} is one higher, so a
+     * hook can stop a redrive loop.
      */
     static DeadLetterDecision redrive() {
         return new Redrive();

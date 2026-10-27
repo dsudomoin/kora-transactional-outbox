@@ -37,7 +37,7 @@ public record DeadLetter(
         PENDING,
         /** Kept for humans: decided {@code keep}, or dead while no hook was set. */
         KEPT,
-        /** Decided {@code redriveAt}: redriven automatically at {@code dueAt}. */
+        /** Decided {@code redrive} or {@code redriveAt}: redriven automatically at {@code dueAt}. */
         SCHEDULED
     }
 }

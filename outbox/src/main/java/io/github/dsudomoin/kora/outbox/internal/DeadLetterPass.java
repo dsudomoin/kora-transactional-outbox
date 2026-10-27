@@ -17,6 +17,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
@@ -39,10 +41,15 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * one transaction (read committed, {@code idle_in_transaction_session_timeout} = hook timeout + 30 s): claim up to
  * {@code deadLetters.batchSize} due letters {@code for update skip locked}, so no two passes on any instance hand one
  * letter at once; call the hook, bounded by {@code deadLetters.timeout}, while the claim holds them; commit its
- * decisions, or, after a failed call, a backoff for every letter of it. A redrive ({@link Resender}, the
- * {@code <redriven>} count, the dead row deleted) waits at most {@code partitions.swapLockTimeout} for a key lock, so
- * a pass never stalls a writer longer than the tail swap does; past it the whole batch rolls back unchanged (no hook
- * failure: the next pass calls the hook again).
+ * decisions, or, after a failed call, a backoff for every letter of it. That transaction takes no key lock: a
+ * {@code redrive} commits as {@code redriveAt(now)}, so a decision is never lost and the hook is called once for it.
+ * Scheduled letters due are then redriven, a batch per transaction ({@link Resender}, the {@code <redriven>} count,
+ * the dead rows deleted). Their key locks are taken without waiting ({@code pg_try_advisory_xact_lock}): a letter
+ * whose key is held, by an open {@code send} of it, is due again after {@code relay.retry.initialDelay} while the
+ * others go on. Any other lock the insert waits for is waited for at most {@code partitions.swapLockTimeout} each:
+ * while it waits, writers of the keys it holds wait too. A batch that fails after its claim rolls back, and its
+ * letters are then due again after {@code initialDelay}, so they hold back no letter behind them; a lock timeout
+ * (55P03) is a WARN, at most once a minute, and ends the phase until the next pass; any other failure propagates.
  */
 public final class DeadLetterPass {
 
@@ -62,12 +69,15 @@ public final class DeadLetterPass {
     private final Duration timeout;
     private final Duration initialDelay;
     private final Duration maxDelay;
+    private final int keyNamespace;
     private final String redriveLockTimeout;
     private final String claim;
     private final String keep;
     private final String schedule;
     private final String fail;
     private final String delete;
+    private final String defer;
+    private final String heldKeys;
     private final String remember;
     private final String keepPending;
     private final String nextDue;
@@ -79,8 +89,8 @@ public final class DeadLetterPass {
     /** A claimed letter with its headers in the stored encoding, as a redrive inserts them. */
     private record Claimed(DeadLetter letter, @Nullable byte[] headers) {}
 
-    /** A committed batch: the letters claimed and redriven; the call's failure, or the decisions it committed. */
-    private record Batch(int claimed, int redriven, @Nullable Throwable failure, List<DeadLetterDecision> decisions) {}
+    /** A committed hand-over: the letters claimed; the call's failure, or the decisions it committed. */
+    private record Batch(int claimed, @Nullable Throwable failure, List<DeadLetterDecision> decisions) {}
 
     public DeadLetterPass(JdbcConnectionFactory db, TableNames names, OutboxConfig config,
             @Nullable OutboxDeadLetterHandler hook, OutboxMetrics metrics) {
@@ -94,6 +104,7 @@ public final class DeadLetterPass {
         this.timeout = config.deadLetters().timeout();
         this.initialDelay = config.relay().retry().initialDelay();
         this.maxDelay = config.relay().retry().maxDelay();
+        this.keyNamespace = names.keyNamespace();
         this.redriveLockTimeout = "set local lock_timeout = '"
                 + config.partitions().swapLockTimeout().toMillis() + "ms'";
         claim = "select " + COLUMNS + " from " + dead + " where status = ? and due_at <= now() order by due_at, id"
@@ -104,6 +115,9 @@ public final class DeadLetterPass {
         fail = "update " + dead + " set handler_attempts = handler_attempts + 1, last_handler_error = ?,"
                 + " due_at = now() + make_interval(secs => ?) where id = ?";
         delete = "delete from " + dead + " where id = any(?)";
+        defer = "update " + dead + " set due_at = now() + make_interval(secs => ?) where id = any(?)";
+        // one row whatever the driver's fetch size, so every hash is tried (see Resender.LOCK_ALL); never waits
+        heldKeys = "select array_agg(h) filter (where not pg_try_advisory_xact_lock(?, h)) from unnest(?::int[]) h";
         // one row per message, should two of its letters be redriven together
         remember = "insert into " + names.redriven() + " (message_id, redrives)"
                 + " select m, max(r) from unnest(?::uuid[], ?::int[]) u(m, r) group by m"
@@ -125,16 +139,16 @@ public final class DeadLetterPass {
     }
 
     /**
-     * With a hook, hands due pending letters to it batch after batch, until a batch is not full, a call fails (its
-     * backoff then holds the hook back, not just its letters) or a redrive meets a held key lock; without one, makes
-     * every pending letter kept. Then redrives the due scheduled letters. Returns the letters this run redrove: the
-     * caller wakes the relay when there are any. A database failure propagates, leaving the batch as it was.
+     * With a hook, hands due pending letters to it batch after batch, until a batch is not full or a call fails (its
+     * backoff then holds the hook back, not just its letters); without one, makes every pending letter kept. Then
+     * redrives the due scheduled letters, those just decided {@code redrive} included. Returns the letters this run
+     * redrove: the caller wakes the relay when there are any. One run at a time per pass, so a second caller's hook
+     * call never waits for the first one's inside its own timeout.
      */
-    public int runOnce() {
+    public synchronized int runOnce() {
         try (var c = db.newConnection()) {
-            int redriven = 0;
             if (active()) {
-                redriven += handOver(c);
+                handOver(c);
             } else {
                 inTx(c, tx -> {
                     try (var st = tx.createStatement()) {
@@ -142,7 +156,7 @@ public final class DeadLetterPass {
                     }
                 });
             }
-            return redriven + redriveScheduled(c);
+            return redriveScheduled(c);
         } catch (SQLException e) {
             throw new RuntimeSqlException(e);
         }
@@ -171,38 +185,37 @@ public final class DeadLetterPass {
         executor.shutdownNow();
     }
 
-    private int handOver(Connection c) throws SQLException {
-        int redriven = 0;
+    private void handOver(Connection c) throws SQLException {
         while (true) {
+            var ids = new ArrayList<Long>();
             Batch batch;
             try {
-                batch = inTx(c, this::handOverBatch);
-            } catch (SQLException e) {
-                if (!blocked(e)) {
-                    throw e;
-                }
-                return redriven;
+                batch = inTx(c, tx -> handOverBatch(tx, ids));
+            } catch (SQLException | RuntimeException e) {
+                recover(c, ids, e);
+                return;
             }
             if (batch.failure() != null) {
                 metrics.deadHookFailure();
                 warn("outbox dead-letter hook failed on " + batch.claimed() + " letters of " + dead
                         + "; they stay pending and are handed to it again after a backoff", batch.failure());
-                return redriven;
+                return;
             }
             for (var decision : batch.decisions()) {
                 metrics.deadDecision(name(decision));
             }
-            redriven += batch.redriven();
             if (batch.claimed() < batchSize) {
-                return redriven;
+                return;
             }
         }
     }
 
-    private Batch handOverBatch(Connection tx) throws SQLException {
+    /** {@code ids} gets the claimed letters' ids, for {@link #recover} should the transaction fail after the claim. */
+    private Batch handOverBatch(Connection tx, List<Long> ids) throws SQLException {
         var claimed = claim(tx, "pending");
+        claimed.forEach(c -> ids.add(c.letter().id()));
         if (claimed.isEmpty()) {
-            return new Batch(0, 0, null, List.of());
+            return new Batch(0, null, List.of());
         }
         List<DeadLetterDecision> decisions;
         try {
@@ -218,7 +231,6 @@ public final class DeadLetterPass {
         }
         var kept = new ArrayList<Long>();
         var discarded = new ArrayList<Long>();
-        var redriven = new ArrayList<Claimed>();
         int scheduled = 0;
         try (var ps = tx.prepareStatement(schedule)) {
             for (int i = 0; i < claimed.size(); i++) {
@@ -228,11 +240,10 @@ public final class DeadLetterPass {
                     kept.add(letter.letter().id());
                 } else if (decision instanceof DeadLetterDecision.Discard) {
                     discarded.add(letter.letter().id());
-                } else if (decision instanceof DeadLetterDecision.Redrive) {
-                    redriven.add(letter);
                 } else {
-                    // the database clamps it; within Postgres' range first, so Instant.MAX is no failing batch
-                    var at = ((DeadLetterDecision.RedriveAt) decision).at();
+                    // the database clamps it to [now, now + 7 days], so redrive = redriveAt(EPOCH) = redriveAt(now);
+                    // Postgres' range first, so Instant.MAX is no failing batch
+                    var at = decision instanceof DeadLetterDecision.RedriveAt r ? r.at() : Instant.EPOCH;
                     var ceiling = Instant.now().plus(8, ChronoUnit.DAYS);
                     ps.setObject(1, (at.isAfter(ceiling) ? ceiling : at.isBefore(Instant.EPOCH) ? Instant.EPOCH : at)
                             .atOffset(ZoneOffset.UTC));
@@ -247,31 +258,99 @@ public final class DeadLetterPass {
         }
         byIds(tx, keep, kept);
         byIds(tx, delete, discarded);
-        redrive(tx, redriven);
-        return new Batch(claimed.size(), redriven.size(), null, decisions);
+        return new Batch(claimed.size(), null, decisions);
     }
 
-    /** Due scheduled letters, batch after batch until one is not full or meets a held key lock; returns how many. */
+    /** Due scheduled letters, batch after batch until one is not full; returns how many were redriven. */
     private int redriveScheduled(Connection c) throws SQLException {
         int redriven = 0;
         while (true) {
-            int n;
+            var ids = new ArrayList<Long>();
             try {
-                n = inTx(c, tx -> {
-                    var claimed = claim(tx, "scheduled");
-                    redrive(tx, claimed);
-                    return claimed.size();
+                redriven += inTx(c, tx -> redriveBatch(tx, ids));
+            } catch (SQLException | RuntimeException e) {
+                recover(c, ids, e);
+                return redriven;
+            }
+            if (ids.size() < batchSize) {
+                return redriven;
+            }
+        }
+    }
+
+    /** One batch of due scheduled letters, but those whose key is held, which are deferred; {@code ids} as claimed. */
+    private int redriveBatch(Connection tx, List<Long> ids) throws SQLException {
+        var claimed = claim(tx, "scheduled");
+        claimed.forEach(c -> ids.add(c.letter().id()));
+        var hashes = claimed.stream()
+                .map(c -> c.letter().key() == null ? null : Hashing.keyHash(c.letter().topic(), c.letter().key()))
+                .toList();
+        var held = held(tx, hashes);
+        var ready = new ArrayList<Claimed>();
+        var deferred = new ArrayList<Long>();
+        for (int i = 0; i < claimed.size(); i++) {
+            if (hashes.get(i) != null && held.contains(hashes.get(i))) {
+                deferred.add(claimed.get(i).letter().id());
+            } else {
+                ready.add(claimed.get(i));
+            }
+        }
+        defer(tx, deferred);
+        redrive(tx, ready); // its own key locks are ours already: Resender takes them again without waiting
+        return ready.size();
+    }
+
+    /** Tries the key lock of each distinct hash without waiting; returns the hashes another transaction holds. */
+    private Set<Integer> held(Connection tx, List<Integer> hashes) throws SQLException {
+        var distinct = hashes.stream().filter(Objects::nonNull).distinct().toArray(Integer[]::new);
+        if (distinct.length == 0) {
+            return Set.of();
+        }
+        try (var ps = tx.prepareStatement(heldKeys)) {
+            ps.setInt(1, keyNamespace);
+            ps.setArray(2, tx.createArrayOf("int4", distinct));
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                var held = rs.getArray(1);
+                return held == null ? Set.of() : Set.of((Integer[]) held.getArray());
+            }
+        }
+    }
+
+    /**
+     * After a batch rolled back on {@code failure}: its claimed letters, if any, are due again after
+     * {@code initialDelay}, set in a fresh transaction, so they hold back no letter behind them and {@link #nextDue}
+     * finds them. Returns after a lock timeout (a WARN), which ends the phase: no key lock is waited for, so it was a
+     * table's lock, which the batches after it would wait for too. Rethrows any other failure.
+     */
+    private void recover(Connection c, List<Long> ids, Exception failure) throws SQLException {
+        if (!ids.isEmpty()) {
+            try {
+                inTx(c, tx -> {
+                    defer(tx, ids);
+                    return null;
                 });
-            } catch (SQLException e) {
-                if (!blocked(e)) {
-                    throw e;
-                }
-                return redriven;
+            } catch (SQLException | RuntimeException e) {
+                failure.addSuppressed(e);
             }
-            redriven += n;
-            if (n < batchSize) {
-                return redriven;
+        }
+        if (failure instanceof SQLException s) {
+            if (blocked(s)) {
+                return;
             }
+            throw s;
+        }
+        throw (RuntimeException) failure; // the callers catch SQLException | RuntimeException only
+    }
+
+    private void defer(Connection tx, List<Long> ids) throws SQLException {
+        if (ids.isEmpty()) {
+            return;
+        }
+        try (var ps = tx.prepareStatement(defer)) {
+            ps.setDouble(1, initialDelay.toNanos() / 1e9);
+            ps.setArray(2, tx.createArrayOf("bigint", ids.toArray()));
+            ps.executeUpdate();
         }
     }
 
@@ -321,7 +400,7 @@ public final class DeadLetterPass {
             }
             ps.executeBatch();
         }
-        return new Batch(claimed.size(), 0, failure, List.of());
+        return new Batch(claimed.size(), failure, List.of());
     }
 
     /** Back into the outbox, the redrive counted in {@code <redriven>}, the dead rows deleted. */
@@ -330,7 +409,7 @@ public final class DeadLetterPass {
             return;
         }
         try (var st = tx.createStatement()) {
-            st.execute(redriveLockTimeout); // after the claim: only the key locks wait no longer than the swap
+            st.execute(redriveLockTimeout); // after the claim: the insert waits for a lock no longer than the swap
         }
         resender.insertAll(tx, letters.stream().map(c -> new Resender.Row(c.letter().messageId(),
                 c.letter().topic(), c.letter().key(), c.letter().payload(), c.headers())).toList());
@@ -404,14 +483,13 @@ public final class DeadLetterPass {
         }
     }
 
-    /** A redrive past its key-lock wait: the batch rolled back as it was, retried by the next pass. */
+    /** A lock timeout (55P03), logged; its batch rolled back and is due again after {@code initialDelay}. */
     private boolean blocked(SQLException e) {
         if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
             return false;
         }
-        warn("outbox dead-letter pass on " + dead + " waited over outbox.partitions.swapLockTimeout for a lock (a"
-                + " transaction holding a key being redriven): its batch is left as it was for the next pass; "
-                + e.getMessage(), null);
+        warn("outbox dead-letter pass on " + dead + " timed out waiting for a lock: its batch rolled back and is"
+                + " due again after outbox.relay.retry.initialDelay; " + e.getMessage(), null);
         return true;
     }
 

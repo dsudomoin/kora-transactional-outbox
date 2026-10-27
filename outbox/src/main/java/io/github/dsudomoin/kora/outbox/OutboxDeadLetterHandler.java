@@ -26,7 +26,7 @@ public interface OutboxDeadLetterHandler {
      */
     List<DeadLetterDecision> handle(List<DeadLetter> letters) throws Exception;
 
-    /** No hook: every dead letter is kept for humans without a call (the Kafka module's default when its DLQ is off). */
+    /** No hook: every dead letter is kept for humans, without a call (the Kafka module's default, its DLQ off). */
     OutboxDeadLetterHandler NONE = letters -> {
         throw new UnsupportedOperationException("NONE is never called");
     };

@@ -36,6 +36,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
@@ -124,7 +125,8 @@ class DeadLetterPassIT {
 
         assertThat(status(id)).as("the dead row is gone").isNull();
         try (var c = TestDb.connect(); var st = c.createStatement();
-                var rs = st.executeQuery("select shard, message_id, topic, key, payload, headers from " + names.base())) {
+                var rs = st.executeQuery(
+                        "select shard, message_id, topic, key, payload, headers from " + names.base())) {
             assertThat(rs.next()).isTrue();
             assertThat(rs.getInt(1)).isEqualTo(Hashing.shard(Hashing.keyHash("t", bytes("k")), config.shards()));
             assertThat(rs.getObject(2, UUID.class)).isEqualTo(messageId);
@@ -277,19 +279,11 @@ class DeadLetterPassIT {
     }
 
     @Test
-    void redriveQueuesBehindAConcurrentSendOfTheSameKey() throws Exception {
-        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
+    void aRedriveOfAHeldKeyWaitsScheduledWithoutAnotherCall() throws Exception {
         long id = letter("t", "k", "dead", List.of());
         var messageId = messageId(id);
-        var sent = new CountDownLatch(1);
         var commit = new CountDownLatch(1);
-        var sender = pool.submit(() -> db.inTx((SqlFunction0<UUID>) () -> {
-            var live = outbox.send(OutboxMessage.of("t", "k", bytes("live")));
-            sent.countDown();
-            awaitLatch(commit);
-            return live;
-        }));
-        assertThat(sent.await(10, SECONDS)).as("the sender holds the key lock").isTrue();
+        var sender = openSend("k", "live", commit);
         var calls = new AtomicInteger();
         var pass = pass(letters -> {
             calls.incrementAndGet();
@@ -301,26 +295,94 @@ class DeadLetterPassIT {
 
         assertThat(Duration.ofNanos(System.nanoTime() - started)).as("no longer than a writer waits for the swap")
                 .isLessThan(config.swapLockTimeout().plusSeconds(1));
-        assertThat(status(id)).isEqualTo("pending");
+        assertThat(status(id)).isEqualTo("scheduled");
         assertThat(handlerAttempts(id)).as("not the hook's failure").isZero();
 
         commit.countDown();
         var live = sender.get(10, SECONDS);
-        assertThat(pass.runOnce()).isEqualTo(1);
+        await(Duration.ofSeconds(5), () -> pass.runOnce() == 1);
 
-        assertThat(calls).as("the hook decides again").hasValue(2);
+        assertThat(calls).as("decided once").hasValue(1);
         try (var c = TestDb.connect(); var st = c.createStatement();
                 var rs = st.executeQuery("select message_id from " + names.base() + " order by id")) {
             var order = new ArrayList<UUID>();
             while (rs.next()) {
                 order.add(rs.getObject(1, UUID.class));
             }
-            assertThat(order).containsExactly(live, messageId);
+            assertThat(order).as("behind the send").containsExactly(live, messageId);
         }
         var handler = new RecordingHandler();
         relay(handler).drain();
         assertThat(handler.delivered()).extracting(r -> new String(r.payload(), UTF_8))
                 .containsExactly("live", "dead");
+    }
+
+    @Test
+    void aHeldKeyDoesNotHoldBackOtherRedrives() throws Exception {
+        long held = letter("t", "k", "held", List.of());
+        long free = letter("t", "j", "free", List.of());
+        execute("update " + names.dead() + " set status = 'scheduled'");
+        var commit = new CountDownLatch(1);
+        var sender = openSend("k", "live", commit);
+        var pass = pass(null);
+
+        assertThat(pass.runOnce()).as("the other key, in the same pass").isEqualTo(1);
+        assertThat(status(free)).isNull();
+        assertThat(status(held)).isEqualTo("scheduled");
+
+        commit.countDown();
+        sender.get(10, SECONDS);
+        await(Duration.ofSeconds(5), () -> pass.runOnce() == 1);
+        assertThat(status(held)).isNull();
+    }
+
+    @Test
+    void aLockTimeoutDefersTheBatchToTheNextPass() throws Exception {
+        long id = letter("t", "k", "p", List.of());
+        execute("update " + names.dead() + " set status = 'scheduled'");
+        var pass = pass(null);
+
+        try (var locker = TestDb.connect()) {
+            locker.setAutoCommit(false);
+            TestSql.execute(locker, "lock table " + names.base() + " in access exclusive mode");
+            long started = System.nanoTime();
+            assertThat(pass.runOnce()).isZero();
+            assertThat(Duration.ofNanos(System.nanoTime() - started))
+                    .isLessThan(config.swapLockTimeout().plusSeconds(1));
+            assertThat(status(id)).isEqualTo("scheduled");
+            locker.rollback();
+        }
+
+        await(Duration.ofSeconds(5), () -> pass.runOnce() == 1);
+        assertThat(status(id)).isNull();
+    }
+
+    @Test
+    void oneRunAtATimePerPass() throws Exception {
+        config.deadLettersBatchSize(1).deadLettersTimeout(Duration.ofMillis(700));
+        long a = letter("t", "a", "p", List.of());
+        long b = letter("t", "b", "p", List.of());
+        var pass = pass(letters -> {
+            Thread.sleep(400);
+            return all(letters, keep());
+        });
+        var start = new CountDownLatch(1);
+        var runs = new ArrayList<Future<Integer>>();
+        for (int i = 0; i < 2; i++) {
+            runs.add(pool.submit(() -> {
+                start.await();
+                return pass.runOnce();
+            }));
+        }
+        start.countDown();
+        for (var run : runs) {
+            run.get(10, SECONDS);
+        }
+
+        assertThat(registry.find("outbox.dead.hook.failures").counter())
+                .as("no call timed out waiting for the other run's").isNull();
+        assertThat(status(a)).isEqualTo("kept");
+        assertThat(status(b)).isEqualTo("kept");
     }
 
     @Test
@@ -375,6 +437,20 @@ class DeadLetterPassIT {
         try (var c = TestDb.connect()) {
             assertThat(queryLong(c, "select count(*) from " + names.dead() + " where status = 'kept'")).isEqualTo(200);
         }
+    }
+
+    /** A transaction that has sent {@code payload} with {@code key} on topic t and stays open until {@code commit}. */
+    private Future<UUID> openSend(String key, String payload, CountDownLatch commit) throws Exception {
+        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
+        var sent = new CountDownLatch(1);
+        var sender = pool.submit(() -> db.inTx((SqlFunction0<UUID>) () -> {
+            var messageId = outbox.send(OutboxMessage.of("t", key, bytes(payload)));
+            sent.countDown();
+            awaitLatch(commit);
+            return messageId;
+        }));
+        assertThat(sent.await(10, SECONDS)).as("the sender holds the key lock").isTrue();
+        return sender;
     }
 
     private DeadLetterPass pass(@Nullable OutboxDeadLetterHandler hook) {
