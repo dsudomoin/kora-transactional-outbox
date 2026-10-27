@@ -250,6 +250,37 @@ class XidRecoveryIT {
         }
     }
 
+    /**
+     * While a recovery holds the tick and cursor tables, another instance's halt check and heartbeat wait at most
+     * 100 ms: a starting instance takes no shards (halted) instead of hanging in its relay's init.
+     */
+    @Test
+    void otherInstancesWaitForARecoveryAtMostTheirLockTimeout() throws Exception {
+        bootstrap();
+        var checked = maintenance();
+        assertThat(checked.checkHalt()).isFalse();
+        try (var recovering = TestDb.connect(); var err = new CapturedStderr()) {
+            recovering.setAutoCommit(false); // as a recovery locks them, for its run
+            execute(recovering, "lock table " + names.cursor() + ", " + names.checkpoint() + ", " + names.tick()
+                    + " in access exclusive mode");
+            var release = Executors.newSingleThreadScheduledExecutor();
+            release.schedule(() -> { // so a check without its timeout ends, and fails the test instead of hanging it
+                recovering.rollback();
+                return null;
+            }, 3, TimeUnit.SECONDS);
+            try {
+                long start = System.nanoTime();
+                assertThat(maintenance().checkHalt()).as("a new instance: halted until it can read").isTrue();
+                assertThat(checked.checkHalt()).as("its last answer stands").isFalse();
+                new Heartbeat(db, schema, schema.config(), false).beat();
+                assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(2));
+                assertThat(err.text()).contains("outbox heartbeat").contains("waited 100 ms for a lock");
+            } finally {
+                release.shutdown();
+            }
+        }
+    }
+
     @Test
     void haltModeNeverRecoversByItself() throws Exception {
         config.xidRegression("halt");

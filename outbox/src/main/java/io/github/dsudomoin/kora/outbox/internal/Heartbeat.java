@@ -22,7 +22,8 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * other instances' rows expired for {@link #FORGET_AFTER} (instances that died without a clean shutdown) and reads the
  * cursors' shard count into the instance's {@link ShardGuard}, so a writer-only instance stops writing within one beat
  * of another instance's reshard. {@link #stop()} deletes the row; a beat that commits after it deletes it again. A
- * failed beat is logged, and the next one retries.
+ * failed beat is logged, and the next one retries. A beat waits at most {@code 100 ms} for a lock (a recovery holds
+ * the cursor table for its run): then the shard count stands as last read, with a one-line WARN.
  */
 public final class Heartbeat {
 
@@ -121,6 +122,9 @@ public final class Heartbeat {
     void beat() { // package-private for a test
         try (var c = db.newConnection()) {
             c.setAutoCommit(false);
+            try (var st = c.createStatement()) { // a transaction's: no leak
+                st.execute("set local lock_timeout = " + Maintenance.SHARDS_LOCK_TIMEOUT.toMillis());
+            }
             try (var ps = c.prepareStatement(beat)) {
                 ps.setString(1, id); // the cleanup's; the upsert's parameters follow
                 bind(ps, 1, id, shards, hookActive, interval);
@@ -138,6 +142,12 @@ public final class Heartbeat {
                 delete(db, names, id);
             }
         } catch (Throwable t) { // logged, never thrown: a throw would cancel every later beat without a word
+            if (t instanceof SQLException e && "55P03".equals(e.getSQLState())) {
+                log.warn("outbox heartbeat of instance {} into {} waited {} ms for a lock (a recovery holds {} for its"
+                        + " run?); the shard count stands as last read, retrying in {}", id, names.instance(),
+                        Maintenance.SHARDS_LOCK_TIMEOUT.toMillis(), names.cursor(), interval);
+                return;
+            }
             log.warn("outbox heartbeat of instance {} into {} failed; retrying in {}", id, names.instance(), interval,
                     t);
         }

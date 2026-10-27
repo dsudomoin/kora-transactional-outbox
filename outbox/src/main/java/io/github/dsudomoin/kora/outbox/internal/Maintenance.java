@@ -78,7 +78,8 @@ public final class Maintenance {
     private static final int STALE_INTERVALS = 5;
     /** Shards per anchor transaction, so one holds at most this many advisory locks. */
     static final int ANCHOR_CHUNK = 128;
-    private static final Duration SHARDS_LOCK_TIMEOUT = Duration.ofMillis(100);
+    /** How long a read outside the maintenance lock waits for a table a recovery holds; also the heartbeat's. */
+    static final Duration SHARDS_LOCK_TIMEOUT = Duration.ofMillis(100);
     private static final String LOCK_NOT_AVAILABLE = "55P03";
 
     private final JdbcConnectionFactory db;
@@ -119,6 +120,8 @@ public final class Maintenance {
     private final AtomicLong mismatchLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final String cursorShards;
     private volatile boolean halted;
+    /** Whether a check of the xid counter has answered yet. */
+    private volatile boolean xidChecked;
     /** The cursors' shard count when it differs from {@link #shards}, else null. */
     @Nullable
     private volatile Integer mismatch;
@@ -232,12 +235,29 @@ public final class Maintenance {
 
     /**
      * The xid-regression check and the shard count check alone, without the maintenance lock: refreshes
-     * {@link #halted()} and returns it; never recovers, and leaves the ERROR to the run that says why it did not.
+     * {@link #halted()} and returns it; never recovers, and leaves the ERROR to the run that says why it did not. Each
+     * read waits at most {@link #SHARDS_LOCK_TIMEOUT} for a lock on its table, which a recovery holds for its run:
+     * after that the last answer stands, and before any, the xid check's is halted, so no worker starts on ticks a
+     * recovery is replacing.
      */
     public boolean checkHalt() {
         try (var c = db.newConnection()) {
-            c.setAutoCommit(true);
-            checkXidCounter(c);
+            c.setAutoCommit(false);
+            try (var st = c.createStatement()) {
+                st.execute("set local lock_timeout = " + SHARDS_LOCK_TIMEOUT.toMillis()); // a transaction's: no leak
+                checkXidCounter(c);
+                c.commit();
+            } catch (SQLException e) {
+                c.rollback();
+                if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                    throw e;
+                }
+                if (!xidChecked) {
+                    halted = true;
+                }
+            } finally {
+                c.setAutoCommit(true);
+            }
             checkShards(c);
             return halted();
         } catch (SQLException e) {
@@ -703,6 +723,7 @@ public final class Maintenance {
     @Nullable
     private synchronized XidRecovery.Check checkXidCounter(Connection c) throws SQLException {
         var check = recovery.check(c);
+        xidChecked = true;
         if (!check.halted()) {
             if (check.recorded() != null) { // ticks repaired: the regressed ones are gone
                 execute(c, "delete from " + names.halt());
