@@ -133,7 +133,8 @@ public final class OrphanRestore {
                     ps.executeUpdate();
                 }
                 last = read < CHUNK;
-                if (last && left == 0) { // under the lock still: no row can reach the table between this read and the drop
+                // under the lock still: no row can reach the table between this read and the drop
+                if (last && left == 0) {
                     st.execute("drop table " + table);
                     try (var ps = c.prepareStatement(unmarkDropping)) {
                         ps.setString(1, names.unqualified(table));
