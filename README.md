@@ -1320,7 +1320,8 @@ premake / 2 × xidsPerPartition  ≥  пик xid в секунду (весь к�
 - каждый таймаут — WARN «outbox maintenance step 'partition extension' on ... failed (SQLState 55P03)» с транзакциями,
   которые держат блокировку сразу после него: pid, приложение и возраст транзакции;
 - после 10 таких запусков подряд или когда впереди осталось меньше `premake / 2` диапазонов — ERROR «outbox partition
-  tail swap of ... timed out waiting for writers on N due runs in a row» не чаще раза в час.
+  tail swap of <base> timed out waiting for writers' locks on <таблица> on N due runs in a row, M ranges ahead of the
+  current xid: ... (K transactions hold a lock on <таблица> right after, the oldest: pid ...)» не чаще раза в час.
 
 Что делать: вызывайте `send` последним в транзакции; или поднимите `swapLockTimeout` до p99 длительности таких
 транзакций (столько же будут стоять писатели при каждой попытке); или найдите их по pid из WARN. Отрепетировано:

@@ -94,7 +94,9 @@ public final class XidPartitions {
     private static final String LOCK_HOLDERS = """
             with h as (select a.pid, a.application_name, a.xact_start from pg_stat_activity a
                         where a.pid in (select l.pid from pg_locks l where l.locktype = 'relation'
-                                          and l.relation = to_regclass(?) and l.granted)
+                                          and l.relation = to_regclass(?) and l.granted
+                                          and l.database = (select oid from pg_database
+                                                             where datname = current_database()))
                           and a.pid <> pg_backend_pid())
             select (select count(*) from h),
                    (select string_agg(format('pid %s (%s) in a transaction open %s', pid, application_name,
@@ -392,13 +394,13 @@ public final class XidPartitions {
             holders = "who held it could not be read: " + read;
         }
         if ((failed >= STUCK_SWAPS || s.ahead < premake / 2) && due(stuckLogged, STUCK_LOG_INTERVAL)) {
-            log.error("outbox partition tail swap of {} timed out waiting for writers on {} due runs in a row, {}"
-                    + " ranges ahead of the current xid: writer transactions hold their lock on the outbox longer than"
-                    + " outbox.partitions.swapLockTimeout {} ms after their send, and overlap, so the swap never gets"
-                    + " its gap ({}). Each attempt stalls writers for swapLockTimeout; once the ranges run out, rows go"
-                    + " to the tail and it is not turned into a range either. Send last in the transaction, or raise"
-                    + " swapLockTimeout to those transactions' p99 duration, or find them by the pids above. This ERROR"
-                    + " repeats at most once an hour", names.base(), e.table, failed, s.ahead,
+            log.error("outbox partition tail swap of {} timed out waiting for writers' locks on {} on {} due runs in"
+                    + " a row, {} ranges ahead of the current xid: writer transactions hold their lock on the outbox"
+                    + " longer than outbox.partitions.swapLockTimeout {} ms after their send, and overlap, so the swap"
+                    + " never gets its gap ({}). Each attempt stalls writers for swapLockTimeout; once the ranges run"
+                    + " out, rows go to the tail and it is not turned into a range either. Send last in the"
+                    + " transaction, or raise swapLockTimeout to those transactions' p99 duration, or find them by the"
+                    + " pids above. This ERROR repeats at most once an hour", names.base(), e.table, failed, s.ahead,
                     swapLockTimeout.toMillis(), holders);
         }
         return new SQLException(e.getMessage() + "; " + holders, e.getSQLState(), e);
