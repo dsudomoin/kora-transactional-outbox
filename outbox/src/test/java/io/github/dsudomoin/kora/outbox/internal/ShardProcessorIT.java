@@ -3120,7 +3120,8 @@ class ShardProcessorIT {
         assertThat(retryRows()).hasSize(2).last().asString().startsWith("b#1:1:");
 
         script = null;
-        assertThat(processGroup(0, 1).get(1)).as("the next step hands it").isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(processGroup(0, 1).get(1)).as("the next step hands it")
+                .isEqualTo(new ShardResult(PROGRESS, 1, true));
         assertThat(delivered()).endsWith("b#1");
         assertThat(cursor(1).retryDueAt()).isNull();
     }

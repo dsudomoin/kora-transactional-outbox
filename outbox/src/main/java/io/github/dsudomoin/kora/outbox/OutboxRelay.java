@@ -19,6 +19,9 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.Executors;
@@ -26,9 +29,11 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.locks.LockSupport;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -37,25 +42,24 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 /**
- * The background relay: {@code relay.workers} daemon threads {@code outbox-relay-N}, each repeatedly making
- * a tick when due, reading every shard's cursor once and running one {@link ShardProcessor} step per candidate shard,
- * each in its own transaction; plus maintenance right after start and then every
- * {@code partitions.maintenanceInterval} on the daemon thread {@code outbox-maintenance}. Neither starts when
- * {@code relay.enabled} is false; {@link #drain()} works either way. Idle workers park until {@link #wake()}, a new tick
- * made by this relay, or the next tick attempt is due, so an idle relay does not spin; an idle attempt makes a tick
- * only when the newest tick of any instance is about {@code idlePollInterval} old, so an idle cluster makes about one
- * tick per {@code idlePollInterval}. A shard is a candidate only when a tick after its effective tick holds its rows
- * (each tick records the shards that gained rows, see {@link Ticks}), its batch is in progress or a retry head or
+ * The background relay: {@code relay.workers} daemon threads {@code outbox-relay-N}, each repeatedly making a tick when
+ * due and stepping groups of candidate shards, a {@link ShardProcessor} step of each group in its own transaction
+ * ({@link Round}: the workers share one read of the cursors per latest tick); plus maintenance right after start and
+ * then every {@code partitions.maintenanceInterval} on the daemon thread {@code outbox-maintenance}. Neither starts
+ * when {@code relay.enabled} is false; {@link #drain()} works either way. Idle workers park until {@link #wake()}, a
+ * new tick made by this relay, or the next tick attempt is due, so an idle relay does not spin; an idle attempt makes a
+ * tick only when the newest tick of any instance is about {@code idlePollInterval} old, so an idle cluster makes about
+ * one tick per {@code idlePollInterval}. A shard is a candidate only when a tick after its effective tick holds its
+ * rows (each tick records the shards that gained rows, see {@link Ticks}), its batch is in progress or a retry head or
  * parked row is due, so a shard without new rows costs no step: maintenance's checkpoint moves its effective tick on
  * (see {@link Cursors}), which keeps tick cleanup and partition drops going. Every tick this relay makes wakes all its
- * workers, which spread the tick's shards
- * with new rows between them. A wake-up that cannot make a tick yet ({@code minTickInterval}) only brings the tick
- * forward, so under a high commit rate the workers read cursors per tick, not per commit. While
- * {@link Maintenance#halted()} the workers take no shards. Dead letters go to the {@link DeadLetterPass} on the daemon
- * thread {@code outbox-dead-letters} (also not started when the relay is disabled; {@link #drain()} ends with one run
- * of it): a run right after start, then after each committed step that moved a row to the dead table, when the
- * earliest letter is due, and at least every {@code maintenanceInterval}; so a slow or failing hook never holds up a
- * shard step.
+ * workers, which spread the tick's shards with new rows between them, in groups. A wake-up that cannot make a tick yet
+ * ({@code minTickInterval}) only brings the tick forward, so under a high commit rate the workers read cursors per
+ * tick, not per commit. While {@link Maintenance#halted()} the workers take no shards. Dead letters go to the
+ * {@link DeadLetterPass} on the daemon thread {@code outbox-dead-letters} (also not started when the relay is disabled;
+ * {@link #drain()} ends with one run of it): a run right after start, then after each committed step that moved a row
+ * to the dead table, when the earliest letter is due, and at least every {@code maintenanceInterval}; so a slow or
+ * failing hook never holds up a shard step.
  */
 public final class OutboxRelay implements Lifecycle {
 
@@ -64,6 +68,8 @@ public final class OutboxRelay implements Lifecycle {
     private static final long WARN_INTERVAL = TimeUnit.SECONDS.toNanos(10);
     /** How long interrupted workers get to roll back after {@code shutdownTimeout}. */
     private static final long INTERRUPT_GRACE = TimeUnit.SECONDS.toNanos(1);
+    /** The most shards one step takes: a group's statements bind arrays of this size. */
+    private static final int MAX_GROUP = 256;
 
     private final JdbcConnectionFactory db;
     private final OutboxConfig config;
@@ -92,6 +98,18 @@ public final class OutboxRelay implements Lifecycle {
     private final AtomicLong deadLettered = new AtomicLong();
     /** Per shard, when a worker of this relay last started a step on it ({@code nanoTime}). */
     private final AtomicLongArray stepStarted;
+    /**
+     * Per shard, 1 after a step of it failed (an exception, the transaction rolled back), until a step of it alone
+     * succeeds: it is stepped alone meanwhile, so a shard that stays stuck (e.g. its effective tick deleted by hand)
+     * rolls back no neighbour's step. In memory, per relay instance.
+     */
+    private final AtomicIntegerArray isolated;
+    /** The candidates of the latest tick a worker read them for; replaced under {@link #roundLock}. */
+    @Nullable
+    private volatile Round round;
+    private final ReentrantLock roundLock = new ReentrantLock();
+    /** Incremented by every step that put shards back into a round; parked workers wake on it. */
+    private final AtomicLong requeued = new AtomicLong();
 
     // tick scheduling, shared by the workers: at most one attempt per minTickInterval for wake-ups, per idle period else
     private final Object tickState = new Object();
@@ -129,6 +147,7 @@ public final class OutboxRelay implements Lifecycle {
         this.idleTickAge = Duration.ofNanos(Math.max(minTickNanos, idleNanos - idleNanos / 4));
         this.lastTickAttempt = System.nanoTime() - idleNanos; // the first pass ticks
         this.stepStarted = new AtomicLongArray(config.shards());
+        this.isolated = new AtomicIntegerArray(config.shards());
         long created = System.nanoTime();
         for (int i = 0; i < config.shards(); i++) {
             stepStarted.set(i, created);
@@ -303,12 +322,15 @@ public final class OutboxRelay implements Lifecycle {
                             + " towards tick " + target + "; pending: " + pending);
                 }
                 boolean worked = false;
-                for (var cursor : pending) {
-                    var result = processInOwnTransaction(c, cursor.shard(), target, now);
-                    delivered += result.delivered();
-                    worked |= result.status() == ShardStatus.PROGRESS || result.status() == ShardStatus.PAUSED;
-                    if (result.delivered() > 0) {
-                        progressed = System.nanoTime();
+                for (int from = 0; from < pending.size(); from += MAX_GROUP) {
+                    var group = pending.subList(from, Math.min(pending.size(), from + MAX_GROUP)).stream()
+                            .map(Cursor::shard).toList();
+                    for (var result : processInOwnTransaction(c, group, target, now)) {
+                        delivered += result.delivered();
+                        worked |= result.status() == ShardStatus.PROGRESS || result.status() == ShardStatus.PAUSED;
+                        if (result.delivered() > 0) {
+                            progressed = System.nanoTime();
+                        }
                     }
                 }
                 if (!worked) {
@@ -340,24 +362,26 @@ public final class OutboxRelay implements Lifecycle {
     }
 
     /**
-     * One shard step in its own transaction on {@code c}; leaves {@code c} in autocommit, rolled back on failure. A
-     * step that moved a row to the dead table wakes the dead-letter thread once committed.
+     * One step of the group of {@code shards} in its own transaction on {@code c}; leaves {@code c} in autocommit,
+     * rolled back on failure. A step that moved a row of any of them to the dead table wakes the dead-letter thread
+     * once committed.
      */
-    private ShardResult processInOwnTransaction(Connection c, int shard, long latest, Instant now)
+    private List<ShardResult> processInOwnTransaction(Connection c, List<Integer> shards, long latest, Instant now)
             throws SQLException, InterruptedException {
         try {
             ShardProcessor.prepareTransaction(c, relay.batchTimeout());
-            var result = processor.tryProcess(c, shard, latest, now);
+            var results = processor.tryProcess(c, shards, latest, now);
             c.commit();
             c.setAutoCommit(true);
-            if (result.deadLettered() && deadLetters.active()) { // without a hook the letter is kept already
+            // without a hook the letter is kept already
+            if (deadLetters.active() && results.stream().anyMatch(ShardResult::deadLettered)) {
                 deadLettered.incrementAndGet();
                 var dead = deadLetterThread;
                 if (dead != null) {
                     LockSupport.unpark(dead);
                 }
             }
-            return result;
+            return results;
         } catch (Throwable t) {
             rollback(c, t);
             throw t;
@@ -436,11 +460,12 @@ public final class OutboxRelay implements Lifecycle {
     }
 
     /**
-     * Parks until {@code deadline}, release, or (when {@code wakeable}) a wake-up after {@code seen} or a tick of this
-     * relay after {@code seenTicks}.
+     * Parks until {@code deadline}, release, or (when {@code wakeable}) a wake-up after {@code seen}, a tick of this
+     * relay after {@code seenTicks} or shards put back into a round after {@code seenRequeued}.
      */
-    private void park(long deadline, boolean wakeable, long seen, long seenTicks) {
-        park(deadline, () -> wakeable && (wakeups.get() != seen || ticksMade.get() != seenTicks));
+    private void park(long deadline, boolean wakeable, long seen, long seenTicks, long seenRequeued) {
+        park(deadline, () -> wakeable && (wakeups.get() != seen || ticksMade.get() != seenTicks
+                || requeued.get() != seenRequeued));
     }
 
     /** Parks until {@code deadline}, release, or {@code woken}, which a waker makes true before it unparks. */
@@ -455,10 +480,79 @@ public final class OutboxRelay implements Lifecycle {
         }
     }
 
+    /**
+     * The candidates of one read of every shard's cursor for the latest tick {@link #latest}, shared by the workers of
+     * this relay whose pass sees that tick: each takes the next group of {@link #groupSize} shards in candidate order
+     * ({@link Worker#candidates}). A shard a step left with work (any {@code PROGRESS}) goes back to the end of the
+     * round, while it is current, those the step left untouched (nothing delivered) ahead of the others, so a shard
+     * that keeps a group's call or read to itself (a slow call wound down at the soft deadline, a hot shard filling the
+     * read, the default handler's stop after 3 failing keys) comes after the shards it left unread. A new tick ends
+     * the round: the next pass reads the cursors again, and that read decides which shards still have work.
+     */
+    private final class Round {
+
+        final long latest;
+        /** When the cursors were read ({@code nanoTime}). */
+        final long read;
+        /** {@code min(MAX_GROUP, max(1, ceil(candidates / workers)))}. */
+        final int groupSize;
+        private final ArrayDeque<Integer> queue;
+        /** In {@link #queue}. */
+        private final BitSet queued = new BitSet();
+        /** Put back by a step after the read: not stale however recently it was stepped. */
+        private final BitSet back = new BitSet();
+
+        Round(long latest, long read, List<Integer> candidates) {
+            this.latest = latest;
+            this.read = read;
+            this.groupSize = Math.min(MAX_GROUP, Math.max(1,
+                    (candidates.size() + relay.workers() - 1) / relay.workers()));
+            this.queue = new ArrayDeque<>(candidates);
+            candidates.forEach(queued::set);
+        }
+
+        /**
+         * The next group, empty when the round is done. A shard a sibling stepped after the read is skipped: its
+         * candidacy is stale, and that sibling's step put it back if it left work. A shard {@link #isolated} is a
+         * group of its own.
+         */
+        synchronized List<Integer> take() {
+            var group = new ArrayList<Integer>(Math.min(groupSize, queue.size()));
+            while (group.size() < groupSize && !queue.isEmpty()) {
+                int shard = queue.peekFirst();
+                boolean alone = isolated.get(shard) == 1;
+                if (alone && !group.isEmpty()) {
+                    break;
+                }
+                queue.pollFirst();
+                queued.clear(shard);
+                boolean stale = !back.get(shard) && stepStarted.get(shard) - read > 0;
+                back.clear(shard);
+                if (stale) {
+                    continue;
+                }
+                group.add(shard);
+                if (alone) {
+                    break;
+                }
+            }
+            return group;
+        }
+
+        /** Puts {@code shards} back at the end, in their order; a shard still queued keeps its place. */
+        synchronized void putBack(List<Integer> shards) {
+            for (var shard : shards) {
+                if (!queued.get(shard)) {
+                    queue.addLast(shard);
+                    queued.set(shard);
+                    back.set(shard);
+                }
+            }
+        }
+    }
+
     private final class Worker implements Runnable {
 
-        /** Rotates shards of equal tick so the workers start on different shards. */
-        private final int offset = ThreadLocalRandom.current().nextInt(config.shards());
         private long lastWarn = System.nanoTime() - WARN_INTERVAL;
         private int suppressed;
 
@@ -467,8 +561,9 @@ public final class OutboxRelay implements Lifecycle {
             while (!stopping) {
                 long seen = wakeups.get();
                 long seenTicks = ticksMade.get();
+                long seenRequeued = requeued.get();
                 if (maintenance.halted()) { // xid regression: rows would be skipped, take no shards
-                    park(System.nanoTime() + idleNanos, false, seen, seenTicks);
+                    park(System.nanoTime() + idleNanos, false, seen, seenTicks, seenRequeued);
                     continue;
                 }
                 boolean worked;
@@ -487,27 +582,30 @@ public final class OutboxRelay implements Lifecycle {
                     }
                     Thread.interrupted(); // not stopping: a stray interrupt is one more failure
                     warn("outbox relay worker failed, retrying in " + relay.idlePollInterval(), t);
-                    park(System.nanoTime() + idleNanos, false, seen, seenTicks); // wake-ups do not cut it short
+                    // wake-ups do not cut it short
+                    park(System.nanoTime() + idleNanos, false, seen, seenTicks, seenRequeued);
                     continue;
                 }
                 if (!worked) {
-                    awaitWork(seen, seenTicks);
+                    awaitWork(seen, seenTicks, seenRequeued);
                 }
             }
         }
 
         /**
-         * Parks after a pass without work until release, a tick of this relay, the next tick attempt being due, or a
-         * wake-up that can make that attempt now. A wake-up within {@code minTickInterval} of the last attempt only
-         * registers its commit (the attempt comes after {@code minTickInterval}, so its latency stays within
-         * {@code 2 × minTickInterval}): a pass would re-read the cursors this worker just read, as no tick of this
-         * relay came since, and a high commit rate would turn into one cursor read per commit and worker.
+         * Parks after a pass without work until release, a tick of this relay, shards put back into a round, the next
+         * tick attempt being due, or a wake-up that can make that attempt now. A wake-up within
+         * {@code minTickInterval} of the last attempt only registers its commit (the attempt comes after
+         * {@code minTickInterval}, so its latency stays within {@code 2 × minTickInterval}): no tick of this relay came
+         * since, so a pass would find the round of the tick this worker just saw, and a high commit rate would turn
+         * into one pass per commit and worker.
          */
-        private void awaitWork(long seen, long seenTicks) {
+        private void awaitWork(long seen, long seenTicks, long seenRequeued) {
             while (true) {
-                park(nextTickDue(), true, seen, seenTicks);
+                park(nextTickDue(), true, seen, seenTicks, seenRequeued);
                 long woken = wakeups.get();
-                if (stopping || ticksMade.get() != seenTicks || woken == seen || tickAttemptDue(woken)) {
+                if (stopping || ticksMade.get() != seenTicks || requeued.get() != seenRequeued || woken == seen
+                        || tickAttemptDue(woken)) {
                     return;
                 }
                 seen = woken;
@@ -515,53 +613,114 @@ public final class OutboxRelay implements Lifecycle {
         }
 
         /**
-         * Runs one shard step per candidate of one cursor read, each in its own transaction; returns whether a step
-         * did work (progress or a pause).
+         * Steps groups of the current round until it has none left (one cursor read per latest tick, see
+         * {@link #readRound}); returns whether a step did work (progress or a pause).
          */
         private boolean pass(long seen) throws Exception {
             try (var c = db.newConnection()) {
                 c.setAutoCommit(true);
                 tickIfDue(c, seen);
-                long latest = ticks.latest(c).id();
-                var selected = Instant.now().truncatedTo(ChronoUnit.MICROS);
-                long read = System.nanoTime();
+                readRound(c);
                 boolean worked = false;
-                for (var shard : candidates(cursors.positions(c, latest), selected)) {
-                    if (stopping) {
+                while (!stopping) {
+                    var r = round; // a sibling may have read a newer tick: its round is the one to work on
+                    var group = r.take();
+                    if (group.isEmpty()) {
                         break;
                     }
-                    if (stepStarted.get(shard) - read > 0) {
-                        // a sibling stepped it after this cursor read, so its candidacy is stale; the sibling's pass
-                        // worked (or failed) and re-reads, so any work left there is not lost
-                        continue;
-                    }
-                    stepStarted.set(shard, System.nanoTime());
-                    // a fresh clock per step: a long pass must not pause shards or schedule retries from a stale one;
-                    // a later clock keeps a selected shard unpaused or due (a clock stepped back only yields NO_WORK)
-                    var now = Instant.now().truncatedTo(ChronoUnit.MICROS);
-                    try {
-                        var status = processInOwnTransaction(c, shard, latest, now).status();
-                        worked |= status == ShardStatus.PROGRESS || status == ShardStatus.PAUSED;
-                    } catch (InterruptedException | VirtualMachineError e) {
-                        throw e;
-                    } catch (Throwable e) { // rolled back; a stuck shard sorts first and must not starve the rest
-                        if (stopping) { // e.g. the processor closed under it: run() logs it at debug
-                            throw e;
-                        }
-                        warn("outbox shard " + shard + " step failed, retried in a later pass", e);
-                    }
+                    worked |= step(c, r, group);
                 }
                 return worked;
             }
         }
 
         /**
+         * Makes sure {@link #round} is of the latest tick: reads the latest tick and, when the round is of another, the
+         * cursors, under {@link #roundLock}, so the workers of this relay read the cursors once per tick and never
+         * replace a round with one of an older tick.
+         */
+        private void readRound(Connection c) throws SQLException, InterruptedException {
+            roundLock.lockInterruptibly();
+            try {
+                long latest = ticks.latest(c).id();
+                var r = round;
+                if (r == null || r.latest != latest) {
+                    var selected = Instant.now().truncatedTo(ChronoUnit.MICROS);
+                    long read = System.nanoTime();
+                    round = new Round(latest, read, candidates(cursors.positions(c, latest), selected));
+                }
+            } finally {
+                roundLock.unlock();
+            }
+        }
+
+        /**
+         * One step of {@code group} in its own transaction; puts the shards it left with work back into the round. A
+         * step of several shards that fails is redone with each shard alone, at once, so a shard that keeps failing
+         * holds up no neighbour; one that fails alone is {@link #isolated}, logged, and retried in a later pass.
+         */
+        private boolean step(Connection c, Round r, List<Integer> group) throws Exception {
+            long started = System.nanoTime();
+            for (var shard : group) {
+                stepStarted.set(shard, started);
+            }
+            // a fresh clock per step: a long pass must not pause shards or schedule retries from a stale one; a later
+            // clock keeps a selected shard unpaused or due (a clock stepped back only yields NO_WORK)
+            var now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+            List<ShardResult> results;
+            try {
+                results = processInOwnTransaction(c, group, r.latest, now);
+            } catch (InterruptedException | VirtualMachineError e) {
+                throw e;
+            } catch (Throwable e) { // rolled back
+                if (stopping) { // e.g. the processor closed under it: run() logs it at debug
+                    throw e;
+                }
+                if (group.size() == 1) {
+                    isolated.set(group.get(0), 1);
+                    warn("outbox shard " + group.get(0) + " step failed, retried in a later pass", e);
+                    return false;
+                }
+                log.debug("outbox step of shards {} failed; stepping each alone", group, e);
+                boolean worked = false;
+                for (var shard : group) {
+                    worked |= step(c, r, List.of(shard));
+                }
+                return worked;
+            }
+            if (group.size() == 1) {
+                isolated.set(group.get(0), 0);
+            }
+            boolean worked = false;
+            var untouched = new ArrayList<Integer>();
+            var progressed = new ArrayList<Integer>();
+            for (int i = 0; i < group.size(); i++) {
+                var result = results.get(i);
+                worked |= result.status() == ShardStatus.PROGRESS || result.status() == ShardStatus.PAUSED;
+                if (result.status() == ShardStatus.PROGRESS) {
+                    (result.delivered() == 0 ? untouched : progressed).add(group.get(i));
+                }
+            }
+            untouched.addAll(progressed);
+            // into its own round only: a newer one read the cursors itself, and a shard this step caught up would
+            // otherwise take a step (a cursor row) for every idle tick made meanwhile
+            if (!untouched.isEmpty() && r == round) {
+                r.putBack(untouched);
+                requeued.incrementAndGet();
+                wakeAll();
+            }
+            return worked;
+        }
+
+        /**
          * {@link Position#behind() Behind} the latest tick (a tick after its effective tick holds its rows), mid-batch
-         * or with a due retry head or parked row, and not paused; lowest effective tick first. All of it comes from the
-         * database, so every instance sees the same candidates, whichever instance made the ticks.
+         * or with a due retry head or parked row, and not paused; lowest effective tick first, ties from a random
+         * shard on, so no shard is always last. All of it comes from the database, so every instance sees the same
+         * candidates, whichever instance made the ticks.
          */
         private List<Integer> candidates(List<Position> all, Instant now) {
             int shards = config.shards();
+            int offset = ThreadLocalRandom.current().nextInt(shards);
             return all.stream()
                     .filter(p -> p.behind() || p.cursor().targetTickId() != null
                             || due(p.cursor().retryDueAt(), now) || due(p.cursor().parkedDueAt(), now))

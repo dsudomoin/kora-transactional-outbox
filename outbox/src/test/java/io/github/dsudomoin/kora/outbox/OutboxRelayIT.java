@@ -32,6 +32,7 @@ import java.sql.PreparedStatement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -40,6 +41,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -1151,6 +1153,191 @@ class OutboxRelayIT {
     }
 
     @Test
+    void workersShareOneCandidateReadPerTick() throws Exception {
+        config.shards(64).workers(4).minTickInterval(Duration.ofMillis(50)).idlePollInterval(Duration.ofMillis(200));
+        bootstrap();
+        var reads = new AtomicInteger();
+        var handler = new RecordingHandler();
+        var relay = relay(observed(sql -> {
+            if (sql.startsWith("with c0 as (select c.* from generate_series")) { // Cursors.positions, not a tick
+                reads.incrementAndGet();
+            }
+        }), handler);
+        relay.init();
+        awaitParked();
+        int readsBefore = reads.get();
+        long ticks = ticksMade();
+
+        var writers = Executors.newFixedThreadPool(4);
+        var sent = new ConcurrentLinkedQueue<UUID>();
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        try {
+            var done = new ArrayList<Future<?>>();
+            for (int w = 0; w < 4; w++) {
+                var outbox = outbox(relay::wake);
+                done.add(writers.submit(() -> {
+                    while (System.nanoTime() < until) {
+                        sent.addAll(send(outbox, IntStream.range(0, 20).mapToObj(i -> msg("t",
+                                "k" + ThreadLocalRandom.current().nextInt(500), "m")).toArray(OutboxMessage[]::new)));
+                    }
+                    return null;
+                }));
+            }
+            for (var f : done) {
+                f.get(30, TimeUnit.SECONDS);
+            }
+        } finally {
+            writers.shutdown();
+        }
+        await(Duration.ofSeconds(10), () -> handler.delivered().size() == sent.size());
+
+        long made = ticksMade() - ticks;
+        int read = reads.get() - readsBefore;
+        System.out.printf("%d messages, %d ticks, %d positions reads by %d workers%n", sent.size(), made, read,
+                config.workers());
+        // every tick wakes all workers; they share the read of it (before: one read per pass and worker)
+        assertThat(made).isGreaterThan(10);
+        assertThat((long) read).as("positions reads for %d ticks", made).isLessThanOrEqualTo(made + 1);
+        assertIdOrderPerKey(handler.delivered());
+    }
+
+    @Test
+    void aStuckShardDoesNotStopItsNeighbours() throws Exception {
+        config.shards(4).workers(1); // one worker: all four candidates in one group
+        bootstrap();
+        var handler = new RecordingHandler();
+        var first = start(handler);
+        // shard 0's cursor past the checkpoint's tick, which then stays valid for the other shards (deleting the
+        // checkpoint's own tick would strand every shard); maintenance does not run again for an hour
+        await(Duration.ofSeconds(5), () -> {
+            try (var c = TestDb.connect()) {
+                return queryLong(c, "select count(*) from " + schema.names().maintenance()) > 0;
+            }
+        });
+        long stuckAt = 0;
+        for (int a = 1; stuckAt <= checkpointTick(); a++) {
+            assertThat(a).as("rows sent to shard 0").isLessThanOrEqualTo(10);
+            send(outbox(first::wake), msg("t", keyOnShard(0, "a"), "a#" + a));
+            int sent = a;
+            await(Duration.ofSeconds(5), () -> handler.delivered().size() == sent);
+            try (var c = TestDb.connect()) {
+                stuckAt = queryLong(c, "select tick_id from " + schema.names().cursor()
+                        + " where shard = 0 order by seq desc limit 1");
+            }
+        }
+        first.release();
+        int before = handler.delivered().size();
+        try (var c = TestDb.connect()) { // by hand: the tick shard 0's cursor stands at
+            execute(c, "delete from " + schema.names().tick() + " where id = " + stuckAt);
+        }
+        var groups = new CopyOnWriteArrayList<List<Integer>>();
+        try (var err = new CapturedStderr()) {
+            var relay = relay(steppedGroups(groups::add), handler);
+            var outbox = outbox(relay::wake);
+            send(outbox, IntStream.range(0, 4).mapToObj(shard -> msg("t", keyOnShard(shard, "b"), "b" + shard))
+                    .toArray(OutboxMessage[]::new));
+            relay.init();
+
+            await(Duration.ofSeconds(10), () -> handler.delivered().size() == before + 3);
+            assertThat(handler.delivered().subList(before, before + 3)).extracting(OutboxRelayIT::payload)
+                    .containsExactlyInAnyOrder("b1", "b2", "b3");
+            await(Duration.ofSeconds(5), () -> err.text().contains("outbox shard 0 step failed"));
+            assertThat(err.text()).contains("no tick " + stuckAt + " for shard 0");
+            // keeps failing, alone: one shared step at most found it out
+            send(outbox, IntStream.range(1, 4).mapToObj(shard -> msg("t", keyOnShard(shard, "c"), "c" + shard))
+                    .toArray(OutboxMessage[]::new));
+            await(Duration.ofSeconds(10), () -> handler.delivered().size() == before + 6);
+            int seen = groups.size();
+            await(Duration.ofSeconds(5), () -> groups.size() > seen + 2);
+            assertThat(groups.stream().filter(g -> g.contains(0) && g.size() > 1)).as("shared steps of shard 0")
+                    .hasSizeLessThanOrEqualTo(1);
+            assertThat(groups.stream().filter(g -> g.equals(List.of(0)))).as("steps of shard 0 alone")
+                    .hasSizeGreaterThan(1);
+        }
+    }
+
+    @Test
+    void manyShardsDeliverInOrderUnderLoad() throws Exception {
+        // 2 instances × 4 workers over 1024 shards; a slow shard whose calls wind down at the soft deadline (1.6 s)
+        // with its group's later shards unread, and a hot key whose shard fills the group's read
+        config.shards(1024).workers(4).batchSize(1000).batchTimeout(Duration.ofSeconds(2));
+        bootstrap();
+        var slowKey = keyOnShard(7, "slow");
+        var hotKey = keyOnShard(9, "hot");
+        var delivered = ConcurrentHashMap.<UUID>newKeySet();
+        var duplicates = new AtomicInteger();
+        var outOfOrder = new ConcurrentLinkedQueue<String>();
+        var lastId = new ConcurrentHashMap<String, Long>();
+        var handler = new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {
+                if (payload(record).startsWith("slow")) { // 300 ms, deaf to the wind-down's interrupt
+                    long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300);
+                    while (System.nanoTime() < end) {
+                        Thread.onSpinWait();
+                    }
+                }
+                if (!delivered.add(record.messageId())) {
+                    duplicates.incrementAndGet();
+                }
+                lastId.compute(key(record), (k, last) -> {
+                    if (last != null && last >= record.id()) {
+                        outOfOrder.add(k + ": " + record.id() + " after " + last);
+                    }
+                    return last == null ? record.id() : Math.max(last, record.id());
+                });
+            }
+        };
+        var started = List.of(start(handler), start(handler));
+        var sent = ConcurrentHashMap.<UUID>newKeySet();
+        var writers = Executors.newFixedThreadPool(8);
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+        try {
+            var done = new ArrayList<Future<?>>();
+            for (int w = 0; w < 8; w++) {
+                int writer = w;
+                var outbox = outbox(started.get(w % 2)::wake);
+                done.add(writers.submit(() -> {
+                    var random = ThreadLocalRandom.current();
+                    while (System.nanoTime() < until) {
+                        OutboxMessage[] messages;
+                        long pause;
+                        if (writer == 0) { // a burst of slow records: more than one call fits before its deadline
+                            messages = IntStream.range(0, 8).mapToObj(i -> msg("t", slowKey, "slow" + i))
+                                    .toArray(OutboxMessage[]::new);
+                            pause = 3000;
+                        } else if (writer == 1) {
+                            messages = IntStream.range(0, 100).mapToObj(i -> msg("t", hotKey, "hot"))
+                                    .toArray(OutboxMessage[]::new);
+                            pause = 20;
+                        } else {
+                            messages = IntStream.range(0, 10).mapToObj(i -> msg("t", "k" + random.nextInt(8192),
+                                    "m")).toArray(OutboxMessage[]::new);
+                            pause = 10;
+                        }
+                        sent.addAll(send(outbox, messages));
+                        Thread.sleep(pause);
+                    }
+                    return null;
+                }));
+            }
+            for (var f : done) {
+                f.get(90, TimeUnit.SECONDS);
+            }
+        } finally {
+            writers.shutdown();
+        }
+        System.out.printf("%d messages sent in 60 s%n", sent.size());
+        await(Duration.ofSeconds(60), () -> delivered.size() >= sent.size());
+
+        assertThat(delivered).hasSameSizeAs(sent);
+        assertThat(delivered.containsAll(sent)).as("every message delivered").isTrue(); // a hash lookup each
+        assertThat(duplicates).hasValue(0);
+        assertThat(outOfOrder).as("per-key order").isEmpty();
+        assertThat(lastId).containsKeys(slowKey, hotKey);
+    }
+
+    @Test
     void rowsCoveredByAnotherInstancesTicksAreDelivered() throws Exception {
         // this relay's idle attempts find a younger tick of the other instance and insert none
         config.shards(32).idlePollInterval(Duration.ofMillis(500));
@@ -1727,6 +1914,12 @@ class OutboxRelayIT {
 
     /** {@link #db} whose new connections count the shard steps (shard lock attempts) per shard. */
     private JdbcConnectionFactory countingSteps(Map<Integer, AtomicInteger> steps) {
+        return steppedGroups(group -> group.forEach(shard -> steps.computeIfAbsent(shard, s -> new AtomicInteger())
+                .incrementAndGet()));
+    }
+
+    /** {@link #db} whose new connections report the shards of every step (a shard lock attempt), in group order. */
+    private JdbcConnectionFactory steppedGroups(Consumer<List<Integer>> stepped) {
         return new JdbcConnectionFactory() {
             @Override
             public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
@@ -1750,10 +1943,8 @@ class OutboxRelayIT {
                                 return Proxy.newProxyInstance(PreparedStatement.class.getClassLoader(),
                                         new Class<?>[] {PreparedStatement.class}, (p, m, a) -> {
                                             if (m.getName().equals("setArray") && (int) a[0] == 5) { // the shards
-                                                for (var shard : (Object[]) ((java.sql.Array) a[1]).getArray()) {
-                                                    steps.computeIfAbsent((Integer) shard, s -> new AtomicInteger())
-                                                            .incrementAndGet();
-                                                }
+                                                stepped.accept(Arrays.stream((Object[]) ((java.sql.Array) a[1])
+                                                        .getArray()).map(shard -> (Integer) shard).toList());
                                             }
                                             return invoke(m, ps, a);
                                         });
