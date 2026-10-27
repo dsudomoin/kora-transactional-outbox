@@ -196,6 +196,52 @@ class KafkaDeadLetterHandlerTest {
         }
     }
 
+    /**
+     * A refusal on the caller thread leaves the producer open: the batch-mate failed for a reason of its own, so it is
+     * not sent again, and the call fails at once.
+     */
+    @Test
+    void aClientSideRefusalSendsNothingAgain() {
+        var handler = handler(TEMPLATE, r -> switch (new String(r.value(), UTF_8)) {
+            case "big" -> new RecordTooLargeException("over max.request.size");
+            case "down" -> new NotEnoughReplicasException("not enough replicas");
+            default -> null;
+        });
+
+        assertThatThrownBy(() -> handler.handle(List.of(letter(1, "a", "big", null), letter(2, "b", "down", null))))
+                .isInstanceOf(KafkaException.class)
+                .hasMessageContaining("1 of 2 dead letters");
+        assertThat(producers).as("one round").hasSize(1);
+        assertThat(producers.get(0).history()).isEmpty(); // neither record was appended
+    }
+
+    /**
+     * Many refusals in one batch take a round each; should the pass cut the call meanwhile, the refusals seen so far
+     * are remembered: the next call keeps those letters with no send and publishes the rest.
+     */
+    @Test
+    void refusalsOfACallCutShortAreRememberedByTheNext() throws Exception {
+        var handler = handler(TEMPLATE, false, r -> null);
+        var letters = List.of(letter(1, "a", "big", null), letter(2, "b", "v", null), letter(3, "c", "v", null));
+
+        var cut = executor.submit(() -> handler.handle(letters));
+        awaitSent(0, 3).errorNext(new RecordTooLargeException("too large"));
+        awaitSent(1, 2); // its batch-mates' second round, in flight
+        cut.cancel(true); // as the pass does at outbox.deadLetters.timeout
+
+        try (var err = new CapturedStderr()) {
+            var next = executor.submit(() -> handler.handle(letters)); // runs once the cut call has returned
+            awaitSent(2, 2).completeNext();
+            producers.get(2).completeNext();
+
+            assertThat(next.get(5, SECONDS)).containsExactly(DeadLetterDecision.keep(), DeadLetterDecision.discard(),
+                    DeadLetterDecision.discard());
+            assertThat(err.text()).contains("WARN")
+                    .contains("refused it for good on its dead-letter topic " + DLQ + " before");
+        }
+        assertThat(producers.get(2).history()).extracting(r -> new String(r.key(), UTF_8)).containsExactly("b", "c");
+    }
+
     /** A fixed template naming the letter's own topic would publish it back where it died. */
     @Test
     void aDeadLetterTopicThatIsTheLettersOwnIsKept() throws Exception {

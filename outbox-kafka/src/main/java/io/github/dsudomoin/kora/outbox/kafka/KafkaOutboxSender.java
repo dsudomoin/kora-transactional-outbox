@@ -176,8 +176,18 @@ public final class KafkaOutboxSender implements Lifecycle {
      * and keeps the flag.
      */
     public List<Outcome> send(List<OutboxRecord> records) {
+        return sendAndReport(records).outcomes();
+    }
+
+    /**
+     * {@link #send}'s outcomes, and whether its producer was closed by a record Kafka refused for good after the
+     * append ({@code Permanent} from the I/O thread): the records in flight with it then failed for that alone.
+     */
+    record Sent(List<Outcome> outcomes, boolean closedByRefusal) {}
+
+    Sent sendAndReport(List<OutboxRecord> records) {
         if (records.isEmpty()) {
-            return List.of();
+            return new Sent(List.of(), false);
         }
         long deadline = System.nanoTime() + wait.toNanos();
         var pooled = pool.pollFirst();
@@ -190,7 +200,7 @@ public final class KafkaOutboxSender implements Lifecycle {
             if (!call.await(deadline)) {
                 call.close(Thread.currentThread().isInterrupted() ? "interrupted" : "not acknowledged within " + wait);
             }
-            return outcomes(call, records, partitions);
+            return new Sent(outcomes(call, records, partitions), call.closedByRefusal());
         } catch (RuntimeException | Error e) {
             call.close("aborted by " + e); // unknown state: never reuse the producer
             throw e;
@@ -507,13 +517,15 @@ public final class KafkaOutboxSender implements Lifecycle {
     private static final class Call {
         final Producer<byte[], byte[]> producer;
         final Thread caller = Thread.currentThread();
-        final Outcome[] outcomes; // guarded by this, like ownFailure, metadata, pending, started and closeReason
+        final Outcome[] outcomes; // guarded by this, like ownFailure, metadata, pending, started, closeReason, closedBy
         final boolean[] ownFailure;
         final RecordMetadata[] metadata;
         int pending;
         int started; // records 0 until started were handed to the loop body, in order
         volatile boolean closed; // written under this
         String closeReason = "";
+        @Nullable
+        Exception closedBy; // the failure whose failed() closed the call, if one did
         @Nullable
         Exception refused; // caller thread only: what send() reported through the callback before appending
         boolean metadataTimedOut; // caller thread only
@@ -587,10 +599,17 @@ public final class KafkaOutboxSender implements Lifecycle {
             synchronized (this) {
                 record(i, outcome(e), !closed && Thread.currentThread() != caller, kafka);
                 closeProducer = markClosed("an earlier send failed: " + e);
+                if (closeProducer) {
+                    closedBy = e;
+                }
             }
             if (closeProducer) {
                 closeQuietly(producer, Duration.ZERO);
             }
+        }
+
+        synchronized boolean closedByRefusal() {
+            return closedBy != null && outcome(closedBy) instanceof Outcome.Permanent;
         }
 
         /** Idempotent. Callers must not hold this monitor: closing from the caller joins the I/O thread. */
