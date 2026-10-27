@@ -8,6 +8,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.kora.outbox.internal.Cursors;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
+import io.github.dsudomoin.kora.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
 import io.github.dsudomoin.kora.outbox.internal.OrphanRestore;
 import io.github.dsudomoin.kora.outbox.internal.OutboxMetrics;
@@ -448,7 +449,8 @@ class OperationsUnderLoadIT {
         schema.init();
         names = schema.names();
         maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
-        relay = new OutboxRelay(db, config, schema, recording, new OutboxMetrics(null), null, maintenance);
+        relay = new OutboxRelay(db, config, schema, recording, new OutboxMetrics(null), null, maintenance,
+                new DeadLetterPass(db, names, config, null, new OutboxMetrics(null)));
         outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new OutboxMetrics(null));
         relay.init();
         for (int i = 0; i < WRITERS; i++) {
