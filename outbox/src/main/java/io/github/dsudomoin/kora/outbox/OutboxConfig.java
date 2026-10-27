@@ -257,5 +257,13 @@ public interface OutboxConfig {
         default Duration clockMargin() {
             return Duration.ofMinutes(10);
         }
+
+        /**
+         * The whole recovery transaction's deadline, writers waiting for it all along; each statement gets what is
+         * left. Default 10 min.
+         */
+        default Duration timeout() {
+            return Duration.ofMinutes(10);
+        }
     }
 }

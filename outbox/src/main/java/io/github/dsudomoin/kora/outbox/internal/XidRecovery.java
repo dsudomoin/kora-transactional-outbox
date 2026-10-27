@@ -31,7 +31,8 @@ public final class XidRecovery {
 
     private static final Logger log = LoggerFactory.getLogger(XidRecovery.class);
     private static final Duration LOCK_TIMEOUT = Duration.ofSeconds(5);
-    private static final Duration STATEMENT_TIMEOUT = Duration.ofMinutes(10);
+    /** Above {@code maxRows}, how long a count stands before the next run counts again. */
+    private static final long RECOUNT_INTERVAL = TimeUnit.MINUTES.toNanos(5);
 
     /**
      * One read of the xid check: the current xid, the highest tick xmax (0 without ticks) and the recorded halt's
@@ -51,6 +52,7 @@ public final class XidRecovery {
     private final TableNames names;
     private final int shards;
     private final long maxRows;
+    private final Duration timeout;
     private final long size;
     private final XidPartitions partitions;
     /**
@@ -64,6 +66,11 @@ public final class XidRecovery {
     final String xidCheck; // for a test of its plan
     private final String haltInsert;
     private final String holding;
+    /** The last count above {@code maxRows} and its {@code nanoTime}, or null: a run within the interval reuses it. */
+    @Nullable
+    private long[] overMaxRows;
+    /** Whether the last {@link #recover} took the outbox's lock: a failure after it stalled writers. */
+    private boolean outboxLocked;
     /** For tests: runs once the pending detach is finished, before the transaction. */
     @Nullable
     SqlConsumer<Connection> beforeTransaction;
@@ -75,6 +82,7 @@ public final class XidRecovery {
         this.names = names;
         this.shards = config.shards();
         this.maxRows = config.recovery().maxRows();
+        this.timeout = config.recovery().timeout();
         this.size = config.partitions().xidsPerPartition();
         this.partitions = new XidPartitions(names, config.partitions());
         long margin = TimeUnit.MICROSECONDS.convert(config.recovery().clockMargin());
@@ -119,42 +127,103 @@ public final class XidRecovery {
         }
     }
 
-    /** How many rows {@link #recover} would re-send now; one scan of the outbox, under no lock. */
-    public long rowsToSave(Connection c) throws SQLException {
-        try (var st = c.createStatement(); var rs = st.executeQuery("select count(*) from (" + saved + ") s")) {
-            rs.next();
-            return rs.getLong(1);
+    /**
+     * How many rows {@link #recover} would re-send now; one scan of the outbox, under no lock, in a transaction of its
+     * own under {@code statement_timeout} = {@code outbox.recovery.timeout}, whatever the session's. Rows written
+     * between this count and the recovery's lock are re-sent too, so {@code maxRows} is approximate.
+     */
+    public long rowsToSave(Connection autocommit) throws SQLException {
+        var c = autocommit;
+        c.setAutoCommit(false);
+        try (var st = c.createStatement()) {
+            st.execute("set local statement_timeout = " + timeout.toMillis() + Ticks.noTransactionTimeout(c));
+            long rows = queryLong(st, "select count(*) from (" + saved + ") s");
+            c.commit();
+            return rows;
+        } catch (Throwable e) {
+            try {
+                c.rollback();
+            } catch (SQLException cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            throw e;
+        } finally {
+            c.setAutoCommit(true);
         }
     }
 
     /**
      * The automatic recovery, for a caller holding {@code LOCK_MAINTENANCE}: checks again (another instance may have
      * recovered meanwhile), then recovers when at most {@code outbox.recovery.maxRows} rows are to be re-sent, with an
-     * ERROR saying how many were. Returns null when nothing is halted any more, else why the relay stays halted,
-     * a failed recovery included (rolled back: the next attempt starts over).
+     * ERROR saying how many were. Returns null when nothing is halted any more, else why the relay stays halted. Above
+     * {@code maxRows} the count stands for 5 min, so a halted outbox is not scanned every run. A failed recovery rolls
+     * back; it is tried again by the next run only when it failed before it locked the outbox. One that failed after
+     * stalled writers for its run, as each try would again (a statement timeout on large rows or a cold cache), so its
+     * cause goes into {@code <base>_halt.recovery_failed}, and no instance tries again by itself: like above
+     * {@code maxRows}, the relay stays halted until the admin call, which may run with a longer
+     * {@code outbox.recovery.timeout}.
      */
     @Nullable
     String autoRecover(Connection autocommit) {
+        outboxLocked = false;
         try {
             var check = check(autocommit);
             if (!check.halted()) {
                 return null;
             }
+            var failed = recoveryFailed(autocommit);
+            if (failed != null) {
+                return stopped(failed);
+            }
+            var over = overMaxRows;
+            if (over != null && System.nanoTime() - over[1] < RECOUNT_INTERVAL) {
+                return exceeds(over[0]);
+            }
             long rows = rowsToSave(autocommit);
             if (rows > maxRows) {
-                return rows + " rows to re-send exceed outbox.recovery.maxRows " + maxRows;
+                overMaxRows = new long[] {rows, System.nanoTime()};
+                return exceeds(rows);
             }
+            overMaxRows = null;
             long sent = recover(autocommit);
             log.error("{}, recovered: {} rows re-sent, the ones the relay may not have delivered: new messages with"
                     + " new ids and xids and the same message ids, so consumers drop within their inbox window the ones"
                     + " delivered before", detected(check), sent);
             return null;
-        } catch (SQLException e) {
-            return "the recovery failed (SQLState " + e.getSQLState() + "): " + e.getMessage()
-                    + "; the next maintenance run retries it";
-        } catch (RuntimeException e) {
-            return "the recovery failed: " + e + "; the next maintenance run retries it";
+        } catch (SQLException | RuntimeException e) {
+            var cause = e instanceof SQLException x ? "SQLState " + x.getSQLState() + ": " + x.getMessage()
+                    : e.toString();
+            if (!outboxLocked) {
+                return "the recovery failed (" + cause + "); the next maintenance run retries it";
+            }
+            try (var ps = autocommit.prepareStatement("update " + names.halt() + " set recovery_failed = ?")) {
+                ps.setString(1, cause);
+                ps.executeUpdate();
+            } catch (SQLException | RuntimeException cleanup) {
+                return "the recovery failed after it locked the outbox (" + cause + "), and recording that failed too ("
+                        + cleanup + "); the next maintenance run retries it";
+            }
+            return stopped(cause);
         }
+    }
+
+    /** {@code <base>_halt.recovery_failed}: why the automatic recovery stopped trying, null while it has not. */
+    @Nullable
+    private String recoveryFailed(Connection c) throws SQLException {
+        try (var st = c.createStatement();
+                var rs = st.executeQuery("select recovery_failed from " + names.halt())) {
+            return rs.next() ? rs.getString(1) : null;
+        }
+    }
+
+    private String exceeds(long rows) {
+        return rows + " rows to re-send exceed outbox.recovery.maxRows " + maxRows;
+    }
+
+    private String stopped(String cause) {
+        return "the automatic recovery failed after it locked the outbox, so writers waited for it (" + cause + ");"
+                + " it is not tried again by itself, as each try would stall writers again. If it ran out of"
+                + " outbox.recovery.timeout " + timeout + ", raise that first";
     }
 
     /** The ERROR while halted: what the check found, {@code why} no recovery ran, and the call that runs one. */
@@ -171,9 +240,10 @@ public final class XidRecovery {
     }
 
     /**
-     * Recovers in one read-committed transaction ({@code lock_timeout} 5 s, {@code statement_timeout} 10 min,
-     * {@code idle_in_transaction_session_timeout} 5 s, so Postgres ends the session of a frozen holder and writers go
-     * on; no {@code transaction_timeout}), for a caller holding {@code LOCK_MAINTENANCE}; returns the rows re-sent, or
+     * Recovers in one read-committed transaction ({@code lock_timeout} 5 s, one deadline of
+     * {@code outbox.recovery.timeout} for the whole of it, each statement's {@code statement_timeout} what is left of
+     * it, {@code idle_in_transaction_session_timeout} 5 s, so Postgres ends the session of a frozen holder and writers
+     * go on; no {@code transaction_timeout}), for a caller holding {@code LOCK_MAINTENANCE}; returns the rows re-sent, or
      * 0 with no change when there is neither a regression nor a halt row. First, outside it, a detach left pending is
      * finished ({@link XidPartitions#finishPendingDetach}), so its wait for older snapshots stalls no writer. Then:
      * ACCESS EXCLUSIVE on the cursor, checkpoint and tick tables, in the order every relay statement opens them, so no
@@ -196,21 +266,28 @@ public final class XidRecovery {
      */
     public long recover(Connection autocommit) throws SQLException {
         var c = autocommit;
+        outboxLocked = false;
         partitions.finishPendingDetach(c, LOCK_TIMEOUT);
         if (beforeTransaction != null) {
             beforeTransaction.accept(c);
         }
         long sent;
+        long deadline = System.nanoTime() + timeout.toNanos();
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
             st.execute("set transaction isolation level read committed"); // first: before any statement of the tx
-            st.execute("set local lock_timeout = " + LOCK_TIMEOUT.toMillis() + "; set local statement_timeout = "
-                    + STATEMENT_TIMEOUT.toMillis() + "; set local idle_in_transaction_session_timeout = "
-                    + LOCK_TIMEOUT.toMillis() + Ticks.noTransactionTimeout(c));
+            st.execute("set local lock_timeout = " + LOCK_TIMEOUT.toMillis()
+                    + "; set local idle_in_transaction_session_timeout = " + LOCK_TIMEOUT.toMillis()
+                    + Ticks.noTransactionTimeout(c));
+            timeLeft(st, deadline);
             st.execute("lock table " + names.cursor() + ", " + names.checkpoint() + ", " + names.tick()
                     + " in access exclusive mode");
+            timeLeft(st, deadline);
             st.execute("lock table " + names.base() + " in access exclusive mode");
+            outboxLocked = true;
+            timeLeft(st, deadline);
             st.execute("lock table " + names.dropping() + ", " + names.halt() + " in exclusive mode");
+            timeLeft(st, deadline);
             var check = check(c);
             if (check.current() >= check.tickXmax() && check.recorded() == null) {
                 c.rollback();
@@ -219,20 +296,24 @@ public final class XidRecovery {
             // before the copy, so writers do not wait it out: the parent hides the rows of a pending detach, which the
             // drop below would lose, and a FINALIZE here would wait for older snapshots, writers queued behind the
             // outbox lock among them
+            timeLeft(st, deadline);
             var pending = PartitionDdl.pendingDetach(c, names.base());
             if (pending != null) {
                 throw new IllegalStateException("the detach of " + pending + " became pending after the recovery of "
                         + names.base() + " finished the one before it: rolled back, the next attempt finishes it"
                         + " first");
             }
+            timeLeft(st, deadline);
             long shardsPresent = queryLong(st, "select count(distinct shard) from " + names.cursor());
             if (shardsPresent != 0 && shardsPresent != shards) {
                 throw new IllegalStateException("outbox.shards = " + shards + " but " + names.cursor() + " holds"
                         + " cursors for " + shardsPresent + " shards: the recovery keeps the shard of every row it"
                         + " re-sends, so set outbox.shards back to " + shardsPresent);
             }
+            timeLeft(st, deadline);
             st.execute("create unlogged table " + holding + " as " + saved);
-            setAside(c, st);
+            setAside(c, st, deadline);
+            timeLeft(st, deadline);
             // above the ids the retry, parked and dead rows keep, which may outlive every outbox row of theirs
             try (var ps = c.prepareStatement("select setval(pg_get_serial_sequence(?, 'id'), greatest("
                     + "(select coalesce(max(id), 0) from " + names.base() + "),"
@@ -243,11 +324,15 @@ public final class XidRecovery {
                 ps.execute();
             }
             for (var partition : partitionsOf(c)) {
+                timeLeft(st, deadline);
                 st.execute("drop table " + partition);
             }
+            timeLeft(st, deadline);
             st.execute("delete from " + names.tick() + "; delete from " + names.cursor() + "; delete from "
                     + names.checkpoint() + "; delete from " + names.dropping() + "; delete from " + names.halt());
+            timeLeft(st, deadline);
             makeRanges(c);
+            timeLeft(st, deadline);
             long tick = insertTick(c);
             // a step reads the retry or parked table only when its cursor says it is due (null: no rows) or on its
             // full check, so new cursors carry them, as steps store them: the earliest next_attempt_at of the retry
@@ -260,9 +345,11 @@ public final class XidRecovery {
                 ps.setInt(2, shards);
                 ps.executeUpdate();
             }
+            timeLeft(st, deadline);
             sent = st.executeUpdate("insert into " + names.base() + " (shard, message_id, topic, key, payload, headers)"
                     + " select shard, message_id, topic, key, payload, headers from " + holding
                     + " order by created_at, id");
+            timeLeft(st, deadline);
             st.execute("drop table " + holding);
             c.commit();
         } catch (Throwable e) { // an Error too: setAutoCommit(true) below would commit the work so far
@@ -282,22 +369,24 @@ public final class XidRecovery {
      * The tables outside the outbox's partition tree whose rows the parent does not show: every standalone range (but
      * one whose digits fit no long, no table of the library's) and a standalone tail is set aside.
      */
-    private void setAside(Connection c, Statement st) throws SQLException {
+    private void setAside(Connection c, Statement st, long deadline) throws SQLException {
         int prefix = names.unqualified(names.partitionPrefix()).length();
         for (var table : PartitionDdl.standalone(c, names.base(), "_x[0-9]+")) {
             var digits = names.unqualified(table).substring(prefix);
             if (XidPartitions.xidOf(digits) != null) {
-                setAside(st, table, digits);
+                setAside(st, table, digits, deadline);
             }
         }
         if (PartitionDdl.attachment(c, names.base(), names.tail()) == Attachment.STANDALONE) {
-            setAside(st, names.tail(), null);
+            setAside(st, names.tail(), null, deadline);
         }
     }
 
     /** Drops {@code table} when empty, else renames it {@code <base>_o<digits>}, by default its lowest xid. */
-    private void setAside(Statement st, String table, @Nullable String digits) throws SQLException {
+    private void setAside(Statement st, String table, @Nullable String digits, long deadline) throws SQLException {
+        timeLeft(st, deadline);
         st.execute("lock table " + table + " in access exclusive mode");
+        timeLeft(st, deadline);
         String lowest;
         try (var rs = st.executeQuery("select min(xid)::text from (select xid from " + table + " limit "
                 + (digits == null ? "all" : "1") + ") t")) {
@@ -371,6 +460,19 @@ public final class XidRecovery {
             rs.next();
             return rs.getLong(1);
         }
+    }
+
+    /**
+     * {@code statement_timeout} for the next statement: what is left until {@code deadline}; when nothing is, a
+     * statement-timeout failure (57014) at once.
+     */
+    private void timeLeft(Statement st, long deadline) throws SQLException {
+        long left = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+        if (left < 1) { // 0 would be no timeout at all
+            throw new SQLException("the xid-regression recovery of " + names.base() + " ran out of"
+                    + " outbox.recovery.timeout " + timeout, "57014");
+        }
+        st.execute("set local statement_timeout = " + left);
     }
 
     private static long queryLong(Statement st, String sql) throws SQLException {

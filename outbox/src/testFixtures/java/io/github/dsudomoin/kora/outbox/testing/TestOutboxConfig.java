@@ -47,6 +47,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private String xidRegression = "auto";
     private long maxRows = 1_000_000L;
     private Duration clockMargin = Duration.ofMinutes(10);
+    private Duration recoveryTimeout = Duration.ofMinutes(10);
 
     // OutboxConfig
 
@@ -429,6 +430,16 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
 
     public TestOutboxConfig clockMargin(Duration clockMargin) {
         this.clockMargin = clockMargin;
+        return this;
+    }
+
+    @Override
+    public Duration timeout() {
+        return recoveryTimeout;
+    }
+
+    public TestOutboxConfig recoveryTimeout(Duration recoveryTimeout) {
+        this.recoveryTimeout = recoveryTimeout;
         return this;
     }
 }

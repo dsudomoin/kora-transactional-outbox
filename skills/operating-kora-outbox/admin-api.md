@@ -62,7 +62,9 @@ curl -s -X POST -H "$KEY" $API/recovery/xid-regression
 - **Orphans** («Осиротевшие партиции»): compare the orphan's rows with what consumers got (the README's `select`),
   then one `restore` call with the cut-off `fromXid` (`0` returns all).
 - **xid halt** («Восстановление после регрессии xid (xid regression recovery)»): one `POST /recovery/xid-regression`;
-  writers wait about 2.5–3 s per million rows re-sent. Never delete the `<table>_halt` row.
+  writers wait about 2.5–3 s per million rows re-sent. On a large outbox, or after the ERROR «failed after it locked
+  the outbox», first raise `outbox.recovery.timeout` on the calling instance and restart it. Never delete the
+  `<table>_halt` row.
 - **Stranded shards** («Застрявшие шарды»): no admin call. Stop all instances and run the README's single
   transaction exactly as printed, shard numbers from the ERROR, on a copy first; consumers get the shards' rows again.
 - **After a rollback window** («Rolling-деплои», «Обновление с предыдущего релиза (5fc60dd), смешанный парк и

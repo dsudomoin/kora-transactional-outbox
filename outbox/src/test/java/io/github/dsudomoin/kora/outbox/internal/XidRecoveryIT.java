@@ -137,6 +137,119 @@ class XidRecoveryIT {
         assertThat(tickExists(forged)).isTrue();
     }
 
+    /**
+     * A recovery that fails once it locked the outbox (here: out of its timeout copying large rows) stalled writers
+     * for its run, as each try would: no instance tries again by itself, a restart neither; the admin call does.
+     */
+    @Test
+    void aRecoveryThatFailedHoldingTheOutboxLockIsNotTriedAgain() throws Exception {
+        config.relayEnabled(false).recoveryTimeout(Duration.ofMillis(100));
+        bootstrap();
+        try (var c = TestDb.connect()) { // 10 000 rows of 8 kB out of line: the count is quick, their copy is not
+            execute(c, "insert into " + names.base() + " (shard, message_id, topic, payload) select s % "
+                    + config.shards() + ", gen_random_uuid(), 't', (select decode(string_agg(md5(random()::text || s"
+                    + " || i), ''), 'hex') from generate_series(1, 500) i) from generate_series(1, 10000) s");
+        }
+        forgeRegression();
+        var outbox = outbox(null);
+        var stop = new AtomicBoolean();
+        var errors = new ConcurrentLinkedQueue<Throwable>();
+        var locked = new AtomicInteger(); // samples that found ACCESS EXCLUSIVE on the outbox held or awaited
+        var pool = Executors.newFixedThreadPool(2);
+        var tasks = new ArrayList<Future<?>>();
+        var maintenance = maintenance();
+        try {
+            tasks.add(pool.submit(() -> {
+                while (!stop.get()) {
+                    try {
+                        send(outbox, msg("t", "w", "w"));
+                    } catch (Throwable t) {
+                        errors.add(t);
+                    }
+                }
+            }));
+            tasks.add(pool.submit(() -> {
+                try (var c = TestDb.connect()) {
+                    while (!stop.get()) {
+                        if (queryLong(c, "select count(*) from pg_locks where relation = to_regclass('" + names.base()
+                                + "') and mode = 'AccessExclusiveLock'") > 0) {
+                            locked.incrementAndGet();
+                        }
+                        Thread.sleep(2);
+                    }
+                }
+                return null;
+            }));
+
+            String first;
+            try (var err = new CapturedStderr()) {
+                assertThat(maintenance.runOnce()).isTrue();
+                first = err.text();
+            }
+            assertThat(first).contains("ERROR").contains("the automatic recovery failed after it locked the outbox")
+                    .contains("57014").contains("raise that first").contains("OutboxAdmin.recoverXidRegression()");
+            assertThat(locked.get()).as("the first try held the outbox").isPositive();
+            assertThat(maintenance.halted()).isTrue();
+            try (var c = TestDb.connect()) {
+                assertThat(queryString(c, "select recovery_failed from " + names.halt())).contains("57014");
+            }
+
+            locked.set(0);
+            assertThat(maintenance.runOnce()).isTrue();
+            String restart;
+            try (var err = new CapturedStderr()) {
+                bootstrap();
+                restart = err.text();
+            }
+            assertThat(locked.get()).as("neither the next run nor a restart took the outbox lock").isZero();
+            assertThat(restart).contains("it is not tried again by itself");
+            assertThat(maintenance.halted()).isTrue();
+        } finally {
+            stop.set(true);
+            for (var task : tasks) {
+                task.get(10, TimeUnit.SECONDS);
+            }
+            pool.shutdown();
+        }
+        assertThat(errors).isEmpty();
+
+        config.recoveryTimeout(Duration.ofMinutes(10)); // as the README says: raise it, then call
+        assertThat(admin(maintenance()).recoverXidRegression()).isPositive();
+        assertThat(haltRows()).isZero();
+    }
+
+    /** Above maxRows a halted outbox is not scanned on every run: the count stands for 5 min. */
+    @Test
+    void aboveMaxRowsTheCountStandsForFiveMinutes() throws Exception {
+        config.maxRows(10);
+        bootstrap();
+        send(outbox(null), messages("m", 100));
+        forgeRegression();
+        var recovery = maintenance().recovery;
+
+        try (var c = TestDb.connect()) {
+            assertThat(recovery.autoRecover(c)).startsWith("100 rows to re-send");
+            send(outbox(null), messages("n", 50));
+
+            assertThat(recovery.autoRecover(c)).as("not counted again").startsWith("100 rows to re-send");
+        }
+    }
+
+    /** The count gets the recovery's own statement timeout, whatever the session's. */
+    @Test
+    void theCountRunsUnderTheRecoveryTimeout() throws Exception {
+        bootstrap();
+        try (var c = TestDb.connect()) {
+            execute(c, "insert into " + names.base() + " (shard, message_id, topic) select s % " + config.shards()
+                    + ", gen_random_uuid(), 't' from generate_series(1, 1000000) s");
+            forgeRegression();
+            execute(c, "set statement_timeout = '100ms'"); // as a short role default would: the count takes longer
+
+            assertThat(new XidRecovery(names, config).rowsToSave(c)).isEqualTo(1_000_000);
+            assertThat(queryString(c, "show statement_timeout")).as("the session's again").isEqualTo("100ms");
+        }
+    }
+
     @Test
     void haltModeNeverRecoversByItself() throws Exception {
         config.xidRegression("halt");

@@ -63,6 +63,7 @@ class OutboxConfigTest {
                   recovery.xidRegression = halt
                   recovery.maxRows = 5000
                   recovery.clockMargin = 1h
+                  recovery.timeout = 30m
                 }
                 """);
 
@@ -78,6 +79,7 @@ class OutboxConfigTest {
         assertThat(config.recovery().xidRegression()).isEqualTo("halt");
         assertThat(config.recovery().maxRows()).isEqualTo(5000);
         assertThat(config.recovery().clockMargin()).isEqualTo(Duration.ofHours(1));
+        assertThat(config.recovery().timeout()).isEqualTo(Duration.ofMinutes(30));
     }
 
     @Test
@@ -135,6 +137,7 @@ class OutboxConfigTest {
         assertRejected("outbox.recovery.maxRows = -1", "outbox.recovery.maxRows must not be negative: -1");
         assertRejected("outbox.recovery.clockMargin = -1ms",
                 "outbox.recovery.clockMargin must not be negative: PT-0.001S");
+        assertRejected("outbox.recovery.timeout = 0ms", "outbox.recovery.timeout must be positive: PT0S");
     }
 
     private static void assertRejected(String hocon, String message) {
@@ -190,5 +193,6 @@ class OutboxConfigTest {
         assertThat(recovery.xidRegression()).isEqualTo("auto");
         assertThat(recovery.maxRows()).isEqualTo(1_000_000L);
         assertThat(recovery.clockMargin()).isEqualTo(Duration.ofMinutes(10));
+        assertThat(recovery.timeout()).isEqualTo(Duration.ofMinutes(10));
     }
 }

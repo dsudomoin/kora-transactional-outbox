@@ -30,9 +30,9 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * {@code outbox.recovery.xidRegression = auto} and at most {@code outbox.recovery.maxRows} rows to re-send, recovered
  * before any relay starts ({@link XidRecovery}, under {@code LOCK_MAINTENANCE}, taken after {@code LOCK_SCHEMA});
  * otherwise, or while another session holds that lock, startup goes on halted (the relay delivers nothing, writes go
- * on) with an ERROR naming the admin call that runs the recovery. The recovery runs under its own timeouts (a
- * 10 min {@code statement_timeout}), and other instances' startups wait for it behind the schema lock, at most a
- * minute. The schema lock and every bootstrap DDL statement wait at
+ * on) with an ERROR naming the admin call that runs the recovery. The recovery runs under its own timeouts (one
+ * deadline of {@code outbox.recovery.timeout}, 10 min by default), and other instances' startups wait for it behind
+ * the schema lock, at most a minute. The schema lock and every bootstrap DDL statement wait at
  * most 5 s for a lock ({@code lock_timeout}), and every bootstrap statement runs under a 1 min
  * {@code statement_timeout} (replacing a shorter role default): one that needs longer, such as an index built anew on a
  * populated table, fails startup with SQLState 57014 and is left to run by hand; the dead table's {@code <dead>_due},
@@ -173,6 +173,7 @@ public final class OutboxSchema implements Lifecycle {
         require(recovery.maxRows() >= 0, "outbox.recovery.maxRows must not be negative: " + recovery.maxRows());
         require(!recovery.clockMargin().isNegative(),
                 "outbox.recovery.clockMargin must not be negative: " + recovery.clockMargin());
+        require(recovery.timeout().toMillis() > 0, "outbox.recovery.timeout must be positive: " + recovery.timeout());
     }
 
     static void validateShards(int shards) {
@@ -450,13 +451,16 @@ public final class OutboxSchema implements Lifecycle {
                       redrives   int not null,
                       at         timestamptz not null default now()
                     )""");
-            // the xid-regression halt, persisted by Maintenance: one row while halted
+            // the xid-regression halt, persisted by Maintenance: one row while halted; recovery_failed: why the
+            // automatic recovery stopped trying (XidRecovery#autoRecover)
             st.execute("create table if not exists " + n.halt() + """
                      (
-                      id            int primary key default 1 check (id = 1),
-                      halted_at     timestamptz not null default now(),
-                      max_tick_xmax xid8 not null
+                      id              int primary key default 1 check (id = 1),
+                      halted_at       timestamptz not null default now(),
+                      max_tick_xmax   xid8 not null,
+                      recovery_failed text
                     )""");
+            addColumn(c, n.halt(), "recovery_failed", "text"); // the previous release's table
             // when a maintenance run last completed every step, on any instance; until the first one, bootstrap time
             st.execute("create table if not exists " + n.maintenance() + """
                      (

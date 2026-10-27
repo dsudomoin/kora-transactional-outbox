@@ -83,7 +83,8 @@ regression recovery)»).
 |---|---|---|
 | `xidRegression` | `"auto"` | `auto` or `halt`. `auto`: the instance holding the maintenance lock recovers by itself when at most `maxRows` rows must be re-sent. `halt`: never by itself; the relay waits for `recoverXidRegression` (admin API). |
 | `maxRows` | `1000000` | ≥ 0. Rows the automatic recovery re-sends while writers wait for it; more leave the relay halted. |
-| `clockMargin` | `10m` | ≥ 0. Rows written since the newest tick before the regression minus this margin are re-sent. |
+| `clockMargin` | `10m` | ≥ 0. Rows written since the newest tick before the regression minus this margin are re-sent, in `created_at, id` order: a new server's clock behind the old one's can put a key's new message before its old undelivered one. |
+| `timeout` | `10m` | > 0. Deadline of the whole recovery transaction (writers wait for it); each statement gets what is left; also the row count's `statement_timeout`. An automatic recovery that failed after locking the outbox is not tried again by itself. |
 
 ## `outbox.deadLetters`
 
