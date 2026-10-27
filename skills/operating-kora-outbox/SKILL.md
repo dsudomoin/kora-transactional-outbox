@@ -1,58 +1,59 @@
 ---
 name: operating-kora-outbox
-description: Use when monitoring, alerting on, sizing or troubleshooting kora-transactional-outbox in a running Kora service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, rows in outbox_retry, outbox_parked or outbox_dead, redrive, tail overflow, orphaned partitions, «outbox relay halted» or «xid counter went backwards», changing outbox.shards, rolling deploys, pg_dump/restore or failover. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox».
+description: Use when monitoring, alerting on, sizing or troubleshooting kora-transactional-outbox in a running Kora service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, dead letters and the dead-letter hook, the admin API (OutboxAdmin, kora-outbox-admin, /kora-outbox/admin/v1), redrive or discard, tail overflow, orphaned partitions, stranded shards, «outbox relay halted» or «xid regression detected», outbox.shards and the emergency reshard, «refuses this write», rolling deploys, upgrades and rollback to the previous release, pg_dump/restore or failover. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox», «админка outbox».
 ---
 
 # Operating kora-outbox
 
 ## Overview
 
-Recovery procedures live in the library README (https://github.com/dsudomoin/kora-transactional-outbox#readme),
-under the Russian section names quoted below. Follow them as written, on a staging copy first (not yet rehearsed on
-a live database). **Never improvise SQL against the library's tables.**
+Procedures: the library README (https://github.com/dsudomoin/kora-transactional-outbox#readme), Russian section
+names quoted below. Act through the admin API: `OutboxAdmin` in code or `kora-outbox-admin` over HTTP
+([admin-api.md](admin-api.md)). **Never improvise SQL against the library's tables**; run only SQL the README prints,
+as written, on a staging copy first.
 
-## Alerts (need a Micrometer `MeterRegistry` in the graph)
+## Wake someone: delivery stopped or soon stops
 
 | Signal | Meaning | README section |
 |---|---|---|
-| `outbox.shard.lag` growing | Target down, slow handler, too few workers | «Обработка сбоев» |
-| `outbox.dead.size` > 0 | Dead letters to triage | «Dead letters» |
-| `outbox.maintenance.since_success` > 5 × `maintenanceInterval` | No maintenance on any instance | «Обслуживание работает там же, где relay» |
-| `outbox.partitions.premade` < 2 or `outbox.partitions.overflow` = 1 | Rows go, or soon go, to the tail | «Переполнение хвоста (tail overflow)» |
+| `outbox.shard.lag` growing | Target down, slow handler, too few workers; with ERROR «outbox shards [...] start from ticks [...] that no longer exist»: stranded shards | «Обработка сбоев», «Застрявшие шарды» |
+| `outbox.maintenance.since_success` > 5 × `maintenanceInterval` | No maintenance anywhere; `transaction_pooling` = 1: a pooler | «Обслуживание работает там же, где relay» |
 | `outbox.partitions.xids_left` not NaN | Tail detached: inserts fail at 0 | «Партиции» |
-| `outbox.partitions.orphaned` or `outbox.inbox.partitions.orphaned` > 0 | A detached range holds rows | «Осиротевшие партиции» |
-| `outbox.maintenance.transaction_pooling` = 1 | Maintenance skipped behind a transaction pooler | «Соединения: без transaction pooling» |
-| ERROR «outbox relay halted» | xid regression after a logical restore: stop writers | «Восстановление после регрессии xid (xid regression recovery)» |
+| `outbox.dead.pending.oldest` > X (X > `relay.retry.maxDelay`) and `outbox.dead.hook.failures` growing | Hook failing: letters wait, its alerts are not sent | «Dead letters» |
+| ERROR «outbox xid regression detected» | «recovered»: done; «relay halted»: reason at line end, maybe `POST /recovery/xid-regression` | «Восстановление после регрессии xid (xid regression recovery)» |
 
-Also watch `outbox.delivery.delay` p99, `outbox.messages.failed{outcome}`, `outbox.parked.size`. Every meter and its
-Prometheus name: [metrics.md](metrics.md). Dashboard: `observability/grafana/dashboards/outbox.json` in the library
-repo.
+## Morning: nothing lost, waits for a human
+
+| Signal | README section |
+|---|---|
+| `outbox.dead.size` grows, `outbox.dead.pending` does not (kept letters) | «Dead letters» |
+| `outbox.partitions.orphaned` or `outbox.inbox.partitions.orphaned` > 0 | «Осиротевшие партиции» |
+| `outbox.partitions.overflow` = 1 past one extension cycle, `outbox.partitions.premade` < 2 | «Переполнение хвоста (tail overflow)» |
+| `outbox.parked.size` not back to its level | «Алерты» |
+
+Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dashboards/outbox.json`.
 
 ## Never
 
-- Touch `<table>_retry` or `<table>_parked` rows by hand. Redrive dead letters by moving rows from `<table>_dead`
-  back into `<table>` in one transaction («Dead letters»): `message_id` is kept, so inbox consumers deduplicate within
-  their window.
+- Change rows of `<table>_retry`, `_parked`, `_dead`, `_cursor`, `_instance` or `_halt` by hand; use the admin API.
 - Detach outbox partitions by hand, or drop or truncate library tables while instances run.
-- Delete the `<table>_halt` row without the repair steps of the xid procedure.
-- Disable the relay on every instance: maintenance runs only where the relay runs.
+- Disable the relay on every instance: maintenance and the dead-letter pass run only where the relay runs.
 
-## Sizing
+## Shards and pool
 
-- **Shards** (default 32): one worker per shard at a time; parallelism = min(shards, instances × workers).
-  A shard with new rows costs a step per tick (DB CPU, 1/32 shards: 10/20 % at 100 msg/s, 26/81 % at 1k):
-  4–8 suit low traffic. Changing `outbox.shards` needs an empty outbox («Решардинг»).
-- **Workers** (default 4): each holds a connection while working; `db.maxPoolSize` ≥ own peak + workers + 3 (the
-  two maintenance runs and the dead-letter thread, which holds one for its whole run), + 1 while `drain()` runs.
-- **Idle cost** («Стоимость простоя»): about `1 / idlePollInterval + shards / 5` write transactions per second per
-  cluster (11.4 with defaults); a larger `idlePollInterval` idles cheaper.
-- **premake** («Партиции»): `premake / 2 × xidsPerPartition ≥ peak xid/s × longest snapshot seconds`.
-- Worked profiles: [sizing-examples.md](../using-kora-outbox/sizing-examples.md).
+- **`outbox.shards`: leave it unset.** A new outbox gets 256, an existing one keeps its count: upgrades need no
+  setting. A differing set value is the **emergency reshard**, never routine: stop writers, wait for
+  `outbox.shard.lag` 0, stop all instances, start with the new value («Решардинг»). Startup refuses while another
+  instance or relay runs or anything is undelivered; an old-count instance refuses `send` («refuses this write»).
+  Details: [config-reference.md](../using-kora-outbox/config-reference.md).
+- **Pool:** `db.maxPoolSize` ≥ own peak + `relay.workers` + 3, + 1 while `drain()` runs. Profiles:
+  [sizing-examples.md](../using-kora-outbox/sizing-examples.md).
 
 ## Deploys and incidents
 
 - «Rolling-деплои»: same schema-qualified `outbox.table` and `outbox.inbox.table` everywhere; inbox `retention` /
-  `partitionInterval` changes on all instances at once; shutdown redelivers unfinished batches (duplicates, no loss).
-- Restart after changing `outbox.*` under hot config reload: gauges keep reading the first components.
-- «Репликация, failover и PITR»: async-replica failover can deliver events whose data is gone; PITR redelivers.
-- `relay.retry.maxAttempts = 0` (default): a key stuck on a broken target never reaches dead letters; only lag shows it.
+  `partitionInterval` on all instances at once; shutdown redelivers unfinished batches.
+- **Rollback to the previous release** (5fc60dd): «Rolling-деплои», item «Обновление с предыдущего релиза (5fc60dd),
+  смешанный парк и откат». The old release writes dead letters `kept`: list the window's kept letters afterwards.
+- «Репликация, failover и PITR»: async failover can deliver events whose data is gone; PITR redelivers.
+- `relay.retry.maxAttempts = 0` (default): a key stuck on a broken target shows only as lag.

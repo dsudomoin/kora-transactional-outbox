@@ -1,6 +1,6 @@
 # Concurrent delivery inside handleBatch
 
-A sequential handler delivers at most min(shards, instances × workers) / mean seconds per record (8 / 0.3 s ≈ 26
+A sequential handler delivers at most min(shards, instances × workers) / mean seconds per record (2 × 4 / 0.3 s ≈ 26
 msg/s), whatever the `batchSize`. Above that, deliver the records of one call concurrently.
 [ConcurrentAuditHandler.java](ConcurrentAuditHandler.java) follows every rule below; start from it. The `handleBatch`
 contract in SKILL.md still holds: one outcome per record in input order, no nulls, never throw.
@@ -35,6 +35,7 @@ contract in SKILL.md still holds: one outcome per record in input order, no null
 
 ## Worked numbers
 
-Profile 4 in [sizing-examples.md](../using-kora-outbox/sizing-examples.md): 3 instances, 8 shards, 2 000 orders/s with
-one audit event each, audit p99 300 ms. With `workers` 4, `batchSize` 400 and P = 200: about 9 100 rows/s against
-4 000 needed (2.3×, also with one instance down), and at most 8 × 200 = 1 600 requests in flight at the audit service.
+Profile 4 in [sizing-examples.md](../using-kora-outbox/sizing-examples.md): 3 instances, default 256 shards, 2 000
+orders/s with one audit event each, audit p99 300 ms. With `workers` 4, `batchSize` 400 and P = 200: about 9 100
+rows/s against 4 000 needed with one instance down (2.3×), and at most 12 × 200 = 2 400 requests in flight at the audit
+service.

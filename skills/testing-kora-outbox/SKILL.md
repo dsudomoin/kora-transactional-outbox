@@ -23,8 +23,8 @@ instead of 66.
 3. Config: `relay.enabled = false`, the fast partition settings, `bootstrap.servers` from the container, a unique
    `outbox.table` per test class when classes share one database.
 4. Act through the real service method, then `int delivered = relay.drain();` (`@TestComponent OutboxRelay relay`).
-   It makes a tick and processes every shard up to it. With the relay left on, poll for the effect with a deadline;
-   never sleep and then assert.
+   It makes a tick and processes every shard up to it. With the relay on, poll with a deadline; never sleep and then
+   assert.
 5. Assert on the target, not on outbox rows: the Kafka record's value, key, and
    `KafkaOutboxHeaders.messageId(record)` equal to the id `send` returned, or the HTTP stub's body and
    `Idempotency-Key` equal to that id.
