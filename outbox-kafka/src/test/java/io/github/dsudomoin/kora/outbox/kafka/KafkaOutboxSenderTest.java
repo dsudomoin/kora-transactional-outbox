@@ -70,12 +70,14 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 class KafkaOutboxSenderTest {
 
-    private static final String TOPIC = "t";
+    static final String TOPIC = "t";
     private static final String OTHER = "u";
+    /** {@link KafkaDeadLetterHandlerTest}'s dead-letter topic of {@link #TOPIC}. */
+    static final String DLQ = TOPIC + ".dlq";
     private static final int PARTITIONS = 4;
     private static final Node NODE = new Node(0, "localhost", 9092);
     private static final Cluster CLUSTER = new Cluster("c", List.of(NODE),
-            Stream.of(TOPIC, OTHER).flatMap(topic -> IntStream.range(0, PARTITIONS)
+            Stream.of(TOPIC, OTHER, DLQ).flatMap(topic -> IntStream.range(0, PARTITIONS)
                     .mapToObj(i -> new PartitionInfo(topic, i, NODE, new Node[] {NODE}, new Node[] {NODE})))
                     .toList(),
             Set.of(), Set.of());
@@ -1020,7 +1022,7 @@ class KafkaOutboxSenderTest {
      * MockProducer closer to KafkaProducer: {@code failure} fails matching records the way client-side errors are
      * reported (callback inside {@code send}), and {@code close} aborts every incomplete send through its callback.
      */
-    private static class TestProducer extends MockProducer<byte[], byte[]> {
+    static class TestProducer extends MockProducer<byte[], byte[]> {
         private final Function<ProducerRecord<byte[], byte[]>, RuntimeException> failure;
 
         TestProducer(boolean autoComplete, Function<ProducerRecord<byte[], byte[]>, RuntimeException> failure) {

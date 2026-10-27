@@ -37,9 +37,14 @@ public final class TestKafka {
 
     /** A new topic with a unique name. */
     public static String createTopic(int partitions) {
-        var name = "t-" + UUID.randomUUID();
+        return createTopic("t-" + UUID.randomUUID(), partitions, Map.of());
+    }
+
+    /** A new topic {@code name} with topic-level {@code configs}, such as {@code max.message.bytes}. */
+    public static String createTopic(String name, int partitions, Map<String, String> configs) {
         try (var admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers()))) {
-            admin.createTopics(List.of(new NewTopic(name, partitions, (short) 1))).all().get(30, TimeUnit.SECONDS);
+            admin.createTopics(List.of(new NewTopic(name, partitions, (short) 1).configs(configs)))
+                    .all().get(30, TimeUnit.SECONDS);
         } catch (Exception e) {
             throw new IllegalStateException("cannot create topic " + name, e);
         }

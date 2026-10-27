@@ -3,10 +3,13 @@ package io.github.dsudomoin.kora.outbox.kafka.wiring;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.dsudomoin.kora.outbox.DeadLetter;
 import io.github.dsudomoin.kora.outbox.Outbox;
 import io.github.dsudomoin.kora.outbox.OutboxMessage;
+import io.github.dsudomoin.kora.outbox.OutboxPermanentException;
 import io.github.dsudomoin.kora.outbox.OutboxRecord;
 import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
+import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import java.time.Duration;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
@@ -30,8 +33,8 @@ class KafkaReplaceIT implements KoraAppTestConfigModifier {
     private RecordingHandler handler;
 
     @Override
-    public KoraConfigModification config() {
-        return KafkaOutboxModuleIT.config("kafka-replace");
+    public KoraConfigModification config() { // the module's dead-letter topic is on: the app's hook still replaces it
+        return KafkaOutboxModuleIT.config("kafka-replace", TestDb.uniqueTable(), "deadLetterTopic = \"{topic}.dlq\"");
     }
 
     @Test
@@ -43,5 +46,19 @@ class KafkaReplaceIT implements KoraAppTestConfigModifier {
             Thread.sleep(10);
         }
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactly(id);
+    }
+
+    @Test
+    void appHookReplacesTheDefault(@TestComponent KafkaReplaceTestApp.RecordingHook hook) throws Exception {
+        handler.failAlways(r -> "poison".equals(new String(r.key(), UTF_8)),
+                () -> new OutboxPermanentException("bad payload"));
+
+        var id = db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "poison", "p".getBytes(UTF_8))));
+
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (hook.handed.isEmpty() && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        assertThat(hook.handed).extracting(DeadLetter::messageId).containsExactly(id);
     }
 }

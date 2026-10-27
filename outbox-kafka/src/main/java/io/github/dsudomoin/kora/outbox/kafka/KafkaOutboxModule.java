@@ -1,6 +1,7 @@
 package io.github.dsudomoin.kora.outbox.kafka;
 
 import io.github.dsudomoin.kora.outbox.OutboxConfig;
+import io.github.dsudomoin.kora.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.kora.outbox.OutboxHandler;
 import io.github.dsudomoin.kora.outbox.OutboxModule;
 import jakarta.annotation.Nullable;
@@ -9,8 +10,8 @@ import ru.tinkoff.kora.config.common.Config;
 import ru.tinkoff.kora.config.common.extractor.ConfigValueExtractor;
 
 /**
- * Relays the outbox to Kafka: provides {@link KafkaOutboxSender} and, as the default {@link OutboxHandler}, a
- * {@link KafkaOutboxHandler}.
+ * Relays the outbox to Kafka: provides {@link KafkaOutboxSender}, as the default {@link OutboxHandler} a
+ * {@link KafkaOutboxHandler} and, as the default {@link OutboxDeadLetterHandler}, a {@link KafkaDeadLetterHandler}.
  * <pre>{@code
  * @KoraApp
  * interface App extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, KafkaOutboxModule {}
@@ -33,6 +34,12 @@ import ru.tinkoff.kora.config.common.extractor.ConfigValueExtractor;
  * "More than one component matches dependency type: OutboxHandler". A handler wrapping {@code kafka.handler()} (for
  * logging or metrics) must delegate {@code handleBatch} as well as {@code handle}; see {@link KafkaOutboxHandler}.
  *
+ * <p>Dead letters stay in the dead table unless {@code outbox.kafka.deadLetterTopic} is set:
+ * <pre>{@code
+ * outbox.kafka.deadLetterTopic = "{topic}.dlq"
+ * }</pre>
+ * An app's own {@code OutboxDeadLetterHandler} component replaces that hook, the key set or not.
+ *
  * @see OutboxModule
  */
 public interface KafkaOutboxModule {
@@ -53,5 +60,11 @@ public interface KafkaOutboxModule {
     @DefaultComponent
     default KafkaOutboxHandler kafkaOutboxHandler(KafkaOutboxSender sender) {
         return sender.handler();
+    }
+
+    /** Publishes dead letters with {@code outbox.kafka.deadLetterTopic} set, keeps them without. */
+    @DefaultComponent
+    default KafkaDeadLetterHandler kafkaDeadLetterHandler(KafkaOutboxConfig config, KafkaOutboxSender sender) {
+        return new KafkaDeadLetterHandler(sender, config.deadLetterTopic());
     }
 }

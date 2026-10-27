@@ -32,13 +32,18 @@ public final class KafkaOutboxPublisher<K, V> {
     public KafkaOutboxPublisher(
             Outbox outbox, String topic, Serializer<K> keySerializer, Serializer<V> valueSerializer) {
         this.outbox = Objects.requireNonNull(outbox, "outbox");
-        // validated now, not on the first send; Kafka's rule (Topic.validate, not public API) refuses the rest
-        if (topic == null || !VALID_TOPIC.matcher(topic).matches() || topic.equals(".") || topic.equals("..")) {
+        // validated now, not on the first send
+        if (!validTopic(topic)) {
             throw new IllegalArgumentException("invalid Kafka topic name: '" + topic + "'");
         }
         this.topic = topic;
         this.keySerializer = Objects.requireNonNull(keySerializer, "keySerializer");
         this.valueSerializer = Objects.requireNonNull(valueSerializer, "valueSerializer");
+    }
+
+    /** Kafka's rule for topic names (Topic.validate, not public API), which refuses the rest. */
+    static boolean validTopic(@Nullable String topic) {
+        return topic != null && VALID_TOPIC.matcher(topic).matches() && !topic.equals(".") && !topic.equals("..");
     }
 
     /** Returns the message id. */
