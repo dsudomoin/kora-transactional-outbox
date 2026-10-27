@@ -13,3 +13,23 @@ paths:
             text/plain:
               schema:
                 type: string
+  /status:
+    get:
+      operationId: appStatus
+      responses:
+        '200':
+          description: The app's own status, not the outbox's
+          content:
+            text/plain:
+              schema:
+                type: string
+  /dead-letters:
+    get:
+      operationId: appDeadLetters
+      responses:
+        '200':
+          description: The app's own dead letters, not the outbox's
+          content:
+            text/plain:
+              schema:
+                type: string
