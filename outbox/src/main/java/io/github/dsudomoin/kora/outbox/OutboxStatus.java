@@ -16,8 +16,8 @@ import java.util.List;
  * the tail is attached ({@code outbox.partitions.xids_left}); {@code maintenanceSinceSuccessSeconds}: since a
  * maintenance run last completed on any instance, null without that record ({@code outbox.maintenance.since_success});
  * {@code shards}: this instance's shard count, as the bootstrap resolved {@code outbox.shards}; {@code instances}: the
- * instances' heartbeats, by id (a crashed instance's row stays until unseen for an hour, or 10 ×
- * {@code maintenanceInterval} when longer).
+ * instances' heartbeats, by id, expired ones too (a crashed instance's row stays an hour after its heartbeat expired,
+ * 3 × {@code maintenanceInterval} after its last beat).
  */
 public record OutboxStatus(
         boolean halted,

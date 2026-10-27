@@ -356,8 +356,8 @@ components:
         instances:
           type: array
           description: >-
-            The instances' heartbeats, by id; a crashed instance's row stays until unseen for an hour (or 10 ×
-            outbox.partitions.maintenanceInterval when longer)
+            The instances' heartbeats, by id, expired ones too; a crashed instance's row stays an hour after its
+            heartbeat expired (3 × outbox.partitions.maintenanceInterval after its last beat)
           items:
             $ref: '#/components/schemas/Instance'
     Instance:
