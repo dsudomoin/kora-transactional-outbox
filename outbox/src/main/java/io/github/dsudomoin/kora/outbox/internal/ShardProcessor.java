@@ -242,11 +242,14 @@ public final class ShardProcessor implements AutoCloseable {
      * shard at a time ({@link #retryPass}); no shard's retry pass starts once the step has spent {@code batchTimeout}.
      * Each shard is classified on its own, with these rules across shards:
      * <ul>
-     *   <li>The read takes at most {@code batchSize} rows in all; when it is cut there, a shard with rows is mid-batch
-     *   at its last row, and a shard without is untouched (it may simply be unread).</li>
+     *   <li>The read takes at most {@code batchSize} rows in all; when it is cut there and the shards' limits add up
+     *   to more, a shard with rows is mid-batch at its last row, and a shard without is untouched (it may simply be
+     *   unread). When the limits fit in {@code batchSize}, nothing is cut: every shard read all it asked for.</li>
      *   <li>When the call attempted any record, a shard whose handed rows all came back NotAttempted without
      *   {@code notBefore} (the default handler stopping after other shards' failing keys, a wind-down) is untouched.
-     *   </li>
+     *   The default handler's stop after 3 failing keys counts keys across the whole call, so it can straddle two
+     *   shards: when a shard's first key is the third failure, that shard is charged with it (one failed attempt, a
+     *   pause) although the two before were a neighbour's.</li>
      *   <li>A call of several shards that fails as a whole ({@link FailedCall}) says nothing about any of them: each is
      *   untouched and called alone ({@link #solo}) until a call of its own does not fail as a whole. A shard that
      *   probes is called alone too, so the head it isolates is the only record of its call. Such calls follow the
@@ -259,6 +262,9 @@ public final class ShardProcessor implements AutoCloseable {
      */
     public List<ShardResult> tryProcess(Connection inTx, List<Integer> shards, long latestTickId, Instant now)
             throws SQLException, InterruptedException {
+        if (new HashSet<>(shards).size() != shards.size()) {
+            throw new IllegalArgumentException("shards are not distinct: " + shards);
+        }
         long started = System.nanoTime();
         now = now.truncatedTo(ChronoUnit.MICROS); // as Postgres stores it: due times compare exactly
         var results = new ShardResult[shards.size()];
@@ -371,11 +377,13 @@ public final class ShardProcessor implements AutoCloseable {
                         s.full ? hasRetryRows(inTx, s.shard) : s.retryDue != null || s.wroteRetry));
             }
             var batch = reader.readMany(inTx, shardReads, relay.batchSize());
+            // limits that fit in batchSize read all they asked for: a read of exactly batchSize rows then cuts nothing
+            boolean cut = batch.cut() && reads.stream().mapToLong(s -> s.limit).sum() > relay.batchSize();
             var shared = new ArrayList<Step>(reads.size());
             var alone = new ArrayList<Step>();
             for (var s : reads) {
                 s.rows = batch.rows().get(s.shard);
-                s.cut = batch.cut();
+                s.cut = cut;
                 if (s.cut && s.rows.isEmpty()) {
                     s.untouched = true; // maybe unread: the shards after the cut have no rows they would have had
                     continue;

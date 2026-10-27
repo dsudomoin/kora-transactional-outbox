@@ -411,23 +411,14 @@ public final class Ticks {
     }
 
     /**
-     * For a fresh batch of {@code shard} from the tick {@code afterId}: the last tick before the first one after it, up
-     * to {@code latestId}, that marks the shard, when that is past {@code afterId}; null when none is. A tick marks the
+     * For a fresh batch of each shard from its tick in {@code afterIds}: the last tick before the first one after it,
+     * up to {@code latestId}, that marks the shard, when that is past its tick; absent when none is. A tick marks the
      * shard when its {@code dirty} has the shard's bit or is null (or of another non-zero length), when it follows a
      * gap in tick ids, or when it is the latest. The ticks skipped mark nothing of the shard and chain (see the class
      * comment), so the shard has no row visible in the tick returned and not in {@code afterId}: its batch can start
      * there, read the same rows and cover its {@code maxTicksPerBatch} ticks from the first that may hold them. The
-     * tick comes without its snapshot ({@link Tick#snapshot()} null), as {@link #between}'s.
-     */
-    @Nullable
-    public Tick lastUnmarked(Connection c, int shard, long afterId, long latestId) throws SQLException {
-        return lastUnmarked(c, Map.of(shard, afterId), latestId).get(shard);
-    }
-
-    /**
-     * {@link #lastUnmarked(Connection, int, long, long)} of each shard from its tick in {@code afterIds}, keyed by
-     * shard (a shard with none is absent), in one statement: per shard an index scan from its tick that stops at the
-     * first tick marking it.
+     * ticks come without their snapshots ({@link Tick#snapshot()} null), as {@link #between}'s, keyed by shard, from
+     * one statement: per shard an index scan from its tick that stops at the first tick marking it.
      */
     public Map<Integer, Tick> lastUnmarked(Connection c, Map<Integer, Long> afterIds, long latestId)
             throws SQLException {

@@ -191,7 +191,14 @@ public final class BatchReader {
                 }
             }
         }
-        // no order by in the statement: the lateral's rows come out per shard in id order, but nothing guarantees it
+        // Why each shard's rows are a prefix of its read when the outer limit cuts the statement: the lateral is
+        // ordered by id and limited per shard, so it yields the shard's rows in id order; the planner can only run it
+        // as a nested loop over unnest's rows, which come out in ordinality order, so the statement emits shard by
+        // shard and the outer limit stops inside one shard, with the shards after it unread; and the statement runs
+        // as a portal with a fetch size, which Postgres never gives a parallel plan (a Gather would interleave the
+        // shards' rows and the limit could keep a later row of a shard while dropping an earlier one). A change to
+        // any of the three (an outer order by, a hash or merge join, no fetch size) breaks the prefix rule silently.
+        // No order by in the statement: the rows are sorted here, by position and id, and nothing else relies on it
         read.sort(Comparator.comparingLong(Positioned::position).thenComparingLong(p -> p.row().record().id()));
         for (var p : read) {
             rows.get(reads.get((int) p.position() - 1).shard()).add(p.row());

@@ -3090,6 +3090,50 @@ class ShardProcessorIT {
         assertThat(cursor(1).failures()).isZero();
     }
 
+    @Test
+    void aGroupStepStartsNoRetryPassOnceItSpentBatchTimeout() throws Exception {
+        var timeout = Duration.ofMillis(300);
+        config.shards(2).batchTimeout(timeout);
+        bootstrap();
+        var a = keysOnShard(0, 2);
+        var b = keysOnShard(1, 2);
+        var once = Outcome.retry(new RuntimeException("once"));
+        script = answering(Map.of("a#1", once, "b#1", once));
+        send(msg("t", a.get(0), "a#1"), msg("t", a.get(1), "a2#1"), msg("t", b.get(0), "b#1"),
+                msg("t", b.get(1), "b2#1"));
+        tick();
+        assertThat(process(processor, 0)).isEqualTo(new ShardResult(PROGRESS, 1, true)); // a#1 diverted
+        assertThat(process(processor, 1)).isEqualTo(new ShardResult(PROGRESS, 1, true)); // b#1 diverted
+        now = now.plus(INITIAL); // both heads due
+        var before = cursor(1);
+        long rows = cursorRows(1);
+        script = hangingPast(timeout, records -> payloads(records).contains("a#1"), handler::handleBatch);
+        calls.clear();
+
+        // shard 0's retry call outlives batchTimeout: shard 1's retry pass waits for its next step
+        assertThat(processGroup(0, 1)).containsExactly(new ShardResult(PROGRESS, 0, true),
+                new ShardResult(PROGRESS, 0, true));
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("a#1"));
+        assertThat(cursor(1)).as("deferred: its cursor as it was").isEqualTo(before);
+        assertThat(cursorRows(1)).isEqualTo(rows);
+        assertThat(retryRows()).hasSize(2).last().asString().startsWith("b#1:1:");
+
+        script = null;
+        assertThat(processGroup(0, 1).get(1)).as("the next step hands it").isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(delivered()).endsWith("b#1");
+        assertThat(cursor(1).retryDueAt()).isNull();
+    }
+
+    @Test
+    void aGroupOfRepeatedShardsIsRefused() throws Exception {
+        config.shards(2);
+        bootstrap();
+
+        assertThatThrownBy(() -> processGroup(0, 1, 0)).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("not distinct");
+    }
+
     private void bootstrap() throws Exception {
         var schema = new OutboxSchema(db, config);
         schema.init();

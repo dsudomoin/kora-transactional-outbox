@@ -16,6 +16,7 @@ import java.sql.Connection;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
@@ -75,7 +76,7 @@ class TicksIT {
     /** {@link Ticks#lastUnmarked}'s tick id, null for none. */
     @Nullable
     private Long lastUnmarked(Connection c, int shard, long afterId, long latestId) throws Exception {
-        var tick = ticks.lastUnmarked(c, shard, afterId, latestId);
+        var tick = ticks.lastUnmarked(c, Map.of(shard, afterId), latestId).get(shard);
         return tick == null ? null : tick.id();
     }
 
