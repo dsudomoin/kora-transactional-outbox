@@ -5,6 +5,12 @@ Micrometer meters, registered only when the Kora graph has a `MeterRegistry` (fo
 `_bucket` series (`outbox_messages_delivered_total`, `outbox_delivery_delay_seconds_bucket`); gauges keep the plain
 name (`outbox_shard_lag`, `outbox_dead_size`).
 
+Without Kora the same meters come from `OutboxMetrics` (`outbox-micrometer`) passed to
+`OutboxRuntime.builder(...).telemetry(...)`. `ObservationOutboxTelemetry` adds two Micrometer observations on top:
+`outbox.enqueue` per send call and `outbox.deliver` per record (span kind CONSUMER, parented by the stored trace; tags
+`messaging.destination.name`, `outbox.outcome`). Rename them with an `Outbox*ObservationConvention`, rename meters with
+a `MeterFilter`.
+
 | Meter | Type | Tags | Meaning |
 |---|---|---|---|
 | `outbox.messages.enqueued` | counter | `topic` | Counted in `send`, including sends whose transaction rolled back. Do not compute backlog as enqueued − delivered; use `outbox.shard.lag`. |

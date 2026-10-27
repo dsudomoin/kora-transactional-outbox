@@ -2241,6 +2241,34 @@ Gauges регистрируются один раз на имя, и побежд
 через `Tracer`. Без Kora передайте реализацию в `OutboxRuntime.builder(...).telemetry(...)`, например
 `new OutboxMetrics(registry)` для тех же метров.
 
+### Micrometer Observation
+
+Для приложения без Kora, чьи метрики и трассы идут через Micrometer Observation, в `outbox-micrometer` есть
+`ObservationOutboxTelemetry`:
+
+```java
+var telemetry = ObservationOutboxTelemetry.builder(observationRegistry, new OutboxMetrics(meterRegistry))
+        .tracing(tracer, propagator) // micrometer-tracing: обработчик получит запись со span-ом доставки
+        .build();
+var runtime = OutboxRuntime.builder(config, transactions, handler).telemetry(telemetry).build();
+```
+
+- `outbox.enqueue` (span `outbox enqueue`) — одно наблюдение на `send`/`sendAll`. Это наблюдение отправителя
+  (`SenderContext`): propagating-обработчик приложения кладёт его контекст в заголовки сообщений; сообщение со своими
+  заголовками трассы оставляет их.
+- `outbox.deliver` (span `outbox deliver <topic>`) — одно наблюдение на доставляемую запись. Это наблюдение получателя
+  (`ReceiverContext`): родитель — контекст, сохранённый при отправке, поэтому span имеет kind `CONSUMER` (в Kora —
+  `PRODUCER`). Ключи с низкой кардинальностью: `messaging.destination.name`, `outbox.outcome` (`delivered`, `retry`,
+  `permanent`, `not_attempted`, `requeued`, `failed`, если вызов обработчика прервался); с высокой: `outbox.message_id`,
+  `outbox.attempt`, `outbox.delay_ms`. Ошибки `retry` и `permanent` записываются в наблюдение.
+- С `tracing(tracer, propagator)` запись, которую получает обработчик, несёт заголовки span-а доставки, а в
+  `handleBatch` по умолчанию (и в `OutboxHandler.inRecordScope`) это наблюдение текущее. Без этого вызова запись
+  приходит с сохранёнными заголовками, а micrometer-tracing в classpath не нужен.
+- Остальные события и gauges — метры `OutboxMetrics` из таблицы выше.
+- Имена и ключи меняются своими `OutboxEnqueueObservationConvention` и `OutboxDeliveryObservationConvention` в
+  билдере, имена и теги метров — `MeterFilter` Micrometer. Своих настроек имён у модуля нет.
+- Наблюдение на запись стоит аллокаций на потоке relay; на стенде эта цена ещё не измерена.
+
 ### Локальный стенд
 
 В `observability/` лежит локальный стенд для бенчмарк-приложения: Postgres 16 (2 CPU, 4 ГБ), Kafka, Prometheus,
