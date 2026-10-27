@@ -73,7 +73,10 @@ class XidRecoveryIT {
         await(Duration.ofSeconds(5), () -> handler.delivered().size() >= 20);
         long forged = forgeRegression();
         sent.addAll(send(outbox, messages("after", 20))); // xids the forged tick takes for relayed
-        await(Duration.ofSeconds(5), () -> latestTickId() > forged); // workers go on ticking past it
+        // the workers' next tick is refused: they record the halt and stop, ahead of maintenance
+        await(Duration.ofSeconds(5), maintenance::halted);
+        assertThat(haltRows()).isOne();
+        assertThat(latestTickId()).as("no tick after the forged one").isEqualTo(forged);
 
         try (var other = TestDb.connect()) { // two instances detect it: only the maintenance lock holder recovers
             advisory(other, "pg_advisory_lock");
