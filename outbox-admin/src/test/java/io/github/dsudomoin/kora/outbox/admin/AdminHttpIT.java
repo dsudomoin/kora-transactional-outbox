@@ -242,6 +242,27 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         assertThat(outboxMessageIds()).isEmpty();
     }
 
+    /** A blank topic or error dropped would widen the call to every letter the rest of the filter matches. */
+    @Test
+    void blankFilterStringsAreRefusedByBulkCalls() throws Exception {
+        long id = letter(1, "t", "k", "boom", T0, KEPT);
+        long other = letter(2, "u", "k", "boom", T0, KEPT);
+
+        for (var operation : List.of("redrive", "discard")) {
+            for (var body : List.of("{\"filter\":{\"topic\":\"\",\"status\":\"kept\"}}",
+                    "{\"filter\":{\"topic\":\" \",\"status\":\"kept\"}}",
+                    "{\"filter\":{\"error\":\"\",\"topic\":\"t\"}}")) {
+                var response = call("POST", "/dead-letters/" + operation, body);
+
+                assertJson(response, 400);
+                assertThat(response.body()).as(operation + " " + body).startsWith("{\"message\":\"a blank ");
+            }
+        }
+        assertThat(deadIds()).containsExactly(id, other);
+        assertThat(outboxMessageIds()).isEmpty();
+        assertThat(find("topic=&status=kept")).as("reads still take a blank one as absent").containsExactly(id, other);
+    }
+
     /** A typo must never widen a call: {@code eror} ignored would discard every letter of the topic. */
     @Test
     void unknownFieldsAreRefused() throws Exception {

@@ -163,8 +163,22 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
         return ids;
     }
 
+    /**
+     * A bulk call's filter: a blank {@code topic} or {@code error} is refused, not dropped as {@link DeadLetterFilter}
+     * drops it, since dropped it would widen the call to every topic or error the rest of the filter matches.
+     */
     private static DeadLetterFilter filter(Filter f) {
-        return filter(f.topic(), f.key(), f._error(), f.failedFrom(), f.failedTo(), f.status());
+        return filter(notBlank("topic", f.topic()), f.key(), notBlank("error", f._error()), f.failedFrom(),
+                f.failedTo(), f.status());
+    }
+
+    @Nullable
+    private static String notBlank(String field, @Nullable String value) {
+        if (value != null && value.isBlank()) {
+            throw new IllegalArgumentException("a blank " + field + " in a filter matches every " + field
+                    + ": leave it out, or name one");
+        }
+        return value;
     }
 
     private static DeadLetterFilter filter(@Nullable String topic, @Nullable String key, @Nullable String error,
