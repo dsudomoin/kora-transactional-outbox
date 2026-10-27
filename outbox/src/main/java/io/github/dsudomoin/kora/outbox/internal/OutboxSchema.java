@@ -526,8 +526,8 @@ public final class OutboxSchema implements Lifecycle {
      * {@code expires_at} ahead, set by each instance's bootstrap and {@link Heartbeat} from its own interval), and
      * while the newest tick is younger than the longest of: 2 × the longer of {@code idlePollInterval} and
      * {@code minTickInterval} plus {@link #TICK_MARGIN}; 3 × the largest gap among the last {@value #TICK_GAPS} ticks
-     * (relays with longer intervals than this instance's); {@link #tickFloor}: a relay of a release without the
-     * heartbeat still runs. That guard alone is waited out, up to {@link #tickWait}, before it refuses. Then one
+     * (relays with longer intervals than this instance's), at most {@link #tickWait}; {@link #tickFloor}: a relay of a
+     * release without the heartbeat still runs. That guard alone is waited out, up to {@link #tickWait}, before it refuses. Then one
      * transaction: {@code pg_advisory_xact_lock} on {@code LOCK_MAINTENANCE}, {@code LOCK_SWAP} (relay steps hold it
      * shared) and {@code LOCK_TICK}, in that order, so no maintenance run, step or tick interleaves; then {@code SHARE}
      * on the outbox, so no write commits between the checks and the switch (writers wait and go on after the commit);
@@ -635,7 +635,9 @@ public final class OutboxSchema implements Lifecycle {
                 if (rs.wasNull()) {
                     return; // no tick at all
                 }
-                bound = Math.max(Math.max(own.toMillis(), 3 * rs.getLong(2)), tickFloor.toMillis());
+                // the cadence term capped at the wait: one old long pause among the ticks cannot block a reshard
+                long cadence = Math.min(3 * rs.getLong(2), tickWait.toMillis());
+                bound = Math.max(Math.max(own.toMillis(), cadence), tickFloor.toMillis());
             }
             if (ago >= bound) {
                 return;

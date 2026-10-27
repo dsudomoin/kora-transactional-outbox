@@ -191,21 +191,25 @@ class ReshardIT {
     }
 
     @Test
-    void theTickGuardCoversRelaysWithLongerIntervals() throws Exception {
+    void anOldLongPauseAmongTheTicksIsWaitedAtMostTheBoundedWait() throws Exception {
         start(config(4));
         stopped();
-        // the newest tick 2 min old, a minute after the one before: an old relay idling at a 1 min poll interval
-        execute("update " + names.tick() + " set created_at = now() - interval '3 minutes'");
+        // the newest tick 4 s old, 10 min after the one before: 3 × that gap is 30 min, capped at the 8 s wait
+        execute("update " + names.tick() + " set created_at = now() - interval '10 minutes 4 seconds'");
         execute("insert into " + names.tick() + " (snapshot, created_at) select pg_current_snapshot(),"
-                + " now() - interval '2 minutes'");
+                + " now() - interval '4 seconds'");
         var schema = schema(config(8));
         schema.tickFloor = Duration.ZERO;
-        schema.tickWait = Duration.ofSeconds(1);
+        schema.tickWait = Duration.ofSeconds(8);
 
-        assertThatThrownBy(schema::init)
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("a relay is still running")
-                .hasMessageMatching("(?s).*no tick for 18\\d{4} ms.*"); // 3 × the minute between the two
+        long started = System.nanoTime();
+        try (var err = new CapturedStderr()) {
+            schema.init();
+            assertThat(err.text()).as("the cadence term counts, above the own 5 s bound, capped at the wait")
+                    .contains("for the latest tick to be 8000 ms old").contains("resharded");
+        }
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(8));
+        assertThat(cursorShards()).isEqualTo(8);
     }
 
     @Test
