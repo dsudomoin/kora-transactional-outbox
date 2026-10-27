@@ -48,6 +48,8 @@ curl -s -X POST -H "$KEY" $API/recovery/xid-regression
 - 200 with JSON (changing calls: `{"count": N}`); 400 rejected input (unknown field, over 1 000 `ids`, empty filter,
   not an orphan); 401 / 403 from the authorizer; 409 not now (maintenance running: retry; no xid regression); 500
   otherwise. Every error body is `{"message": "..."}`.
+- Reads (`/status`, find, count) wait at most 5 s for a lock and 60 s per statement: during an xid regression
+  recovery, which holds its tables, `/status` answers 500 (55P03) after 5 s; retry once it is done.
 - A body holds exactly one of `ids` (up to 1 000) and `filter`. `status` is `pending`, `kept` or `scheduled`. A filter
   key is UTF-8 text: for a binary key use `ids` or `OutboxAdmin`.
 - Times come back in milliseconds while Postgres keeps microseconds: a `failedAt` copied into `failedFrom`/`failedTo`
