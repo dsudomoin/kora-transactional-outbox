@@ -40,7 +40,7 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * ({@link DeadLetters#redrive}), so no writer waits for one of its key locks. Filters are bound parameters, never
  * interpolated; user text is logged with control characters escaped ({@link #printable}). {@code restoreOrphan} and
  * {@code recoverXidRegression} hold the maintenance lock for their whole run, so maintenance's steps never run beside
- * them.
+ * them. The reads, {@code status} and the dead-letter find and count, give up on a statement after 60 s (57014).
  */
 public final class PgOutboxAdmin implements OutboxAdmin {
 
@@ -63,6 +63,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private final String dead;
     /** How long a call under the maintenance lock waits for a maintenance run in progress; shorter in tests. */
     Duration maintenanceWait = Duration.ofSeconds(60);
+    /** Each statement's limit in {@code status} and the dead-letter reads; shorter in tests. */
+    Duration readTimeout = Duration.ofSeconds(60);
     /** For tests: runs after each bulk chunk's commit. */
     @Nullable
     SqlConsumer<Connection> afterChunk;
@@ -95,9 +97,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     @Override
     public OutboxStatus status() {
         requireOwnTransactions();
-        try (var c = db.newConnection()) {
-            c.setAutoCommit(true);
-            return new OutboxStatus(
+        try (var conn = db.newConnection()) {
+            return read(conn, c -> new OutboxStatus(
                     queryBoolean(c, "select exists (select 1 from " + names.halt() + ")"),
                     maintenance.lagSeconds(c),
                     retries.size(c),
@@ -112,7 +113,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                     partitions.xidsLeft(c),
                     maintenance.secondsSinceSuccess(c),
                     shards,
-                    instances(c));
+                    instances(c)));
         } catch (SQLException e) {
             throw new RuntimeSqlException(e);
         }
@@ -137,19 +138,22 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             throw new IllegalArgumentException("limit must be within 1.." + CHUNK + ": " + limit);
         }
         var where = Where.of(filter);
-        try (var c = db.newConnection();
-                var ps = c.prepareStatement("select " + DeadLetters.COLUMNS + " from " + dead + " where "
+        try (var conn = db.newConnection()) {
+            var letters = read(conn, c -> {
+                try (var ps = c.prepareStatement("select " + DeadLetters.COLUMNS + " from " + dead + " where "
                         + where.sql() + " and id > ? order by id limit ?")) {
-            c.setAutoCommit(true);
-            int next = where.bind(ps);
-            ps.setLong(next, afterId == null ? Long.MIN_VALUE : afterId);
-            ps.setInt(next + 1, limit);
-            var letters = new ArrayList<DeadLetter>();
-            try (var rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    letters.add(DeadLetters.read(rs).letter());
+                    int next = where.bind(ps);
+                    ps.setLong(next, afterId == null ? Long.MIN_VALUE : afterId);
+                    ps.setInt(next + 1, limit);
+                    var page = new ArrayList<DeadLetter>();
+                    try (var rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            page.add(DeadLetters.read(rs).letter());
+                        }
+                    }
+                    return page;
                 }
-            }
+            });
             return new DeadLetterPage(letters, letters.size() < limit ? null : letters.get(letters.size() - 1).id());
         } catch (SQLException e) {
             throw new RuntimeSqlException(e);
@@ -160,14 +164,16 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     public long countDeadLetters(DeadLetterFilter filter) {
         requireOwnTransactions();
         var where = Where.of(filter);
-        try (var c = db.newConnection();
-                var ps = c.prepareStatement("select count(*) from " + dead + " where " + where.sql())) {
-            c.setAutoCommit(true);
-            where.bind(ps);
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                return rs.getLong(1);
-            }
+        try (var conn = db.newConnection()) {
+            return read(conn, c -> {
+                try (var ps = c.prepareStatement("select count(*) from " + dead + " where " + where.sql())) {
+                    where.bind(ps);
+                    try (var rs = ps.executeQuery()) {
+                        rs.next();
+                        return rs.getLong(1);
+                    }
+                }
+            });
         } catch (SQLException e) {
             throw new RuntimeSqlException(e);
         }
@@ -409,6 +415,17 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             }
         }
         return new Chunk(ids.size(), ids.stream().mapToLong(Long::longValue).max().orElse(after), ids.size());
+    }
+
+    /**
+     * A read-only call's {@code body} in one transaction ({@link #inTx}) under {@code statement_timeout} =
+     * {@link #readTimeout} (each statement's, lock waits included), so a slow read gives its pool connection back.
+     */
+    private <T> T read(Connection c, SqlFunction1<Connection, T> body) throws SQLException {
+        return inTx(c, tx -> {
+            execute(tx, "set local statement_timeout = " + readTimeout.toMillis());
+            return body.apply(tx);
+        });
     }
 
     /** {@code body} in one read-committed transaction on {@code c}, committed, or rolled back on any failure. */

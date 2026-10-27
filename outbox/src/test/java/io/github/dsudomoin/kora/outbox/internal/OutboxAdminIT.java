@@ -48,6 +48,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
+import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 class OutboxAdminIT {
 
@@ -394,6 +395,29 @@ class OutboxAdminIT {
         assertThat(outboxMessageIds()).containsExactly(at, above);
         assertThat(admin.status().orphans()).isEmpty();
         assertThat(wakes).hasValue(1);
+    }
+
+    /** A read stuck behind a lock (or a slow scan) gives its pool connection back after readTimeout. */
+    @Test
+    void readsGiveUpAfterTheirTimeout() throws Exception {
+        admin.readTimeout = Duration.ofMillis(300);
+        try (var holder = TestDb.connect()) {
+            holder.setAutoCommit(false);
+            TestSql.execute(holder, "lock table " + names.dead() + " in access exclusive mode");
+            pool.submit(() -> { // so a read without its timeout ends, and fails the test instead of hanging it
+                Thread.sleep(3000);
+                holder.rollback();
+                return null;
+            });
+
+            for (ThrowingCallable read : List.<ThrowingCallable>of(() -> admin.countDeadLetters(DeadLetterFilter.any()),
+                    () -> admin.findDeadLetters(DeadLetterFilter.any(), null, 10), admin::status)) {
+                long start = System.nanoTime();
+                assertThatThrownBy(read).isInstanceOfSatisfying(RuntimeSqlException.class,
+                        e -> assertThat(((SQLException) e.getCause()).getSQLState()).isEqualTo("57014"));
+                assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(2));
+            }
+        }
     }
 
     @Test
