@@ -4,8 +4,12 @@ import io.github.dsudomoin.kora.outbox.OutboxAdmin;
 import io.github.dsudomoin.kora.outbox.admin.api.OutboxAdminApiControllerModule;
 import io.github.dsudomoin.kora.outbox.admin.api.OutboxAdminApiDelegate;
 import io.github.dsudomoin.kora.outbox.admin.model.DeadLetterStatus;
+import io.github.dsudomoin.kora.outbox.admin.model.Filter;
 import io.github.dsudomoin.kora.outbox.admin.model.ModelError;
 import io.github.dsudomoin.kora.outbox.admin.model.OrphanKind;
+import io.github.dsudomoin.kora.outbox.admin.model.Selection;
+import java.time.OffsetDateTime;
+import java.util.List;
 import ru.tinkoff.kora.http.server.common.handler.BlockingRequestExecutor;
 import ru.tinkoff.kora.http.server.common.handler.StringParameterReader;
 import ru.tinkoff.kora.json.common.JsonReader;
@@ -50,5 +54,17 @@ public interface OutboxAdminHttpModule extends OutboxAdminApiControllerModule {
 
     default JsonWriter<OrphanKind> outboxAdminOrphanKindJsonWriter(JsonWriter<String> strings) {
         return new OrphanKind.JsonWriter(strings);
+    }
+
+    /** Refuses a field the contract does not name, which the generated reader would skip. */
+    default JsonReader<Selection> outboxAdminSelectionJsonReader(JsonReader<List<Long>> ids,
+            JsonReader<Filter> filter) {
+        return RequestReaders.selection(ids, filter);
+    }
+
+    /** Refuses a field the contract does not name, which the generated reader would skip. */
+    default JsonReader<Filter> outboxAdminFilterJsonReader(JsonReader<OffsetDateTime> times,
+            JsonReader<DeadLetterStatus> statuses) {
+        return RequestReaders.filter(times, statuses);
     }
 }

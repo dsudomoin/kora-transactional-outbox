@@ -5,9 +5,10 @@ info:
   description: >-
     The kora-outbox admin API: status, dead letters, orphans and the xid-regression recovery, each call acting on the
     shared database, so any instance answers the same. No security scheme is declared: access is decided by the
-    service's OutboxAdminAuthorizer, which runs before every operation and answers 401 or 403 with an Error. A call
-    refused for its input answers 400; one that cannot run in the outbox's current state (maintenance running, no xid
-    regression to recover) answers 409.
+    service's OutboxAdminAuthorizer, which runs before every operation and answers 401 or 403 with an Error (500,
+    "authorization failed", when it fails). A call refused for its input answers 400, a request body with a field
+    this contract does not name included; one that cannot run in the outbox's current state (maintenance running, no
+    xid regression to recover) answers 409. Every one of them carries an Error.
 paths:
   /kora-outbox/admin/v1/status:
     get:
@@ -350,10 +351,10 @@ components:
     OrphanKind:
       type: string
       description: >-
-        DETACHED_BY_LIBRARY: detached by maintenance as relayed but not dropped, which moves its rows back itself;
-        FOREIGN: detached by someone else, perhaps before the relay reached its rows, restore it after comparing them
-        with what was delivered; SET_ASIDE: set aside by the xid-regression recovery, restore it.
-      enum: [DETACHED_BY_LIBRARY, FOREIGN, SET_ASIDE]
+        detached_by_library: detached by maintenance as relayed but not dropped, which moves its rows back itself;
+        foreign: detached by someone else, perhaps before the relay reached its rows, restore it after comparing them
+        with what was delivered; set_aside: set aside by the xid-regression recovery, restore it.
+      enum: [detached_by_library, foreign, set_aside]
     DeadLetterStatus:
       type: string
       description: >-
@@ -437,10 +438,13 @@ components:
           description: Base64; absent for a null value
     Selection:
       type: object
-      description: Exactly one of ids and filter
+      description: Exactly one of ids and filter; a field not named here is refused
+      additionalProperties: false
       properties:
         ids:
           type: array
+          maxItems: 1000
+          description: At most 1000; a filter serves more
           items:
             type: integer
             format: int64
@@ -448,7 +452,9 @@ components:
           $ref: '#/components/schemas/Filter'
     Filter:
       type: object
-      description: A letter matches when every given field does; an empty filter is refused
+      description: >-
+        A letter matches when every given field does; an empty filter is refused, and so is a field not named here
+      additionalProperties: false
       properties:
         topic:
           type: string

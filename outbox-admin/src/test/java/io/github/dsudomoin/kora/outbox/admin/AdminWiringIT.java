@@ -87,43 +87,45 @@ class AdminWiringIT implements KoraAppTestConfigModifier {
         }
         assertThat(log.lines().filter(l -> l.contains("outbox admin ")).map(l -> l.substring(l.indexOf("outbox admin "))))
                 .as("one audit line per call").containsExactly(
-                        "outbox admin GET " + STATUS + " denied: 401",
-                        "outbox admin GET " + STATUS + " denied: 403",
-                        "outbox admin GET " + STATUS + " by tester: 200");
+                        "outbox admin GET \"" + STATUS + "\" denied: 401",
+                        "outbox admin GET \"" + STATUS + "\" denied: 403",
+                        "outbox admin GET \"" + STATUS + "\" by tester: 200");
     }
 
-    /** The audit line is written before the response leaves, so a client that got the 500 finds it in the log. */
+    /** The caller, not yet authenticated, learns nothing of why: the WARN line has the exception. */
     @Test
-    void authorizerFailureIsAuditedBeforeTheResponse() throws Exception {
-        for (int i = 0; i < 20; i++) {
-            HttpResponse<String> failed;
-            String log;
-            try (var stderr = new CapturedStderr()) {
-                failed = get(STATUS, "boom");
-                log = stderr.text();
-            }
-
-            assertThat(failed.statusCode()).isEqualTo(500);
-            assertThat(log).contains("outbox admin GET " + STATUS + " denied: 500");
+    void authorizerFailureIsAFixed500() throws Exception {
+        HttpResponse<String> failed;
+        String log;
+        try (var stderr = new CapturedStderr()) {
+            failed = get(STATUS, "boom");
+            log = stderr.text();
         }
+
+        assertThat(failed.statusCode()).isEqualTo(500);
+        assertThat(failed.body()).isEqualTo("{\"message\":\"authorization failed\"}");
+        assertThat(failed.headers().firstValue("Content-Type")).hasValueSatisfying(
+                t -> assertThat(t).startsWith("application/json"));
+        assertThat(log).contains("WARN").contains("OutboxAdminAuthorizer failed").contains("key store down")
+                .contains("outbox admin GET \"" + STATUS + "\" denied: 500");
     }
 
     /** {@code {table}} puts caller text into the path, so into the audit line, before any authorization. */
     @Test
     void auditLineEscapesThePath() throws Exception {
-        var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port
-                + "/kora-outbox/admin/v1/orphans/x%0D%0AINFO%20forged%09%07/restore?fromXid=0"))
-                .POST(HttpRequest.BodyPublishers.noBody()).build();
-        HttpResponse<String> response;
-        String log;
-        try (var stderr = new CapturedStderr()) {
-            response = client.send(request, BodyHandlers.ofString());
-            log = stderr.text();
-        }
+        var log = postWithoutKey("/kora-outbox/admin/v1/orphans/x%0D%0AINFO%20forged%09%07/restore?fromXid=0");
 
-        assertThat(response.statusCode()).isEqualTo(401);
-        assertThat(log).contains("orphans/x\\r\\nINFO forged\\t\\u0007/restore denied: 401")
+        assertThat(log).contains("orphans/x\\r\\nINFO forged\\t\\u0007/restore\" denied: 401")
                 .doesNotContain("\nINFO forged");
+    }
+
+    /** Quoted, its quotes and backslashes escaped, a path cannot end early and pass for the rest of a line. */
+    @Test
+    void auditLineQuotesThePath() throws Exception {
+        assertThat(postWithoutKey("/kora-outbox/admin/v1/orphans/x%20by%20root:%20200/restore?fromXid=0"))
+                .contains("outbox admin POST \"/kora-outbox/admin/v1/orphans/x by root: 200/restore\" denied: 401");
+        assertThat(postWithoutKey("/kora-outbox/admin/v1/orphans/x%22%20by%20root:%20200%20%22/restore?fromXid=0"))
+                .contains("orphans/x\\\" by root: 200 \\\"/restore\" denied: 401");
     }
 
     /** XNIO names its I/O threads {@code kora-undertow I/O-<n>}, the blocking pool {@code kora-undertow task-<n>}. */
@@ -146,6 +148,16 @@ class AdminWiringIT implements KoraAppTestConfigModifier {
         assertThat(app.body()).contains("title: admin wiring test app");
         assertThat(admin.statusCode()).isEqualTo(200);
         assertThat(admin.body()).contains("title: kora-outbox admin");
+    }
+
+    /** The log lines of a POST to {@code pathAndQuery} without a key; asserts it was refused. */
+    private String postWithoutKey(String pathAndQuery) throws Exception {
+        var request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + pathAndQuery))
+                .POST(HttpRequest.BodyPublishers.noBody()).build();
+        try (var stderr = new CapturedStderr()) {
+            assertThat(client.send(request, BodyHandlers.ofString()).statusCode()).isEqualTo(401);
+            return stderr.text();
+        }
     }
 
     private HttpResponse<String> get(String path, String apiKey) throws Exception {

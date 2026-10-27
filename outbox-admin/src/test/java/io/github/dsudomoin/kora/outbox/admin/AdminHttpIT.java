@@ -38,6 +38,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.LongStream;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
@@ -106,7 +108,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
                 + "\"retrySize\":2,\"parkedSize\":0,\"deadLetters\":[{\"topic\":\"a\",\"status\":\"kept\",\"count\":2},"
                 + "{\"topic\":\"a\",\"status\":\"pending\",\"count\":1},"
                 + "{\"topic\":\"b\",\"status\":\"scheduled\",\"count\":1}],"
-                + "\"orphans\":[{\"table\":\"" + orphan + "\",\"kind\":\"FOREIGN\"}],\"tailOverflow\":false,"
+                + "\"orphans\":[{\"table\":\"" + orphan + "\",\"kind\":\"foreign\"}],\"tailOverflow\":false,"
                 + "\"premade\":2,\"maintenanceSinceSuccessSeconds\":S,\"shards\":2}");
     }
 
@@ -216,7 +218,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
 
         for (var operation : List.of("redrive", "discard")) {
             for (var body : List.of("{\"ids\":[" + id + "],\"filter\":{\"topic\":\"t\"}}", "{}", "{\"filter\":{}}",
-                    "{\"filter\":{\"topic\":\" \"}}", "{\"ids\":[null]}")) {
+                    "{\"filter\":{\"topic\":\" \"}}", "{\"ids\":[null]}", "null")) {
                 var response = call("POST", "/dead-letters/" + operation, body);
 
                 assertJson(response, 400);
@@ -225,6 +227,38 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         }
         assertThat(deadIds()).containsExactly(id);
         assertThat(outboxMessageIds()).isEmpty();
+    }
+
+    /** A typo must never widen a call: {@code eror} ignored would discard every letter of the topic. */
+    @Test
+    void unknownFieldsAreRefused() throws Exception {
+        long id = letter(1, "t", "k", "boom", T0, KEPT);
+
+        for (var operation : List.of("redrive", "discard")) {
+            for (var body : List.of("{\"filter\":{\"topic\":\"t\",\"eror\":\"x\"}}",
+                    "{\"filter\":{\"topic\":\"t\"},\"limit\":1}", "{\"idz\":[1],\"filter\":{\"topic\":\"t\"}}")) {
+                var response = call("POST", "/dead-letters/" + operation, body);
+
+                assertJson(response, 400);
+                assertThat(response.body()).as(operation + " " + body).startsWith("{\"message\":\"unknown field '");
+            }
+        }
+        assertThat(deadIds()).containsExactly(id);
+        assertThat(outboxMessageIds()).isEmpty();
+    }
+
+    @Test
+    void idsAreCappedAt1000() throws Exception {
+        long id = letter(1, "t", "k", "boom", T0, KEPT);
+        var thousand = LongStream.rangeClosed(1, 1000).mapToObj(Long::toString).collect(Collectors.joining(","));
+
+        var tooMany = call("POST", "/dead-letters/discard", "{\"ids\":[" + thousand + ",1001]}");
+
+        assertJson(tooMany, 400);
+        assertThat(tooMany.body()).startsWith("{\"message\":\"at most 1000 ids");
+        assertThat(deadIds()).containsExactly(id);
+        assertThat(call("POST", "/dead-letters/discard", "{\"ids\":[" + thousand + "]}").body())
+                .isEqualTo("{\"count\":1}");
     }
 
     @Test
@@ -250,12 +284,13 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         orphanRow(orphan, 1, 10);
 
         for (var table : List.of(orphan + ";drop table " + victim, names().base() + "_x1000' or '1'='1",
-                victim, names().base())) {
+                victim, names().base(), "otherschema." + orphan)) {
             var response = call("POST", "/orphans/" + encode(table).replace("+", "%20") + "/restore?fromXid=0",
                     null);
 
             assertJson(response, 400);
-            assertThat(response.body()).as(table).startsWith("{\"message\":\"");
+            assertThat(response.body()).as("the decoded name reached the call")
+                    .startsWith("{\"message\":\"" + table + " is not ");
         }
         assertThat(exists(victim)).isTrue();
         assertThat(exists(orphan)).isTrue();
@@ -294,20 +329,27 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
             assertJson(response, 400);
             assertThat(response.body()).startsWith("{\"message\":\"limit must be within 1..1000");
         }
-        for (var query : List.of("limit=x", "afterId=x")) {
-            assertThat(call("GET", "/dead-letters?" + query, null).statusCode()).as(query).isEqualTo(400);
-        }
+        var badLimit = call("GET", "/dead-letters?limit=x", null);
+        assertJson(badLimit, 400);
+        assertThat(badLimit.body()).isEqualTo("{\"message\":\"Query parameter 'limit' has invalid value: x\"}");
+        var malformed = call("POST", "/dead-letters/discard", "not json");
+        assertJson(malformed, 400);
+        assertThat(malformed.body()).startsWith("{\"message\":\"Unrecognized token 'not'");
+
+        var rejected = new ArrayList<HttpResponse<String>>();
+        rejected.add(call("GET", "/dead-letters?afterId=x", null));
         for (var query : List.of("failedFrom=yesterday", "failedTo=2026-10-27", "status=PENDING", "status=gone")) {
-            for (var path : List.of("/dead-letters?", "/dead-letters/count?")) {
-                assertThat(call("GET", path + query, null).statusCode()).as(path + query).isEqualTo(400);
-            }
+            rejected.add(call("GET", "/dead-letters?" + query, null));
+            rejected.add(call("GET", "/dead-letters/count?" + query, null));
         }
-        assertThat(call("POST", "/orphans/" + names().base() + "_x1000/restore", null).statusCode())
-                .as("fromXid required").isEqualTo(400);
-        assertThat(call("POST", "/orphans/" + names().base() + "_x1000/restore?fromXid=x", null).statusCode())
-                .isEqualTo(400);
-        assertThat(call("POST", "/dead-letters/redrive", "{\"ids\":[\"x\"]}").statusCode()).isEqualTo(400);
-        assertThat(call("POST", "/dead-letters/discard", "not json").statusCode()).isEqualTo(400);
+        rejected.add(call("POST", "/orphans/" + names().base() + "_x1000/restore", null)); // fromXid required
+        rejected.add(call("POST", "/orphans/" + names().base() + "_x1000/restore?fromXid=x", null));
+        rejected.add(call("POST", "/dead-letters/redrive", "{\"ids\":[\"x\"]}"));
+        rejected.add(call("POST", "/dead-letters/redrive", null));
+        for (var response : rejected) {
+            assertJson(response, 400);
+            assertThat(response.body()).as(response.uri().toString()).startsWith("{\"message\":\"");
+        }
         assertThat(deadIds()).containsExactly(id);
     }
 
@@ -324,7 +366,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         }
 
         assertThat(response.statusCode()).isEqualTo(500);
-        assertThat(log).contains("outbox admin GET " + API + "/dead-letters/count by tester: 500");
+        assertThat(log).contains("outbox admin GET \"" + API + "/dead-letters/count\" by tester: 500");
     }
 
     // ---------------------------------------------------------------------------------------------------- fixtures

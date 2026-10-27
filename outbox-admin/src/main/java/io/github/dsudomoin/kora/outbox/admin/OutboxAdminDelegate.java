@@ -57,11 +57,14 @@ import java.util.function.Supplier;
 
 /**
  * The admin API over {@link OutboxAdmin}: an {@link IllegalArgumentException} of a call answers 400, an
- * {@link IllegalStateException} 409, both with its message; anything else is the HTTP server's 500.
+ * {@link IllegalStateException} 409, both with its message; anything else is the HTTP server's 500. Enums are mapped
+ * by exhaustive {@code switch}, so a constant added on either side fails the build instead of a request.
  */
 public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
 
     private static final int DEFAULT_LIMIT = 100;
+    /** As the contract's {@code maxItems}: the library binds every id in each chunk's query. */
+    private static final int MAX_IDS = 1000;
 
     private final OutboxAdmin admin;
 
@@ -97,7 +100,7 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
     }
 
     @Override
-    public RedriveDeadLettersApiResponse redriveDeadLetters(Selection selection) {
+    public RedriveDeadLettersApiResponse redriveDeadLetters(@Nullable Selection selection) {
         return call(() -> {
             var ids = ids(selection);
             long n = ids != null ? admin.redriveDeadLetters(ids) : admin.redriveDeadLetters(filter(selection.filter()));
@@ -106,7 +109,7 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
     }
 
     @Override
-    public DiscardDeadLettersApiResponse discardDeadLetters(Selection selection) {
+    public DiscardDeadLettersApiResponse discardDeadLetters(@Nullable Selection selection) {
         return call(() -> {
             var ids = ids(selection);
             long n = ids != null ? admin.discardDeadLetters(ids) : admin.discardDeadLetters(filter(selection.filter()));
@@ -143,14 +146,19 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
 
     /** The ids, or null for the filter: exactly one of them. */
     @Nullable
-    private static List<Long> ids(Selection selection) {
-        if ((selection.ids() == null) == (selection.filter() == null)) {
+    private static List<Long> ids(@Nullable Selection selection) {
+        if (selection == null || (selection.ids() == null) == (selection.filter() == null)) {
             throw new IllegalArgumentException("give exactly one of ids and filter");
         }
-        if (selection.ids() != null && selection.ids().stream().anyMatch(Objects::isNull)) {
+        var ids = selection.ids();
+        if (ids != null && ids.size() > MAX_IDS) {
+            throw new IllegalArgumentException("at most " + MAX_IDS + " ids, not " + ids.size()
+                    + ": select more with a filter");
+        }
+        if (ids != null && ids.stream().anyMatch(Objects::isNull)) {
             throw new IllegalArgumentException("ids must be numbers, not null");
         }
-        return selection.ids();
+        return ids;
     }
 
     private static DeadLetterFilter filter(Filter f) {
@@ -162,14 +170,22 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
             @Nullable DeadLetterStatus status) {
         return new DeadLetterFilter(topic, key == null ? null : key.getBytes(UTF_8), error,
                 failedFrom == null ? null : failedFrom.toInstant(), failedTo == null ? null : failedTo.toInstant(),
-                status == null ? null : io.github.dsudomoin.kora.outbox.DeadLetter.Status.valueOf(status.name()));
+                status == null ? null : letterStatus(status));
+    }
+
+    private static io.github.dsudomoin.kora.outbox.DeadLetter.Status letterStatus(DeadLetterStatus status) {
+        return switch (status) {
+            case PENDING -> io.github.dsudomoin.kora.outbox.DeadLetter.Status.PENDING;
+            case KEPT -> io.github.dsudomoin.kora.outbox.DeadLetter.Status.KEPT;
+            case SCHEDULED -> io.github.dsudomoin.kora.outbox.DeadLetter.Status.SCHEDULED;
+        };
     }
 
     private static Status status(OutboxStatus s) {
         return new Status(s.halted(), s.lagSeconds(), s.retrySize(), s.parkedSize(),
                 s.deadLetters().stream().map(c -> new DeadLetterCount(c.topic(), status(c.status()), c.count()))
                         .toList(),
-                s.orphans().stream().map(o -> new Orphan(o.table(), OrphanKind.valueOf(o.kind().name()))).toList(),
+                s.orphans().stream().map(o -> new Orphan(o.table(), kind(o.kind()))).toList(),
                 s.tailOverflow(), s.premade(), s.xidsLeft(), s.maintenanceSinceSuccessSeconds(), s.shards());
     }
 
@@ -181,7 +197,19 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
     }
 
     private static DeadLetterStatus status(io.github.dsudomoin.kora.outbox.DeadLetter.Status status) {
-        return DeadLetterStatus.valueOf(status.name());
+        return switch (status) {
+            case PENDING -> DeadLetterStatus.PENDING;
+            case KEPT -> DeadLetterStatus.KEPT;
+            case SCHEDULED -> DeadLetterStatus.SCHEDULED;
+        };
+    }
+
+    private static OrphanKind kind(OutboxStatus.OrphanKind kind) {
+        return switch (kind) {
+            case DETACHED_BY_LIBRARY -> OrphanKind.DETACHED_BY_LIBRARY;
+            case FOREIGN -> OrphanKind.FOREIGN;
+            case SET_ASIDE -> OrphanKind.SET_ASIDE;
+        };
     }
 
     private static OffsetDateTime utc(Instant instant) {
