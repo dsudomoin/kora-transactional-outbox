@@ -47,6 +47,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
@@ -117,6 +118,8 @@ class OperationsUnderLoadIT {
     private final AtomicReference<Sent> holderSent = new AtomicReference<>();
     /** Writers do not send {@link #HELD} meanwhile: they would queue behind the holder. */
     private volatile boolean skipHeld;
+    /** Writers' sends of {@link #HELD} in progress, counted before they read {@link #skipHeld}. */
+    private final AtomicInteger heldSends = new AtomicInteger();
     private TableNames names;
     private PgOutbox outbox;
     private OutboxRelay relay;
@@ -165,11 +168,17 @@ class OperationsUnderLoadIT {
             restoreStarted = System.nanoTime();
             maintenanceLock(pause, "pg_advisory_unlock");
 
+            // a run may also give up in the first chunk, on a writer's key, moving nothing: wait for one that gave up
+            // once the first chunk was in, which stayed moved, so the next run resumes, not restarts
             var failed = failedRuns(orphan);
-            await(FIRST_FAILURE_CAP, "a maintenance run giving up on " + HELD, () -> failed.matcher(log.text()).find());
+            var before = new AtomicLong(-1); // failed runs logged before the first chunk was seen in
+            await(FIRST_FAILURE_CAP, "a maintenance run giving up on " + HELD + " past the first chunk", () -> {
+                // read before the count, which waits for a chunk in progress
+                long failures = failed.matcher(log.text()).results().count();
+                return remaining(orphan) == ORPHAN_ROWS - CHUNK && !before.compareAndSet(-1, failures)
+                        && failures > before.get();
+            });
             firstFailure = System.nanoTime() - restoreStarted;
-            assertThat(remaining(orphan)).as("the first chunk stayed moved: the next run resumes, not restarts")
-                    .isEqualTo(ORPHAN_ROWS - CHUNK);
             release.countDown();
             holder.join(BOUND.toMillis());
             skipHeld = false;
@@ -186,9 +195,9 @@ class OperationsUnderLoadIT {
                     + names.unqualified(orphan.table()) + "'")).as("its <base>_dropping marker").isZero();
         }
 
-        var delivered = finish("oursOrphanIsRestoredUnderLoad", failed.size() + " maintenance runs gave up on " + HELD
-                + ", the first after " + TimeUnit.NANOSECONDS.toMillis(firstFailure) + " ms, then one restored the rest"
-                + " of " + orphan.rows().size() + " rows");
+        var delivered = finish("oursOrphanIsRestoredUnderLoad", failed.size() + " maintenance runs gave up, one past"
+                + " the first chunk seen " + TimeUnit.NANOSECONDS.toMillis(firstFailure) + " ms in, then one restored"
+                + " the rest of " + orphan.rows().size() + " rows");
 
         assertThat(Duration.ofNanos(maxLatency.get())).as("the slowest writer transaction").isLessThan(WRITER_BOUND);
         assertPutBackInOrder(delivered, orphan.rows().stream().collect(Collectors.toMap(r -> r, r -> restoreStarted)));
@@ -203,8 +212,8 @@ class OperationsUnderLoadIT {
         Orphan orphan;
         long restoreStarted;
         long firstFailure;
-        int calls = 1;
-        int failedCalls = 1;
+        int calls = 0;
+        int failedCalls = 0;
         try (var pause = TestDb.connect(); var c = TestDb.connect(); var pin = TestDb.connect()) {
             maintenanceLock(pause, "pg_advisory_lock");
             var range = relayedRange(c, pin);
@@ -218,21 +227,32 @@ class OperationsUnderLoadIT {
 
             var holder = holdKey();
             restoreStarted = System.nanoTime();
-            var first = CompletableFuture.supplyAsync(() -> admin.restoreOrphan(orphan.table(), orphan.from()));
-            Throwable failure = null;
-            try {
-                first.get(FIRST_FAILURE_CAP.toMillis(), TimeUnit.MILLISECONDS);
-            } catch (ExecutionException e) {
-                failure = e.getCause();
-            } catch (TimeoutException e) {
-                throw new AssertionError("the first restoreOrphan call did not give up on " + HELD + " within "
-                        + FIRST_FAILURE_CAP, e);
+            // a call may also give up in the first chunk, on a writer's key, moving nothing: call until one gave up
+            // past it, which stayed moved, so the next call resumes, not restarts
+            long cap = restoreStarted + FIRST_FAILURE_CAP.toNanos();
+            while (true) {
+                calls++;
+                var call = CompletableFuture.supplyAsync(() -> admin.restoreOrphan(orphan.table(), orphan.from()));
+                Throwable failure = null;
+                try {
+                    call.get(Math.max(0, cap - System.nanoTime()), TimeUnit.NANOSECONDS);
+                } catch (ExecutionException e) {
+                    failure = e.getCause();
+                } catch (TimeoutException e) {
+                    throw new AssertionError("restoreOrphan did not give up on " + HELD + " within "
+                            + FIRST_FAILURE_CAP + ", call " + calls, e);
+                }
+                assertThat(failure).as("call %d, while %s is held", calls, HELD).isInstanceOfSatisfying(
+                        RuntimeSqlException.class, OperationsUnderLoadIT::assertLockNotAvailable);
+                failedCalls++;
+                long left = remaining(orphan);
+                assertThat(left).as("rows left after call %d", calls)
+                        .isIn((long) ORPHAN_ROWS, (long) (ORPHAN_ROWS - CHUNK));
+                if (left == ORPHAN_ROWS - CHUNK) {
+                    break;
+                }
             }
             firstFailure = System.nanoTime() - restoreStarted;
-            assertThat(failure).as("the first call, past a chunk, meets " + HELD)
-                    .isInstanceOfSatisfying(RuntimeSqlException.class, OperationsUnderLoadIT::assertLockNotAvailable);
-            assertThat(remaining(orphan)).as("the first chunk stayed moved: the next call resumes, not restarts")
-                    .isEqualTo(ORPHAN_ROWS - CHUNK);
             release.countDown();
             holder.join(BOUND.toMillis());
             skipHeld = false;
@@ -252,8 +272,8 @@ class OperationsUnderLoadIT {
         await(BOUND, "the orphan gauge back to 0", () -> gauge("outbox.partitions.orphaned") == 0);
 
         var delivered = finish("foreignOrphanIsRestoredByTheAdminUnderLoad", calls + " restoreOrphan calls, "
-                + failedCalls + " gave up (the first after " + TimeUnit.NANOSECONDS.toMillis(firstFailure) + " ms),"
-                + " restored " + orphan.rows().size() + " rows");
+                + failedCalls + " gave up (one past the first chunk " + TimeUnit.NANOSECONDS.toMillis(firstFailure)
+                + " ms in), restored " + orphan.rows().size() + " rows");
 
         assertThat(Duration.ofNanos(maxLatency.get())).as("the slowest writer transaction").isLessThan(WRITER_BOUND);
         assertPutBackInOrder(delivered, orphan.rows().stream().collect(Collectors.toMap(r -> r, r -> restoreStarted)));
@@ -278,6 +298,7 @@ class OperationsUnderLoadIT {
         }
         assertThat(db.inTx((SqlFunction0<Set<UUID>>) () -> inbox.tryAcceptAll(before))).hasSize(before.size());
         pools.get(1).addAll(before);
+        var detachIssued = new AtomicLong(Long.MAX_VALUE); // just before the detach statement
         var attachedSeen = new AtomicLong(Long.MAX_VALUE); // when the test saw it attached again
         var tolerated = new AtomicLong();
         for (int i = 0; i < WRITERS; i++) {
@@ -289,8 +310,12 @@ class OperationsUnderLoadIT {
                     boolean redelivered = random.nextBoolean() && !pool.isEmpty();
                     var id = redelivered ? pool.get(random.nextInt(pool.size())) : v7(range == 0 ? current : detached);
                     long started = System.nanoTime();
+                    var issued = new long[1];
                     try {
-                        boolean accepted = db.inTx((SqlFunction0<Boolean>) () -> inbox.tryAccept(id));
+                        boolean accepted = db.inTx((SqlFunction0<Boolean>) () -> {
+                            issued[0] = System.nanoTime(); // its insert, which the detach makes fail
+                            return inbox.tryAccept(id);
+                        });
                         commits.incrementAndGet();
                         if (accepted == redelivered) {
                             errors.add(new AssertionError((redelivered ? "a recorded id accepted again: "
@@ -300,8 +325,8 @@ class OperationsUnderLoadIT {
                         }
                     } catch (RuntimeSqlException e) {
                         // no partition takes an id of the detached range (documented) until the attach
-                        if (range == 1 && started < attachedSeen.get() && e.getCause() instanceof SQLException s
-                                && NO_PARTITION.equals(s.getSQLState())) {
+                        if (range == 1 && issued[0] >= detachIssued.get() && issued[0] < attachedSeen.get()
+                                && e.getCause() instanceof SQLException s && NO_PARTITION.equals(s.getSQLState())) {
                             tolerated.incrementAndGet();
                         } else {
                             errors.add(e);
@@ -320,6 +345,7 @@ class OperationsUnderLoadIT {
             var lock = "(" + TableNames.of(table).resolve(c).internalNamespace() + ", "
                     + TableNames.LOCK_INBOX_MAINTENANCE + ")";
             execute(pause, "select pg_advisory_lock" + lock); // after the run in progress, if any
+            detachIssued.set(System.nanoTime());
             execute(c, "alter table " + table + " detach partition " + detached.name() + " concurrently");
             assertThat(PartitionDdl.listRanges(c, table)).doesNotContain(detached);
             long during = commits.get();
@@ -332,7 +358,7 @@ class OperationsUnderLoadIT {
         await(BOUND, "load after the attach", () -> commits.get() >= attached + 1000);
         stopLoad();
         System.out.printf("OperationsUnderLoadIT inboxOrphanIsAttachedBackUnderLoad: %d writer commits, %d ids"
-                + " recorded, %d inserts into the detached range failed (23514) before the attach, the slowest %.1f"
+                + " recorded, %d inserts into the detached range failed (23514) until the attach, the slowest %.1f"
                 + " ms%n", commits.get(), pools.get(0).size() + pools.get(1).size(), tolerated.get(),
                 maxLatency.get() / 1e6);
 
@@ -429,8 +455,13 @@ class OperationsUnderLoadIT {
             run("writer-" + i, () -> {
                 while (!stopping.get()) {
                     var key = "k" + ThreadLocalRandom.current().nextInt(KEYS);
-                    if (skipHeld && key.equals(HELD)) {
-                        continue;
+                    boolean held = key.equals(HELD);
+                    if (held) {
+                        heldSends.incrementAndGet(); // first: holdKey sees this send, or this writer sees skipHeld
+                        if (skipHeld) {
+                            heldSends.decrementAndGet();
+                            continue;
+                        }
                     }
                     long started = System.nanoTime();
                     try {
@@ -442,6 +473,10 @@ class OperationsUnderLoadIT {
                         commits.incrementAndGet();
                     } catch (RuntimeException e) {
                         errors.add(e);
+                    } finally {
+                        if (held) {
+                            heldSends.decrementAndGet();
+                        }
                     }
                 }
             });
@@ -451,11 +486,12 @@ class OperationsUnderLoadIT {
 
     /**
      * Sends {@link #HELD} in a transaction that stays open until {@link #release}, as a business transaction that sent
-     * the key and goes on working; writers skip the key from now on. Returns once it holds the key lock. Its
-     * {@link Sent} is recorded after its commit; its wait is no writer's latency.
+     * the key and goes on working; writers skip the key from now on, and it starts once none is sending it. Returns
+     * once it holds the key lock. Its {@link Sent} is recorded after its commit; its wait is no writer's latency.
      */
-    private Thread holdKey() throws InterruptedException {
+    private Thread holdKey() throws Exception {
         skipHeld = true;
+        await(BOUND, "writers done with their sends of " + HELD, () -> heldSends.get() == 0);
         var holding = new CountDownLatch(1);
         var holder = run("key-holder", () -> {
             var id = db.inTx((SqlFunction0<UUID>) () -> {
