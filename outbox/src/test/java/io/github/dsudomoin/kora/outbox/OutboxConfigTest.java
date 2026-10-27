@@ -120,6 +120,10 @@ class OutboxConfigTest {
                 "outbox.deadLetters.retention must not be negative: PT-0.001S");
         assertRejected("outbox.deadLetters.redriveHistory = 0ms",
                 "outbox.deadLetters.redriveHistory must be positive: PT0S");
+        assertRejected("outbox.deadLetters.retention = 3651d",
+                "outbox.deadLetters.retention must be at most 3650d: PT87624H");
+        assertRejected("outbox.deadLetters.redriveHistory = 3651d",
+                "outbox.deadLetters.redriveHistory must be at most 3650d: PT87624H");
     }
 
     @Test

@@ -10,6 +10,7 @@ import io.github.dsudomoin.kora.outbox.OutboxMessage;
 import io.github.dsudomoin.kora.outbox.OutboxRecord;
 import io.github.dsudomoin.kora.outbox.OutboxRelay;
 import io.github.dsudomoin.kora.outbox.Outcome;
+import io.github.dsudomoin.kora.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
 import io.github.dsudomoin.kora.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.kora.outbox.internal.OutboxSchema;
@@ -269,7 +270,8 @@ class KafkaEndToEndIT {
         schema = new OutboxSchema(db, config);
         schema.init();
         relay = new OutboxRelay(db, config, schema, handler, metrics, tracer,
-                new Maintenance(db, schema.names(), config, metrics));
+                new Maintenance(db, schema.names(), config, metrics),
+                new DeadLetterPass(db, schema.names(), config, null, metrics));
         relay.init();
         outbox = new PgOutbox(db, schema, config.shards(), relay::wake, metrics);
     }

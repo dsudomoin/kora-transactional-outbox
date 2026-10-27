@@ -1053,7 +1053,8 @@ class MaintenanceIT {
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
         assertThat(registry.getMeters()).extracting(m -> m.getId().getName()).containsExactlyInAnyOrder(
                 "outbox.shard.lag", "outbox.retry.size", "outbox.dead.size", "outbox.dead.pending",
-                "outbox.dead.pending.oldest", "outbox.parked.size", "outbox.partitions.premade", "outbox.partitions.overflow", "outbox.partitions.xids_left",
+                "outbox.dead.pending.oldest", "outbox.parked.size", "outbox.partitions.premade",
+                "outbox.partitions.overflow", "outbox.partitions.xids_left",
                 "outbox.partitions.orphaned", "outbox.maintenance.transaction_pooling",
                 "outbox.maintenance.since_success");
         var handler = new RecordingHandler()
@@ -1195,7 +1196,8 @@ class MaintenanceIT {
     }
 
     private OutboxRelay relay(OutboxHandler handler, Maintenance maintenance) {
-        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance);
+        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance,
+                new DeadLetterPass(db, schema.names(), config, null, new OutboxMetrics(null)));
         relays.add(relay);
         return relay;
     }

@@ -5,6 +5,7 @@ import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryLong;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.dsudomoin.kora.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
 import io.github.dsudomoin.kora.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.kora.outbox.internal.OutboxSchema;
@@ -265,7 +266,8 @@ class TailSwapIT {
                 }
                 return recording.handleBatch(records);
             }
-        }, new OutboxMetrics(null), null, maintenance);
+        }, new OutboxMetrics(null), null, maintenance, new DeadLetterPass(db, names, config, null,
+                new OutboxMetrics(null)));
         var outbox = new PgOutbox(db, schema, config.shards(), relay::wake, new OutboxMetrics(null));
         for (int i = 0; i < WRITERS; i++) {
             run("tail-swap-writer-" + i, () -> {

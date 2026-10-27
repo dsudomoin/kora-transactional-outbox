@@ -42,7 +42,8 @@ repo.
 - **Shards** (default 32): one worker per shard at a time; parallelism = min(shards, instances × workers).
   A shard with new rows costs a step per tick (DB CPU, 1/32 shards: 10/20 % at 100 msg/s, 26/81 % at 1k):
   4–8 suit low traffic. Changing `outbox.shards` needs an empty outbox («Решардинг»).
-- **Workers** (default 4): each holds a connection while working; `db.maxPoolSize` ≥ own peak + workers + 2.
+- **Workers** (default 4): each holds a connection while working; `db.maxPoolSize` ≥ own peak + workers + 3 (the
+  two maintenance runs and the dead-letter thread, which holds one for its whole run), + 1 while `drain()` runs.
 - **Idle cost** («Стоимость простоя»): about `1 / idlePollInterval + shards / 5` write transactions per second per
   cluster (11.4 with defaults); a larger `idlePollInterval` idles cheaper.
 - **premake** («Партиции»): `premake / 2 × xidsPerPartition ≥ peak xid/s × longest snapshot seconds`.

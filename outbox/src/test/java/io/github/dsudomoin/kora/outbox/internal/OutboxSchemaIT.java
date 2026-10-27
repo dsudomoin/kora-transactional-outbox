@@ -387,6 +387,7 @@ class OutboxSchemaIT {
     @Test
     void relayAndEnqueueRejectBadConfigWithTheSameMessages() {
         var schema = new OutboxSchema(db, config); // not initialized: their checks come first
+        var valid = new DeadLetterPass(db, TableNames.of(config.table()), config, null, new OutboxMetrics(null));
         List<Map.Entry<String, Consumer<TestOutboxConfig>>> cases = List.of(
                 Map.entry("outbox.relay.workers", c -> c.workers(0)),
                 Map.entry("outbox.relay.minTickInterval", c -> c.minTickInterval(Duration.ofMillis(-1))),
@@ -398,7 +399,7 @@ class OutboxSchemaIT {
             e.getValue().accept(invalid);
 
             assertThatThrownBy(() -> new OutboxRelay(db, invalid, schema, new RecordingHandler(),
-                    new OutboxMetrics(null), null, null))
+                    new OutboxMetrics(null), null, null, valid))
                     .as(e.getKey())
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageStartingWith(e.getKey() + " ");

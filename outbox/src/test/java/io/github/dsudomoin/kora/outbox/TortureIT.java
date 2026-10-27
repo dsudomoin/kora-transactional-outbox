@@ -8,6 +8,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier;
 import io.github.dsudomoin.kora.outbox.internal.Cursors;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
+import io.github.dsudomoin.kora.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.kora.outbox.internal.Hashing;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
 import io.github.dsudomoin.kora.outbox.internal.OutboxMetrics;
@@ -140,7 +141,8 @@ class TortureIT {
 
         for (int i = 0; i < 3; i++) {
             var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null,
-                    new Maintenance(db, names, config, new OutboxMetrics(null)));
+                    new Maintenance(db, names, config, new OutboxMetrics(null)),
+                    new DeadLetterPass(db, names, config, null, new OutboxMetrics(null)));
             relays.add(relay);
             relay.init();
         }

@@ -48,6 +48,8 @@ public final class OutboxSchema implements Lifecycle {
     /** {@code LOCK_TIMEOUT} each: a minute for other instances' bootstraps, which take milliseconds each. */
     private static final int SCHEMA_LOCK_ATTEMPTS = 12;
     private static final String LOCK_NOT_AVAILABLE = "55P03";
+    /** Bound of {@code deadLetters.retention} and {@code redriveHistory}: 10 years, an age maintenance compares. */
+    private static final Duration MAX_DEAD_LETTER_AGE = Duration.ofDays(3650);
 
     private final JdbcConnectionFactory db;
     private final OutboxConfig config;
@@ -122,8 +124,12 @@ public final class OutboxSchema implements Lifecycle {
                 "outbox.deadLetters.timeout must be positive: " + deadLetters.timeout());
         require(!deadLetters.retention().isNegative(),
                 "outbox.deadLetters.retention must not be negative: " + deadLetters.retention());
+        require(deadLetters.retention().compareTo(MAX_DEAD_LETTER_AGE) <= 0,
+                "outbox.deadLetters.retention must be at most 3650d: " + deadLetters.retention());
         require(deadLetters.redriveHistory().compareTo(Duration.ZERO) > 0,
                 "outbox.deadLetters.redriveHistory must be positive: " + deadLetters.redriveHistory());
+        require(deadLetters.redriveHistory().compareTo(MAX_DEAD_LETTER_AGE) <= 0,
+                "outbox.deadLetters.redriveHistory must be at most 3650d: " + deadLetters.redriveHistory());
         var recovery = config.recovery();
         require(recovery.xidRegression().equals("auto") || recovery.xidRegression().equals("halt"),
                 "outbox.recovery.xidRegression must be auto or halt: " + recovery.xidRegression());

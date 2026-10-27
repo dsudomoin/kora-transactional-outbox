@@ -642,7 +642,8 @@ class XidRecoveryIT {
     }
 
     private OutboxRelay relay(OutboxHandler handler, Maintenance maintenance) {
-        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance);
+        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance,
+                new DeadLetterPass(db, schema.names(), config, null, new OutboxMetrics(null)));
         relays.add(relay);
         return relay;
     }

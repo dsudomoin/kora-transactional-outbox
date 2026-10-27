@@ -406,7 +406,7 @@ public final class Maintenance {
     /** {@code delete} with the one parameter: {@code age} in seconds; returns the rows deleted. */
     private static int deleteOlder(Connection c, String delete, Duration age) throws SQLException {
         try (var ps = c.prepareStatement(delete)) {
-            ps.setDouble(1, age.getSeconds() + age.getNano() / 1e9); // no overflow, whatever the config says
+            ps.setDouble(1, age.toNanos() / 1e9);
             return ps.executeUpdate();
         }
     }

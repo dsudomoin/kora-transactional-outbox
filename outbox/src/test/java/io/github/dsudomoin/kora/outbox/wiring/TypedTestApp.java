@@ -17,7 +17,8 @@ import ru.tinkoff.kora.json.common.annotation.Json;
 
 /**
  * JSON template and an explicit serializer in one app: compiles only if Kora prefers the explicit
- * {@code OutboxSerializer<Custom>} over the template, although {@code Custom} is {@code @Json} too.
+ * {@code OutboxSerializer<Custom>} over the template, although {@code Custom} is {@code @Json} too. It has no
+ * dead-letter hook component.
  */
 @KoraApp
 public interface TypedTestApp extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, OutboxJsonModule,

@@ -195,7 +195,7 @@ public interface OutboxConfig {
 
         /**
          * Kept letters older than this, by their {@code failed_at}, are deleted by maintenance; 0 = kept forever, the
-         * default. Letters still pending for the hook are never deleted.
+         * default; at most 3650 days. Letters still pending for the hook are never deleted.
          */
         default Duration retention() {
             return Duration.ZERO;
@@ -203,7 +203,7 @@ public interface OutboxConfig {
 
         /**
          * How long the count of a message's redrives is remembered, so a redriven message that dies again carries
-         * it. Default 30 days.
+         * it. Default 30 days, at most 3650 days.
          */
         default Duration redriveHistory() {
             return Duration.ofDays(30);

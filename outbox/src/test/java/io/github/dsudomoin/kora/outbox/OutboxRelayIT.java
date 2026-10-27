@@ -49,6 +49,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.stream.IntStream;
@@ -219,14 +220,14 @@ class OutboxRelayIT {
                     if (sql.contains("pg_try_advisory_lock(")) { // a maintenance run
                         runs.incrementAndGet();
                     }
-                }))));
+                })), noHook(db)));
         relays.get(0).init();
         await(Duration.ofSeconds(5), () -> runs.get() == 1);
 
         config.relayEnabled(false);
         var disabled = new AtomicInteger();
         relays.add(new OutboxRelay(db, config, schema, new RecordingHandler(), new OutboxMetrics(null), null,
-                maintenance(observed(sql -> disabled.incrementAndGet()))));
+                maintenance(observed(sql -> disabled.incrementAndGet())), noHook(db)));
         relays.get(1).init();
         relays.get(1).release();
         assertThat(disabled).hasValue(0);
@@ -262,7 +263,7 @@ class OutboxRelayIT {
         };
         try (var err = new CapturedStderr()) {
             relays.add(new OutboxRelay(db, config, schema, new RecordingHandler(), new OutboxMetrics(null), null,
-                    maintenance(failing)));
+                    maintenance(failing), noHook(db)));
             relays.get(0).init();
 
             // the scheduler swallows what a run throws and silently cancels all later runs: only the log tells
@@ -398,18 +399,24 @@ class OutboxRelayIT {
     void aHangingHookDoesNotDelayDelivery() throws Exception {
         config.deadLettersTimeout(Duration.ofMinutes(1)); // the call is never cut while the test runs
         bootstrap();
-        var withoutHook = new ConcurrentHashMap<String, Long>();
-        var plain = relay(record -> withoutHook.put(payload(record), System.nanoTime()));
+        var delivered = new AtomicReference<Map<String, Long>>();
+        OutboxHandler handler = record -> {
+            if ("poison".equals(key(record))) { // its step wakes the dead-letter thread
+                throw new OutboxPermanentException("bad payload");
+            }
+            delivered.get().put(payload(record), System.nanoTime());
+        };
+        var plain = relay(handler);
         plain.init();
         awaitParked();
-        var baseline = p99(deliveryDelays(outbox(plain::wake), withoutHook));
+        deliveryDelays(outbox(plain::wake), delivered, "warm-up");
+        var baseline = p99(deliveryDelays(outbox(plain::wake), delivered, "baseline"));
         plain.release();
 
         var entered = new CountDownLatch(1);
         var never = new CountDownLatch(1);
-        var withHook = new ConcurrentHashMap<String, Long>();
         pendingLetter("dead");
-        var relay = relay(record -> withHook.put(payload(record), System.nanoTime()), letters -> {
+        var relay = relay(handler, letters -> {
             entered.countDown();
             never.await(); // until release() interrupts it
             return List.of();
@@ -417,8 +424,10 @@ class OutboxRelayIT {
         relay.init();
         assertThat(entered.await(5, TimeUnit.SECONDS)).as("the hook hangs").isTrue();
         awaitParked();
-        var hanging = p99(deliveryDelays(outbox(relay::wake), withHook));
+        var hanging = p99(deliveryDelays(outbox(relay::wake), delivered, "hanging"));
 
+        assertThat(rows(schema.names().dead() + " where status = 'pending' and key = 'poison'::bytea"))
+                .as("the run's own letter, waiting behind the hanging call").isEqualTo(1);
         // 20 ms on top of 2×: scheduler noise of a run of a few seconds on a shared machine
         assertThat(hanging).as("p99 with a hanging hook, %s without", baseline)
                 .isLessThanOrEqualTo(baseline.multipliedBy(2).plusMillis(20));
@@ -485,29 +494,83 @@ class OutboxRelayIT {
         bootstrap();
         pendingLetter("a");
         var entered = new CountDownLatch(1);
+        var done = new CountDownLatch(1); // ends the hook, which no interrupt does, before later tests run
         var relay = relay(new RecordingHandler(), letters -> {
             entered.countDown();
-            long until = System.nanoTime() + TimeUnit.MINUTES.toNanos(1);
-            while (System.nanoTime() < until) {
+            while (true) {
                 try {
-                    Thread.sleep(100);
+                    if (done.await(1, TimeUnit.MINUTES)) {
+                        return List.of();
+                    }
                 } catch (InterruptedException ignored) {
                     // a hook that will not stop
                 }
             }
-            return List.of();
         });
-        relay.init();
-        assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+        try {
+            relay.init();
+            assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
 
-        long releasing = System.nanoTime();
-        relay.release();
+            long releasing = System.nanoTime();
+            relay.release();
 
-        assertThat(Duration.ofNanos(System.nanoTime() - releasing)).isLessThan(Duration.ofSeconds(2));
-        assertThat(deadLetterThreads()).isEmpty();
-        try (var c = TestDb.connect()) {
-            assertThat(queryString(c, "select status || '/' || handler_attempts from " + schema.names().dead()))
-                    .as("no attempt spent").isEqualTo("pending/0");
+            assertThat(Duration.ofNanos(System.nanoTime() - releasing)).isLessThan(Duration.ofSeconds(2));
+            assertThat(deadLetterThreads()).isEmpty();
+            try (var c = TestDb.connect()) {
+                assertThat(queryString(c, "select status || '/' || handler_attempts from " + schema.names().dead()))
+                        .as("no attempt spent").isEqualTo("pending/0");
+            }
+        } finally {
+            done.countDown();
+        }
+    }
+
+    @Test
+    void drainFitsThePoolBudgetBesideAHangingHookAndBusyWorkers() throws Exception {
+        config.workers(2).deadLettersTimeout(Duration.ofSeconds(2)); // each hanging call is cut after 2 s
+        bootstrap();
+        // README: relay.workers + 3 (the two maintenance runs, the dead-letter thread's run), + 1 while drain() runs
+        var tight = TestDb.newDatabase(config.workers() + 3 + 1);
+        var peaks = new ConcurrentHashMap<Thread, Integer>();
+        var factory = tracking(tight, peaks);
+        var entered = new CountDownLatch(1);
+        var done = new CountDownLatch(1);
+        var metrics = new OutboxMetrics(null);
+        OutboxHandler slow = record -> {
+            if ("poison".equals(key(record))) {
+                throw new OutboxPermanentException("bad payload");
+            }
+            Thread.sleep(20);
+        };
+        var relay = new OutboxRelay(factory, config, schema, slow, metrics, null, maintenance(db),
+                new DeadLetterPass(factory, schema.names(), config, letters -> {
+                    entered.countDown();
+                    done.await(); // until the call is cut
+                    return List.of();
+                }, metrics));
+        relays.add(relay);
+        // stand-ins for an outbox and an inbox maintenance run, at the same time
+        try (var outboxMaintenance = tight.newConnection(); var inboxMaintenance = tight.newConnection()) {
+            relay.init();
+            var outbox = outbox(relay::wake);
+            send(outbox, msg("t", "poison", "p"));
+            assertThat(entered.await(10, TimeUnit.SECONDS)).as("the hook hangs, holding a connection").isTrue();
+            send(outbox, IntStream.range(0, 100).mapToObj(i -> msg("t", "k" + i % 20, "m" + i))
+                    .toArray(OutboxMessage[]::new)); // the workers are busy for about a second
+
+            var drainer = new AtomicReference<Thread>();
+            var drain = CompletableFuture.supplyAsync(() -> {
+                drainer.set(Thread.currentThread());
+                return relay.drain();
+            });
+
+            drain.get(30, TimeUnit.SECONDS);
+            assertThat(peaks.get(drainer.get())).as("connections drain() held at once").isOne();
+            assertThat(peaks.values()).as("no thread of the relay holds two").allMatch(n -> n == 1);
+        } finally {
+            done.countDown();
+            relay.release();
+            tight.release();
         }
     }
 
@@ -836,7 +899,8 @@ class OutboxRelayIT {
         send(outbox(() -> {}), msg("boom", keyOnShard(0, "boom", "x"), "boom")); // every step of shard 0 fails
         var handler = new RecordingHandler();
         try (var err = new CapturedStderr()) {
-            var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), failing, maintenance(db));
+            var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), failing, maintenance(db),
+                    noHook(db));
             relays.add(relay);
             relay.init();
 
@@ -1104,7 +1168,8 @@ class OutboxRelayIT {
         }
         var maintenance = maintenance(db);
         var handler = new RecordingHandler();
-        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance);
+        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance,
+                noHook(db));
         relays.add(relay);
         relay.init();
         await(Duration.ofSeconds(10), () -> IntStream.range(0, config.shards())
@@ -1317,9 +1382,52 @@ class OutboxRelayIT {
     }
 
     private OutboxRelay relay(JdbcConnectionFactory factory, OutboxHandler handler) {
-        var relay = new OutboxRelay(factory, config, schema, handler, new OutboxMetrics(null), null, maintenance(db));
+        var relay = new OutboxRelay(factory, config, schema, handler, new OutboxMetrics(null), null, maintenance(db),
+                noHook(factory));
         relays.add(relay);
         return relay;
+    }
+
+    /** {@code pool}, recording per thread the most connections it held at once. */
+    private static JdbcConnectionFactory tracking(JdbcDatabase pool, Map<Thread, Integer> peaks) {
+        var open = new ConcurrentHashMap<Thread, AtomicInteger>();
+        return new JdbcConnectionFactory() {
+            @Override
+            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
+                return pool.withConnection(callback);
+            }
+
+            @Override
+            public Connection currentConnection() {
+                return pool.currentConnection();
+            }
+
+            @Override
+            public Connection newConnection() {
+                var c = pool.newConnection();
+                var thread = Thread.currentThread();
+                var count = open.computeIfAbsent(thread, t -> new AtomicInteger());
+                peaks.merge(thread, count.incrementAndGet(), Math::max);
+                var closed = new AtomicBoolean();
+                return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                        new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                            if (method.getName().equals("close") && closed.compareAndSet(false, true)) {
+                                count.decrementAndGet();
+                            }
+                            return invoke(method, c, args);
+                        });
+            }
+
+            @Override
+            public DataBaseTelemetry telemetry() {
+                return pool.telemetry();
+            }
+        };
+    }
+
+    /** A dead-letter pass without a hook: every dead letter is kept. */
+    private DeadLetterPass noHook(JdbcConnectionFactory factory) {
+        return new DeadLetterPass(factory, schema.names(), config, null, new OutboxMetrics(null));
     }
 
     private OutboxRelay relay(OutboxHandler handler, OutboxDeadLetterHandler hook) {
@@ -1375,25 +1483,33 @@ class OutboxRelayIT {
     }
 
     /**
-     * 1000 messages over 50 keys in 100 transactions, 5 ms apart; returns how long after its commit each one reached
-     * {@code delivered}, keyed by payload.
+     * 1000 messages over 50 keys in 100 transactions, 5 ms apart, and one {@code poison} message among them; returns
+     * how long after its commit each of the 1000 reached {@code delivered} (a fresh map for this run).
      */
-    private List<Duration> deliveryDelays(PgOutbox outbox, Map<String, Long> delivered) throws Exception {
+    private List<Duration> deliveryDelays(PgOutbox outbox, AtomicReference<Map<String, Long>> delivered, String run)
+            throws Exception {
+        var arrived = new ConcurrentHashMap<String, Long>();
+        delivered.set(arrived);
         var committed = new ConcurrentHashMap<String, Long>();
         for (int tx = 0; tx < 100; tx++) {
             int t = tx;
-            var messages = IntStream.range(0, 10).mapToObj(i -> msg("t", "k" + (t * 10 + i) % 50, t + "/" + i))
-                    .toArray(OutboxMessage[]::new);
-            send(outbox, messages);
+            var messages = new ArrayList<OutboxMessage>();
+            IntStream.range(0, 10)
+                    .forEach(i -> messages.add(msg("t", "k" + (t * 10 + i) % 50, run + "/" + t + "/" + i)));
+            if (tx == 50) {
+                messages.add(msg("t", "poison", run + "/poison"));
+            }
+            send(outbox, messages.toArray(OutboxMessage[]::new));
             long now = System.nanoTime();
             for (var m : messages) {
                 committed.put(new String(m.payload(), UTF_8), now);
             }
             Thread.sleep(5);
         }
-        await(Duration.ofSeconds(30), () -> delivered.size() == 1000);
+        committed.remove(run + "/poison");
+        await(Duration.ofSeconds(30), () -> arrived.size() == 1000);
         return committed.entrySet().stream()
-                .map(e -> Duration.ofNanos(Math.max(0, delivered.get(e.getKey()) - e.getValue())))
+                .map(e -> Duration.ofNanos(Math.max(0, arrived.get(e.getKey()) - e.getValue())))
                 .toList();
     }
 

@@ -5,6 +5,7 @@ import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryLong;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.dsudomoin.kora.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
 import io.github.dsudomoin.kora.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.kora.outbox.internal.OutboxSchema;
@@ -221,7 +222,8 @@ class XidRegressionDumpRestoreIT {
 
     private OutboxRelay relay(JdbcDatabase db, OutboxSchema schema, OutboxHandler handler) {
         var maintenance = new Maintenance(db, schema.names(), config, new OutboxMetrics(null));
-        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance);
+        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance,
+                new DeadLetterPass(db, schema.names(), config, null, new OutboxMetrics(null)));
         relays.add(relay);
         return relay;
     }

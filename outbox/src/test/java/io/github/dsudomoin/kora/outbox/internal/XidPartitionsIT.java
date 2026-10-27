@@ -468,7 +468,8 @@ class XidPartitionsIT {
         var partitions = new XidPartitions(names, config.partitions());
         var handler = new RecordingHandler();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null));
-        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance);
+        var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null, maintenance,
+                new DeadLetterPass(db, schema.names(), config, null, new OutboxMetrics(null)));
 
         try (var c = TestDb.connect()) {
             long lower = tail(c, names);

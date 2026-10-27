@@ -5,10 +5,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.google.protobuf.StringValue;
 import io.github.dsudomoin.kora.outbox.OutboxHeader;
+import io.github.dsudomoin.kora.outbox.OutboxPermanentException;
 import io.github.dsudomoin.kora.outbox.OutboxRecord;
 import io.github.dsudomoin.kora.outbox.OutboxRelay;
+import io.github.dsudomoin.kora.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
+import io.github.dsudomoin.kora.outbox.testing.TestSql;
 import io.github.dsudomoin.kora.outbox.wiring.TypedTestApp.AppCode;
 import io.github.dsudomoin.kora.outbox.wiring.TypedTestApp.Custom;
 import io.github.dsudomoin.kora.outbox.wiring.TypedTestApp.OrderCreated;
@@ -26,6 +29,8 @@ import ru.tinkoff.kora.test.extension.junit5.TestComponent;
 
 @KoraAppTest(TypedTestApp.class)
 class TypedOutboxIT implements KoraAppTestConfigModifier {
+
+    private final String table = TestDb.uniqueTable();
 
     @TestComponent
     private JdbcDatabase db;
@@ -52,7 +57,21 @@ class TypedOutboxIT implements KoraAppTestConfigModifier {
                   table = %s
                   relay.enabled = false
                 }
-                """.formatted(TestDb.jdbcUrl(), TestDb.user(), TestDb.password(), TestDb.uniqueTable()));
+                """.formatted(TestDb.jdbcUrl(), TestDb.user(), TestDb.password(), table));
+    }
+
+    @Test
+    void withoutAHookComponentDeadLettersAreKept(@TestComponent DeadLetterPass pass) throws Exception {
+        handler.failAlways(r -> r.topic().equals("custom"), () -> new OutboxPermanentException("bad payload"));
+        db.inTx((SqlRunnable) () -> app.custom().send("custom", "k", new Custom("dead")));
+
+        assertThat(relay.drain()).isZero(); // ends with a run of the pass: nothing for it to hand
+
+        assertThat(pass.active()).as("no hook in the graph").isFalse();
+        try (var c = TestDb.connect()) {
+            assertThat(TestSql.queryString(c, "select string_agg(status, ',') from " + table + "_dead"))
+                    .isEqualTo("kept");
+        }
     }
 
     @Test

@@ -108,19 +108,10 @@ public final class OutboxRelay implements Lifecycle {
     private volatile boolean started;
     private volatile boolean stopping;
 
-    /** Without a dead-letter hook: every dead letter is kept. */
-    public OutboxRelay(JdbcConnectionFactory db, OutboxConfig config, OutboxSchema schema, OutboxHandler handler,
-            OutboxMetrics metrics, @Nullable Tracer tracer, Maintenance maintenance) {
-        this(db, config, schema, handler, metrics, tracer, maintenance, withoutHook(db, config, schema, metrics));
-    }
-
-    private static DeadLetterPass withoutHook(JdbcConnectionFactory db, OutboxConfig config, OutboxSchema schema,
-            OutboxMetrics metrics) {
-        OutboxSchema.validate(config); // a bad config fails as such, before the schema is asked for its names
-        return new DeadLetterPass(db, schema.names(), config, null, metrics);
-    }
-
-    /** {@code deadLetters}: the pass this relay runs, and closes on {@link #release()}. */
+    /**
+     * {@code deadLetters}: the pass this relay runs, and closes on {@link #release()}; its hook, or none, decides the
+     * fate of the dead letters.
+     */
     public OutboxRelay(JdbcConnectionFactory db, OutboxConfig config, OutboxSchema schema, OutboxHandler handler,
             OutboxMetrics metrics, @Nullable Tracer tracer, Maintenance maintenance, DeadLetterPass deadLetters) {
         OutboxSchema.validate(config);
@@ -252,13 +243,23 @@ public final class OutboxRelay implements Lifecycle {
      * call delivered. Works whether or not the relay runs: it contends with the workers for shard locks. Handler
      * failures are outcomes (see {@link OutboxHandler}); a database failure of a step propagates. Ends with one run of
      * the dead-letter pass, so the hook has had the letters this call made, whether or not the relay runs; letters it
-     * redrives are new messages, after D.
+     * redrives are new messages, after D. It holds one connection at a time: the pass runs once the shards' is closed,
+     * after the dead-letter thread's run in progress, if any.
      *
      * @throws IllegalStateException when no shard advanced for {@code 2 × (batchTimeout + 5 s)}, twice the longest a
      *     tail swap waits for relay steps in flight, while work remains (e.g. a shard paused by a down target), or
      *     while maintenance has halted the relay (xid regression)
      */
     public int drain() {
+        int delivered = drainShards();
+        if (deadLetters.runOnce() > 0) {
+            wake();
+        }
+        return delivered;
+    }
+
+    /** {@link #drain()} but its dead-letter run, on one connection of its own. */
+    private int drainShards() {
         maintenance.checkHalt(); // the recorded halt: maintenance does not run while the relay is disabled
         requireNotHalted();
         // a swap keeps every step out while it waits for those in flight: no progress for that long is no stall
@@ -282,9 +283,6 @@ public final class OutboxRelay implements Lifecycle {
                 var all = cursors.latestAll(c, config.shards());
                 var pending = all.stream().filter(cursor -> !drained(cursor, target, now)).toList();
                 if (pending.isEmpty()) {
-                    if (deadLetters.runOnce() > 0) {
-                        wake();
-                    }
                     return delivered;
                 }
                 // a position change of a pending shard, by this call or a worker; a pause or due time alone is no
@@ -347,7 +345,7 @@ public final class OutboxRelay implements Lifecycle {
             var result = processor.tryProcess(c, shard, latest, now, draining);
             c.commit();
             c.setAutoCommit(true);
-            if (result.deadLettered()) {
+            if (result.deadLettered() && deadLetters.active()) { // without a hook the letter is kept already
                 deadLettered.incrementAndGet();
                 var dead = deadLetterThread;
                 if (dead != null) {

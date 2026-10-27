@@ -11,7 +11,6 @@ import io.github.dsudomoin.kora.outbox.OutboxModule;
 import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
-import ru.tinkoff.kora.common.Component;
 import ru.tinkoff.kora.common.KoraApp;
 import ru.tinkoff.kora.common.annotation.Root;
 import ru.tinkoff.kora.config.hocon.HoconConfigModule;
@@ -24,8 +23,15 @@ public interface CoreTestApp extends HoconConfigModule, JdbcDatabaseModule, Outb
         return new RecordingHandler();
     }
 
-    /** The app's own dead-letter hook, a component as an app writes one: keeps every letter, recording it. */
-    @Component
+    /**
+     * The app's own dead-letter hook component. A factory, not a {@code @Component} class: Kora puts every
+     * {@code @Component} class of the module into every app of it, and {@link TypedTestApp} has none.
+     */
+    default RecordingHook outboxDeadLetterHandler() {
+        return new RecordingHook();
+    }
+
+    /** Keeps every letter, recording it. */
     final class RecordingHook implements OutboxDeadLetterHandler {
 
         final List<DeadLetter> handed = new CopyOnWriteArrayList<>();

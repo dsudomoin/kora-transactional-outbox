@@ -46,8 +46,10 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * sum, and while one lasts the writers of the keys the batch holds wait too, so a batch that meets several held
  * table locks stalls them for that many waits. A batch that fails after its claim rolls back, and those of its
  * letters still due are then due again after {@code initialDelay} (none another pass decided meanwhile), so they hold
- * back no letter behind them; a lock timeout (55P03) is a WARN, at most once a minute, and ends the phase until the
- * next pass; any other failure propagates. Hook failures have a WARN of their own, at most once a minute too.
+ * back no letter behind them. In the redrive phase a lock timeout (55P03) is a WARN, at most once a minute, and ends
+ * the phase until the next pass; any other failure, and any failure of a hand-over (a lock timeout writing the hook's
+ * decisions included: the hook is called again for them), propagates. Hook failures have a WARN of their own, at
+ * most once a minute too.
  */
 public final class DeadLetterPass {
 
@@ -126,10 +128,25 @@ public final class DeadLetterPass {
      * backoff then holds the hook back, not just its letters); without one, makes every pending letter kept. Then
      * redrives the due scheduled letters, those just decided {@code redrive} included. Returns the letters this run
      * redrove: the caller wakes the relay when there are any. One run at a time per pass, so a second caller's hook
-     * call never waits for the first one's inside its own timeout.
+     * call never waits for the first one's inside its own timeout; the wait for it is interruptible. A run that starts
+     * after {@link #close()}, as one queued behind another may, does nothing and returns 0.
      */
     public int runOnce() {
-        running.lock();
+        try {
+            running.lockInterruptibly();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("outbox dead-letter pass interrupted", e);
+        }
+        try {
+            return closed ? 0 : run();
+        } finally {
+            running.unlock();
+        }
+    }
+
+    /** One run under {@link #running}. */
+    private int run() {
         try (var c = db.newConnection()) {
             if (active()) {
                 handOver(c);
@@ -143,8 +160,6 @@ public final class DeadLetterPass {
             return redriveScheduled(c);
         } catch (SQLException e) {
             throw new RuntimeSqlException(e);
-        } finally {
-            running.unlock();
         }
     }
 
@@ -171,7 +186,7 @@ public final class DeadLetterPass {
     /**
      * Stops the hook thread, interrupting a call in progress: its letters roll back, without a failed attempt, and
      * those still due are due again after {@code initialDelay}. A run in progress stops after its batch; a later
-     * {@link #runOnce} with letters fails.
+     * {@link #runOnce} does nothing.
      */
     public void close() {
         closed = true;
@@ -179,14 +194,15 @@ public final class DeadLetterPass {
     }
 
     private void handOver(Connection c) throws SQLException {
-        while (true) {
+        while (!closed) {
             var ids = new ArrayList<Long>();
             Batch batch;
             try {
                 batch = inTx(c, tx -> handOverBatch(tx, ids));
             } catch (SQLException | RuntimeException e) {
-                recover(c, ids, e);
-                return;
+                // even a lock timeout: the hook may have answered, so it is called again, and the caller backs off
+                deferStillDue(c, ids, e);
+                throw e;
             }
             if (batch.failure() != null) {
                 metrics.deadHookFailure();
@@ -203,7 +219,7 @@ public final class DeadLetterPass {
         }
     }
 
-    /** {@code ids} gets the claimed letters' ids, for {@link #recover} should the transaction fail after the claim. */
+    /** {@code ids} gets the claimed letters' ids, for {@link #deferStillDue} should the transaction fail later. */
     private Batch handOverBatch(Connection tx, List<Long> ids) throws SQLException {
         var claimed = claim(tx, "pending");
         claimed.forEach(c -> ids.add(c.letter().id()));
@@ -271,8 +287,12 @@ public final class DeadLetterPass {
             try {
                 split = inTx(c, tx -> redriveBatch(tx, ids));
             } catch (SQLException | RuntimeException e) {
-                recover(c, ids, e);
-                return redriven;
+                deferStillDue(c, ids, e);
+                if (e instanceof SQLException s && blocked(s)) {
+                    // no key lock is waited for, so it was a table's lock, which the batches after it would wait for
+                    return redriven;
+                }
+                throw e;
             }
             redriven += split.ready().size();
             if (ids.size() < batchSize || !split.held().isEmpty()) {
@@ -303,28 +323,21 @@ public final class DeadLetterPass {
     /**
      * After a batch rolled back on {@code failure}: its claimed letters, if any, that are still due are due again
      * after {@code initialDelay}, set in a fresh transaction, so they hold back no letter behind them and
-     * {@link #untilNextDue} finds them; one another pass has decided since the rollback keeps that decision. Returns
-     * after a lock timeout (a WARN), which ends the phase: no key lock is waited for, so it was a table's lock, which
-     * the batches after it would wait for too. Rethrows any other failure.
+     * {@link #untilNextDue} finds them; one another pass has decided since the rollback keeps that decision. A failure
+     * of that is added to {@code failure}, which the caller handles.
      */
-    private void recover(Connection c, List<Long> ids, Exception failure) throws SQLException {
-        if (!ids.isEmpty()) {
-            try {
-                inTx(c, tx -> {
-                    defer(tx, ids);
-                    return null;
-                });
-            } catch (SQLException | RuntimeException e) {
-                failure.addSuppressed(e);
-            }
+    private void deferStillDue(Connection c, List<Long> ids, Exception failure) {
+        if (ids.isEmpty()) {
+            return;
         }
-        if (failure instanceof SQLException s) {
-            if (blocked(s)) {
-                return;
-            }
-            throw s;
+        try {
+            inTx(c, tx -> {
+                defer(tx, ids);
+                return null;
+            });
+        } catch (SQLException | RuntimeException e) {
+            failure.addSuppressed(e);
         }
-        throw (RuntimeException) failure; // the callers catch SQLException | RuntimeException only
     }
 
     private void defer(Connection tx, List<Long> ids) throws SQLException {

@@ -35,6 +35,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -485,6 +486,74 @@ class DeadLetterPassIT {
     }
 
     @Test
+    void aRunQueuedBehindAnotherDoesNothingOnceClosed() throws Exception {
+        config.deadLettersBatchSize(1);
+        letter("t", "a", "p", List.of());
+        long b = letter("t", "b", "p", List.of());
+        var bDue = dueAt(b);
+        var entered = new CountDownLatch(1);
+        var pass = pass(letters -> {
+            entered.countDown();
+            Thread.sleep(60_000);
+            return all(letters, keep());
+        });
+        var first = pool.submit(pass::runOnce); // claims a, its hook call hangs
+        assertThat(entered.await(10, SECONDS)).isTrue();
+        var queued = new CompletableFuture<Integer>();
+        var interrupted = new CompletableFuture<Throwable>();
+        var queuedThread = new Thread(() -> queued.complete(pass.runOnce()));
+        var interruptedThread = new Thread(() -> {
+            try {
+                pass.runOnce();
+            } catch (Throwable t) {
+                interrupted.complete(t);
+            }
+        });
+        queuedThread.start();
+        interruptedThread.start();
+        awaitWaiting(queuedThread);
+        awaitWaiting(interruptedThread);
+
+        interruptedThread.interrupt();
+        assertThat(interrupted.get(5, SECONDS)).as("its wait for the run lock is interruptible")
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("interrupted");
+        pass.close();
+
+        assertThatThrownBy(() -> first.get(10, SECONDS)).hasCauseInstanceOf(IllegalStateException.class);
+        assertThat(queued.get(10, SECONDS)).as("started after close(): no claim").isZero();
+        assertThat(dueAt(b)).as("b neither claimed nor deferred").isEqualTo(bDue);
+        assertThat(handlerAttempts(b)).isZero();
+    }
+
+    @Test
+    void aLockTimeoutWritingTheDecisionsFailsTheRun() throws Exception {
+        long id = letter("t", "k", "p", List.of());
+        var calls = new AtomicInteger();
+        try (var locker = TestDb.connect()) {
+            locker.setAutoCommit(false);
+            var pass = pass(letters -> { // answers, then the write of its decision waits for a table lock
+                calls.incrementAndGet();
+                TestSql.execute(locker, "lock table " + names.dead() + " in share mode");
+                pool.submit(() -> {
+                    Thread.sleep(6000); // past the 5 s lock_timeout of the hand-over
+                    locker.rollback();
+                    return null;
+                });
+                return all(letters, keep());
+            });
+
+            // not swallowed like a redrive's: the hook answered, so the caller backs off before it is called again
+            assertThatThrownBy(pass::runOnce).isInstanceOf(RuntimeSqlException.class)
+                    .cause().satisfies(e -> assertThat(((SQLException) e).getSQLState()).isEqualTo("55P03"));
+        }
+
+        assertThat(calls).hasValue(1);
+        assertThat(status(id)).isEqualTo("pending");
+        assertThat(handlerAttempts(id)).as("no failure of the hook").isZero();
+        assertThat(registry.find("outbox.dead.hook.failures").counter()).isNull();
+    }
+
+    @Test
     void hookFailuresAndLockTimeoutsWarnApart() throws Exception {
         letter("t", "a", "p", List.of());
         var calls = new AtomicInteger();
@@ -623,6 +692,11 @@ class DeadLetterPassIT {
         };
     }
 
+    /** Until {@code thread} parks, waiting for the pass's run lock. */
+    private static void awaitWaiting(Thread thread) throws Exception {
+        await(Duration.ofSeconds(5), () -> thread.getState() == Thread.State.WAITING);
+    }
+
     /** Some transaction holds the key lock of {@code key} on topic t. */
     private boolean keyLockGranted(String key) throws SQLException {
         try (var c = TestDb.connect(); var ps = c.prepareStatement("select count(*) from pg_locks"
@@ -645,7 +719,7 @@ class DeadLetterPassIT {
 
     private OutboxRelay relay(RecordingHandler handler) {
         var relay = new OutboxRelay(db, config, schema, handler, new OutboxMetrics(null), null,
-                new Maintenance(db, names, config, new OutboxMetrics(null)));
+                new Maintenance(db, names, config, new OutboxMetrics(null)), pass(null));
         relays.add(relay);
         return relay;
     }
