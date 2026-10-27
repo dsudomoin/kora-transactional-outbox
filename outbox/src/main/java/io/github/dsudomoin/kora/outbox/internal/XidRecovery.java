@@ -71,7 +71,9 @@ public final class XidRecovery {
     private long[] overMaxRows;
     /**
      * Whether the last {@link #recover} began its copy under the outbox's lock: a failure from there on stalled
-     * writers for as long. One before it (a lock wait, a check) held them for milliseconds and is tried again.
+     * writers for as long. One before it is tried again by the next run: a check right after the lock held writers
+     * for milliseconds, and the lock waits before it at most {@code LOCK_TIMEOUT} (5 s) each, writers queued behind
+     * the one on the outbox meanwhile.
      */
     private boolean outboxLocked;
     /** For tests: runs once the pending detach is finished, before the transaction. */
@@ -244,8 +246,9 @@ public final class XidRecovery {
 
     /**
      * Recovers in one read-committed transaction ({@code lock_timeout} 5 s, one deadline of
-     * {@code outbox.recovery.timeout} for the whole of it, each statement's {@code statement_timeout} what is left of
-     * it, {@code idle_in_transaction_session_timeout} 5 s, so Postgres ends the session of a frozen holder and writers
+     * {@code outbox.recovery.timeout} for it, each statement's {@code statement_timeout} what is left of it; the
+     * partition DDL of the new ranges is not held to it: each such statement runs under {@link PartitionDdl#execute}'s
+     * own (its lock timeout + 60 s), which, rarely needed, can carry the transaction past the deadline, {@code idle_in_transaction_session_timeout} 5 s, so Postgres ends the session of a frozen holder and writers
      * go on; no {@code transaction_timeout}), for a caller holding {@code LOCK_MAINTENANCE}; returns the rows
      * re-sent, or 0 with no change when there is neither a regression nor a halt row. First, outside it, a detach left
      * pending is finished ({@link XidPartitions#finishPendingDetach}), so its wait for older snapshots stalls no
@@ -347,6 +350,7 @@ public final class XidRecovery {
                     + " p where p.shard = s) from generate_series(0, ? - 1) s")) {
                 ps.setLong(1, tick);
                 ps.setInt(2, shards);
+                timeLeft(st, deadline);
                 ps.executeUpdate();
             }
             timeLeft(st, deadline);
