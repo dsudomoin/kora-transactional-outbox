@@ -72,6 +72,19 @@ public final class OutboxMetrics {
         }
     }
 
+    /** {@code decision} is {@code keep}, {@code discard}, {@code redrive} or {@code redrive_at}. */
+    public void deadDecision(String decision) {
+        if (registry != null) {
+            registry.counter("outbox.dead.decisions", "decision", decision).increment();
+        }
+    }
+
+    public void deadHookFailure() {
+        if (registry != null) {
+            registry.counter("outbox.dead.hook.failures").increment();
+        }
+    }
+
     /**
      * Registers the gauge once; later calls with the same name keep the first supplier. Names: {@code
      * outbox.shard.lag}, {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.parked.size},

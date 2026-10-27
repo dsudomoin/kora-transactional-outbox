@@ -31,6 +31,8 @@ class OutboxMetricsTest {
             noop.batch(Duration.ofMillis(5));
             noop.shardPaused();
             noop.inboxOutsideWindow();
+            noop.deadDecision("keep");
+            noop.deadHookFailure();
             noop.gauge("outbox.retry.size", () -> 1);
         }).doesNotThrowAnyException();
     }
