@@ -1399,6 +1399,41 @@ class MaintenanceIT {
         }
     }
 
+    @Test
+    void aDeadDueIndexBuildThatTimesOutBacksOff() throws Exception {
+        config.maintenanceInterval(Duration.ofSeconds(1));
+        bootstrap();
+        String index = names.dead() + "_due";
+        String state = "select coalesce((select indexrelid || ':' || indisvalid from pg_index"
+                + " where indexrelid = to_regclass(?)), 'missing')";
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(300));
+        try (var c = TestDb.connect(); var holder = TestDb.connect()) {
+            execute(c, "drop index " + index);
+            deadLetter(1, "pending", "1 minute");
+            holder.setAutoCommit(false); // a long transaction on the dead table: the build's lock wait times out
+            execute(holder, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
+                    + " values (2, 0, gen_random_uuid(), 't', now(), 1)");
+
+            String failed;
+            try (var err = new CapturedStderr()) {
+                assertThat(maintenance.runOnce()).isTrue();
+                failed = queryString(c, state, index);
+                assertThat(failed).as("left invalid by the timed-out build").endsWith(":false");
+                assertThat(err.text()).contains(index).contains("lock wait").contains("next try in 1 s");
+            }
+            try (var err = new CapturedStderr()) {
+                assertThat(maintenance.runOnce()).isTrue();
+                assertThat(queryString(c, state, index)).as("not tried again within the backoff").isEqualTo(failed);
+                assertThat(err.text()).doesNotContain(index);
+            }
+
+            holder.rollback();
+            Thread.sleep(1100);
+            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(queryString(c, state, index)).endsWith(":true");
+        }
+    }
+
     /** A dead letter of {@code status} that failed {@code age} ago (an interval), due now unless kept. */
     private void deadLetter(long id, String status, String age) throws SQLException {
         try (var c = TestDb.connect()) {
