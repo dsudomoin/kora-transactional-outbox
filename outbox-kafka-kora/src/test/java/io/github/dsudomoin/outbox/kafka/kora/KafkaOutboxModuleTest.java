@@ -21,7 +21,7 @@ class KafkaOutboxModuleTest {
      * 20 s + 5 s + 5 s against 30 s.
      */
     @Test
-    void warnsOnlyWhenACallCanOutlastBatchTimeout() {
+    void warnsOnlyWhenACallCanOutlastBatchTimeout() throws Exception {
         KafkaOutboxConfig defaults = () -> props("bootstrap.servers", "localhost:9092");
         KafkaOutboxConfig slowMetadata = () -> props("bootstrap.servers", "localhost:9092", "max.block.ms", 10000);
         var module = new KafkaOutboxModule() {};

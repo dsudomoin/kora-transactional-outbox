@@ -69,7 +69,7 @@ class KafkaEndToEndIT {
         if (relay != null) {
             relay.close();
         }
-        senders.forEach(KafkaOutboxSender::release);
+        senders.forEach(KafkaOutboxSender::close);
         tracing.close();
         db.release();
         Context.clear();

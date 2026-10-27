@@ -36,6 +36,7 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import org.apache.kafka.clients.producer.BufferExhaustedException;
 import org.apache.kafka.clients.producer.Callback;
@@ -61,7 +62,6 @@ import org.apache.kafka.common.header.internals.RecordHeader;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import ru.tinkoff.kora.application.graph.Lifecycle;
 
 /**
  * Delivers relayed records to Kafka. Each {@link #send} borrows one pooled idempotent producer. The first
@@ -92,7 +92,7 @@ import ru.tinkoff.kora.application.graph.Lifecycle;
  * {@code KafkaOutboxModule} logs a WARN at startup when {@code delivery.timeout.ms} + 5 s + {@code max.block.ms}
  * exceeds {@code batchTimeout} itself.
  */
-public final class KafkaOutboxSender implements Lifecycle {
+public final class KafkaOutboxSender implements AutoCloseable {
 
     private static final Duration WAIT_SLACK = Duration.ofSeconds(5);
     private static final Duration RELEASE_TIMEOUT = Duration.ofSeconds(5);
@@ -108,11 +108,21 @@ public final class KafkaOutboxSender implements Lifecycle {
     private volatile boolean released;
 
     public KafkaOutboxSender(KafkaOutboxConfig config) {
-        this(producerConfig(config.driverProperties()));
+        this(config, KafkaProducer::new);
     }
 
-    private KafkaOutboxSender(ProducerConfig config) {
-        this(() -> new KafkaProducer<>(config.originals()), Duration.ofMillis(config.getInt(DELIVERY_TIMEOUT_MS_CONFIG)),
+    /**
+     * {@code producers} makes each producer the sender pools, from the validated properties (the forced and defaulted
+     * ones set): the application's own Kafka client factory, e.g. one that adds its metrics or interceptors.
+     */
+    public KafkaOutboxSender(KafkaOutboxConfig config,
+            Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
+        this(producerConfig(config.driverProperties()), producers);
+    }
+
+    private KafkaOutboxSender(ProducerConfig config,
+            Function<Map<String, Object>, Producer<byte[], byte[]>> producers) {
+        this(() -> producers.apply(config.originals()), Duration.ofMillis(config.getInt(DELIVERY_TIMEOUT_MS_CONFIG)),
                 Duration.ofMillis(config.getLong(MAX_BLOCK_MS_CONFIG)), Clock.systemUTC());
     }
 
@@ -213,7 +223,7 @@ public final class KafkaOutboxSender implements Lifecycle {
 
     private void giveBack(Pooled pooled) {
         pool.offerFirst(pooled);
-        if (released && pool.remove(pooled)) { // release() has drained the pool already
+        if (released && pool.remove(pooled)) { // close() has drained the pool already
             closeQuietly(pooled.producer, RELEASE_TIMEOUT);
         }
     }
@@ -443,10 +453,7 @@ public final class KafkaOutboxSender implements Lifecycle {
     }
 
     @Override
-    public void init() {}
-
-    @Override
-    public void release() {
+    public void close() {
         released = true;
         for (Pooled pooled; (pooled = pool.pollFirst()) != null; ) {
             closeQuietly(pooled.producer, RELEASE_TIMEOUT);

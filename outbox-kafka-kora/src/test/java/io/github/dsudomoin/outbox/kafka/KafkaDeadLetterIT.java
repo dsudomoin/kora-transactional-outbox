@@ -48,7 +48,7 @@ class KafkaDeadLetterIT {
             relay.close();
         }
         if (sender != null) {
-            sender.release();
+            sender.close();
         }
         db.release();
         Context.clear();
@@ -109,7 +109,7 @@ class KafkaDeadLetterIT {
             }
         };
         var module = new KafkaOutboxModule() {};
-        sender = module.kafkaOutboxSender(kafka, config);
+        sender = module.kafkaOutboxSender(kafka, config).value();
         var hook = module.kafkaDeadLetterHandler(kafka, sender, config);
         schema = new OutboxSchema(db, config);
         schema.start();

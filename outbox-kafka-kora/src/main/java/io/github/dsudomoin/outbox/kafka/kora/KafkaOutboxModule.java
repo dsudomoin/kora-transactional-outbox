@@ -9,6 +9,7 @@ import io.github.dsudomoin.outbox.kafka.KafkaOutboxHandler;
 import io.github.dsudomoin.outbox.kafka.KafkaOutboxSender;
 import io.github.dsudomoin.outbox.kora.OutboxModule;
 import jakarta.annotation.Nullable;
+import ru.tinkoff.kora.application.graph.LifecycleWrapper;
 import ru.tinkoff.kora.common.DefaultComponent;
 import ru.tinkoff.kora.config.common.Config;
 import ru.tinkoff.kora.config.common.extractor.ConfigValueExtractor;
@@ -48,19 +49,20 @@ import ru.tinkoff.kora.config.common.extractor.ConfigValueExtractor;
  */
 public interface KafkaOutboxModule {
 
-    default KafkaOutboxConfig kafkaOutboxConfig(Config config, ConfigValueExtractor<KafkaOutboxConfig> extractor) {
+    default KafkaOutboxConfig kafkaOutboxConfig(Config config, ConfigValueExtractor<KoraKafkaOutboxConfig> extractor) {
         return extractor.extract(config.get("outbox.kafka"));
     }
 
     /** {@code outbox} is the relay's config, absent when the app does not include {@link OutboxModule}. */
-    default KafkaOutboxSender kafkaOutboxSender(KafkaOutboxConfig config, @Nullable OutboxConfig outbox) {
+    default LifecycleWrapper<KafkaOutboxSender> kafkaOutboxSender(KafkaOutboxConfig config,
+            @Nullable OutboxConfig outbox) {
         var sender = new KafkaOutboxSender(config);
         if (outbox != null) {
             sender.warnIfLongerThan("outbox.relay.batchTimeout", outbox.relay().batchTimeout(), "The relay interrupts"
                     + " a call at 80% of batchTimeout; the sender then stops at once, keeps acked records as delivered"
                     + " and retries the rest, so slow sends end as retries");
         }
-        return sender;
+        return new LifecycleWrapper<>(sender, s -> {}, KafkaOutboxSender::close);
     }
 
     @DefaultComponent

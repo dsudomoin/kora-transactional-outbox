@@ -18,6 +18,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
@@ -80,6 +81,7 @@ class KafkaOutboxSenderTest {
                     .toList(),
             Set.of(), Set.of());
     private static final Duration DELIVERY_TIMEOUT = Duration.ofSeconds(20);
+    private static final KafkaOutboxConfig CONFIG = () -> props("bootstrap.servers", "localhost:9092");
 
     private final List<MockProducer<byte[], byte[]>> producers = new CopyOnWriteArrayList<>();
     private final ExecutorService executor = Executors.newCachedThreadPool();
@@ -954,7 +956,7 @@ class KafkaOutboxSenderTest {
         producer.completeNext();
         result.get(5, SECONDS);
 
-        sender.release();
+        sender.close();
         assertThat(producer.closed()).isTrue();
     }
 
@@ -963,7 +965,7 @@ class KafkaOutboxSenderTest {
         var sender = sender(DELIVERY_TIMEOUT);
         var result = sendAsync(sender, List.of(record(1, "a")));
         var producer = awaitSent(0, 1);
-        sender.release(); // the call in flight still holds the producer
+        sender.close(); // the call in flight still holds the producer
         producer.completeNext();
 
         assertThat(result.get(5, SECONDS)).containsExactly(Outcome.delivered());
@@ -998,6 +1000,68 @@ class KafkaOutboxSenderTest {
      * MockProducer closer to KafkaProducer: {@code failure} fails matching records the way client-side errors are
      * reported (callback inside {@code send}), and {@code close} aborts every incomplete send through its callback.
      */
+    @Test
+    void factoryGetsValidatedProperties() {
+        var seen = new CopyOnWriteArrayList<Map<String, Object>>();
+        var sender = new KafkaOutboxSender(CONFIG, properties -> {
+            seen.add(properties);
+            return new TestProducer(true, r -> null);
+        });
+
+        assertThat(sender.send(List.of(record(1, "a")))).containsExactly(Outcome.delivered());
+
+        assertThat(seen).hasSize(1);
+        assertThat(seen.get(0))
+                .containsEntry("bootstrap.servers", "localhost:9092")
+                .containsEntry("enable.idempotence", "true")
+                .containsEntry("acks", "all")
+                .containsEntry("key.serializer", ByteArraySerializer.class.getName())
+                .containsEntry("value.serializer", ByteArraySerializer.class.getName())
+                .containsEntry("delivery.timeout.ms", "20000")
+                .containsEntry("max.block.ms", "5000")
+                .containsEntry("enable.metrics.push", "false");
+    }
+
+    @Test
+    void factoryProducerIsUsed() {
+        var producer = new TestProducer(true, r -> null);
+        var sender = new KafkaOutboxSender(CONFIG, properties -> producer);
+
+        assertThat(sender.send(List.of(record(1, "a"), record(2, null)))).containsExactly(Outcome.delivered(),
+                Outcome.delivered());
+        assertThat(producer.history()).hasSize(2);
+    }
+
+    @Test
+    void failedProducerIsReplacedThroughFactory() throws Exception {
+        var sender = new KafkaOutboxSender(CONFIG, properties -> {
+            var producer = new TestProducer(false, r -> null);
+            producers.add(producer);
+            return producer;
+        });
+        var failed = sendAsync(sender, List.of(record(1, "a")));
+        awaitSent(0, 1).errorNext(new NotLeaderOrFollowerException("gone"));
+        assertThat(failed.get(5, SECONDS).get(0)).isInstanceOf(Outcome.Retry.class);
+
+        var next = sendAsync(sender, List.of(record(2, "c"))); // a key off the partition that now cools
+        awaitSent(1, 1).completeNext();
+
+        assertThat(next.get(5, SECONDS)).containsExactly(Outcome.delivered());
+        assertThat(producers).as("the factory made the replacement").hasSize(2);
+        assertThat(producers.get(0).closed()).isTrue();
+    }
+
+    @Test
+    void closeClosesFactoryProducers() {
+        var producer = new TestProducer(true, r -> null);
+        var sender = new KafkaOutboxSender(CONFIG, properties -> producer);
+        sender.send(List.of(record(1, "a")));
+
+        sender.close();
+
+        assertThat(producer.closed()).isTrue();
+    }
+
     static class TestProducer extends MockProducer<byte[], byte[]> {
         private final Function<ProducerRecord<byte[], byte[]>, RuntimeException> failure;
 

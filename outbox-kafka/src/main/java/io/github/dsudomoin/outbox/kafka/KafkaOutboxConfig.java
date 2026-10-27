@@ -2,10 +2,8 @@ package io.github.dsudomoin.outbox.kafka;
 
 import jakarta.annotation.Nullable;
 import java.util.Properties;
-import ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor;
 
-/** HOCON path {@code outbox.kafka}. */
-@ConfigValueExtractor
+/** The Kafka handler's settings. With Kora, HOCON path {@code outbox.kafka}, keys named as here. */
 public interface KafkaOutboxConfig {
 
     /** Kafka producer properties; see {@link KafkaOutboxSender} for the ones it forces or defaults. */
