@@ -179,20 +179,40 @@ class OutboxSchemaIT {
         var n = TableNames.of(config.table());
         try (var c = TestDb.connect()) {
             // a tick table of an older version, with a tick whose shard set says no shard gained rows
-            execute(c, "alter table " + n.tick() + " drop column dirty, add column shards smallint[]");
+            execute(c, "alter table " + n.tick() + " drop column dirty");
             long old = queryLong(c, "insert into " + n.tick() + " (snapshot, max_id, shards)"
                     + " select pg_current_snapshot(), 0, '{}' returning id");
 
             new OutboxSchema(db, config).init();
             new OutboxSchema(db, config).init(); // and once more, on the migrated table
 
-            assertThat(OutboxSchema.columnExists(c, n.tick(), "shards")).as("old column dropped").isFalse();
+            assertThat(OutboxSchema.columnExists(c, n.tick(), "shards")).as("kept for the previous release").isTrue();
             assertThat(queryString(c, "select count(*) || ':' || count(dirty) from " + n.tick())).isEqualTo("2:0");
             assertThat(new Cursors(n, config.shards()).positions(c, old)).as("old ticks count as all shards")
                     .extracting(Cursors.Position::behind).containsOnly(true).hasSize(config.shards());
             assertThat(new Ticks(n, config.shards()).make(c, Duration.ZERO)).isTrue();
             assertThat(queryString(c, "select dirty::text from " + n.tick() + " order by id desc limit 1"))
                     .as("no shard gained rows: no bits").isEmpty();
+        }
+    }
+
+    @Test
+    void tickShardsColumnIsKept() throws Exception {
+        new OutboxSchema(db, config).init();
+        var n = TableNames.of(config.table());
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select format_type(atttypid, atttypmod) || ':' || (not attnotnull)::text"
+                    + " from pg_attribute where attrelid = to_regclass(?) and attname = 'shards'", n.tick()))
+                    .as("the previous release writes and reads it").isEqualTo("smallint[]:true");
+            // as an earlier build of this branch left it
+            execute(c, "alter table " + n.tick() + " drop column shards");
+
+            new OutboxSchema(db, config).init();
+
+            assertThat(OutboxSchema.columnExists(c, n.tick(), "shards")).as("made again").isTrue();
+            assertThat(new Ticks(n, config.shards()).make(c, Duration.ZERO)).isTrue();
+            assertThat(queryString(c, "select (shards is null)::text from " + n.tick() + " order by id desc limit 1"))
+                    .as("every shard, for the previous release's reader").isEqualTo("true");
         }
     }
 
@@ -387,6 +407,9 @@ class OutboxSchemaIT {
                 Map.entry("outbox.relay.batchTimeout", c -> c.batchTimeout(Duration.ZERO)),
                 Map.entry("outbox.relay.shutdownTimeout", c -> c.shutdownTimeout(Duration.ofMillis(-1))),
                 Map.entry("outbox.relay.headFailuresBeforeDivert", c -> c.headFailuresBeforeDivert(0)),
+                Map.entry("outbox.relay.cursorAnchorInterval", c -> c.cursorAnchorInterval(Duration.ZERO)),
+                Map.entry("outbox.relay.cursorAnchorInterval", c -> c.maintenanceInterval(Duration.ofMinutes(2))
+                        .cursorAnchorInterval(Duration.ofMinutes(1))),
                 Map.entry("outbox.relay.retry.initialDelay", c -> c.retry(Duration.ZERO, Duration.ofSeconds(1), 0)),
                 Map.entry("outbox.relay.retry.maxDelay", c -> c.retry(Duration.ofSeconds(2), Duration.ofSeconds(1), 0)),
                 Map.entry("outbox.relay.retry.maxAttempts",

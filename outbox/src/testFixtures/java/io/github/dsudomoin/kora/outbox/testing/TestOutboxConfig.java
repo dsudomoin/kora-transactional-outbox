@@ -24,6 +24,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private Duration batchTimeout = Duration.ofSeconds(5);
     private Duration shutdownTimeout = Duration.ofSeconds(5);
     private int headFailuresBeforeDivert = 3;
+    private Duration cursorAnchorInterval = Duration.ofHours(1);
     private Duration retryInitial = Duration.ofMillis(50);
     private Duration retryMax = Duration.ofMillis(500);
     private int retryMaxAttempts = 0;
@@ -228,6 +229,16 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
 
     public TestOutboxConfig headFailuresBeforeDivert(int headFailuresBeforeDivert) {
         this.headFailuresBeforeDivert = headFailuresBeforeDivert;
+        return this;
+    }
+
+    @Override
+    public Duration cursorAnchorInterval() {
+        return cursorAnchorInterval;
+    }
+
+    public TestOutboxConfig cursorAnchorInterval(Duration cursorAnchorInterval) {
+        this.cursorAnchorInterval = cursorAnchorInterval;
         return this;
     }
 

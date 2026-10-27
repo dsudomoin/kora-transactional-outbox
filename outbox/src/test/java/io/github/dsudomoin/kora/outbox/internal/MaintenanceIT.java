@@ -147,8 +147,8 @@ class MaintenanceIT {
             assertThat(err.text()).contains("WARN").contains("lock timeout");
             assertThat(lastSuccess()).as("a run with a failed step is no success").isEqualTo(succeeded);
             assertThat(ranges()).as("still listed, attached or detach-pending").containsAll(processed);
-            long processedTick = horizonTickId();
-            assertThat(tickIds()).as("the steps after the drop still ran").allMatch(id -> id >= processedTick);
+            assertThat(queryLong(reader, "select count(*) from " + names.cursor()))
+                    .as("the steps after the drop still ran: cursor cleanup").isEqualTo(config.shards());
             reader.commit();
         }
 
@@ -421,11 +421,16 @@ class MaintenanceIT {
             assertThat(queryLong(c, "select count(*) from " + names.cursor())).isGreaterThan(config.shards());
         }
         var cursorsBefore = latestCursors();
-        assertThat(tickIds()).contains(drained.get(0));
+        var ticksBefore = tickIds();
+        assertThat(ticksBefore).contains(drained.get(0));
+        // the shards no drain stepped are idle on the bootstrap tick, which no run has anchored yet
+        long floor = Math.min(slow, cursorsBefore.stream().mapToLong(Cursor::tickId).min().orElseThrow());
 
         assertThat(maintenance().runOnce()).isTrue();
 
-        assertThat(tickIds()).containsExactly(slow, target, newer); // from the slowest shard's tick on
+        // from the slowest shard's tick on, and from every latest cursor row's
+        assertThat(tickIds()).containsExactlyElementsOf(ticksBefore.stream().filter(id -> id >= floor).toList())
+                .contains(slow, target, newer);
         assertThat(ranges()).as("ranges the lagging shard has not passed").containsAll(between);
         assertThat(latestCursors()).isEqualTo(cursorsBefore);
         try (var c = TestDb.connect()) {
@@ -434,7 +439,7 @@ class MaintenanceIT {
     }
 
     @Test
-    void idleShardsDoNotHoldBackTickCleanupOrDrops() throws Exception {
+    void cleanupKeepsEveryLatestCursorTick() throws Exception {
         bootstrap(); // 4 shards
         var handler = new RecordingHandler();
         var relay = relay(handler, maintenance());
@@ -455,7 +460,8 @@ class MaintenanceIT {
 
         assertThat(maintenance().runOnce()).isTrue();
 
-        assertThat(tickIds()).as("the idle shards' cursor ticks are gone").containsExactly(drained);
+        // the previous release steps from the cursor's tick: the idle shards' stays, the drops go by the checkpoint
+        assertThat(tickIds()).as("from the lowest cursor tick on").startsWith(bootstrapTick).endsWith(drained);
         for (var b : processed) {
             assertThat(exists(b.name())).as(b.name()).isFalse();
         }
@@ -473,10 +479,76 @@ class MaintenanceIT {
             later = ticks.latest(c).id();
         }
         assertThat(maintenance().runOnce()).isTrue();
-        assertThat(tickIds()).containsExactly(later);
+        assertThat(tickIds()).startsWith(bootstrapTick).endsWith(later);
+        assertThat(tickIds()).containsAll(latestCursors().stream().map(Cursor::tickId).toList());
         var ids = send(IntStream.range(0, 20).mapToObj(i -> msg("t", "k" + i, "m" + i)).toArray(OutboxMessage[]::new));
         assertThat(relay.drain()).isEqualTo(ids.size());
         assertThat(latestCursors()).as("every shard stepped").noneMatch(cursor -> cursor.tickId() == bootstrapTick);
+    }
+
+    @Test
+    void idleShardsGetAnAnchorEveryInterval() throws Exception {
+        config.maintenanceInterval(Duration.ofSeconds(1)).cursorAnchorInterval(Duration.ofSeconds(2));
+        bootstrap(); // 4 shards, every cursor on the bootstrap tick
+        var relay = relay(new RecordingHandler(), maintenance());
+        var maintenance = maintenance();
+        long started = System.nanoTime();
+        send(msg("t", "k", "a"));
+        assertThat(relay.drain()).isOne();
+        makeTick();
+        long seq = maxCursorSeq();
+
+        assertThat(maintenance.runOnce()).isTrue();
+        assertThat(maintenance.runOnce()).isTrue();
+
+        assertThat(maxCursorSeq()).as("within the interval: no cursor row").isEqualTo(seq);
+        Thread.sleep(Math.max(0, 2500 - (System.nanoTime() - started) / 1_000_000));
+        long latest = makeTick();
+
+        assertThat(maintenance.runOnce()).isTrue();
+
+        try (var c = TestDb.connect()) {
+            var positions = new Cursors(names, config.shards()).positions(c, latest);
+            assertThat(positions).hasSize(config.shards()).allSatisfy(p -> {
+                assertThat(p.cursor().tickId()).as("shard " + p.cursor().shard()).isEqualTo(p.effectiveTickId());
+                assertThat(p.cursor().targetTickId()).isNull();
+            });
+        }
+        assertThat(tickIds()).as("the anchors free the ticks below them").containsExactly(latest);
+        seq = maxCursorSeq();
+        assertThat(maintenance.runOnce()).isTrue();
+        assertThat(maxCursorSeq()).as("anchored: no cursor row until the next interval").isEqualTo(seq);
+    }
+
+    @Test
+    void dueWorkIsRepairedOnIdleShards() throws Exception {
+        bootstrap(); // 4 shards, every cursor on the bootstrap tick, no due in any
+        var handler = new RecordingHandler();
+        var relay = relay(handler, maintenance());
+        var retried = UUID.randomUUID();
+        var parkedId = UUID.randomUUID();
+        try (var c = TestDb.connect()) { // as a pre-requeue instance or a hand edit leaves them: no due in the cursor
+            execute(c, "insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at, attempts,"
+                    + " next_attempt_at) values (900001, 2, '" + retried + "', 't', 'r'::bytea, now(), 1,"
+                    + " now() - interval '1 second')");
+            execute(c, "insert into " + names.parked() + " (id, shard, message_id, topic, key, created_at, due_at)"
+                    + " values (900002, 2, '" + parkedId + "', 't', 'p'::bytea, now(), now() - interval '2 second')");
+        }
+        assertThat(relay.drain()).as("nothing steps an idle shard without a due").isZero();
+        long rows = outboxRows();
+
+        assertThat(maintenance().runOnce()).isTrue();
+
+        try (var c = TestDb.connect()) {
+            var cursor = new Cursors(names, config.shards()).latest(c, 2).cursor();
+            assertThat(cursor.retryDueAt()).isEqualTo(new RetryStore(names, false).minDue(c, 2)).isNotNull();
+            assertThat(cursor.parkedDueAt()).isEqualTo(new ParkedStore(names, new RetryStore(names, false))
+                    .minDue(c, 2)).isNotNull();
+        }
+        assertThat(relay.drain()).isEqualTo(2);
+        assertThat(handler.delivered()).extracting(OutboxRecord::messageId)
+                .containsExactlyInAnyOrder(retried, parkedId);
+        assertThat(outboxRows()).as("no new row on the shard").isEqualTo(rows);
     }
 
     @Test
@@ -505,15 +577,15 @@ class MaintenanceIT {
             assertThat(queryString(c, "select string_agg(tick_id::text, ',') from " + names.checkpoint()))
                     .as("replaced by the run's").isEqualTo(Long.toString(latest));
         }
-        assertThat(tickIds()).as("cleanup went by the cursors").containsExactly(latest);
+        assertThat(tickIds()).as("cleanup went by the cursors, which keep their tick")
+                .containsExactly(latestCursors().get(0).tickId(), latest);
         assertThat(lastSuccess()).isGreaterThan(succeeded);
 
         try (var c = TestDb.connect(); var err = new CapturedStderr()) { // forged again within a minute: no ERROR
             execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + ahead
                     + ", B'0000', " + ahead + ")");
             assertThat(maintenance.runOnce()).isTrue();
-            // the cursors' tick is gone by now, so the shards are stranded: that ERROR is its own
-            assertThat(err.text()).doesNotContain("It counted for nothing");
+            assertThat(err.text()).doesNotContain("It counted for nothing").doesNotContain("no longer exist");
         }
     }
 
@@ -533,7 +605,8 @@ class MaintenanceIT {
         }
         var maintenance = maintenance();
 
-        assertThat(maintenance.runOnce()).isTrue(); // checkpoints on the tick, cleanup deletes the bootstrap tick
+        long bootstrapTick = latestCursors().get(0).tickId();
+        assertThat(maintenance.runOnce()).isTrue(); // checkpoints on the tick
         assertThat(maintenance.runOnce()).isTrue(); // reads by that checkpoint
 
         try (var c = TestDb.connect()) {
@@ -542,7 +615,7 @@ class MaintenanceIT {
             assertThat(queryString(c, "select tick_id || ':' || busy::text from " + names.checkpoint()))
                     .isEqualTo(latest + ":0000");
         }
-        assertThat(tickIds()).as("the idle shards' cursor ticks are gone").containsExactly(latest);
+        assertThat(tickIds()).as("the idle shards' cursor ticks are kept").containsExactly(bootstrapTick, latest);
         var ids = send(msg("t", "k", "a"));
         assertThat(relay.drain()).isOne();
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactlyElementsOf(ids);
@@ -558,10 +631,11 @@ class MaintenanceIT {
             latest = ticks.latest(c).id();
         }
         var maintenance = maintenance();
-        assertThat(maintenance.runOnce()).isTrue(); // the checkpoint moves every shard on; the bootstrap tick goes
+        assertThat(maintenance.runOnce()).isTrue(); // the checkpoint moves every shard on
         long bootstrapTick = latestCursors().get(0).tickId();
         try (var c = TestDb.connect()) { // as if the tick at its id came from another history, made after it
             execute(c, "update " + names.checkpoint() + " set created_at = created_at - interval '1 hour'");
+            execute(c, "delete from " + names.tick() + " where id = " + bootstrapTick); // and the cursors' by hand
         }
 
         try (var err = new CapturedStderr()) {
@@ -1665,6 +1739,26 @@ class MaintenanceIT {
     private long horizonXmin() throws SQLException {
         try (var c = TestDb.connect()) {
             return new Ticks(names, config.shards()).get(c, horizonTickId()).snapshot().xmin();
+        }
+    }
+
+    private long makeTick() throws SQLException {
+        try (var c = TestDb.connect()) {
+            var ticks = new Ticks(names, config.shards());
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            return ticks.latest(c).id();
+        }
+    }
+
+    private long maxCursorSeq() throws SQLException {
+        try (var c = TestDb.connect()) {
+            return queryLong(c, "select max(seq) from " + names.cursor());
+        }
+    }
+
+    private long outboxRows() throws SQLException {
+        try (var c = TestDb.connect()) {
+            return queryLong(c, "select count(*) from " + names.base());
         }
     }
 

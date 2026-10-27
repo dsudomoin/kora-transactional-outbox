@@ -6,6 +6,7 @@ import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Types;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -14,6 +15,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Per-shard progress as an insert-only log {@code <base>_cursor}: the row with the highest {@code seq} of
@@ -47,12 +49,38 @@ import java.util.Map;
  *   <li>Cursors only move forward, so a cursor appended after the read keeps both. A step that read its cursor and
  *       effective tick before the checkpoint started from E' or above, and reads the same rows as from the new
  *       effective tick, because the range between them is empty for the shard: so a batch it left in progress also
- *       goes on from the effective tick, above its cursor's tick, whose row cleanup may have deleted.</li>
+ *       goes on from the effective tick, above its cursor's tick.</li>
  *   <li>Every effective tick exists: the new ones are L, {@code busy_tick_id} (an effective tick at the read) or above,
  *       a cursor's tick at or above them, and cleanup deletes only ticks below the lowest effective tick, which no
  *       checkpoint lowers: each new effective tick is L or at least {@code busy_tick_id}, which is at least the lowest
  *       effective tick at the read.</li>
  * </ol>
+ *
+ * <p>The previous release ({@code feature/requeue}) knows no checkpoint: its steps start from the latest cursor row's
+ * {@code tick_id} (and its {@code target_tick_id} while a batch is in progress), its cleanup deletes ticks below the
+ * lowest of those, and its ticks carry the shard sets {@code shards} that this version leaves null (every shard). So
+ * that it runs beside this version during a rolling deploy and resumes after a rollback, three things hold:
+ * <ul>
+ *   <li>Tick cleanup's floor is the lower of the lowest effective tick and the lowest latest cursor row's tick
+ *       ({@link #lowestTick}): no latest cursor row (nor its target, above it) is on a deleted tick. Cursors only move
+ *       forward, so the floor read before the delete stays below every latest row.</li>
+ *   <li><em>Anchors</em> ({@link #anchors}): each maintenance run, after its checkpoint, appends for each shard with
+ *       a 0 bit, no batch in progress and its latest row on a tick below its effective tick E made
+ *       {@code outbox.relay.cursorAnchorInterval} or more ago, that row at E (no batch in progress,
+ *       {@code paused_until} and {@code failures} kept). By the 0 bit no row of the shard is visible in E and not in
+ *       the row's tick, so it changes neither the shard's rows to read nor its effective tick, and keeps cursors
+ *       moving forward; it is written under the shard's lock, from the row a step left. So ticks are kept for about
+ *       one anchor interval, and an idle relay appends one row per shard per interval.</li>
+ *   <li>Every anchor, and every run's <em>due repair</em> for a shard whose latest row has {@code retry_due_at} or
+ *       {@code parked_due_at} null while {@code <retry>} or {@code <parked>} hold rows of it (a row of a pre-requeue
+ *       instance, a hand edit), carries both dues as the tables hold them: a step of an idle shard looks at those
+ *       tables only by its dues, and no tick marks it.</li>
+ * </ul>
+ * The partition drop horizon stays the effective one ({@link #busyTick}), above some cursor rows' ticks. An old reader
+ * starting from such a row's tick C, at or below the shard's effective tick E, is still safe: no row of the shard is
+ * visible in E and not in C (the range between is empty for it), so every row it reads is not visible in E, so at or
+ * above E's xmin, above the horizon; the dropped ranges below it held only rows visible in E, relayed, and the xids of
+ * C's snapshot it looks up there find nothing.
  * A run writes its checkpoint from its own read, in one statement that also deletes the one before (runs hold
  * {@code LOCK_MAINTENANCE}, so one at a time), so readers see exactly one. A step reads its effective tick's row in
  * the statement that reads its cursor and the checkpoint ({@link #latest}): with one snapshot, the checkpoint it sees
@@ -127,6 +155,8 @@ public final class Cursors {
     private final String appendAll;
     private final String positions;
     private final String checkpoint;
+    private final String anchors;
+    private final String lowestTick;
 
     /** {@code shards}: {@code outbox.shards}, the length of a checkpoint's {@code busy} bitmap. */
     public Cursors(TableNames names, int shards) {
@@ -167,6 +197,64 @@ public final class Cursors {
         this.checkpoint = "with gone as (delete from " + names.checkpoint() + ") insert into " + names.checkpoint()
                 + " (tick_id, busy, busy_tick_id, created_at) values (?, ?::varbit, ?, greatest(clock_timestamp(),"
                 + " (select created_at from " + names.tick() + " where id = ?)))";
+        // per shard asked: an index probe for the cursor, the checkpoint read once, a primary key probe for the
+        // cursor's tick and an index probe each for the earliest retry head and parked row (their _due indexes)
+        this.anchors = "select c.shard, case when a.anchor then c.eff else c.tick_id end,"
+                + " case when not a.anchor then c.target_tick_id end, case when not a.anchor then c.last_id else 0 end,"
+                + " c.paused_until, c.failures, d.retry_due, d.parked_due from (select c.*, " + effective + " eff,"
+                + " case when length(k.busy) = " + shards + " then get_bit(k.busy, c.shard) = 0 else false end idle"
+                + " from unnest(?::int[]) s(shard) cross join lateral (select " + COLUMNS + " from " + names.cursor()
+                + " where shard = s.shard order by seq desc limit 1) c left join " + newestCheckpoint(names)
+                + " k on true) c left join " + names.tick() + " t on t.id = c.tick_id"
+                + " cross join lateral (select (select min(next_attempt_at) from " + names.retry()
+                + " where shard = c.shard and next_attempt_at is not null) retry_due, (select min(due_at) from "
+                + names.parked() + " where shard = c.shard) parked_due) d"
+                // a tick dated in the future (the clock stepped back since) counts as old, so a wrong clock cannot
+                // keep a shard's tick, and every tick above it, forever
+                + " cross join lateral (select c.idle and c.target_tick_id is null and c.tick_id < c.eff"
+                + " and (t.created_at is null or t.created_at <= clock_timestamp() - ? * interval '1 microsecond'"
+                + " or t.created_at > clock_timestamp()) anchor) a"
+                + " where a.anchor or c.retry_due_at is null and d.retry_due is not null"
+                + " or c.parked_due_at is null and d.parked_due is not null order by c.shard";
+        this.lowestTick = "select min(c.tick_id) from generate_series(0, " + shards + " - 1) s cross join lateral"
+                + " (select tick_id from " + names.cursor() + " where shard = s order by seq desc limit 1) c";
+    }
+
+    /**
+     * The cursor rows maintenance appends for {@code shards} (see the class comment), in shard order: an
+     * <em>anchor</em> for a shard idle at the newest checkpoint (bit 0), with no batch in progress, whose latest
+     * cursor row is on a tick below its effective tick made {@code anchorInterval} or more ago (or gone, or dated in
+     * the future): that row at the effective tick, no batch in progress, {@code paused_until} and {@code failures}
+     * kept; a <em>due repair</em> for a shard with rows in {@code <retry>} or {@code <parked>} whose latest cursor row
+     * has the matching due null, whatever its position: that row as it is. Both carry {@code retry_due_at} and
+     * {@code parked_due_at} as the tables hold them now ({@link RetryStore#minDue}, {@link ParkedStore#minDue}), so
+     * only under the shard's lock are they exact.
+     */
+    public List<Cursor> anchors(Connection c, Collection<Integer> shards, Duration anchorInterval)
+            throws SQLException {
+        var result = new ArrayList<Cursor>();
+        if (shards.isEmpty()) {
+            return result;
+        }
+        try (var ps = c.prepareStatement(anchors)) {
+            ps.setArray(1, c.createArrayOf("int4", shards.toArray()));
+            ps.setLong(2, TimeUnit.MICROSECONDS.convert(anchorInterval));
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    result.add(cursor(rs));
+                }
+            }
+        }
+        return result;
+    }
+
+    /** The lowest {@code tick_id} of the shards' latest cursor rows; null without cursors. */
+    @Nullable
+    public Long lowestTick(Connection c) throws SQLException {
+        try (var st = c.createStatement(); var rs = st.executeQuery(lowestTick)) {
+            rs.next();
+            return rs.getObject(1, Long.class);
+        }
     }
 
     /**

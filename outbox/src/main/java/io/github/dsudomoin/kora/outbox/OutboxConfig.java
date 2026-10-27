@@ -85,6 +85,15 @@ public interface OutboxConfig {
             return 3;
         }
 
+        /**
+         * How long an idle shard's latest cursor row may stay on a tick below its effective one before maintenance
+         * appends one at the effective tick (an anchor): ticks are kept from the lowest latest cursor row's tick on,
+         * as the previous release starts its steps there. At least {@code outbox.partitions.maintenanceInterval}.
+         */
+        default Duration cursorAnchorInterval() {
+            return Duration.ofHours(1);
+        }
+
         default RetryConfig retry() {
             return new RetryConfig() {};
         }

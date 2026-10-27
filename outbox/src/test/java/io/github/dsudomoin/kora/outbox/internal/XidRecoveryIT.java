@@ -493,7 +493,10 @@ class XidRecoveryIT {
         try (var c = TestDb.connect()) {
             assertThat(new Ticks(names, config.shards()).make(c, Duration.ZERO)).isTrue();
         }
-        assertThat(maintenance().runOnce()).isTrue(); // a checkpoint past the drain tick, and the ticks below it gone
+        assertThat(maintenance().runOnce()).isTrue(); // a checkpoint past the drain tick
+        try (var c = TestDb.connect()) { // cleanup keeps the cursors' ticks: gone by hand, as an earlier build left them
+            execute(c, "delete from " + names.tick() + " where id < (select tick_id from " + names.checkpoint() + ")");
+        }
         assertThat(tickExists(drained)).as("the relayed shard's cursor tick").isFalse();
         try (var c = TestDb.connect()) {
             assertThat(new XidRecovery(names, config).rowsToSave(c)).as("relayed up to its effective tick").isZero();

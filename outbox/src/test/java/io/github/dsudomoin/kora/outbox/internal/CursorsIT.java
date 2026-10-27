@@ -10,6 +10,7 @@ import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
 import java.sql.Connection;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
@@ -272,6 +273,42 @@ class CursorsIT {
             assertThat(cursors.positions(c, t3)).extracting(Cursors.Position::effectiveTickId)
                     .containsExactly(b, t3, b, t2);
             assertThat(cursors.latest(c, 0).effectiveTickId()).isEqualTo(b);
+        }
+    }
+
+    @Test
+    void anchorsMoveIdleShardsToTheirEffectiveTickAndRepairMissingDues() throws Exception {
+        var names = bootstrap(); // 4 shards, every cursor on the bootstrap tick
+        var cursors = new Cursors(names, config.shards());
+        var all = List.of(0, 1, 2, 3);
+        try (var c = TestDb.connect()) {
+            long b = queryLong(c, "select max(id) from " + names.tick());
+            long t2 = tick(c, names, "B'0100'", 10);
+            cursors.checkpoint(c, t2, cursors.positions(c, t2)); // 0100: shard 1 busy at b
+            cursors.append(c, cursors.latest(c, 2).cursor().withPause(T2, 2)); // paused, idle all the same
+            cursors.append(c, cursors.latest(c, 3).cursor().withProgress(b, t2, 7)); // a batch in progress
+            assertThat(cursors.lowestTick(c)).isEqualTo(b);
+            assertThat(cursors.anchors(c, all, Duration.ofHours(1))).as("all younger than the interval").isEmpty();
+
+            var anchors = cursors.anchors(c, all, Duration.ZERO);
+
+            assertThat(anchors).as("idle shards without a batch in progress")
+                    .containsExactly(new Cursor(0, t2, null, 0, null, 0, null, null),
+                            new Cursor(2, t2, null, 0, T2, 2, null, null));
+
+            execute(c, "insert into " + names.retry() + " (id, shard, message_id, topic, created_at, next_attempt_at)"
+                    + " values (1, 3, gen_random_uuid(), 't', now(), '" + T1 + "')");
+            execute(c, "insert into " + names.parked() + " (id, shard, message_id, topic, created_at, due_at)"
+                    + " values (2, 1, gen_random_uuid(), 't', now(), '" + T2 + "')");
+            assertThat(cursors.anchors(c, all, Duration.ofHours(1))).as("dues missing, whatever the age")
+                    .containsExactly(new Cursor(1, b, null, 0, null, 0, null, T2),
+                            new Cursor(3, b, t2, 7, null, 0, T1, null));
+            assertThat(cursors.anchors(c, List.of(0, 1), Duration.ZERO)).as("only the shards asked")
+                    .containsExactly(new Cursor(0, t2, null, 0, null, 0, null, null),
+                            new Cursor(1, b, null, 0, null, 0, null, T2));
+            cursors.appendAll(c, cursors.anchors(c, all, Duration.ZERO));
+            assertThat(cursors.anchors(c, all, Duration.ZERO)).as("written: nothing more").isEmpty();
+            assertThat(cursors.lowestTick(c)).isEqualTo(b);
         }
     }
 

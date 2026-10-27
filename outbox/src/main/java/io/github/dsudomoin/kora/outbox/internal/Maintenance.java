@@ -1,6 +1,7 @@
 package io.github.dsudomoin.kora.outbox.internal;
 
 import io.github.dsudomoin.kora.outbox.OutboxConfig;
+import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Position;
 import io.github.dsudomoin.kora.outbox.internal.Ticks.Tick;
 import jakarta.annotation.Nullable;
@@ -13,6 +14,7 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.IntStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
@@ -40,13 +42,17 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * the latest tick and the shards busy at it, by which a shard without new rows moves on without a cursor row; the
  * drops and the tick cleanup go by its effective ticks, and a run that fails to write it does neither; a checkpoint
  * whose tick is gone or was made after it, as tick ids going backwards in a partial restore leave it, counts for
- * nothing and is replaced, with an ERROR at most once a minute), drop of
+ * nothing and is replaced, with an ERROR at most once a minute), the cursor anchors and due repairs
+ * ({@link Cursors#anchors}: a cursor row at its effective tick for each shard idle at that checkpoint whose latest row
+ * lies below it and is older than {@code outbox.relay.cursorAnchorInterval}, and one for each shard whose latest row
+ * misses a due its {@code <retry>} or {@code <parked>} rows need; in one transaction under the shards' locks), drop of
  * processed partitions, drop of ranges left detached but not dropped: by a crash of this library's maintenance once
  * relayed (one still holding rows at or above the horizon first has those moved back into the outbox as new messages,
  * {@link OrphanRestore}, unless {@code outbox.partitions.restoreOrphans} is off), by anyone else only when empty
  * (and ranges the xid-regression recovery set aside, {@code <base>_o<digits>}, likewise:
  * {@code outbox.partitions.orphaned} counts the ones kept, with an ERROR each run, as their rows lie outside the
- * outbox), tick cleanup, cursor cleanup, deletion of kept dead letters older than
+ * outbox), tick cleanup (below the lowest effective tick, but never below a latest cursor row's tick, where the
+ * previous release starts its steps: see {@link Cursors}), cursor cleanup, deletion of kept dead letters older than
  * {@code outbox.deadLetters.retention} (by {@code failed_at}; none when it is 0, pending or scheduled ones never) and
  * of redrive counts older than {@code outbox.deadLetters.redriveHistory}, the start of the dead table's
  * {@code <dead>_due} build when it is missing or invalid ({@link DeadIndexBuilder}: on its own thread, off the
@@ -78,6 +84,8 @@ public final class Maintenance {
     private final XidPartitions partitions;
     private final Ticks ticks;
     private final Cursors cursors;
+    private final int shards;
+    private final Duration anchorInterval;
     private final RetryStore retries;
     private final ParkedStore parked;
     final OrphanRestore orphanRestore; // for a test's seam
@@ -128,6 +136,8 @@ public final class Maintenance {
         this.partitions = new XidPartitions(names, config.partitions());
         this.ticks = new Ticks(names, config.shards());
         this.cursors = new Cursors(names, config.shards());
+        this.shards = config.shards();
+        this.anchorInterval = config.relay().cursorAnchorInterval();
         this.retries = new RetryStore(names, false); // counts rows only, writes no dead row
         this.parked = new ParkedStore(names, retries);
         this.orphanRestore = new OrphanRestore(
@@ -318,15 +328,14 @@ public final class Maintenance {
      * which rows their lost tick had seen is gone with it.
      */
     private void logStranded(Read read) {
-        log.error("outbox shards {} of {} start from ticks {} that no longer exist: deleted by hand, or by cleanup"
-                + " while a checkpoint moved those shards past them, a checkpoint that now counts for nothing (from"
-                + " another history: restoring {} without {}?). Their batches cannot be read, so the relay is stopped"
-                + " for them (each step fails with «its effective tick was deleted»), and maintenance drops no"
-                + " partitions and deletes no ticks until they move; their rows stay in the outbox, and"
-                + " outbox.shard.lag counts from the oldest tick left. To recover, save their unrelayed rows and reset"
-                + " the cursors as the README describes for a restore («Восстановление после регрессии xid»); this"
-                + " ERROR repeats at most once a minute", read.stranded().keySet(), names.base(),
-                read.stranded().values().stream().distinct().sorted().toList(), names.tick(), names.checkpoint());
+        log.error("outbox shards {} of {} start from ticks {} that no longer exist: deleted by hand, or lost with"
+                + " a restore of {} without {} and {} (cleanup keeps every tick a latest cursor row is on). Their"
+                + " batches cannot be read, so the relay is stopped for them (each step fails with «its effective tick"
+                + " was deleted»), and maintenance drops no partitions and deletes no ticks until they move; their rows"
+                + " stay in the outbox, and outbox.shard.lag counts from the oldest tick left. To recover, see the"
+                + " README, «Застрявшие шарды» under «Таблицы»; this ERROR repeats at most once a minute",
+                read.stranded().keySet(), names.base(), read.stranded().values().stream().distinct().sorted().toList(),
+                names.tick(), names.cursor(), names.checkpoint());
     }
 
     private boolean sessionStable(Connection c) throws SQLException {
@@ -418,6 +427,7 @@ public final class Maintenance {
             cursors.checkpoint(c, read.latest().id(), read.positions());
             return read.slowest();
         });
+        step("cursor anchors", () -> anchor(c));
         orphaned = Double.NaN; // unknown unless the orphan step completes
         if (slowest != null) {
             step("partition drop", () -> partitions.dropProcessed(c, slowest.snapshot().xmin(), detachLockTimeout));
@@ -457,7 +467,11 @@ public final class Maintenance {
                 orphaned = left;
                 return null;
             });
-            step("tick cleanup", () -> ticks.deleteBelow(c, slowest.id()));
+            // not below a latest cursor row's tick either, where the previous release starts its steps
+            step("tick cleanup", () -> {
+                var lowest = cursors.lowestTick(c);
+                return ticks.deleteBelow(c, lowest == null ? slowest.id() : Math.min(slowest.id(), lowest));
+            });
         }
         step("cursor cleanup", () -> cursors.deleteSuperseded(c));
         if (!deadRetention.isZero()) {
@@ -498,6 +512,46 @@ public final class Maintenance {
         }
         stepFailed = true; // no success recorded while rows lie outside the outbox
         return false;
+    }
+
+    /**
+     * The anchors and due repairs of {@link Cursors#anchors}, in one transaction: the shards that need one, then each
+     * one's lock without waiting ({@code pg_try_advisory_xact_lock(internalNs, LOCK_SHARD_BASE + shard)}, a step's;
+     * a shard a step holds waits for the next run), then their rows read again after the lock, so from the cursor and
+     * tables a step left, and appended in one statement. Returns the rows appended.
+     */
+    private int anchor(Connection c) throws SQLException {
+        var wanted = cursors.anchors(c, IntStream.range(0, shards).boxed().toList(), anchorInterval);
+        if (wanted.isEmpty()) {
+            return 0;
+        }
+        c.setAutoCommit(false);
+        try {
+            List<Integer> locked;
+            try (var ps = c.prepareStatement("select array(select s from unnest(?::int[]) s"
+                    + " where pg_try_advisory_xact_lock(?, ? + s))")) {
+                ps.setArray(1, c.createArrayOf("int4", wanted.stream().map(Cursor::shard).toArray()));
+                ps.setInt(2, names.internalNamespace());
+                ps.setInt(3, TableNames.LOCK_SHARD_BASE);
+                try (var rs = ps.executeQuery()) {
+                    rs.next();
+                    locked = List.of((Integer[]) rs.getArray(1).getArray());
+                }
+            }
+            var rows = cursors.anchors(c, locked, anchorInterval); // a statement after the lock
+            cursors.appendAll(c, rows);
+            c.commit();
+            return rows.size();
+        } catch (SQLException | RuntimeException e) {
+            try {
+                c.rollback();
+            } catch (SQLException cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            throw e;
+        } finally {
+            c.setAutoCommit(true);
+        }
     }
 
     /** {@code delete} with the one parameter: {@code age} in seconds; returns the rows deleted. */

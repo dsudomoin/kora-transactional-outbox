@@ -34,11 +34,12 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * {@link Maintenance}, concurrently. The schema lock is retried for a
  * minute, then startup fails. On existing tables the bootstrap takes no lock that writers wait behind (index creation
  * is skipped when the index exists, partition extension is optional and left to maintenance when it times out). A tick
- * table made before {@code max_id} or {@code dirty}, a cursor table made before {@code parked_due_at}, a retry table
- * made before {@code requeues} and a dead table made before the dead-letter hook's columns get each column once, and a
- * tick table's {@code shards} (the shard sets {@code dirty} replaces) is dropped once; that ALTER waits for running
- * relay transactions and fails startup on timeout. Ticks without {@code dirty} (null) count as holding rows of every
- * shard; dead letters older than {@code status} are kept and the hook sees new ones only: one ALTER adds the hook's
+ * table made before {@code max_id}, {@code dirty} or {@code shards}, a cursor table made before
+ * {@code parked_due_at}, a retry table made before {@code requeues} and a dead table made before the dead-letter hook's
+ * columns get each column once; such an ALTER waits for running relay transactions and fails startup on timeout. The
+ * tick table keeps {@code shards}, the shard sets {@code dirty} replaces, for the previous release, which writes and
+ * reads it beside or after this one; this version leaves it null (every shard). Ticks without {@code dirty} (null)
+ * count as holding rows of every shard; dead letters older than {@code status} are kept and the hook sees new ones only: one ALTER adds the hook's
  * columns, and their check is not validated, so it scans no row of the dead table under that ALTER's lock.
  */
 public final class OutboxSchema implements Lifecycle {
@@ -118,6 +119,11 @@ public final class OutboxSchema implements Lifecycle {
         require(partitions.premake() >= 2, "outbox.partitions.premake must be at least 2: " + partitions.premake());
         require(partitions.maintenanceInterval().compareTo(Duration.ZERO) > 0,
                 "outbox.partitions.maintenanceInterval must be positive: " + partitions.maintenanceInterval());
+        require(relay.cursorAnchorInterval().compareTo(Duration.ZERO) > 0,
+                "outbox.relay.cursorAnchorInterval must be positive: " + relay.cursorAnchorInterval());
+        require(relay.cursorAnchorInterval().compareTo(partitions.maintenanceInterval()) >= 0,
+                "outbox.relay.cursorAnchorInterval must be at least outbox.partitions.maintenanceInterval: "
+                        + relay.cursorAnchorInterval());
         // sent as whole milliseconds, and lock_timeout = 0 is no limit at all
         require(partitions.swapLockTimeout().toMillis() > 0,
                 "outbox.partitions.swapLockTimeout must be positive: " + partitions.swapLockTimeout());
@@ -220,15 +226,17 @@ public final class OutboxSchema implements Lifecycle {
                       snapshot   pg_snapshot not null,
                       created_at timestamptz not null default clock_timestamp(),
                       max_id     bigint,
-                      dirty      bit varying
+                      dirty      bit varying,
+                      shards     smallint[]
                     )""");
             if (!columnExists(c, n.tick(), "max_id")) { // a tick table made before max_id: a metadata-only change
                 st.execute("alter table " + n.tick() + " add column if not exists max_id bigint");
             }
             addColumn(c, n.tick(), "dirty", "bit varying"); // made before dirty: likewise; its ticks stay null (all)
-            if (columnExists(c, n.tick(), "shards")) { // the shard sets dirty replaces
-                st.execute("alter table " + n.tick() + " drop column if exists shards");
-            }
+            // the shard sets dirty replaces, kept for the previous release beside or after this one: it inserts them
+            // in every tick and reads them (null: every shard, as this version leaves them). Made again where an
+            // earlier build of this version dropped it
+            addColumn(c, n.tick(), "shards", "smallint[]");
             createIndex(c, n.tick() + "_xmax", n.tick() + " ((pg_snapshot_xmax(snapshot)))"); // Maintenance's xid check
             st.execute("create table if not exists " + n.cursor() + """
                      (
