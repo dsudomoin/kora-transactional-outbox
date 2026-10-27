@@ -1257,6 +1257,69 @@ class OutboxRelayIT {
     }
 
     @Test
+    void ticksKeepComingWhileAPassWorksThroughABacklog() throws Exception {
+        config.shards(4).workers(1).batchSize(10).minTickInterval(Duration.ofMillis(50))
+                .idlePollInterval(Duration.ofMillis(200));
+        bootstrap();
+        var delivered = new AtomicInteger();
+        var relay = start(new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) throws Exception {
+                Thread.sleep(2); // 2000 records: about 4 s of one pass, its round never running out
+                delivered.incrementAndGet();
+            }
+        });
+        var outbox = outbox(relay::wake);
+        awaitParked();
+        send(outbox, messagesOnShards(2000, 0, 3).toArray(OutboxMessage[]::new));
+        await(Duration.ofSeconds(5), () -> delivered.get() > 0);
+        long ticks = ticksMade();
+
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        for (int i = 0; System.nanoTime() < until; i++) { // commits that wake the relay, every 50 ms
+            send(outbox, msg("t", "w" + i, "w"));
+            Thread.sleep(50);
+        }
+
+        // a tick attempt per minTickInterval of wake-ups: about 40; before, none until the backlog was through, so
+        // the next tick held everything committed meanwhile, read again in full by each chunk of its batches
+        assertThat(delivered.get()).as("the backlog is still being delivered").isLessThan(2000);
+        assertThat(ticksMade() - ticks).as("ticks made in 2 s").isGreaterThanOrEqualTo(10);
+    }
+
+    @Test
+    void busyShardsAreSteppedAloneAndQuietOnesTogether() throws Exception {
+        config.shards(32).workers(1).batchSize(1000); // groups of up to 32
+        bootstrap();
+        var handler = new RecordingHandler();
+        var groups = new CopyOnWriteArrayList<List<Integer>>();
+        var relay = relay(steppedGroups(groups::add), handler);
+        relay.init();
+        var outbox = outbox(relay::wake);
+        awaitParked();
+        int sent = 0;
+        var waves = new ArrayList<List<List<Integer>>>();
+        for (int rows : new int[] {600, 600, 1, 1}) { // one transaction each, rows per shard
+            int from = groups.size();
+            send(outbox, IntStream.range(0, 32).boxed().flatMap(shard -> IntStream.range(0, rows)
+                    .mapToObj(i -> msg("t", keyOnShard(shard, "k"), "m"))).toArray(OutboxMessage[]::new));
+            sent += 32 * rows;
+            int total = sent;
+            await(Duration.ofSeconds(20), () -> handler.delivered().size() == total);
+            awaitParked();
+            waves.add(List.copyOf(groups.subList(from, groups.size())));
+        }
+
+        // 600 rows a shard: two do not fit in one batchSize read, which would be cut after the first (the rest of
+        // the second read again in the next step, the shards after it untouched); one row a shard: all in one step
+        assertThat(waves.get(1)).as("steps of the second wave of 600 rows a shard").isNotEmpty()
+                .allSatisfy(group -> assertThat(group).hasSize(1));
+        assertThat(waves.get(3).stream().mapToInt(List::size).max().orElse(0)).as("largest step of the second wave"
+                + " of 1 row a shard").isGreaterThanOrEqualTo(16);
+        assertIdOrderPerKey(handler.delivered());
+    }
+
+    @Test
     void manyShardsDeliverInOrderUnderLoad() throws Exception {
         // 2 instances × 4 workers over 1024 shards; a slow shard whose calls wind down at the soft deadline (1.6 s)
         // with its group's later shards unread, and a hot key whose shard fills the group's read

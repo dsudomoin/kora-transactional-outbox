@@ -53,7 +53,10 @@ public final class BatchReader {
         this.selectUnchecked = sql(names, "false");
         // the per-shard parameters arrive as rows of unnest, so the partition bounds are known only as each shard's
         // lateral runs: pruned at run time on every rescan (the xip branch through its lo/hi bounds, as xid = any of a
-        // non-constant array prunes nothing). Each array is cast once, here, not per row
+        // non-constant array prunes nothing). Run-time pruning still opens and locks every partition and index when
+        // the statement starts, past the fast-path locks with a few dozen partitions (2.7 times read's time per row on
+        // the stand), so both branches also carry the group's own constant xid bounds, which prune at plan time.
+        // Each array is cast once, here, not per row
         this.selectMany = manySql(names, "case when u.chk then " + blocked + " else false end");
         // no read checks: the statement does not name the retry table at all
         this.selectManyUnchecked = manySql(names, "false");
@@ -67,9 +70,10 @@ public final class BatchReader {
                 + " chk, i)"
                 + " cross join lateral (select o.* from ("
                 + " select * from " + names.base() + " where shard = u.shard and xid >= u.pmax and xid < u.tmax"
+                + " and xid >= ?::xid8 and xid < ?::xid8"
                 + " union all"
                 + " select * from " + names.base() + " where shard = u.shard and xid >= u.lo and xid <= u.hi"
-                + " and xid = any(u.xip::xid8[])"
+                + " and xid = any(u.xip::xid8[]) and xid >= ?::xid8 and xid < ?::xid8"
                 + ") o where pg_visible_in_snapshot(o.xid, u.snap) and o.id > u.last_id order by o.id limit u.lim) o"
                 + " limit ?";
     }
@@ -157,7 +161,20 @@ public final class BatchReader {
         ps.setArray(8, c.createArrayOf("int8", lastId));
         ps.setArray(9, c.createArrayOf("int4", limit));
         ps.setArray(10, c.createArrayOf("bool", check));
-        ps.setInt(11, totalLimit);
+        // every shard's rows lie in [min(prev xmax, its lowest candidate xip), max(target xmax)): a candidate xip is
+        // in prev's xip, so at or above prev's xmin and below prev's xmax, which is at most target's
+        long low = Long.MAX_VALUE;
+        long high = Long.MIN_VALUE;
+        for (var r : reads) {
+            low = Math.min(low, Math.min(r.prev().xmax(), Arrays.stream(candidateXip(r.prev(), r.target())).min()
+                    .orElse(Long.MAX_VALUE)));
+            high = Math.max(high, r.target().xmax());
+        }
+        for (int i : new int[] {11, 13}) {
+            ps.setString(i, Long.toString(low));
+            ps.setString(i + 1, Long.toString(high));
+        }
+        ps.setInt(15, totalLimit);
     }
 
     /**

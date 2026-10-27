@@ -354,6 +354,9 @@ class BatchReaderIT {
                 covering.add(names.unqualified(names.partitionPrefix()) + x / 1000 * 1000);
             }
             assertThat(partitionsScanned(conn, reads)).as("partitions scanned").isNotEmpty().isSubsetOf(covering);
+            // and at plan time: the statement does not even open the others (run-time pruning opens and locks them
+            // all, past the fast-path locks with a few dozen partitions)
+            assertThat(partitionsPlanned(conn, reads)).as("partitions planned").isNotEmpty().isSubsetOf(covering);
         }
     }
 
@@ -470,6 +473,28 @@ class BatchReaderIT {
             c.rollback();
         }
         return used;
+    }
+
+    /** {@code EXPLAIN} (no analyze) of the statement {@code readMany} runs, bound as it binds it: the partitions planned. */
+    private TreeSet<String> partitionsPlanned(Connection c, List<ShardRead> reads) throws SQLException {
+        var planned = new TreeSet<String>();
+        var partition = Pattern.compile(Pattern.quote(names.unqualified(names.partitionPrefix())) + "\\d+");
+        c.setAutoCommit(false);
+        try (var ps = c.prepareStatement("explain " + reader.manySql())) {
+            execute(c, "set local plan_cache_mode = force_custom_plan");
+            reader.bindMany(ps, reads, 1000);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    var m = partition.matcher(rs.getString(1));
+                    while (m.find()) {
+                        planned.add(m.group());
+                    }
+                }
+            }
+        } finally {
+            c.rollback();
+        }
+        return planned;
     }
 
     private BatchReader.Batch readMany(List<ShardRead> reads, int totalLimit) throws SQLException {
