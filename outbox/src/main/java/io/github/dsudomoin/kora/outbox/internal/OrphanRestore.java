@@ -21,6 +21,7 @@ public final class OrphanRestore {
 
     private final TableNames names;
     private final Resender resender;
+    private final Duration keyLockTimeout;
     /** {@code <base>_x<digits>}, unqualified (as listed on the search_path) or qualified as the outbox is named. */
     private final Pattern range;
     private final String unmarkDropping;
@@ -28,9 +29,15 @@ public final class OrphanRestore {
     @Nullable
     SqlConsumer<Connection> afterChunk;
 
-    public OrphanRestore(TableNames names, Resender resender) {
+    /**
+     * {@code keyLockTimeout} bounds each wait for a key lock (and any other lock the insert waits for), so a chunk
+     * stalls a writer of a key it holds no longer than the tail swap may stall one: pass
+     * {@code outbox.partitions.swapLockTimeout}.
+     */
+    public OrphanRestore(TableNames names, Resender resender, Duration keyLockTimeout) {
         this.names = names;
         this.resender = resender;
+        this.keyLockTimeout = keyLockTimeout;
         var prefix = names.partitionPrefix();
         var unqualified = names.unqualified(prefix);
         this.range = Pattern.compile("(?:" + Pattern.quote(prefix.substring(0, prefix.length() - unqualified.length()))
@@ -41,12 +48,13 @@ public final class OrphanRestore {
     /**
      * Moves the rows of {@code table} with an xid at or above {@code fromXid} back into the outbox, then drops it:
      * <b>its rows below {@code fromXid} go with the table</b>. First {@code create index if not exists <table>_id};
-     * then chunks of {@link #CHUNK} rows in id order, each one read-committed transaction under {@code lock_timeout} =
-     * {@code lockTimeout} that holds ACCESS EXCLUSIVE on {@code table} alone, never on the outbox: it inserts the rows
-     * and deletes them from {@code table} together, so a restore that dies loses and repeats nothing, and the next
-     * call resumes it. The chunk that finds fewer rows, the last, also drops {@code table} and deletes its
-     * {@code <base>_dropping} marker. A lock timeout (SQLState 55P03) rolls back the chunk it hits. Returns the rows
-     * moved.
+     * then chunks of {@link #CHUNK} rows in id order, each one read-committed transaction that holds ACCESS EXCLUSIVE
+     * on {@code table} alone, never on the outbox, waited for at most {@code lockTimeout}: it inserts the rows and
+     * deletes them from {@code table} together, so a restore that dies loses and repeats nothing, and the next call
+     * resumes it. Its key locks are waited for at most {@code keyLockTimeout} each: while it waits for one, writers of
+     * the keys it already holds wait too. The chunk that finds fewer rows, the last, also drops {@code table} and
+     * deletes its {@code <base>_dropping} marker. A lock timeout (SQLState 55P03) rolls back the chunk it hits, rows
+     * and locks. Returns the rows moved.
      *
      * @throws IllegalArgumentException before any SQL that names it, unless {@code table} is {@code <base>_x<digits>},
      *     unqualified or qualified as the outbox is named, and a table in the outbox's schema that is no partition
@@ -85,6 +93,8 @@ public final class OrphanRestore {
                         }
                     }
                 }
+                // from here on, writers may queue behind this chunk's key locks: wait no longer than the swap may
+                st.execute("set local lock_timeout = " + keyLockTimeout.toMillis());
                 resender.insertAll(c, rows);
                 try (var ps = c.prepareStatement("delete from " + table + " where id = any(?)")) {
                     ps.setArray(1, c.createArrayOf("int8", ids.toArray()));

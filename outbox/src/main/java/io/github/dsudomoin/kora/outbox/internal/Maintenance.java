@@ -100,7 +100,8 @@ public final class Maintenance {
         this.cursors = new Cursors(names);
         this.retries = new RetryStore(names);
         this.parked = new ParkedStore(names);
-        this.orphanRestore = new OrphanRestore(names, new Resender(names, config.shards()));
+        this.orphanRestore = new OrphanRestore(
+                names, new Resender(names, config.shards()), config.partitions().swapLockTimeout());
         this.restoreOrphans = config.partitions().restoreOrphans();
         // every tick, not just the newest: workers keep ticking after a regression, and their new ticks look fine; the
         // highest xmax comes from the index <tick>_xmax, as ticks pile up while a paused shard holds cleanup back
@@ -265,12 +266,9 @@ public final class Maintenance {
                 int left = 0;
                 for (var orphan : partitions.dropOrphans(c, horizon, detachLockTimeout)) {
                     if (orphan.ours() && restoreOrphans) {
-                        long moved = orphanRestore.restore(c, orphan.table(), horizon, detachLockTimeout);
-                        log.info("outbox table {}, a range of {} detached as relayed, held rows the relay could not"
-                                + " deliver: moved {} rows at or above xid {}, the slowest shard's horizon, back into"
-                                + " the outbox with new ids and xids, so they are new messages, delivered after later"
-                                + " messages of their keys; rows below it went with the table, which is dropped",
-                                orphan.table(), names.base(), moved, horizon);
+                        if (!restored(c, orphan.table(), horizon)) {
+                            left++;
+                        }
                     } else if (orphan.ours()) {
                         left++;
                         // the columns send writes: moved rows are new messages, with new ids and xids
@@ -305,6 +303,31 @@ public final class Maintenance {
             return null;
         });
         return !stepFailed;
+    }
+
+    /**
+     * Moves the rows of an orphan of ours back from {@code horizon} ({@link OrphanRestore}); false when that failed,
+     * which is logged and fails the step, but not the other orphans': the table is kept, and the next run resumes.
+     */
+    private boolean restored(Connection c, String table, long horizon) {
+        try {
+            long moved = orphanRestore.restore(c, table, horizon, detachLockTimeout);
+            log.info("outbox table {}, a range of {} detached as relayed, held rows the relay could not deliver: moved"
+                    + " {} rows at or above xid {}, the slowest shard's horizon, back into the outbox with new ids and"
+                    + " xids, so they are new messages, delivered after later messages of their keys; rows below it"
+                    + " went with the table, which is dropped", table, names.base(), moved, horizon);
+            return true;
+        } catch (SQLException e) {
+            log.warn("outbox maintenance could not move the rows of {}, a range of {} detached as relayed, back into"
+                    + " the outbox (SQLState {}): {}. It is kept (gauge outbox.partitions.orphaned) and the next run"
+                    + " goes on from the rows moved so far", table, names.base(), e.getSQLState(), e.getMessage());
+        } catch (RuntimeException e) {
+            log.error("outbox maintenance could not move the rows of {}, a range of {} detached as relayed, back into"
+                    + " the outbox. It is kept (gauge outbox.partitions.orphaned) and the next run goes on from the"
+                    + " rows moved so far", table, names.base(), e);
+        }
+        stepFailed = true; // no success recorded while rows lie outside the outbox
+        return false;
     }
 
     /** The tick of the slowest shard; shards mid-batch count by tick id, as their target is not processed yet. */

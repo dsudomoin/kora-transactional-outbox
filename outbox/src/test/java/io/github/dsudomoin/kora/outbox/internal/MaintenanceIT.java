@@ -791,10 +791,108 @@ class MaintenanceIT {
     }
 
     @Test
+    void oneFailingRestoreDoesNotHideTheOtherOrphans() throws Exception {
+        bootstrap();
+        var ours = oursOrphan(relay(new RecordingHandler(), maintenance()), 2);
+        // a range detached by someone else, listed after ours (by name), so the sweep reaches it after the failure
+        long oursLower = Long.parseLong(ours.table().substring(names.partitionPrefix().length()));
+        var foreign = names.partitionPrefix() + (oursLower + 1);
+        try (var c = TestDb.connect()) {
+            execute(c, "create table " + foreign + " (like " + names.base() + " including defaults)");
+            execute(c, "insert into " + foreign + " (id, shard, xid, message_id, topic) values (1, 0, '1',"
+                    + " gen_random_uuid(), 't')");
+        }
+        var registry = new SimpleMeterRegistry();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry), Duration.ofMillis(300));
+        try (var dump = TestDb.connect()) {
+            dump.setAutoCommit(false); // a pg_dump of the orphan: the chunk's ACCESS EXCLUSIVE times out
+            queryLong(dump, "select count(*) from " + ours.table());
+            String succeeded = lastSuccess();
+
+            String log;
+            try (var err = new CapturedStderr()) {
+                assertThat(maintenance.runOnce()).isTrue();
+                log = err.text();
+            }
+
+            assertThat(log).contains("WARN").contains("could not move the rows of " + ours.table()).contains("55P03")
+                    .doesNotContain("step 'orphan drop'");
+            assertThat(log).contains("ERROR").contains("outbox table " + foreign + " holds rows")
+                    .contains("not by this library");
+            assertThat(gauge(registry, "outbox.partitions.orphaned")).as("both kept").isEqualTo(2);
+            assertThat(lastSuccess()).as("a run that left rows outside the outbox is no success").isEqualTo(succeeded);
+            assertThat(count(ours.table(), ours.above())).isEqualTo(2);
+            dump.commit();
+        }
+
+        assertThat(maintenance.runOnce()).isTrue();
+
+        assertThat(exists(ours.table())).isFalse();
+        assertThat(gauge(registry, "outbox.partitions.orphaned")).as("the foreign one").isEqualTo(1);
+    }
+
+    @Test
+    void restoreGivesUpOnABusyKeyWithinSwapLockTimeout() throws Exception {
+        bootstrap(); // swapLockTimeout 200 ms
+        var orphan = oursOrphan(relay(new RecordingHandler(), maintenance()), 100);
+        var keys = new ArrayList<String>();
+        try (var c = TestDb.connect(); var st = c.createStatement();
+                var rs = st.executeQuery("select distinct convert_from(key, 'UTF8') from " + orphan.table()
+                        + " where key is not null")) {
+            while (rs.next()) {
+                keys.add(rs.getString(1));
+            }
+        }
+        keys.sort(Comparator.comparingInt(k -> Hashing.keyHash("t", k.getBytes(UTF_8))));
+        var busy = keys.get(keys.size() - 1); // locked last: the chunk holds every other key while it waits for it
+        var held = keys.get(0);
+        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
+        var restore = maintenance().orphanRestore;
+        var sendTook = new AtomicLong(-1);
+        var errors = new ConcurrentLinkedQueue<Throwable>();
+        try (var business = TestDb.connect()) {
+            business.setAutoCommit(false); // a business transaction that sent the key and goes on working
+            outbox.send(business, msg("t", busy, "busy"));
+            var sender = new Thread(() -> { // a writer of a key the chunk holds, once the chunk waits
+                try (var c = TestDb.connect()) {
+                    while (queryLong(c, "select count(*) from pg_locks where locktype = 'advisory' and not granted"
+                            + " and classid::bigint = " + Integer.toUnsignedLong(names.keyNamespace())) == 0) {
+                        Thread.sleep(1);
+                    }
+                    long start = System.nanoTime();
+                    send(outbox, msg("t", held, "sent meanwhile"));
+                    sendTook.set(System.nanoTime() - start);
+                } catch (Throwable e) {
+                    errors.add(e);
+                }
+            });
+            sender.start();
+
+            long start = System.nanoTime();
+            try (var c = TestDb.connect()) {
+                assertThatThrownBy(() -> restore.restore(c, orphan.table(), orphan.horizon(), Duration.ofSeconds(30)))
+                        .isInstanceOfSatisfying(
+                                SQLException.class, e -> assertThat(e.getSQLState()).isEqualTo("55P03"));
+            }
+            var restoreTook = Duration.ofNanos(System.nanoTime() - start);
+
+            sender.join();
+            assertThat(errors).isEmpty();
+            assertThat(restoreTook).as("the key lock waited for swapLockTimeout, not the 30 s table lock timeout")
+                    .isLessThan(config.swapLockTimeout().plusSeconds(1));
+            assertThat(Duration.ofNanos(sendTook.get())).as("the writer of a held key")
+                    .isLessThan(config.swapLockTimeout().plusSeconds(1));
+            assertThat(count(orphan.table(), orphan.above())).as("nothing moved").isEqualTo(100);
+            assertThat(count(names.base(), orphan.above())).isZero();
+            business.rollback();
+        }
+    }
+
+    @Test
     void restoreRefusesAnythingButAStandaloneRangeOfTheOutbox() throws Exception {
         bootstrap();
         var attached = ranges().stream().filter(b -> b.to() != null).findFirst().orElseThrow().name();
-        var restore = new OrphanRestore(names, new Resender(names, config.shards()));
+        var restore = new OrphanRestore(names, new Resender(names, config.shards()), config.swapLockTimeout());
         try (var c = TestDb.connect()) {
             execute(c, "create schema if not exists other");
             execute(c, "create table other." + names.unqualified(names.partitionPrefix()) + "5 (id bigint)");
