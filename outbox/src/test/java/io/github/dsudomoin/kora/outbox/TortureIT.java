@@ -200,10 +200,10 @@ class TortureIT {
             assertThat(minus(dead, handler.permanentAt.keySet())).as("dead but never failed permanently").isEmpty();
             assertThat(minus(handler.permanentAt.keySet(), dead)).as("failed permanently but not dead").isEmpty();
             assertThat(both(dead, delivered)).as("dead but delivered").isEmpty();
-            assertThat(orderViolations(order, dead, handler.requeued, handler.first, handler.permanentAt))
-                    .as("per (topic, key) first deliveries of never-requeued messages in commit order (and outbox id"
-                            + " order), each requeued one after those committed before it, none before a dead"
-                            + " never-requeued predecessor was attempted")
+            assertThat(orderViolations(order, dead, handler.requeued, handler.passedRequeue, handler.first,
+                    handler.permanentAt))
+                    .as("per (topic, key) each message first delivered after every never-requeued one committed"
+                            + " before it was first delivered or failed permanently; outbox ids in commit order")
                     .isEmpty();
             // a crash fails only its own call, as a whole: each record it delivered is delivered again, once per
             // such call; nothing else redelivers delivered work (the reliable phase does not crash), so a message
@@ -242,70 +242,49 @@ class TortureIT {
     }
 
     /**
-     * Per (topic, key): the committed non-dead never-requeued messages in commit order ({@code commit_order.n}) against
-     * the order of their first successful deliveries; their outbox ids rise in commit order; each requeued message was
-     * first delivered after those committed before it; and none was first delivered before a dead never-requeued
-     * predecessor's first permanent failure (a requeued one may fail after its key went on). {@code requeued}: the
-     * messages that parked before their first delivery or first permanent failure. One line per diverging key.
+     * Per (topic, key), in commit order ({@code commit_order.n}): the outbox ids of the non-dead never-requeued
+     * messages rise; and for each pair A committed before B, A never requeued and B not dead, B was first delivered
+     * after A's first delivery, or after A's first permanent failure when A is dead. {@code requeued}: the messages
+     * that parked before their first delivery or first permanent failure, which their key may pass. {@code passed}:
+     * pairs [A, B] where the handler itself delivered B after answering requeue for A in a call that then crashed,
+     * which discards the answer, so A never parked. One line per diverging key.
      */
     private static List<String> orderViolations(Map<UUID, Row> order, Set<UUID> dead, Set<UUID> requeued,
-            Map<UUID, Delivery> first, Map<UUID, Long> permanentAt) {
+            Set<List<UUID>> passed, Map<UUID, Delivery> first, Map<UUID, Long> permanentAt) {
         var byCommit = new HashMap<String, List<UUID>>(); // dead and requeued included
-        var byDelivery = new HashMap<String, List<UUID>>(); // never requeued
         order.values().stream()
                 .filter(row -> row.key() != null)
                 .sorted(Comparator.comparingInt(Row::n))
                 .forEach(row -> byCommit.computeIfAbsent(row.route(), k -> new ArrayList<>()).add(row.messageId()));
-        first.entrySet().stream()
-                .filter(e -> order.containsKey(e.getKey()) && order.get(e.getKey()).key() != null
-                        && !requeued.contains(e.getKey()))
-                .sorted(Comparator.comparingLong(e -> e.getValue().sequence()))
-                .forEach(e -> byDelivery.computeIfAbsent(order.get(e.getKey()).route(), k -> new ArrayList<>())
-                        .add(e.getKey()));
         var violations = new ArrayList<String>();
         byCommit.forEach((route, all) -> {
             var committed = all.stream().filter(id -> !dead.contains(id) && !requeued.contains(id)).toList();
-            var delivered = byDelivery.getOrDefault(route, List.of());
-            for (int i = 0; i < Math.max(committed.size(), delivered.size()); i++) {
-                var expected = i < committed.size() ? committed.get(i) : null;
-                var actual = i < delivered.size() ? delivered.get(i) : null;
-                if (expected == null || !expected.equals(actual)) {
-                    violations.add(route + " at #" + i + ": commit order has " + describe(expected, order, first)
-                            + ", first deliveries have " + describe(actual, order, first));
-                    return;
-                }
-                if (i > 0 && first.get(expected).outboxId() < first.get(committed.get(i - 1)).outboxId()) {
-                    violations.add(route + " at #" + i + ": outbox id below its predecessor's: "
-                            + describe(committed.get(i - 1), order, first) + " then " + describe(expected, order, first));
+            for (int i = 1; i < committed.size(); i++) {
+                if (first.get(committed.get(i)).outboxId() < first.get(committed.get(i - 1)).outboxId()) {
+                    violations.add(route + ": outbox id below its predecessor's: "
+                            + describe(committed.get(i - 1), order, first) + " then "
+                            + describe(committed.get(i), order, first));
                     return;
                 }
             }
-            UUID lastDead = null;
-            long deadAttempted = 0;
-            UUID lastDelivered = null; // the never-requeued one first delivered last so far, in commit order
-            for (var id : all) {
-                if (dead.contains(id)) {
-                    if (!requeued.contains(id)) {
-                        lastDead = id;
-                        deadAttempted = Math.max(deadAttempted, permanentAt.getOrDefault(id, 0L));
-                    }
+            for (int j = 1; j < all.size(); j++) {
+                var b = all.get(j);
+                if (dead.contains(b)) {
                     continue;
                 }
-                long sequence = first.get(id).sequence();
-                if (sequence < deadAttempted) {
-                    violations.add(route + ": " + describe(id, order, first) + " delivered before its dead"
-                            + " predecessor " + lastDead + " (n " + order.get(lastDead).n() + ") failed at #"
-                            + deadAttempted);
-                    return;
-                }
-                if (!requeued.contains(id)) {
-                    if (lastDelivered == null || sequence > first.get(lastDelivered).sequence()) {
-                        lastDelivered = id;
+                long delivered = first.get(b).sequence();
+                for (var a : all.subList(0, j)) {
+                    if (requeued.contains(a)) {
+                        continue;
                     }
-                } else if (lastDelivered != null && sequence < first.get(lastDelivered).sequence()) {
-                    violations.add(route + ": requeued " + describe(id, order, first) + " delivered before "
-                            + describe(lastDelivered, order, first) + ", committed before it and never requeued");
-                    return;
+                    boolean aDead = dead.contains(a);
+                    long before = aDead ? permanentAt.getOrDefault(a, 0L) : first.get(a).sequence();
+                    if (delivered < before && !passed.contains(List.of(a, b))) {
+                        violations.add(route + ": " + describe(b, order, first) + " first delivered before "
+                                + (aDead ? "the first permanent failure (#" + before + ") of " : "")
+                                + describe(a, order, first) + ", committed before it");
+                        return;
+                    }
                 }
             }
         });
@@ -581,6 +560,8 @@ class TortureIT {
          * before it. A requeue answer the relay did not apply (its call crashed or paused the shard) parks nothing.
          */
         final Set<UUID> requeued = ConcurrentHashMap.newKeySet();
+        /** Pairs [M, R]: a call that then crashed delivered R after answering requeue for M, of R's key. */
+        final Set<List<UUID>> passedRequeue = ConcurrentHashMap.newKeySet();
         final AtomicInteger requeueAnswers = new AtomicInteger();
         final AtomicInteger transientFailures = new AtomicInteger();
         final AtomicInteger downFailures = new AtomicInteger();
@@ -631,6 +612,8 @@ class TortureIT {
         private List<Outcome> attempt(List<OutboxRecord> records, SplittableRandom random) {
             var outcomes = new ArrayList<Outcome>(records.size());
             var failed = new HashSet<Object>();
+            var answeredRequeue = new HashMap<Object, List<UUID>>(); // per key
+            boolean crashing = current.get().crashAt >= 0;
             boolean anyDelivered = false;
             boolean windDown = false;
             for (var record : records) {
@@ -642,6 +625,7 @@ class TortureIT {
                 }
                 if (random.nextInt(100) < 3) {
                     requeueAnswers.incrementAndGet();
+                    answeredRequeue.computeIfAbsent(key, k -> new ArrayList<>()).add(record.messageId());
                     outcomes.add(Outcome.requeue());
                     windDown = random.nextBoolean();
                     continue;
@@ -650,6 +634,11 @@ class TortureIT {
                     handle(record);
                     outcomes.add(Outcome.delivered());
                     anyDelivered = true;
+                    if (crashing) {
+                        for (var m : answeredRequeue.getOrDefault(key, List.of())) {
+                            passedRequeue.add(List.of(m, record.messageId()));
+                        }
+                    }
                 } catch (OutboxPermanentException e) {
                     outcomes.add(Outcome.permanent(e));
                 } catch (Throwable e) { // an Error too, as in the default
