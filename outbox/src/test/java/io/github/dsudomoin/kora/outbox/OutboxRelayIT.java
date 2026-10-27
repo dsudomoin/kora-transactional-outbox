@@ -1557,7 +1557,10 @@ class OutboxRelayIT {
     }
 
     private void aTickWithoutAShardSetStepsEachShardOnce(int idleTicksBefore) throws Exception {
-        config.shards(32).workers(4).minTickInterval(Duration.ofMillis(50)).idlePollInterval(Duration.ofMillis(200));
+        // no idle tick of the relay's own during the sweep: a cursor read racing a sibling's step of a shard (begun
+        // before the read, committed after it) finds the shard behind, and a newer idle tick by then makes its second
+        // step a fresh batch with a cursor row of its own, which a cold JVM (this test alone) hits often
+        config.shards(32).workers(4).minTickInterval(Duration.ofMillis(50)).idlePollInterval(Duration.ofSeconds(30));
         bootstrap();
         var relay = start(new RecordingHandler());
         awaitParked();
@@ -1573,7 +1576,17 @@ class OutboxRelayIT {
         relay.wake();
 
         await(Duration.ofSeconds(5), () -> maxCursorSeq() >= seq + config.shards());
-        Thread.sleep(1000); // idle ticks go on: no shard is behind them, so no further step
+        awaitParked();
+        for (int i = 0; i < 5; i++) { // idle ticks go on: no shard is behind them, so no further step
+            try (var c = TestDb.connect()) {
+                execute(c, "insert into " + schema.names().tick() + " (snapshot, max_id, dirty) select"
+                        + " pg_current_snapshot(), max_id, ''::varbit from " + schema.names().tick()
+                        + " order by id desc limit 1");
+            }
+            relay.wake();
+            Thread.sleep(200);
+        }
+        awaitParked();
         try (var c = TestDb.connect()) {
             assertThat(queryString(c, "select count(*) || ':' || count(distinct shard) from "
                     + schema.names().cursor() + " where seq > " + seq)).as("one cursor row per shard")
