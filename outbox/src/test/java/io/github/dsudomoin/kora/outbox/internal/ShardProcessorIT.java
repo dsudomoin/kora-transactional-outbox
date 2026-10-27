@@ -1,11 +1,11 @@
 package io.github.dsudomoin.kora.outbox.internal;
 
-import static io.github.dsudomoin.kora.outbox.internal.ShardProcessor.ShardStatus.IDLE;
 import static io.github.dsudomoin.kora.outbox.internal.ShardProcessor.ShardStatus.NOT_LOCKED;
 import static io.github.dsudomoin.kora.outbox.internal.ShardProcessor.ShardStatus.NO_WORK;
 import static io.github.dsudomoin.kora.outbox.internal.ShardProcessor.ShardStatus.PAUSED;
 import static io.github.dsudomoin.kora.outbox.internal.ShardProcessor.ShardStatus.PROGRESS;
 import static io.github.dsudomoin.kora.outbox.testing.TestSql.execute;
+import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryLong;
 import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryString;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -947,7 +947,6 @@ class ShardProcessorIT {
         calls.clear();
 
         assertThat(process()).isEqualTo(new ShardResult(NOT_LOCKED, 0, false));
-        assertThat(process(true)).as("a drain's step").isEqualTo(new ShardResult(NOT_LOCKED, 0, false));
         assertThat(calls).isEmpty();
         assertThat(cursorRows()).isEqualTo(cursorRows);
         assertThat(cursor()).isEqualTo(cursor);
@@ -1037,7 +1036,7 @@ class ShardProcessorIT {
 
             // no step holds shard 1 or waits for it: only the queued exclusive request turns this one away, so a
             // stream of new steps cannot keep the swap waiting
-            assertThat(process(processor, 1, false)).isEqualTo(new ShardResult(NOT_LOCKED, 0, false));
+            assertThat(process(processor, 1)).isEqualTo(new ShardResult(NOT_LOCKED, 0, false));
             assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("a#1"));
 
             release.countDown();
@@ -1047,7 +1046,7 @@ class ShardProcessorIT {
             release.countDown();
         }
         swapLock(swap, "pg_advisory_unlock");
-        assertThat(process(processor, 1, false)).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(process(processor, 1)).isEqualTo(new ShardResult(PROGRESS, 1, true));
     }
 
     /** A session waits for {@code LOCK_SWAP} exclusively: the swap's quiesce request is queued. */
@@ -1146,11 +1145,11 @@ class ShardProcessorIT {
             assertThat(queryString(second, "select current_setting('transaction_isolation')"))
                     .isEqualTo("read committed");
             ShardProcessor.prepareTransaction(first, config.batchTimeout());
-            assertThat(processor.tryProcess(first, 0, latest, now, false))
+            assertThat(processor.tryProcess(first, 0, latest, now))
                     .isEqualTo(new ShardResult(PROGRESS, 2, true));
             first.commit();
 
-            assertThat(processor.tryProcess(second, 0, latest, now, false))
+            assertThat(processor.tryProcess(second, 0, latest, now))
                     .isEqualTo(new ShardResult(NO_WORK, 0, true));
             second.commit();
         }
@@ -1509,39 +1508,27 @@ class ShardProcessorIT {
     }
 
     @Test
-    void emptyStepAppendsNoCursorWhileTheCursorTickIsYoungerThanFiveSeconds() throws Exception {
+    void everyStepWithATargetAppends() throws Exception {
         config.maxTicksPerBatch(1);
         bootstrap();
-        long t0 = cursor().tickId();
         long t1 = tick();
         long appends = cursorRows();
 
-        // nothing to read, nothing in retry: no write at all
-        assertThat(process()).isEqualTo(new ShardResult(IDLE, 0, true));
-        assertThat(cursorRows()).isEqualTo(appends);
-        assertThat(cursor().tickId()).isEqualTo(t0);
-
-        // still idle just below 5 s
-        madeBefore(t0, t1, Duration.ofMillis(4900));
-        assertThat(process()).isEqualTo(new ShardResult(IDLE, 0, true));
-        assertThat(cursorRows()).isEqualTo(appends);
-
-        // 5 s old: the cursor moves on, for tick cleanup, partition drops and the lag gauge
-        madeBefore(t0, t1, Duration.ofSeconds(5));
+        // nothing to read: the cursor still moves to the target, so the shard is not behind it afterwards
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+        assertThat(cursorRows()).isEqualTo(appends + 1);
         assertThat(cursor()).isEqualTo(new Cursor(0, t1, null, 0, null, 0, null, null));
 
-        // a target below the latest tick (maxTicksPerBatch 1) appends however young, or maxTicksPerBatch ticks
-        // within 5 s would hold the cursor on the same young target forever
+        // on the latest tick: no target, no write
+        assertThat(process()).isEqualTo(new ShardResult(NO_WORK, 0, true));
+        assertThat(cursorRows()).isEqualTo(appends + 1);
+
+        // a target below the latest tick (maxTicksPerBatch 1): one tick a step, each appended
         long t2 = tick();
         long t3 = tick();
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
         assertThat(cursor().tickId()).isEqualTo(t2);
-        assertThat(process()).isEqualTo(new ShardResult(IDLE, 0, true));
-        assertThat(cursor().tickId()).isEqualTo(t2);
-
-        // drain appends every step, so the cursors reach its tick
-        assertThat(process(true)).isEqualTo(new ShardResult(PROGRESS, 0, true));
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
         assertThat(cursor().tickId()).isEqualTo(t3);
 
         // rows read: appended as before
@@ -1552,7 +1539,53 @@ class ShardProcessorIT {
     }
 
     @Test
-    void emptyStepWhoseRetryDueAtMovedStillAppends() throws Exception {
+    void stepStartsFromTheEffectiveTick() throws Exception {
+        config.maxTicksPerBatch(1);
+        bootstrap();
+        long t0 = cursor().tickId();
+        tick();
+        long t2 = tick();
+        try (var c = TestDb.connect()) {
+            // a checkpoint at t2 that found the shard idle, and cleanup below it: the cursor's own tick is gone
+            checkpointIdleAt(c, t2, t0);
+            execute(c, "delete from " + names.tick() + " where id < " + t2);
+        }
+        assertThat(cursor().tickId()).isEqualTo(t0);
+        long appends = cursorRows();
+
+        assertThat(process()).as("the effective tick is the latest").isEqualTo(new ShardResult(NO_WORK, 0, true));
+        assertThat(cursorRows()).isEqualTo(appends);
+
+        send(msg("t", "a", "a#1"));
+        long t3 = tick();
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t3, null, 0, null, 0, null, null));
+        assertThat(delivered()).containsExactly("a#1");
+    }
+
+    @Test
+    void aBatchInProgressGoesOnFromTheEffectiveTick() throws Exception {
+        bootstrap();
+        long t0 = cursor().tickId();
+        long idle = tick();
+        send(msg("t", "a", "a#1"), msg("t", "b", "b#1"));
+        long t1 = tick();
+        try (var c = TestDb.connect()) {
+            // a step from t0, which read its cursor before the checkpoint below, left the batch (t0, t1] after a#1;
+            // the checkpoint found the shard idle at the tick before the rows, and cleanup deleted t0
+            long first = queryLong(c, "select min(id) from " + names.base());
+            cursors.append(c, cursor().withProgress(t0, t1, first));
+            checkpointIdleAt(c, idle, t0);
+            execute(c, "delete from " + names.tick() + " where id = " + t0);
+        }
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(delivered()).containsExactly("b#1");
+        assertThat(cursor()).isEqualTo(new Cursor(0, t1, null, 0, null, 0, null, null));
+    }
+
+    @Test
+    void aStepWithoutATargetAppendsAMovedRetryDueAt() throws Exception {
         config.maintenanceInterval(Duration.ofNanos(1)); // every step checks the retry table in full
         bootstrap();
         var later = now.plus(Duration.ofHours(1));
@@ -1561,7 +1594,7 @@ class ShardProcessorIT {
                         : Outcome.delivered())
                 .toList();
         send(msg("t", "a", "a#1"), msg("t", "k", "k#1"));
-        tick();
+        long t = tick();
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
         assertThat(cursor().retryDueAt()).isEqualTo(later);
         var moved = later.plus(Duration.ofHours(1));
@@ -1570,16 +1603,15 @@ class ShardProcessorIT {
             ps.setObject(1, moved.atOffset(ZoneOffset.UTC));
             ps.executeUpdate();
         }
-        long t = tick();
         long appends = cursorRows();
 
-        // nothing to read and no head due, but retry_due_at changes: not idle, the step appends
-        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+        // nothing to read and no head due, but retry_due_at changes: the step appends it
+        assertThat(process()).isEqualTo(new ShardResult(NO_WORK, 0, true));
         assertThat(cursorRows()).isEqualTo(appends + 1);
         assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, moved, null));
 
-        tick(); // and once nothing but the tick would change, it is idle again
-        assertThat(process()).isEqualTo(new ShardResult(IDLE, 0, true));
+        // and once nothing would change, no write
+        assertThat(process()).isEqualTo(new ShardResult(NO_WORK, 0, true));
         assertThat(cursorRows()).isEqualTo(appends + 1);
     }
 
@@ -1809,23 +1841,23 @@ class ShardProcessorIT {
             send(msg("t", "a", "a#1"));
             tick();
             for (int i = 1; i <= 4; i++) { // four calls of the sick relay hold its four threads
-                assertThat(process(sick, false).status()).isEqualTo(PAUSED);
+                assertThat(process(sick).status()).isEqualTo(PAUSED);
                 now = cursor().pausedUntil();
             }
             for (int busy = 1; busy <= 2; busy++) { // skipped here for initialDelay, then twice that
-                assertThat(process(sick, false)).isEqualTo(new ShardResult(PAUSED, 0, false));
+                assertThat(process(sick)).isEqualTo(new ShardResult(PAUSED, 0, false));
                 now = cursor().pausedUntil();
             }
             assertThat(process()).as("another relay delivers").isEqualTo(new ShardResult(PROGRESS, 1, true));
             tick();
             now = now.plus(Duration.ofSeconds(1)); // past the sick relay's skip
-            assertThat(process(sick, false).status()).as("read nothing, called nothing").isEqualTo(IDLE);
+            assertThat(process(sick)).as("read nothing, called nothing").isEqualTo(new ShardResult(PROGRESS, 0, true));
             send(msg("t", "b", "b#1"));
             tick();
-            assertThat(process(sick, false)).isEqualTo(new ShardResult(PAUSED, 0, false));
+            assertThat(process(sick)).isEqualTo(new ShardResult(PAUSED, 0, false));
             now = cursor().pausedUntil();
 
-            assertThat(process(sick, false)).as("the idle step kept the count: skipped here 4 × initialDelay")
+            assertThat(process(sick)).as("the empty step kept the count: skipped here 4 × initialDelay")
                     .isEqualTo(new ShardResult(NO_WORK, 0, false));
 
             var skipped = now;
@@ -1834,14 +1866,14 @@ class ShardProcessorIT {
             ShardResult result;
             do {
                 now = now.plus(Duration.ofSeconds(1)); // past any pause or skip
-                result = process(sick, false);
+                result = process(sick);
             } while (result.status() != PROGRESS && System.nanoTime() < deadline);
             assertThat(result).isEqualTo(new ShardResult(PROGRESS, 1, true));
             now = skipped; // the wall clock steps back into a skip of before the reset
             send(msg("t", "c", "c#1"));
             tick();
 
-            assertThat(process(sick, false)).as("that skip went with the count")
+            assertThat(process(sick)).as("that skip went with the count")
                     .isEqualTo(new ShardResult(PROGRESS, 1, true));
         } finally {
             stuck.countDown();
@@ -1869,23 +1901,23 @@ class ShardProcessorIT {
             send(msg("t", "a", "a#1"), msg("t", "b", "b#1"));
             tick();
             for (int i = 1; i <= 4; i++) { // four calls of the sick relay hold its four threads
-                assertThat(process(sick, false).status()).isEqualTo(PAUSED);
+                assertThat(process(sick).status()).isEqualTo(PAUSED);
                 now = cursor().pausedUntil();
             }
             for (int busy = 1; busy <= 6; busy++) { // its skip grows to initialDelay * 32; the shard's pause does not
-                assertThat(process(sick, false)).isEqualTo(new ShardResult(PAUSED, 0, false));
+                assertThat(process(sick)).isEqualTo(new ShardResult(PAUSED, 0, false));
                 var paused = cursor().pausedUntil();
                 assertThat(paused).as("busy step %d", busy).isAfterOrEqualTo(now.plus(INITIAL))
                         .isBefore(now.plus(INITIAL).plusMillis(500));
                 now = busy < 6 ? now.plus(Duration.ofSeconds(30)) : paused; // past the sick relay's skip, but last
             }
-            assertThat(process(sick, false)).as("skipped by the sick relay")
+            assertThat(process(sick)).as("skipped by the sick relay")
                     .isEqualTo(new ShardResult(NO_WORK, 0, false));
 
             assertThat(process()).as("the healthy relay delivers").isEqualTo(new ShardResult(PROGRESS, 2, true));
             send(msg("t", "c", "c#1"));
             tick();
-            assertThat(process(sick, false).status()).isEqualTo(NO_WORK);
+            assertThat(process(sick).status()).isEqualTo(NO_WORK);
             assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
             assertThat(delivered()).containsExactly("a#1", "b#1", "c#1");
         } finally {
@@ -2761,7 +2793,7 @@ class ShardProcessorIT {
         schema.init();
         names = schema.names();
         ticks = new Ticks(names, config.shards());
-        cursors = new Cursors(names);
+        cursors = new Cursors(names, config.shards());
         outbox = new PgOutbox(db, schema, config.shards(), () -> {}, new OutboxMetrics(null));
         var scripted = new OutboxHandler() {
             @Override
@@ -2781,18 +2813,14 @@ class ShardProcessorIT {
 
     /** One worker {@code tryProcess} of shard 0 at the test clock in its own transaction, rolled back on failure. */
     private ShardResult process() throws Exception {
-        return process(false);
+        return process(processor);
     }
 
-    private ShardResult process(boolean draining) throws Exception {
-        return process(processor, draining);
+    private ShardResult process(ShardProcessor processor) throws Exception {
+        return process(processor, 0);
     }
 
-    private ShardResult process(ShardProcessor processor, boolean draining) throws Exception {
-        return process(processor, 0, draining);
-    }
-
-    private ShardResult process(ShardProcessor processor, int shard, boolean draining) throws Exception {
+    private ShardResult process(ShardProcessor processor, int shard) throws Exception {
         long latest;
         try (var c = TestDb.connect()) {
             latest = ticks.latest(c).id();
@@ -2800,7 +2828,7 @@ class ShardProcessorIT {
         try (var c = recording(TestDb.connect())) {
             ShardProcessor.prepareTransaction(c, config.batchTimeout());
             try {
-                var result = processor.tryProcess(c, shard, latest, now, draining);
+                var result = processor.tryProcess(c, shard, latest, now);
                 c.commit();
                 return result;
             } catch (Throwable t) {
@@ -2857,12 +2885,12 @@ class ShardProcessorIT {
         };
     }
 
-    /** Steps until a step finds nothing to do: {@code NO_WORK}, or {@code IDLE} (nothing up to the latest tick). */
+    /** Steps until a step finds nothing to do ({@code NO_WORK}). */
     private List<ShardResult> processUntilNoWork() throws Exception {
         var results = new ArrayList<ShardResult>();
         for (int i = 0; i < 1000; i++) {
             var result = process();
-            if (result.status() == NO_WORK || result.status() == IDLE) {
+            if (result.status() == NO_WORK) {
                 return results;
             }
             results.add(result);
@@ -2875,6 +2903,12 @@ class ShardProcessorIT {
             assertThat(ticks.make(c, Duration.ZERO)).isTrue();
             return ticks.latest(c).id();
         }
+    }
+
+    /** A checkpoint at {@code tickId} that read shard 0 idle on its cursor's tick {@code cursorTick}. */
+    private void checkpointIdleAt(Connection c, long tickId, long cursorTick) throws SQLException {
+        cursors.checkpoint(c, tickId, List.of(new Cursors.Position(
+                new Cursor(0, cursorTick, null, 0, null, 0, null, null), false, cursorTick)));
     }
 
     /** Cursor rows of shard 0 ever appended: the log only grows while maintenance does not run. */
@@ -2893,7 +2927,7 @@ class ShardProcessorIT {
 
     private Cursor cursor() throws SQLException {
         try (var c = TestDb.connect()) {
-            return cursors.latest(c, 0);
+            return cursors.latest(c, 0).cursor();
         }
     }
 

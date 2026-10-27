@@ -47,8 +47,8 @@ class OutboxSchemaIT {
         var n = schema.names();
 
         try (var c = TestDb.connect()) {
-            for (var table : List.of(n.base(), n.tick(), n.cursor(), n.retry(), n.dead(), n.halt(), n.tail(),
-                    n.maintenance(), n.parked(), n.parked() + "_key", n.parked() + "_due", n.redriven())) {
+            for (var table : List.of(n.base(), n.tick(), n.cursor(), n.checkpoint(), n.retry(), n.dead(), n.halt(),
+                    n.tail(), n.maintenance(), n.parked(), n.parked() + "_key", n.parked() + "_due", n.redriven())) {
                 assertThat(queryString(c, "select to_regclass(?)::text", table)).as(table).isEqualTo(table);
             }
             assertThat(queryString(c, "select pg_get_indexdef(to_regclass(?))", n.parked() + "_key"))
@@ -187,11 +187,11 @@ class OutboxSchemaIT {
 
             assertThat(OutboxSchema.columnExists(c, n.tick(), "shards")).as("old column dropped").isFalse();
             assertThat(queryString(c, "select count(*) || ':' || count(dirty) from " + n.tick())).isEqualTo("2:0");
-            assertThat(new Cursors(n).positions(c, config.shards(), old)).as("old ticks count as all shards")
+            assertThat(new Cursors(n, config.shards()).positions(c, old)).as("old ticks count as all shards")
                     .extracting(Cursors.Position::behind).containsOnly(true).hasSize(config.shards());
             assertThat(new Ticks(n, config.shards()).make(c, Duration.ZERO)).isTrue();
             assertThat(queryString(c, "select dirty::text from " + n.tick() + " order by id desc limit 1"))
-                    .isEqualTo("0".repeat(config.shards()));
+                    .as("no shard gained rows: no bits").isEmpty();
         }
     }
 
@@ -212,7 +212,7 @@ class OutboxSchemaIT {
                     .isEqualTo(config.shards() + ":0");
             assertThat(queryString(c, "select id || ':' || attempts || ':' || requeues from " + n.retry()))
                     .isEqualTo("1:2:0");
-            assertThat(new Cursors(n).latestAll(c, config.shards())).hasSize(config.shards());
+            assertThat(new Cursors(n, config.shards()).latestAll(c)).hasSize(config.shards());
         }
     }
 

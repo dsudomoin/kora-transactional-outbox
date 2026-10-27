@@ -103,7 +103,8 @@ class TickShardSetIT {
                     + " and o.xid < pg_snapshot_xmax(t.snapshot) and pg_visible_in_snapshot(o.xid, t.snapshot)"
                     + " and not pg_visible_in_snapshot(o.xid, p.snapshot))";
             long needed = queryLong(c, "select count(*)" + batches);
-            long missing = queryLong(c, "select count(*)" + batches + " and get_bit(t.dirty, s) = 0");
+            long missing = queryLong(c, "select count(*)" + batches // no bits: no shard
+                    + " and case when length(t.dirty) = 0 then true else get_bit(t.dirty, s) = 0 end");
             long recorded = queryLong(c, "select coalesce(sum(bit_count(dirty)), 0) from " + names.tick());
             long ticks = queryLong(c, "select count(*) from " + names.tick() + " where dirty is not null");
             long inFlight = queryLong(c, "select count(*) from " + names.tick()

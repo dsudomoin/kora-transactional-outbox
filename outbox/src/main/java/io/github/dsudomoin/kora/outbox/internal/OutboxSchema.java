@@ -243,6 +243,15 @@ public final class OutboxSchema implements Lifecycle {
             if (!columnExists(c, n.cursor(), "parked_due_at")) { // made before requeue: metadata-only, rows get null
                 st.execute("alter table " + n.cursor() + " add column if not exists parked_due_at timestamptz");
             }
+            // maintenance's checkpoint, which moves idle shards on without cursor rows (Cursors); none until its run
+            st.execute("create table if not exists " + n.checkpoint() + """
+                     (
+                      seq          bigint generated always as identity primary key,
+                      tick_id      bigint not null,
+                      busy         bit varying not null,
+                      busy_tick_id bigint not null,
+                      created_at   timestamptz not null default clock_timestamp()
+                    )""");
             st.execute("create table if not exists " + n.retry() + """
                      (
                       id              bigint primary key,

@@ -483,6 +483,32 @@ class XidRecoveryIT {
     }
 
     @Test
+    void recoveryGoesByEffectiveTicks() throws Exception {
+        config.clockMargin(Duration.ZERO).relayEnabled(false);
+        bootstrap();
+        var relay = relay(new RecordingHandler(), maintenance());
+        send(outbox(null), msg("t", "k", "relayed"));
+        assertThat(relay.drain()).isOne();
+        long drained = latestTickId();
+        try (var c = TestDb.connect()) {
+            assertThat(new Ticks(names, config.shards()).make(c, Duration.ZERO)).isTrue();
+        }
+        assertThat(maintenance().runOnce()).isTrue(); // a checkpoint past the drain tick, and the ticks below it gone
+        assertThat(tickExists(drained)).as("the relayed shard's cursor tick").isFalse();
+        try (var c = TestDb.connect()) {
+            assertThat(new XidRecovery(names, config).rowsToSave(c)).as("relayed up to its effective tick").isZero();
+        }
+        forgeRegression("now()");
+
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance().runOnce()).isTrue();
+
+            assertThat(err.text()).contains("recovered: 0 rows re-sent");
+        }
+        assertThat(count(names.checkpoint())).as("checkpoints go with the cursors").isZero();
+    }
+
+    @Test
     void anXidTakenWhileTheCounterCrossesARangeBoundaryFindsItsRange() throws Exception {
         config.xidsPerPartition(1000).premake(4);
         bootstrap();

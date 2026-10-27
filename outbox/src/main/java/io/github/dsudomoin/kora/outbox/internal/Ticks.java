@@ -24,10 +24,12 @@ import org.slf4j.LoggerFactory;
  * A tick also records the outbox id sequence's high-water mark, which sizes batches by data volume.
  *
  * <p>A tick C also records in {@code dirty} the shards that gained rows since the newest tick P before it, as a bitmap
- * of {@code outbox.shards} bits (bit s, leftmost 0, set for shard s; 128 bytes at 1024 shards): a superset of the
- * shards whose batch (P, C] is not empty, so the relay steps only those (see {@link Cursors#positions}). Null means
- * every shard: the first tick, a tick made while the table held no tick, and ticks made before the column existed or
- * by an instance without it. Why no shard with rows in (P, C] is left out, from the facts the batch reader relies on:
+ * of {@code outbox.shards} bits (bit s, leftmost 0, set for shard s; 128 bytes at 1024 shards), with no bits at all
+ * when no shard gained rows: a superset of the shards whose batch (P, C] is not empty, so the relay steps only those
+ * (see {@link Cursors#positions}), and maintenance's checkpoint moves every other shard past C without a write (see
+ * {@link Cursors}). Null means every shard: the first tick, a tick made while the table held no tick, and ticks made
+ * before the column existed or by an instance without it. Why no shard with rows in (P, C] is left out, from the facts
+ * the batch reader relies on:
  * <ol>
  *   <li>A row the batch reader returns for (P, C] belongs to a committed transaction T visible in C and not in P (its
  *       {@code xid} column is T's top-level xid). Visible in C: {@code T < C.xmax} and T not in C.xip, so T had ended
@@ -52,13 +54,16 @@ import org.slf4j.LoggerFactory;
  *   <li>P is the newest tick the statement sees. The tick lock is held from before that statement to commit, and a
  *       tick's commit is visible before its lock is released, so P is the newest tick of all, and no tick can come
  *       between P and C later: ids grow in lock order ({@code CACHE 1}, checked at startup), and cleanup deletes only
- *       ticks below every cursor, while cursors only move up. So for a cursor on tick P0 the ticks above it chain, each
+ *       ticks below every shard's effective tick, which never falls below the lowest one ({@link Cursors}). So for a
+ *       shard at tick P0 the ticks above it chain, each
  *       made right after the one before it; visibility only grows from tick to tick, so the batch (P0, L] is the union
  *       of the batches between consecutive ticks up to L, and a shard with rows in it has its bit set in (or a null
  *       {@code dirty} on) one of those ticks.</li>
  * </ol>
- * A tick deleted by hand from above a cursor breaks the chain: the shards of its rows are then found only by the idle
- * append ({@link ShardProcessor#IDLE_APPEND_AFTER}), not lost. When the probe estimates its branch 2 to cost more than
+ * A tick deleted by hand from above a shard's effective tick breaks the chain, and leaves a gap in the tick ids:
+ * readers take the tick after a gap for one that marks every shard (as for a gap left by a rolled-back tick insert),
+ * so the shards of its rows are found by a step of every shard, not lost. When the probe estimates its branch 2 to cost
+ * more than
  * {@link #PROBE_BUDGET_MICROS}, it scans neither branch and C gets a null {@code dirty}, every shard: a superset of any
  * set the scans could find, so none of the above depends on the estimate being right.
  *
@@ -103,10 +108,11 @@ public final class Ticks {
      * probe per shard and cluster ({@link #PROBE_MICROS}) plus, inside the clusters' ranges, the estimated rows of
      * transactions committed before P ({@link #ROW_MICROS} each, at the rows per xid of {@link #SPLIT_ROWS}); with
      * those rows per xid unknown, no estimate and no cap. Many clusters trip it too, with no such rows at all. The
-     * cost moves to the relays rather than going away: with every shard marked, each shard's step reads its batch
-     * through {@link BatchReader}, whose second branch looks up every xid of E ({@code xid = any(...)}), so about
+     * cost moves to the relays rather than going away: with every shard marked, each shard steps once, reading its
+     * batch through {@link BatchReader}, whose second branch looks up every xid of E ({@code xid = any(...)}), so about
      * shards × |E| index descents in all, roughly the work of the per-xid probe the clusters replaced (about 266 ms at
-     * 1024 shards and 400 ended xids), read-only, outside the tick lock and spread over the relay workers. The rows
+     * 1024 shards and 400 ended xids), and appending its cursor row: one capped tick costs one sweep of every shard
+     * plus one cursor row per shard, outside the tick lock and spread over the relay workers. The rows
      * inside the ranges are not read: for a shard at P they are no candidates of the batch (P, C], being visible in P.
      * That the heavy load such ranges need has branch 1 mark nearly every shard anyway is an expectation, not a
      * measurement. At 1024 shards a probe estimated just below the budget took about 5 ms (on a scratch Postgres 16,
@@ -171,7 +177,9 @@ public final class Ticks {
                     + " and not x.capped then"
                     // ordinality: the rows come in shard order, and the planner knows it, so the aggregate sorts
                     // nothing
-                    + " (select string_agg(case when d.found is null then '0' else '1' end, '' order by g.i)::varbit"
+                    // and no bit at all when no shard gained rows (an idle tick stores 0 bytes, not shards / 8)
+                    + " (select case when bool_or(d.found is not null) then string_agg(case when d.found is null"
+                    + " then '0' else '1' end, '' order by g.i)::varbit else ''::varbit end"
                     + " from generate_series(0, ? - 1) with ordinality g(s, i)"
                     + " left join lateral ((select 1 found from " + names.base() + " o where o.shard = s"
                     + " and o.xid >= pg_snapshot_xmax(p.snapshot) and o.xid < pg_snapshot_xmax(c.snapshot)"

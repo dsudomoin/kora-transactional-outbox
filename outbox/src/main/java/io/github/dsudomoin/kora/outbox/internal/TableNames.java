@@ -96,6 +96,11 @@ public record TableNames(
         return base + "_maintenance";
     }
 
+    /** Maintenance's checkpoint: the latest tick of its run and the shards busy at it ({@link Cursors}). */
+    public String checkpoint() {
+        return base + "_checkpoint";
+    }
+
     /** Requeued records, waiting for the next record of their key or their due time; they block nothing. */
     public String parked() {
         return base + "_parked";

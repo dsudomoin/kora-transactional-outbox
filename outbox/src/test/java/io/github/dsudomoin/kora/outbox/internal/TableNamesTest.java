@@ -15,6 +15,7 @@ class TableNamesTest {
         assertThat(names.base()).isEqualTo("outbox");
         assertThat(names.tick()).isEqualTo("outbox_tick");
         assertThat(names.cursor()).isEqualTo("outbox_cursor");
+        assertThat(names.checkpoint()).isEqualTo("outbox_checkpoint");
         assertThat(names.retry()).isEqualTo("outbox_retry");
         assertThat(names.dead()).isEqualTo("outbox_dead");
         assertThat(names.redriven()).isEqualTo("outbox_redriven");

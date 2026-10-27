@@ -7,7 +7,6 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.kora.outbox.internal.Cursors;
-import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.kora.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
 import io.github.dsudomoin.kora.outbox.internal.OrphanRestore;
@@ -595,8 +594,8 @@ class OperationsUnderLoadIT {
     private Bound relayedRange(Connection c, Connection pin) throws Exception {
         long deadline = System.nanoTime() + BOUND.toNanos();
         while (true) {
-            long tick = new Cursors(names).latestAll(c, config.shards()).stream().mapToLong(Cursor::tickId).min()
-                    .orElseThrow();
+            long latest = new Ticks(names, config.shards()).latest(c).id();
+            long tick = Cursors.busyTick(new Cursors(names, config.shards()).positions(c, latest), latest);
             long horizon = new Ticks(names, config.shards()).get(c, tick).snapshot().xmin();
             var range = PartitionDdl.listRanges(c, names.base()).stream()
                     .filter(b -> b.to() != null && Long.parseLong(b.to()) <= horizon)

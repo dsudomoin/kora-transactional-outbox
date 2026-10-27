@@ -7,7 +7,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.kora.outbox.internal.BatchClassifier;
 import io.github.dsudomoin.kora.outbox.internal.Cursors;
-import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.kora.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.kora.outbox.internal.Hashing;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
@@ -248,11 +247,11 @@ class TortureIT {
             assertThat(droppedWhileRunning).as("partitions dropped while relaying").isPositive();
             assertThat(queryLong(c, "select count(*) from " + names.retry())).as("retry table").isZero();
             assertThat(queryLong(c, "select count(*) from " + names.parked())).as("parked table").isZero();
-            long xmin = slowestCursorXmin(c, schema);
+            long xmin = horizonXmin(c, schema);
             for (var range : PartitionDdl.listRanges(c, names.base())) {
                 if (range.to() != null && Long.parseLong(range.to()) <= xmin) {
                     assertThat(queryLong(c, "select count(*) from " + range.name()))
-                            .as("rows left in droppable partition %s (slowest cursor xmin %d)", range, xmin)
+                            .as("rows left in droppable partition %s (horizon xmin %d)", range, xmin)
                             .isZero();
                 }
             }
@@ -542,10 +541,12 @@ class TortureIT {
         return ids;
     }
 
-    private long slowestCursorXmin(Connection c, OutboxSchema schema) throws Exception {
-        long tickId = new Cursors(schema.names()).latestAll(c, config.shards()).stream()
-                .mapToLong(Cursor::tickId).min().orElseThrow();
-        return new Ticks(schema.names(), config.shards()).get(c, tickId).snapshot().xmin();
+    /** The xmin of maintenance's horizon: the lowest effective tick of the busy shards, the latest when none. */
+    private long horizonXmin(Connection c, OutboxSchema schema) throws Exception {
+        var ticks = new Ticks(schema.names(), config.shards());
+        long latest = ticks.latest(c).id();
+        long tickId = Cursors.busyTick(new Cursors(schema.names(), config.shards()).positions(c, latest), latest);
+        return ticks.get(c, tickId).snapshot().xmin();
     }
 
     private static void sleep(Duration duration) {

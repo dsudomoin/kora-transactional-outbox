@@ -44,10 +44,11 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * {@code relay.enabled} is false; {@link #drain()} works either way. Idle workers park until {@link #wake()}, a new tick
  * made by this relay, or the next tick attempt is due, so an idle relay does not spin; an idle attempt makes a tick
  * only when the newest tick of any instance is about {@code idlePollInterval} old, so an idle cluster makes about one
- * tick per {@code idlePollInterval}. A shard is a candidate only when a tick after its cursor holds its rows (each tick
- * records the shards that gained rows, see {@link Ticks}), its batch is in progress or a retry head or parked row is
- * due, so a shard without new rows costs a step only when its cursor turns 5 s old, and that step's append keeps tick
- * cleanup and partition drops going. Every tick this relay makes wakes all its workers, which spread the tick's shards
+ * tick per {@code idlePollInterval}. A shard is a candidate only when a tick after its effective tick holds its rows
+ * (each tick records the shards that gained rows, see {@link Ticks}), its batch is in progress or a retry head or
+ * parked row is due, so a shard without new rows costs no step: maintenance's checkpoint moves its effective tick on
+ * (see {@link Cursors}), which keeps tick cleanup and partition drops going. Every tick this relay makes wakes all its
+ * workers, which spread the tick's shards
  * with new rows between them. A wake-up that cannot make a tick yet ({@code minTickInterval}) only brings the tick
  * forward, so under a high commit rate the workers read cursors per tick, not per commit. While
  * {@link Maintenance#halted()} the workers take no shards. Dead letters go to the {@link DeadLetterPass} on the daemon
@@ -120,7 +121,7 @@ public final class OutboxRelay implements Lifecycle {
         this.relay = config.relay();
         this.maintenance = maintenance;
         this.ticks = new Ticks(schema.names(), config.shards());
-        this.cursors = new Cursors(schema.names());
+        this.cursors = new Cursors(schema.names(), config.shards());
         this.deadLetters = deadLetters;
         this.processor = new ShardProcessor(schema.names(), config, handler, metrics, tracer, deadLetters.active());
         this.idleNanos = relay.idlePollInterval().toNanos();
@@ -238,13 +239,14 @@ public final class OutboxRelay implements Lifecycle {
     }
 
     /**
-     * Makes a tick D, then processes every shard until each cursor has reached D, no batch is in progress
-     * and no retry head or parked row is due (one due later does not hold it up); returns the number of messages this
-     * call delivered. Works whether or not the relay runs: it contends with the workers for shard locks. Handler
-     * failures are outcomes (see {@link OutboxHandler}); a database failure of a step propagates. Ends with one run of
-     * the dead-letter pass, so the hook has had the letters this call made, whether or not the relay runs; letters it
-     * redrives are new messages, after D. It holds one connection at a time: the pass runs once the shards' is closed,
-     * after the dead-letter thread's run in progress, if any.
+     * Makes a tick D, then processes shards until none is {@link Position#behind() behind} D (a shard without rows up
+     * to D is not, so it is not stepped), none has a batch in progress and no retry head or parked row is due (one due
+     * later does not hold it up); returns the number of messages this call delivered. Works whether or not the relay
+     * runs: it contends with the workers for shard locks. Handler failures are outcomes (see {@link OutboxHandler}); a
+     * database failure of a step propagates. Ends with one run of the dead-letter pass, so the hook has had the letters
+     * this call made, whether or not the relay runs; letters it redrives are new messages, after D. A database failure
+     * of that run propagates too, a lock timeout while it writes the hook's decisions included. It holds one connection
+     * at a time: the pass runs once the shards' is closed, after the dead-letter thread's run in progress, if any.
      *
      * @throws IllegalStateException when no shard advanced for {@code 2 × (batchTimeout + 5 s)}, twice the longest a
      *     tail swap waits for relay steps in flight, while work remains (e.g. a shard paused by a down target), or
@@ -280,8 +282,8 @@ public final class OutboxRelay implements Lifecycle {
             while (true) {
                 requireNotHalted();
                 var now = Instant.now().truncatedTo(ChronoUnit.MICROS);
-                var all = cursors.latestAll(c, config.shards());
-                var pending = all.stream().filter(cursor -> !drained(cursor, target, now)).toList();
+                var pending = cursors.positions(c, target).stream().filter(p -> !drained(p, now))
+                        .map(Position::cursor).toList();
                 if (pending.isEmpty()) {
                     return delivered;
                 }
@@ -299,7 +301,7 @@ public final class OutboxRelay implements Lifecycle {
                 }
                 boolean worked = false;
                 for (var cursor : pending) {
-                    var result = processInOwnTransaction(c, cursor.shard(), target, now, true);
+                    var result = processInOwnTransaction(c, cursor.shard(), target, now);
                     delivered += result.delivered();
                     worked |= result.status() == ShardStatus.PROGRESS || result.status() == ShardStatus.PAUSED;
                     if (result.delivered() > 0) {
@@ -325,9 +327,9 @@ public final class OutboxRelay implements Lifecycle {
         }
     }
 
-    private static boolean drained(Cursor c, long target, Instant now) {
-        return c.tickId() >= target && c.targetTickId() == null && !due(c.retryDueAt(), now)
-                && !due(c.parkedDueAt(), now);
+    private static boolean drained(Position p, Instant now) {
+        var c = p.cursor();
+        return !p.behind() && c.targetTickId() == null && !due(c.retryDueAt(), now) && !due(c.parkedDueAt(), now);
     }
 
     private static boolean due(@Nullable Instant at, Instant now) {
@@ -338,11 +340,11 @@ public final class OutboxRelay implements Lifecycle {
      * One shard step in its own transaction on {@code c}; leaves {@code c} in autocommit, rolled back on failure. A
      * step that moved a row to the dead table wakes the dead-letter thread once committed.
      */
-    private ShardResult processInOwnTransaction(Connection c, int shard, long latest, Instant now, boolean draining)
+    private ShardResult processInOwnTransaction(Connection c, int shard, long latest, Instant now)
             throws SQLException, InterruptedException {
         try {
             ShardProcessor.prepareTransaction(c, relay.batchTimeout());
-            var result = processor.tryProcess(c, shard, latest, now, draining);
+            var result = processor.tryProcess(c, shard, latest, now);
             c.commit();
             c.setAutoCommit(true);
             if (result.deadLettered() && deadLetters.active()) { // without a hook the letter is kept already
@@ -521,7 +523,7 @@ public final class OutboxRelay implements Lifecycle {
                 var selected = Instant.now().truncatedTo(ChronoUnit.MICROS);
                 long read = System.nanoTime();
                 boolean worked = false;
-                for (var shard : candidates(cursors.positions(c, config.shards(), latest), selected)) {
+                for (var shard : candidates(cursors.positions(c, latest), selected)) {
                     if (stopping) {
                         break;
                     }
@@ -535,7 +537,7 @@ public final class OutboxRelay implements Lifecycle {
                     // a later clock keeps a selected shard unpaused or due (a clock stepped back only yields NO_WORK)
                     var now = Instant.now().truncatedTo(ChronoUnit.MICROS);
                     try {
-                        var status = processInOwnTransaction(c, shard, latest, now, false).status();
+                        var status = processInOwnTransaction(c, shard, latest, now).status();
                         worked |= status == ShardStatus.PROGRESS || status == ShardStatus.PAUSED;
                     } catch (InterruptedException | VirtualMachineError e) {
                         throw e;
@@ -551,21 +553,19 @@ public final class OutboxRelay implements Lifecycle {
         }
 
         /**
-         * {@link Position#behind() Behind} the latest tick (a tick after its cursor holds its rows, or its cursor is
-         * due an idle append), mid-batch or with a due retry head or parked row, and not paused; most behind first.
-         * All of it comes from the database, so every instance sees the same candidates, whichever instance made the
-         * ticks.
+         * {@link Position#behind() Behind} the latest tick (a tick after its effective tick holds its rows), mid-batch
+         * or with a due retry head or parked row, and not paused; lowest effective tick first. All of it comes from the
+         * database, so every instance sees the same candidates, whichever instance made the ticks.
          */
         private List<Integer> candidates(List<Position> all, Instant now) {
             int shards = config.shards();
             return all.stream()
                     .filter(p -> p.behind() || p.cursor().targetTickId() != null
                             || due(p.cursor().retryDueAt(), now) || due(p.cursor().parkedDueAt(), now))
-                    .map(Position::cursor)
-                    .filter(c -> c.pausedUntil() == null || !c.pausedUntil().isAfter(now))
-                    .sorted(Comparator.comparingLong(Cursor::tickId)
-                            .thenComparingInt(c -> Math.floorMod(c.shard() - offset, shards)))
-                    .map(Cursor::shard)
+                    .filter(p -> p.cursor().pausedUntil() == null || !p.cursor().pausedUntil().isAfter(now))
+                    .sorted(Comparator.comparingLong(Position::effectiveTickId)
+                            .thenComparingInt(p -> Math.floorMod(p.cursor().shard() - offset, shards)))
+                    .map(p -> p.cursor().shard())
                     .toList();
         }
 

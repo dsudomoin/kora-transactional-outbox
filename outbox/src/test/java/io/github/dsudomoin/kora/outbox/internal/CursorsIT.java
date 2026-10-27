@@ -2,6 +2,7 @@ package io.github.dsudomoin.kora.outbox.internal;
 
 import static io.github.dsudomoin.kora.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryLong;
+import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryString;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
@@ -30,9 +31,9 @@ class CursorsIT {
 
     @Test
     void latestAllReturnsNewestPerShard() throws Exception {
-        var cursors = new Cursors(bootstrap());
+        var cursors = new Cursors(bootstrap(), 4);
         try (var c = TestDb.connect()) {
-            var initial = cursors.latestAll(c, 4);
+            var initial = cursors.latestAll(c);
             assertThat(initial).extracting(Cursor::shard).containsExactly(0, 1, 2, 3);
             assertThat(initial.get(0).targetTickId()).isNull();
             assertThat(initial.get(0).pausedUntil()).isNull();
@@ -47,9 +48,10 @@ class CursorsIT {
             var newest2 = initial.get(2).withProgress(7, 8L, 42).withPause(T1, 1).withRetryDueAt(T2);
             cursors.append(c, newest2);
 
-            assertThat(cursors.latestAll(c, 4)).containsExactly(newest0, initial.get(1), newest2, initial.get(3));
-            assertThat(cursors.latest(c, 0)).isEqualTo(newest0);
-            assertThat(cursors.latest(c, 2)).isEqualTo(newest2);
+            assertThat(cursors.latestAll(c)).containsExactly(newest0, initial.get(1), newest2, initial.get(3));
+            assertThat(cursors.latest(c, 0)).as("no checkpoint: the cursor's tick")
+                    .isEqualTo(new Cursors.Current(newest0, 9));
+            assertThat(cursors.latest(c, 2)).isEqualTo(new Cursors.Current(newest2, 7));
             assertThat(newest0).isEqualTo(new Cursor(0, 9, null, 0, null, 0, T1, T2));
             assertThat(newest2.parkedDueAt()).isNull();
         }
@@ -70,18 +72,18 @@ class CursorsIT {
 
     @Test
     void deleteSupersededKeepsLatest() throws Exception {
-        var cursors = new Cursors(bootstrap());
+        var cursors = new Cursors(bootstrap(), 4);
         try (var c = TestDb.connect()) {
-            var initial = cursors.latestAll(c, 4);
+            var initial = cursors.latestAll(c);
             for (int i = 1; i <= 3; i++) {
                 cursors.append(c, initial.get(0).withProgress(i, null, 0));
                 cursors.append(c, initial.get(3).withProgress(i, null, 0));
             }
-            var before = cursors.latestAll(c, 4);
+            var before = cursors.latestAll(c);
 
             assertThat(cursors.deleteSuperseded(c)).isEqualTo(6);
 
-            assertThat(cursors.latestAll(c, 4)).isEqualTo(before);
+            assertThat(cursors.latestAll(c)).isEqualTo(before);
             assertThat(queryLong(c, "select count(*) from " + TableNames.of(config.table()).cursor())).isEqualTo(4);
             assertThat(cursors.deleteSuperseded(c)).isZero();
         }
@@ -91,7 +93,7 @@ class CursorsIT {
     void latestAllIsFastWithLongHistory() throws Exception {
         config.shards(32);
         var names = bootstrap();
-        var cursors = new Cursors(names);
+        var cursors = new Cursors(names, config.shards());
         try (var c = TestDb.connect()) {
             c.setAutoCommit(false);
             execute(c, "insert into " + names.cursor() + " (shard, tick_id, last_id)"
@@ -100,12 +102,12 @@ class CursorsIT {
             c.setAutoCommit(true);
 
             for (int i = 0; i < 5; i++) {
-                cursors.latestAll(c, 32);
+                cursors.latestAll(c);
             }
             long[] nanos = new long[20];
             for (int i = 0; i < nanos.length; i++) {
                 long start = System.nanoTime();
-                var all = cursors.latestAll(c, 32);
+                var all = cursors.latestAll(c);
                 nanos[i] = System.nanoTime() - start;
                 assertThat(all).hasSize(32);
                 assertThat(all.get(0).lastId()).isEqualTo(50000);
@@ -119,63 +121,118 @@ class CursorsIT {
     @Test
     void aShardIsBehindWhenATickAfterItsCursorMayHoldItsRows() throws Exception {
         var names = bootstrap(); // 4 shards, every cursor on the bootstrap tick
-        var cursors = new Cursors(names);
+        var cursors = new Cursors(names, config.shards());
         try (var c = TestDb.connect()) {
             long first = queryLong(c, "select max(id) from " + names.tick());
-            assertThat(behind(cursors.positions(c, 4, first))).as("on the latest tick")
+            assertThat(behind(cursors.positions(c, first))).as("on the latest tick")
                     .containsExactly(false, false, false, false);
 
             long t1 = tick(c, names, "B'0100'", 10);
-            long t2 = tick(c, names, "B'0000'", 20);
-            assertThat(behind(cursors.positions(c, 4, t2))).containsExactly(false, true, false, false);
+            long t2 = tick(c, names, "B''", 20); // no shard gained rows
+            assertThat(behind(cursors.positions(c, t2))).containsExactly(false, true, false, false);
             long t3 = tick(c, names, "B'0011'", 30);
-            assertThat(behind(cursors.positions(c, 4, t3))).containsExactly(false, true, true, true);
-            assertThat(behind(cursors.positions(c, 4, t1))).as("ticks above the latest passed in do not count")
+            assertThat(behind(cursors.positions(c, t3))).containsExactly(false, true, true, true);
+            assertThat(behind(cursors.positions(c, t1))).as("ticks above the latest passed in do not count")
                     .containsExactly(false, true, false, false);
 
-            var s1 = cursors.latest(c, 1).withProgress(t2, null, 0).withParkedDueAt(T1);
+            var s1 = cursors.latest(c, 1).cursor().withProgress(t2, null, 0).withParkedDueAt(T1);
             cursors.append(c, s1); // past the tick that held its rows
-            // a batch in progress: candidate on its own
-            var s2 = cursors.latest(c, 2).withProgress(t1, t3, 7).withParkedDueAt(T2);
+            // a batch in progress: never behind, a candidate on its own
+            var s2 = cursors.latest(c, 2).cursor().withProgress(t1, t3, 7).withParkedDueAt(T2);
             cursors.append(c, s2);
-            var positions = cursors.positions(c, 4, t3);
-            assertThat(behind(positions)).containsExactly(false, false, true, true);
-            assertThat(positions).extracting(Cursors.Position::cursor).isEqualTo(cursors.latestAll(c, 4));
+            var positions = cursors.positions(c, t3);
+            assertThat(behind(positions)).containsExactly(false, false, false, true);
+            assertThat(positions).extracting(Cursors.Position::cursor).isEqualTo(cursors.latestAll(c));
+            assertThat(positions).extracting(Cursors.Position::effectiveTickId).containsExactly(first, t2, t1, first);
             assertThat(positions.get(1).cursor()).isEqualTo(s1);
             assertThat(positions.get(2).cursor()).isEqualTo(s2);
 
             long t4 = tick(c, names, "null", 40); // an older instance's tick: any shard may have rows
-            assertThat(behind(cursors.positions(c, 4, t4))).containsExactly(true, true, true, true);
+            assertThat(behind(cursors.positions(c, t4))).containsExactly(true, true, false, true);
             for (int s = 0; s < 4; s++) {
-                cursors.append(c, cursors.latest(c, s).withProgress(t4, null, 0));
+                cursors.append(c, cursors.latest(c, s).cursor().withProgress(t4, null, 0));
             }
             long t5 = tick(c, names, "B'01'", 50); // drawn from another shard count: any shard may have rows
-            assertThat(behind(cursors.positions(c, 4, t5))).containsExactly(true, true, true, true);
+            assertThat(behind(cursors.positions(c, t5))).containsExactly(true, true, true, true);
         }
     }
 
     @Test
-    void anIdleShardIsBehindOnceItsTickIsFiveSecondsOlderThanTheLatest() throws Exception {
-        var names = bootstrap();
-        var cursors = new Cursors(names);
+    void effectivePositionUsesTheCheckpoint() throws Exception {
+        var names = bootstrap(); // 4 shards, every cursor on the bootstrap tick
+        var cursors = new Cursors(names, config.shards());
         try (var c = TestDb.connect()) {
-            assertThat(behind(cursors.positions(c, 4, tick(c, names, "B'0000'", 4_999)))).containsOnly(false);
-            assertThat(behind(cursors.positions(c, 4, tick(c, names, "B'0000'", 5_000)))).as("idle append due")
-                    .containsOnly(true);
-            assertThat(behind(cursors.positions(c, 4, tick(c, names, "B'0000'", -1)))).as("the clock stepped back")
-                    .containsOnly(true);
+            long b = queryLong(c, "select max(id) from " + names.tick());
+            tick(c, names, "B'0100'", 10);
+            long t2 = tick(c, names, "B''", 20);
+            var read = cursors.positions(c, t2);
+            assertThat(behind(read)).containsExactly(false, true, false, false);
+            assertThat(Cursors.busyTick(read, t2)).as("the busy shard's").isEqualTo(b);
+
+            cursors.checkpoint(c, t2, read); // busy 0100 at t2, busy_tick_id b
+
+            assertThat(queryString(c, "select tick_id || ':' || busy::text || ':' || busy_tick_id from "
+                    + names.checkpoint())).isEqualTo(t2 + ":0100:" + b);
+            assertThat(cursors.latest(c, 0).effectiveTickId()).as("idle: the checkpoint's tick").isEqualTo(t2);
+            assertThat(cursors.latest(c, 1).effectiveTickId()).as("busy: its own").isEqualTo(b);
+            assertThat(cursors.latest(c, 0).cursor().tickId()).as("no cursor row written").isEqualTo(b);
+            assertThat(cursors.positions(c, t2)).extracting(Cursors.Position::effectiveTickId)
+                    .containsExactly(t2, b, t2, t2);
+            long t3 = tick(c, names, "B'0010'", 30);
+            assertThat(behind(cursors.positions(c, t3))).containsExactly(false, true, true, false);
+
+            cursors.append(c, cursors.latest(c, 1).cursor().withProgress(t3, null, 0)); // a step of shard 1
+            var positions = cursors.positions(c, t3);
+            assertThat(behind(positions)).containsExactly(false, false, true, false);
+            assertThat(positions).extracting(Cursors.Position::effectiveTickId).containsExactly(t2, t3, t2, t2);
+
+            // shard 3 has a batch in progress up to t2 (from its effective tick, t2 itself): busy too
+            cursors.append(c, cursors.latest(c, 3).cursor().withProgress(b, t2, 1));
+            positions = cursors.positions(c, t3);
+            assertThat(behind(positions)).containsExactly(false, false, true, false);
+
+            cursors.checkpoint(c, t3, positions); // replaces the one before
+            assertThat(queryString(c, "select tick_id || ':' || busy::text || ':' || busy_tick_id from "
+                    + names.checkpoint())).isEqualTo(t3 + ":0011:" + t2);
+            assertThat(cursors.positions(c, t3)).extracting(Cursors.Position::effectiveTickId)
+                    .as("busy shards at the lowest busy shard's tick").containsExactly(t3, t3, t2, t2);
+
+            // shard 3 ends its batch at t2, below the checkpoint's tick, which the read starts from: behind until it
+            // steps, though no tick after t2 marks it
+            cursors.append(c, cursors.latest(c, 3).cursor().withProgress(t2, null, 0));
+            assertThat(behind(cursors.positions(c, t3))).containsExactly(false, false, true, true);
+
+            // a checkpoint of another shard count counts for nothing
+            execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + t3
+                    + ", B'00', " + t3 + ")");
+            assertThat(cursors.positions(c, t3)).extracting(Cursors.Position::effectiveTickId)
+                    .containsExactly(b, t3, b, t2);
+            assertThat(cursors.latest(c, 0).effectiveTickId()).isEqualTo(b);
+        }
+    }
+
+    @Test
+    void theTickAfterAGapInTickIdsCountsAsEveryShard() throws Exception {
+        var names = bootstrap();
+        var cursors = new Cursors(names, config.shards());
+        try (var c = TestDb.connect()) {
+            long gone = tick(c, names, "B'0100'", 10);
+            long latest = tick(c, names, "B''", 20);
+            execute(c, "delete from " + names.tick() + " where id = " + gone); // by hand: its bits are lost
+
+            assertThat(behind(cursors.positions(c, latest))).containsOnly(true);
         }
     }
 
     @Test
     void aShardWhoseCursorTickIsGoneIsBehind() throws Exception {
         var names = bootstrap();
-        var cursors = new Cursors(names);
+        var cursors = new Cursors(names, config.shards());
         try (var c = TestDb.connect()) {
             long latest = tick(c, names, "B'0000'", 10);
             execute(c, "delete from " + names.tick() + " where id < " + latest);
 
-            assertThat(behind(cursors.positions(c, 4, latest))).containsOnly(true);
+            assertThat(behind(cursors.positions(c, latest))).containsOnly(true);
         }
     }
 

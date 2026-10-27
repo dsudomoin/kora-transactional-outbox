@@ -1356,7 +1356,9 @@ Relay находит новые сообщения, сравнивая иден�
    шага 7 обращайтесь с ней как с диапазоном, отсоединённым кем-то другим: сравните её строки с тем, что получили
    потребители, перенесите обратно недоставленные, затем удалите её.
 
-3. Сохраните то, что не прошло relay: по каждому шарду — строки, которых не видит тик его курсора, плюс все строки,
+3. Сохраните то, что не прошло relay: по каждому шарду — строки, которых не видит его эффективный тик (тик курсора
+   или контрольной точки обслуживания `outbox_checkpoint`, если она новее: тик курсора шарда без новых строк могла
+   удалить очистка), плюс все строки,
    записанные в восстановленную базу (T — момент, когда был снят снапшот бэкапа, или момент логического переключения;
    более раннее T лишь добавляет дубликаты). Записывайте T со смещением относительно UTC, например
    `timestamptz '2026-10-26 09:00+00'`: без смещения Postgres читает значение в TimeZone сессии, и если T окажется
@@ -1365,11 +1367,17 @@ Relay находит новые сообщения, сравнивая иден�
 
    ```sql
    create table outbox_unrelayed as
+   with k as (select tick_id, busy, busy_tick_id from outbox_checkpoint order by seq desc limit 1),
+        c as (select distinct on (shard) shard, tick_id from outbox_cursor order by shard, seq desc),
+        e as (select c.shard, case when length(k.busy) = (select count(*) from c)  -- эффективный тик шарда
+                then greatest(c.tick_id, case when get_bit(k.busy, c.shard) = 0 then k.tick_id
+                                              else k.busy_tick_id end)
+                else c.tick_id end tick_id
+                from c left join k on true)
    select o.id, o.shard, o.created_at, o.message_id, o.topic, o.key, o.payload, o.headers
      from outbox o
-     cross join lateral (select c.tick_id from outbox_cursor c
-                          where c.shard = o.shard order by c.seq desc limit 1) c
-     join outbox_tick t on t.id = c.tick_id
+     join e on e.shard = o.shard
+     join outbox_tick t on t.id = e.tick_id
     where (not pg_visible_in_snapshot(o.xid, t.snapshot)
            or o.created_at >= timestamptz '<T>' - interval '10 minutes')  -- записаны после бэкапа или переключения
       and not exists (select 1 from outbox_retry r where r.id = o.id and r.message_id = o.message_id)
@@ -1386,8 +1394,8 @@ Relay находит новые сообщения, сравнивая иден�
      (select coalesce(max(id), 0) from outbox_parked), (select coalesce(max(id), 0) from outbox_dead), 1));
    ```
 
-5. Починка: удалите все партиции (включая хвост), тики, курсоры и маркеры удаления, которые описывают старый счётчик
-   xid, затем маркер остановки.
+5. Починка: удалите все партиции (включая хвост), тики, курсоры, контрольные точки и маркеры удаления, которые
+   описывают старый счётчик xid, затем маркер остановки.
 
    ```sql
    do $$
@@ -1399,6 +1407,7 @@ Relay находит новые сообщения, сравнивая иден�
    end $$;
    delete from outbox_tick;
    delete from outbox_cursor;
+   delete from outbox_checkpoint;
    delete from outbox_dropping;
    delete from outbox_halt;  -- тики и курсоры починены на этом шаге
    ```
@@ -1453,16 +1462,23 @@ Inbox это не затрагивает: он партиционирован п
    select count(*) from (select distinct on (shard) shard, target_tick_id from outbox_cursor
                           order by shard, seq desc) c
     where c.target_tick_id is not null;                          -- незавершённый батч
+   with k as (select tick_id, busy, busy_tick_id from outbox_checkpoint order by seq desc limit 1),
+        c as (select distinct on (shard) shard, tick_id from outbox_cursor order by shard, seq desc),
+        e as (select c.shard, case when length(k.busy) = (select count(*) from c)  -- эффективный тик шарда
+                then greatest(c.tick_id, case when get_bit(k.busy, c.shard) = 0 then k.tick_id
+                                              else k.busy_tick_id end)
+                else c.tick_id end tick_id
+                from c left join k on true)
    select count(*) from outbox o
-     join (select distinct on (shard) shard, tick_id from outbox_cursor order by shard, seq desc) c using (shard)
-     join outbox_tick t on t.id = c.tick_id
+     join e using (shard)
+     join outbox_tick t on t.id = e.tick_id
     where o.xid >= pg_snapshot_xmin(t.snapshot)
-      and not pg_visible_in_snapshot(o.xid, t.snapshot);         -- закоммиченные строки, которые не прошёл ни один курсор
+      and not pg_visible_in_snapshot(o.xid, t.snapshot);         -- закоммиченные строки, которые не прошёл ни один шард
    select count(*) from pg_class c where relname ~ '^outbox_x[0-9]+$' and relkind = 'r'
       and not exists (select 1 from pg_inherits where inhrelid = c.oid);  -- осиротевшие диапазоны: сначала восстановите их
    ```
 
-4. `delete from outbox_cursor;`
+4. `delete from outbox_cursor; delete from outbox_checkpoint;`
 5. Задеплойте с новым `outbox.shards`. Bootstrap создаст по одному курсору на шард на последнем тике.
 
 Новые курсоры начинают с последнего тика, поэтому строка, не прошедшая relay к этому моменту, была бы пропущена или

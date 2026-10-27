@@ -1,12 +1,13 @@
 package io.github.dsudomoin.kora.outbox.internal;
 
 import io.github.dsudomoin.kora.outbox.OutboxConfig;
-import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
+import io.github.dsudomoin.kora.outbox.internal.Cursors.Position;
 import io.github.dsudomoin.kora.outbox.internal.Ticks.Tick;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
@@ -32,9 +33,11 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * with rows becoming a range in it, the library's one ACCESS EXCLUSIVE on the parent besides the recovery's: writers
  * stall for its lock wait, at most {@code outbox.partitions.swapLockTimeout}, and the milliseconds it holds the lock;
  * before it, a wait of up to {@code batchTimeout} + 5 s for relay steps in flight, which blocks no writer but pauses
- * every shard; a step running longer, as one may, defers the swap to the next run), drop of processed partitions,
- * drop of ranges left detached but not dropped: by a crash of this library's maintenance once relayed
- * (one still holding rows at or above the horizon first has those moved back into the outbox as new messages,
+ * every shard; a step running longer, as one may, defers the swap to the next run), the checkpoint ({@link Cursors}:
+ * the latest tick and the shards busy at it, by which a shard without new rows moves on without a cursor row; the
+ * drops and the tick cleanup go by its effective ticks, and a run that fails to write it does neither), drop of
+ * processed partitions, drop of ranges left detached but not dropped: by a crash of this library's maintenance once
+ * relayed (one still holding rows at or above the horizon first has those moved back into the outbox as new messages,
  * {@link OrphanRestore}, unless {@code outbox.partitions.restoreOrphans} is off), by anyone else only when empty
  * (and ranges the xid-regression recovery set aside, {@code <base>_o<digits>}, likewise:
  * {@code outbox.partitions.orphaned} counts the ones kept, with an ERROR each run, as their rows lie outside the
@@ -58,7 +61,6 @@ public final class Maintenance {
 
     private final JdbcConnectionFactory db;
     private final TableNames names;
-    private final int shards;
     private final Duration detachLockTimeout;
     /**
      * How long the tail swap waits for relay steps in flight, every shard paused meanwhile. No bound on a step: its
@@ -111,12 +113,11 @@ public final class Maintenance {
             Duration detachLockTimeout) {
         this.db = db;
         this.names = names;
-        this.shards = config.shards();
         this.detachLockTimeout = detachLockTimeout;
         this.quiesceTimeout = quiesceTimeout(config);
         this.partitions = new XidPartitions(names, config.partitions());
         this.ticks = new Ticks(names, config.shards());
-        this.cursors = new Cursors(names);
+        this.cursors = new Cursors(names, config.shards());
         this.retries = new RetryStore(names, false); // counts rows only, writes no dead row
         this.parked = new ParkedStore(names, retries);
         this.orphanRestore = new OrphanRestore(
@@ -247,11 +248,27 @@ public final class Maintenance {
 
     /** {@code outbox.shard.lag} read now, for {@link PgOutboxAdmin#status()}. */
     double lagSeconds(Connection c) throws SQLException {
-        return lagSeconds(slowestTick(c), ticks.latest(c));
+        return read(c).lagSeconds();
     }
 
-    private static double lagSeconds(Tick slowest, Tick latest) {
-        return Duration.between(slowest.createdAt(), latest.createdAt()).toNanos() / 1e9;
+    /**
+     * One read of every shard's position at the latest tick L. {@code slowest}: the tick of the lowest effective tick
+     * of the shards busy at L ({@link Cursors#busyTick}), L when none: the lag gauge's, and the lowest effective tick
+     * of all once the checkpoint of this read is written.
+     */
+    private record Read(Tick latest, List<Position> positions, Tick slowest) {
+
+        /** {@code outbox.shard.lag}: from the slowest busy shard's effective tick to L, 0 when no shard is busy. */
+        double lagSeconds() {
+            return Duration.between(slowest.createdAt(), latest.createdAt()).toNanos() / 1e9;
+        }
+    }
+
+    private Read read(Connection c) throws SQLException {
+        var latest = ticks.latest(c);
+        var positions = cursors.positions(c, latest.id());
+        long slowest = Cursors.busyTick(positions, latest.id());
+        return new Read(latest, positions, slowest == latest.id() ? latest : ticks.get(c, slowest));
     }
 
     private boolean sessionStable(Connection c) throws SQLException {
@@ -324,7 +341,12 @@ public final class Maintenance {
             partitions.ensurePremade(c, detachLockTimeout, quiesceTimeout);
             return null;
         });
-        var slowest = step("cursor read", () -> slowestTick(c));
+        var read = step("cursor read", () -> read(c));
+        // the drops and tick cleanup go by the effective ticks of this run's checkpoint: without it, none this run
+        var slowest = read == null ? null : step("checkpoint", () -> {
+            cursors.checkpoint(c, read.latest().id(), read.positions());
+            return read.slowest();
+        });
         orphaned = Double.NaN; // unknown unless the orphan step completes
         if (slowest != null) {
             step("partition drop", () -> partitions.dropProcessed(c, slowest.snapshot().xmin(), detachLockTimeout));
@@ -372,7 +394,7 @@ public final class Maintenance {
         }
         step("redrive history cleanup", () -> deleteOlder(c, deleteOldRedrives, redriveHistory));
         step("gauges", () -> {
-            refreshGauges(c, slowest);
+            refreshGauges(c, read);
             return null;
         });
         return !stepFailed;
@@ -411,15 +433,8 @@ public final class Maintenance {
         }
     }
 
-    /** The tick of the slowest shard; shards mid-batch count by tick id, as their target is not processed yet. */
-    private Tick slowestTick(Connection c) throws SQLException {
-        long minTickId = cursors.latestAll(c, shards).stream().mapToLong(Cursor::tickId).min()
-                .orElseThrow(() -> new IllegalStateException("no cursors in " + names.cursor()));
-        return ticks.get(c, minTickId);
-    }
-
-    private void refreshGauges(Connection c, @Nullable Tick slowest) throws SQLException {
-        lag = slowest == null ? Double.NaN : lagSeconds(slowest, ticks.latest(c));
+    private void refreshGauges(Connection c, @Nullable Read read) throws SQLException {
+        lag = read == null ? Double.NaN : read.lagSeconds();
         retrySize = retries.size(c);
         deadSize = retries.deadSize(c);
         try (var st = c.createStatement(); var rs = st.executeQuery(deadPending)) {

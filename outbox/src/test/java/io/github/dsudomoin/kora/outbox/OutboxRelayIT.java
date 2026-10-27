@@ -1010,22 +1010,43 @@ class OutboxRelayIT {
     }
 
     @Test
-    void idleRelayConsumesFewTransactionIds() throws Exception {
-        config.shards(32).workers(4).minTickInterval(Duration.ofMillis(50)).idlePollInterval(Duration.ofMillis(200));
-        bootstrap(); // the defaults
+    void idleRelayWritesOnlyTicks() throws Exception {
+        config.shards(1024).workers(4).minTickInterval(Duration.ofMillis(50)).idlePollInterval(Duration.ofMillis(200))
+                .maintenanceInterval(Duration.ofSeconds(30));
+        bootstrap(); // the defaults, 1024 shards
         start(new RecordingHandler());
         await(Duration.ofSeconds(5), () -> ticksMade() >= 3);
         awaitParked();
-        long xid = currentXid();
-        long started = System.nanoTime();
+        long seq = maxCursorSeq();
+        long ticks = ticksMade();
+        long used;
+        double seconds;
+        // xids are the cluster's: autovacuum analysing the tables earlier tests left would take some of its own
+        try (var c = TestDb.connect()) {
+            execute(c, "alter system set autovacuum = off");
+            execute(c, "select pg_reload_conf()");
+        }
+        try {
+            long xid = currentXid();
+            long started = System.nanoTime();
 
-        Thread.sleep(10_000); // the measured idle period
+            Thread.sleep(30_000); // the measured idle period
 
-        double seconds = (System.nanoTime() - started) / 1e9;
-        double perSecond = (currentXid() - xid) / seconds;
-        System.out.printf("idle relay: %.1f xids/s%n", perSecond);
-        // an idle tick per idlePollInterval plus a cursor append per shard every 5 s: about 11/s (162/s before)
-        assertThat(perSecond).as("xids/s").isLessThan(20);
+            used = currentXid() - xid - 1; // the second currentXid() takes one itself
+            seconds = (System.nanoTime() - started) / 1e9;
+        } finally {
+            try (var c = TestDb.connect()) {
+                execute(c, "alter system reset autovacuum");
+                execute(c, "select pg_reload_conf()");
+            }
+        }
+        System.out.printf("idle relay, 1024 shards: %d xids in %.1f s (%.1f/s), %d ticks%n", used, seconds,
+                used / seconds, ticksMade() - ticks);
+        // an idle tick per idlePollInterval and maintenance (its checkpoint, tick cleanup, its success) per interval:
+        // no cursor row (shards / 5 a second before, 205 xids/s at 1024 shards)
+        assertThat(used).as("xids").isLessThanOrEqualTo(30_000 / config.idlePollInterval().toMillis()
+                + 30 / config.maintenanceInterval().toSeconds() * 2 + 5);
+        assertThat(maxCursorSeq()).as("no cursor row").isEqualTo(seq);
     }
 
     @Test
@@ -1091,10 +1112,9 @@ class OutboxRelayIT {
                 .max().orElse(0);
         System.out.printf("%d sends to shard 5 in %.1f s, %d ticks: shard 5 stepped %s times, the busiest other"
                 + " shard %d times%n", total, seconds, made, steps.get(5), others);
-        // the other shards step only to move their cursors along every 5 s (idle append), each such step tried by
-        // up to every worker the same tick woke; before, every tick stepped every shard behind it
-        assertThat(others).as("steps of the busiest other shard")
-                .isLessThanOrEqualTo(config.workers() * ((int) (seconds / 5) + 2));
+        // the other shards never step: maintenance's checkpoint moves them on (before, every 5 s to move their
+        // cursors along, and before that every tick stepped every shard behind it)
+        assertThat(others).as("steps of the busiest other shard").isZero();
         assertThat(steps.get(5)).as("steps of shard 5").hasPositiveValue();
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).doesNotHaveDuplicates();
         assertIdOrderPerKey(handler.delivered());
@@ -1159,9 +1179,10 @@ class OutboxRelayIT {
         var names = schema.names();
         long dumped = ticksMade();
         try (var c = TestDb.connect()) {
-            // the dump: ticks and cursors as of now (the tick id sequence with them)
-            execute(c, "create table " + names.tick() + "_dump as select * from " + names.tick());
-            execute(c, "create table " + names.cursor() + "_dump as select * from " + names.cursor());
+            // the dump: ticks, cursors and checkpoints as of now (the tick id sequence with them)
+            for (var table : List.of(names.tick(), names.cursor(), names.checkpoint())) {
+                execute(c, "create table " + table + "_dump as select * from " + table);
+            }
             // then a while of idle relaying on the old database
             execute(c, "insert into " + names.tick() + " (snapshot, max_id)"
                     + " select pg_current_snapshot(), 0 from generate_series(1, 1000)");
@@ -1172,8 +1193,8 @@ class OutboxRelayIT {
                 noHook(db));
         relays.add(relay);
         relay.init();
-        await(Duration.ofSeconds(10), () -> IntStream.range(0, config.shards())
-                .allMatch(shard -> cursorTick(shard) > dumped + 900)); // then every shard steps IDLE
+        // then maintenance's checkpoint moves every idle shard on, past the ids the restore goes back to
+        await(Duration.ofSeconds(10), () -> checkpointTick() > dumped + 900);
         awaitParked();
 
         // the restore: its xid regression halts the relay; the operator restores and lifts the halt
@@ -1184,7 +1205,7 @@ class OutboxRelayIT {
         awaitParked();
         try (var c = TestDb.connect()) {
             c.setAutoCommit(false);
-            for (var table : List.of(names.cursor(), names.tick())) {
+            for (var table : List.of(names.cursor(), names.checkpoint(), names.tick())) {
                 execute(c, "delete from " + table);
                 execute(c, "insert into " + table + " overriding system value select * from " + table + "_dump");
             }
@@ -1206,7 +1227,7 @@ class OutboxRelayIT {
         config.shards(8);
         bootstrap();
         var relay = start(new RecordingHandler());
-        awaitParked(); // its idle steps leave the cursors on ticks up to 5 s old
+        awaitParked(); // idle shards leave their cursors on the bootstrap tick
 
         long started = System.nanoTime();
         assertThat(relay.drain()).isZero();
@@ -1222,8 +1243,53 @@ class OutboxRelayIT {
         assertThat(relay.drain()).isZero(); // the cursors are on its tick
 
         long started = System.nanoTime();
-        assertThat(relay.drain()).as("its tick is younger than 5 s after the previous one").isZero();
+        assertThat(relay.drain()).as("no shard behind its tick").isZero();
         assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofMillis(500));
+    }
+
+    @Test
+    void drainDoesNotWaitForIdleShards() throws Exception {
+        config.shards(64).relayEnabled(false);
+        bootstrap();
+        var relay = relay(new RecordingHandler());
+        relay.init();
+        long seq = maxCursorSeq();
+        send(outbox(relay::wake), msg("t", keyOnShard(7, "k"), "m"));
+
+        long started = System.nanoTime();
+        assertThat(relay.drain()).isOne();
+
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofMillis(500));
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select string_agg(shard::text, ',') from " + schema.names().cursor()
+                    + " where seq > " + seq)).as("only the shard with a row stepped, once").isEqualTo("7");
+        }
+        assertThat(relay.drain()).as("and nothing to step after it").isZero();
+        assertThat(maxCursorSeq()).isEqualTo(seq + 1);
+    }
+
+    @Test
+    void aTickWithoutAShardSetStepsEachShardOnce() throws Exception {
+        config.shards(32).workers(4).minTickInterval(Duration.ofMillis(50)).idlePollInterval(Duration.ofMillis(200));
+        bootstrap();
+        var relay = start(new RecordingHandler());
+        awaitParked();
+        long seq = maxCursorSeq();
+        try (var c = TestDb.connect()) { // as a capped or failed probe leaves it: every shard may have rows
+            execute(c, "insert into " + schema.names().tick() + " (snapshot, max_id) select pg_current_snapshot(),"
+                    + " max_id from " + schema.names().tick() + " order by id desc limit 1");
+        }
+        relay.wake();
+
+        await(Duration.ofSeconds(5), () -> maxCursorSeq() >= seq + config.shards());
+        Thread.sleep(1000); // idle ticks go on: no shard is behind them, so no further step
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select count(*) || ':' || count(distinct shard) from "
+                    + schema.names().cursor() + " where seq > " + seq)).as("one cursor row per shard")
+                    .isEqualTo(config.shards() + ":" + config.shards());
+            assertThat(new Cursors(schema.names(), config.shards()).positions(c, ticksMade()))
+                    .extracting(Cursors.Position::behind).containsOnly(false);
+        }
     }
 
     @Test
@@ -1759,17 +1825,23 @@ class OutboxRelayIT {
         }
     }
 
-    private long cursorTick(int shard) {
-        try {
-            return cursor(shard).tickId();
-        } catch (Exception e) {
-            throw new IllegalStateException(e);
+    private Cursor cursor(int shard) throws Exception {
+        try (var c = TestDb.connect()) {
+            return new Cursors(schema.names(), config.shards()).latest(c, shard).cursor();
         }
     }
 
-    private Cursor cursor(int shard) throws Exception {
+    /** The highest cursor {@code seq}: grows with every cursor row written, whatever maintenance deletes. */
+    private long maxCursorSeq() throws Exception {
         try (var c = TestDb.connect()) {
-            return new Cursors(schema.names()).latest(c, shard);
+            return queryLong(c, "select max(seq) from " + schema.names().cursor());
+        }
+    }
+
+    /** The tick of maintenance's checkpoint, 0 without one. */
+    private long checkpointTick() throws Exception {
+        try (var c = TestDb.connect()) {
+            return queryLong(c, "select coalesce(max(tick_id), 0) from " + schema.names().checkpoint());
         }
     }
 

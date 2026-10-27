@@ -71,11 +71,7 @@ import org.slf4j.LoggerFactory;
  */
 public final class ShardProcessor implements AutoCloseable {
 
-    /**
-     * {@code IDLE}: nothing to read up to the latest tick and no retry work; the cursor stays on its older tick
-     * without a write.
-     */
-    public enum ShardStatus { NOT_LOCKED, NO_WORK, IDLE, PROGRESS, PAUSED }
+    public enum ShardStatus { NOT_LOCKED, NO_WORK, PROGRESS, PAUSED }
 
     /**
      * {@code batchFinished}: no batch is in progress on the shard after the call (false when not locked or paused), as
@@ -95,13 +91,6 @@ public final class ShardProcessor implements AutoCloseable {
     /** The handler call running on this thread. */
     private static final ThreadLocal<HandlerCall> CALL = new ThreadLocal<>();
     private static final long BUG_REPORT_INTERVAL = TimeUnit.SECONDS.toNanos(10);
-    /**
-     * How long an idle shard's cursor may stay on its tick without an append (an idle step writes nothing, and the
-     * relay steps a shard without new rows only once its tick is this old, see {@link Cursors.Position#behind()}): an
-     * idle relay then burns about {@code shards / 5} transaction ids a second for cursors, plus its idle ticks, and the
-     * lag gauge, tick cleanup and partition drops trail by up to 5 s at idle.
-     */
-    static final Duration IDLE_APPEND_AFTER = Duration.ofSeconds(5);
     /**
      * The outcome of each record of a call that found every handler thread still busy (calls that outlived
      * {@code batchTimeout} and ignore interrupts hold them): not attempted, so it costs no attempt, counts as no
@@ -169,7 +158,7 @@ public final class ShardProcessor implements AutoCloseable {
         this.metrics = metrics;
         this.tracer = tracer;
         this.ticks = new Ticks(names, config.shards());
-        this.cursors = new Cursors(names);
+        this.cursors = new Cursors(names, config.shards());
         this.reader = new BatchReader(names);
         this.retries = new RetryStore(names, deadLetterHook);
         this.parked = new ParkedStore(names, retries);
@@ -217,14 +206,14 @@ public final class ShardProcessor implements AutoCloseable {
     }
 
     /**
-     * {@code inTx} is prepared by {@link #prepareTransaction}; {@code latestTickId} is the relay's latest tick. An idle
-     * step (no due retry head or parked row, no row read, no cursor change but its tick) writes nothing and returns
-     * {@code IDLE} while the cursor's tick is less than {@link #IDLE_APPEND_AFTER} older than the latest, so an
-     * idle relay burns no transaction ids; {@code draining} steps always append, so the cursor reaches the drain's
-     * tick. {@code NO_WORK} may also mean the shard is skipped here, without its lock or cursor: every handler thread
-     * of this processor was busy at a recent step (see {@link #busyPauses}), and other relay instances go on with it.
+     * {@code inTx} is prepared by {@link #prepareTransaction}; {@code latestTickId} is the relay's latest tick. The
+     * step starts from the shard's effective tick ({@link Cursors}), its cursor's tick or above, and every step with a
+     * target appends a cursor row, an empty read included; a shard without new rows needs no step, as maintenance's
+     * checkpoint moves it on. {@code NO_WORK}: no target (the effective tick is the latest) and nothing due, or the
+     * shard is skipped here, without its lock or cursor: every handler thread of this processor was busy at a recent
+     * step (see {@link #busyPauses}), and other relay instances go on with it.
      */
-    public ShardResult tryProcess(Connection inTx, int shard, long latestTickId, Instant now, boolean draining)
+    public ShardResult tryProcess(Connection inTx, int shard, long latestTickId, Instant now)
             throws SQLException, InterruptedException {
         long started = System.nanoTime();
         now = now.truncatedTo(ChronoUnit.MICROS); // as Postgres stores it: due times compare exactly
@@ -234,13 +223,21 @@ public final class ShardProcessor implements AutoCloseable {
         if (!tryLock(inTx, shard)) {
             return new ShardResult(ShardStatus.NOT_LOCKED, 0, false);
         }
-        var cursor = cursors.latest(inTx, shard); // a statement after the lock: sees the previous holder's commit
+        var current = cursors.latest(inTx, shard); // a statement after the lock: sees the previous holder's commit
+        var cursor = current.cursor();
         if (cursor.pausedUntil() != null && now.isBefore(cursor.pausedUntil())) {
             return new ShardResult(ShardStatus.NO_WORK, 0, cursor.targetTickId() == null);
+        }
+        if (current.effectiveTickId() > cursor.tickId()) {
+            // the shard has no row between its cursor's tick and the effective one, whose snapshot then reads the same
+            // batch, mid-batch too (it lies below the target); the cursor's tick may be gone
+            cursor = cursor.withProgress(current.effectiveTickId(), cursor.targetTickId(), cursor.lastId());
         }
         Tick prev = null;
         Tick target = null;
         if (cursor.targetTickId() != null) {
+            // read right away: maintenance deletes ticks below the effective ticks it reads, which may soon be higher
+            prev = ticks.get(inTx, cursor.tickId());
             // never re-chosen mid-batch: rows of a long transaction below lastId committing after the old target
             // would be skipped
             target = ticks.get(inTx, cursor.targetTickId());
@@ -289,20 +286,13 @@ public final class ShardProcessor implements AutoCloseable {
         boolean called = pass.called; // a handler thread was free
         var status = ShardStatus.PROGRESS;
         var next = cursor;
-        boolean idle = false;
         if (target != null && !busy) {
             // probe mode: after headFailuresBeforeDivert failed attempts in a row, the head row alone
             boolean probe = cursor.failures() >= relay.headFailuresBeforeDivert();
             int limit = probe ? 1 : limits.get(shard);
-            if (prev == null) {
-                prev = ticks.get(inTx, cursor.tickId());
-            }
             // a parked row the retry pass made a retry head blocks its key here too
             var rows = reader.read(inTx, shard, prev.snapshot(), target.snapshot(), cursor.lastId(), limit,
                     full ? hasRetryRows(inTx, shard) : retryDue != null || wroteRetry);
-            // (P, C] read nothing, so the next step's (P, C'] reads (C, C'] exactly: the cursor may stay on P; not
-            // when the target is below the latest tick, or maxTicksPerBatch ticks within IDLE_APPEND_AFTER keep it on P
-            idle = !draining && rows.isEmpty() && target.id() == latestTickId && young(prev, target);
             // a parked record comes back right before the next record of its key: the oldest limit parked rows of
             // the chunk's keys go first in its call (a key blocked in the retry table hands no record, so none); a
             // probe merges none, so the head it isolates is the only record of its call
@@ -372,22 +362,10 @@ public final class ShardProcessor implements AutoCloseable {
         if (full || wroteParked) {
             next = next.withParkedDueAt(wroteParked ? parked.minDue(inTx, shard) : parkedDue);
         }
-        // after retry_due_at and parked_due_at are settled: a full check that corrects one is a change, so the step
-        // appends; an idle step read no row, so its main pass handed no parked row either
-        if (idle && heads.isEmpty() && dueParked.isEmpty()
-                && next.equals(cursor.withProgress(next.tickId(), cursor.targetTickId(), cursor.lastId()))) {
-            return new ShardResult(ShardStatus.IDLE, 0, true);
-        }
         cursors.append(inTx, next);
         metrics.batch(Duration.ofNanos(System.nanoTime() - started));
         return new ShardResult(status, delivered, status == ShardStatus.PROGRESS && next.targetTickId() == null,
                 deadLettered);
-    }
-
-    /** {@code target} made less than {@link #IDLE_APPEND_AFTER} after {@code prev} (both database clock). */
-    private static boolean young(Tick prev, Tick target) {
-        var age = Duration.between(prev.createdAt(), target.createdAt());
-        return !age.isNegative() && age.compareTo(IDLE_APPEND_AFTER) < 0; // a clock stepped back appends
     }
 
     /**

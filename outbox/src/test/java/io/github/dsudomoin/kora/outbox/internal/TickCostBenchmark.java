@@ -170,7 +170,7 @@ class TickCostBenchmark {
             }
             execute(tick, "drop table if exists " + String.join(", ", names.base(), names.tick(), names.cursor(),
                     names.retry(), names.dead(), names.halt(), names.maintenance(), names.dropping(),
-                    names.redriven(), names.base() + "_parked") + " cascade"); // _parked: requeue's, where it exists
+                    names.redriven(), names.base() + "_parked", names.checkpoint()) + " cascade");
         }
     }
 

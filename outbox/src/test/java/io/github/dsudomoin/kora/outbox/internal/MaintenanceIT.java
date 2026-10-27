@@ -33,6 +33,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
@@ -66,7 +67,7 @@ class MaintenanceIT {
         var ids = send(msg("t", "k", "a"), msg("t", null, "b"));
         TestDb.burnXids(3000);
         assertThat(relay.drain()).isEqualTo(2);
-        long xmin = minCursorXmin();
+        long xmin = horizonXmin();
         var before = ranges();
         var processed = before.stream().filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin).toList();
         assertThat(processed).as("ranges below the cursors' xmin").hasSizeGreaterThanOrEqualTo(2);
@@ -107,7 +108,7 @@ class MaintenanceIT {
             }
             TestDb.burnXids(3000); // well past the holder's range
             assertThat(relay.drain()).isZero();
-            assertThat(minCursorXmin()).isLessThan(upperBound(partition));
+            assertThat(horizonXmin()).isLessThan(upperBound(partition));
 
             assertThat(maintenance.runOnce()).isTrue();
 
@@ -115,7 +116,7 @@ class MaintenanceIT {
             holder.commit();
         }
         assertThat(relay.drain()).isEqualTo(1);
-        assertThat(minCursorXmin()).isGreaterThanOrEqualTo(upperBound(partition));
+        assertThat(horizonXmin()).isGreaterThanOrEqualTo(upperBound(partition));
 
         assertThat(maintenance.runOnce()).isTrue();
 
@@ -130,7 +131,7 @@ class MaintenanceIT {
         send(msg("t", "k", "a"));
         TestDb.burnXids(3000);
         relay.drain();
-        long xmin = minCursorXmin();
+        long xmin = horizonXmin();
         var processed = ranges().stream().filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin).toList();
         assertThat(processed).isNotEmpty();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(300));
@@ -146,7 +147,7 @@ class MaintenanceIT {
             assertThat(err.text()).contains("WARN").contains("lock timeout");
             assertThat(lastSuccess()).as("a run with a failed step is no success").isEqualTo(succeeded);
             assertThat(ranges()).as("still listed, attached or detach-pending").containsAll(processed);
-            long processedTick = minCursorTickId();
+            long processedTick = horizonTickId();
             assertThat(tickIds()).as("the steps after the drop still ran").allMatch(id -> id >= processedTick);
             reader.commit();
         }
@@ -245,8 +246,8 @@ class MaintenanceIT {
             }
             long cursorRows;
             try (var c = TestDb.connect()) {
-                var cursors = new Cursors(names);
-                cursors.append(c, cursors.latest(c, 0)); // a superseded row, which cleanup would delete
+                var cursors = new Cursors(names, config.shards());
+                cursors.append(c, cursors.latest(c, 0).cursor()); // a superseded row, which cleanup would delete
                 cursorRows = queryLong(c, "select count(*) from " + names.cursor());
             }
             TestDb.burnXids(3000); // the counter passes every tick again, but cursors still sit on pre-regression ticks
@@ -397,7 +398,7 @@ class MaintenanceIT {
             }
             send(msg("t", "k" + i, "m" + i));
             relay.drain();
-            drained.add(latestCursors().get(0).tickId());
+            drained.add(tickIds().get(tickIds().size() - 1)); // the drain's tick: no relay makes others
         }
         long slow = drained.get(1);
         long target = drained.get(2);
@@ -413,8 +414,8 @@ class MaintenanceIT {
                     .toList();
             assertThat(between).isNotEmpty();
             // shard 0 lags behind the others, mid-batch towards the 3rd drain tick: it counts by its tick, not target
-            var cursors = new Cursors(names);
-            cursors.append(c, cursors.latest(c, 0).withProgress(slow, target, 1));
+            var cursors = new Cursors(names, config.shards());
+            cursors.append(c, cursors.latest(c, 0).cursor().withProgress(slow, target, 1));
             assertThat(ticks.make(c, Duration.ZERO)).isTrue(); // a tick no shard has reached yet
             newer = ticks.latest(c).id();
             assertThat(queryLong(c, "select count(*) from " + names.cursor())).isGreaterThan(config.shards());
@@ -429,6 +430,83 @@ class MaintenanceIT {
         assertThat(latestCursors()).isEqualTo(cursorsBefore);
         try (var c = TestDb.connect()) {
             assertThat(queryLong(c, "select count(*) from " + names.cursor())).isEqualTo(config.shards());
+        }
+    }
+
+    @Test
+    void idleShardsDoNotHoldBackTickCleanupOrDrops() throws Exception {
+        bootstrap(); // 4 shards
+        var handler = new RecordingHandler();
+        var relay = relay(handler, maintenance());
+        long bootstrapTick = tickIds().get(0);
+        send(msg("t", "k", "a"));
+        TestDb.burnXids(3000);
+        assertThat(relay.drain()).isOne();
+        var cursors = latestCursors();
+        assertThat(cursors).as("the drain stepped only the shard with a row")
+                .filteredOn(cursor -> cursor.tickId() == bootstrapTick).hasSize(config.shards() - 1);
+        long drained = tickIds().get(tickIds().size() - 1);
+        long xmin;
+        try (var c = TestDb.connect()) {
+            xmin = new Ticks(names, config.shards()).get(c, drained).snapshot().xmin();
+        }
+        var processed = ranges().stream().filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin).toList();
+        assertThat(processed).as("ranges below the drain tick's xmin").hasSizeGreaterThanOrEqualTo(2);
+
+        assertThat(maintenance().runOnce()).isTrue();
+
+        assertThat(tickIds()).as("the idle shards' cursor ticks are gone").containsExactly(drained);
+        for (var b : processed) {
+            assertThat(exists(b.name())).as(b.name()).isFalse();
+        }
+        assertThat(latestCursors()).as("no cursor row written").isEqualTo(cursors);
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select tick_id || ':' || busy::text from " + names.checkpoint()))
+                    .isEqualTo(drained + ":0000");
+        }
+
+        // idle ticks later, the next run moves on again, and shards whose cursor ticks are long gone deliver
+        long later;
+        try (var c = TestDb.connect()) {
+            var ticks = new Ticks(names, config.shards());
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            later = ticks.latest(c).id();
+        }
+        assertThat(maintenance().runOnce()).isTrue();
+        assertThat(tickIds()).containsExactly(later);
+        var ids = send(IntStream.range(0, 20).mapToObj(i -> msg("t", "k" + i, "m" + i)).toArray(OutboxMessage[]::new));
+        assertThat(relay.drain()).isEqualTo(ids.size());
+        assertThat(latestCursors()).as("every shard stepped").noneMatch(cursor -> cursor.tickId() == bootstrapTick);
+    }
+
+    @Test
+    void lagIsZeroWhenIdle() throws Exception {
+        bootstrap();
+        var registry = new SimpleMeterRegistry();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
+        try (var c = TestDb.connect()) {
+            // every cursor on the bootstrap tick, an hour older than the latest; no shard has rows
+            execute(c, "update " + names.tick() + " set created_at = created_at - interval '1 hour'");
+            assertThat(new Ticks(names, config.shards()).make(c, Duration.ZERO)).isTrue();
+        }
+
+        assertThat(maintenance.runOnce()).isTrue();
+
+        assertThat(gauge(registry, "outbox.shard.lag")).isZero();
+        try (var c = TestDb.connect()) {
+            assertThat(maintenance.lagSeconds(c)).as("OutboxAdmin.status()").isZero();
+        }
+
+        send(msg("t", "k", "a")); // not relayed: its shard is behind the checkpoint's tick, made 10 s before the latest
+        try (var c = TestDb.connect()) {
+            assertThat(new Ticks(names, config.shards()).make(c, Duration.ZERO)).isTrue();
+            execute(c, "update " + names.tick() + " set created_at = created_at - interval '10 seconds' where id ="
+                    + " (select tick_id from " + names.checkpoint() + ")");
+        }
+        assertThat(maintenance.runOnce()).isTrue();
+        assertThat(gauge(registry, "outbox.shard.lag")).isBetween(10.0, 20.0);
+        try (var c = TestDb.connect()) {
+            assertThat(maintenance.lagSeconds(c)).isBetween(10.0, 20.0);
         }
     }
 
@@ -509,7 +587,7 @@ class MaintenanceIT {
         send(msg("t", "k", "a"));
         TestDb.burnXids(3000);
         relay.drain();
-        long xmin = minCursorXmin();
+        long xmin = horizonXmin();
         var pending = ranges().stream()
                 .filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin)
                 .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
@@ -585,7 +663,7 @@ class MaintenanceIT {
         send(msg("t", "k", "a"), msg("t", "other", "b"));
         TestDb.burnXids(3000);
         relay.drain();
-        long xmin = minCursorXmin();
+        long xmin = horizonXmin();
         var orphan = ranges().stream()
                 .filter(b -> b.to() != null && Long.parseLong(b.to()) <= xmin)
                 .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
@@ -622,7 +700,7 @@ class MaintenanceIT {
         send(msg("t", "k", "a"));
         TestDb.burnXids(3000);
         relay.drain();
-        assertThat(minCursorXmin()).as("the horizon passed it").isGreaterThanOrEqualTo(Long.parseLong(orphan.to()));
+        assertThat(horizonXmin()).as("the horizon passed it").isGreaterThanOrEqualTo(Long.parseLong(orphan.to()));
         var registry = new SimpleMeterRegistry();
 
         try (var err = new CapturedStderr()) {
@@ -665,7 +743,7 @@ class MaintenanceIT {
             send(msg("t", "k", "a")); // the relay reads through the parent: it never sees the pending range's row
             TestDb.burnXids(3000);
             relay.drain();
-            assertThat(minCursorXmin()).isGreaterThanOrEqualTo(Long.parseLong(range.to()));
+            assertThat(horizonXmin()).isGreaterThanOrEqualTo(Long.parseLong(range.to()));
 
             assertThat(maintenance.runOnce()).isTrue(); // FINALIZE waits for the report's snapshot: it times out
 
@@ -1063,10 +1141,11 @@ class MaintenanceIT {
         var relay = relay(handler, maintenance);
         send(msg("t", "ok", "1"), msg("t", "poison", "2"), msg("t", "slow", "3"), msg("t", "slow", "4"));
         relay.drain();
+        send(msg("t", "later", "5")); // not relayed: the shard is behind the tick below, 10 s ahead of its cursor
         try (var c = TestDb.connect()) {
-            assertThat(new Ticks(names, config.shards()).make(c, Duration.ZERO)).isTrue(); // not processed: 10 s ahead of the cursor
+            assertThat(new Ticks(names, config.shards()).make(c, Duration.ZERO)).isTrue();
             execute(c, "update " + names.tick() + " set created_at = created_at - interval '10 seconds'"
-                    + " where id = " + minCursorTickId());
+                    + " where id = " + horizonTickId());
             var parked =
                     new OutboxRecord(1_000_000, UUID.randomUUID(), "t", null, null, List.of(), Instant.now(), 0, 0);
             new ParkedStore(names, new RetryStore(names, false))
@@ -1226,18 +1305,25 @@ class MaintenanceIT {
 
     private List<Cursor> latestCursors() throws SQLException {
         try (var c = TestDb.connect()) {
-            return new Cursors(names).latestAll(c, config.shards());
+            return new Cursors(names, config.shards()).latestAll(c);
         }
     }
 
-    private long minCursorTickId() throws SQLException {
-        return latestCursors().stream().mapToLong(Cursor::tickId).min().orElseThrow();
+    /**
+     * The tick a maintenance run now drops partitions and deletes ticks below: the lowest effective tick of the shards
+     * busy at the latest tick, the latest when none, which its checkpoint makes the lowest of all.
+     */
+    private long horizonTickId() throws SQLException {
+        try (var c = TestDb.connect()) {
+            long latest = new Ticks(names, config.shards()).latest(c).id();
+            return Cursors.busyTick(new Cursors(names, config.shards()).positions(c, latest), latest);
+        }
     }
 
-    /** {@code pg_snapshot_xmin} of the tick of the slowest shard. */
-    private long minCursorXmin() throws SQLException {
+    /** {@code pg_snapshot_xmin} of the {@link #horizonTickId} tick. */
+    private long horizonXmin() throws SQLException {
         try (var c = TestDb.connect()) {
-            return new Ticks(names, config.shards()).get(c, minCursorTickId()).snapshot().xmin();
+            return new Ticks(names, config.shards()).get(c, horizonTickId()).snapshot().xmin();
         }
     }
 
@@ -1285,7 +1371,7 @@ class MaintenanceIT {
         var sent = send(msg("t", "k", "a"));
         TestDb.burnXids(3000);
         relay.drain();
-        long horizon = minCursorXmin();
+        long horizon = horizonXmin();
         var range = ranges().stream()
                 .filter(b -> b.to() != null && Long.parseLong(b.to()) <= horizon)
                 .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))

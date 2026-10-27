@@ -6,11 +6,13 @@
 # land in it). Then per shard count the load phases: bulk (2 writers x 10 000 messages, noop handler, no consumer) and
 # low-load at 100 and 1000 msg/s (order mode, Kafka handler, consumer 12 threads, as low-load.sh). The relay at the
 # library defaults: workers 4 and batchSize 1000 set (the bench app's own defaults are 8 and 2000), every other outbox
-# setting unset. Each phase: WARMUP s, then a STEADY s window. Appends its section (in Russian) to RESULTS.
+# setting unset. Each phase: WARMUP s, then a STEADY s window. PHASES (default "background idle load") picks the
+# phases to run. Appends its section (in Russian) to RESULTS.
 source "$(dirname "$0")/lib.sh"
 WARMUP=${WARMUP:-60}
 STEADY=${STEADY:-180}
 RUNS=${*:-${RUNS:-32}}
+PHASES=${PHASES:-background idle load}
 unset OUTBOX_SHARDS OUTBOX_TABLE OUTBOX_RELAY_WORKERS OUTBOX_RELAY_BATCH_SIZE OUTBOX_RELAY_MAX_TICKS \
   OUTBOX_RELAY_MIN_TICK OUTBOX_RELAY_IDLE_POLL OUTBOX_XIDS_PER_PARTITION OUTBOX_MAINTENANCE_INTERVAL
 DEFAULTS=(OUTBOX_RELAY_WORKERS=4 OUTBOX_RELAY_BATCH_SIZE=1000)
@@ -124,13 +126,16 @@ low() { # low SHARDS RATE
 started=$(date -u +'%Y-%m-%d %H:%M')
 commit=$(git -C "$ROOT" rev-parse --short HEAD)
 git -C "$ROOT" diff --quiet HEAD -- || commit="$commit + незакоммиченные изменения"
-background
-for s in $RUNS; do idle "$s"; done
-for s in $RUNS; do
-  bulk "$s"
-  low "$s" 100
-  low "$s" 1000
-done
+phase() { [[ " $PHASES " == *" $1 "* ]]; }
+if phase background; then background; fi
+if phase idle; then for s in $RUNS; do idle "$s"; done; fi
+if phase load; then
+  for s in $RUNS; do
+    bulk "$s"
+    low "$s" 100
+    low "$s" 1000
+  done
+fi
 
 out << EOF
 

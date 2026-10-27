@@ -165,7 +165,7 @@ class TableSpellingIT {
         try (var c = TestDb.connect()) {
             ShardProcessor.prepareTransaction(c, Duration.ofSeconds(10));
             try {
-                var result = processor.tryProcess(c, 0, latestTickId, Instant.now(), false);
+                var result = processor.tryProcess(c, 0, latestTickId, Instant.now());
                 c.commit();
                 return result;
             } catch (Throwable t) {

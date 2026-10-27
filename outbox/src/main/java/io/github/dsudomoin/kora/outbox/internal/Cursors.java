@@ -10,11 +10,41 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Per-shard progress as an insert-only log {@code <base>_cursor}: the row with the highest {@code seq} of
  * a shard is its current cursor. Writers append under the shard's advisory lock; maintenance deletes superseded rows.
+ *
+ * <p>A shard without new rows writes no cursor row: each maintenance run writes a checkpoint {@code <base>_checkpoint}
+ * instead (one row, {@link #checkpoint}): the latest tick L of its read, a {@code busy} bitmap (bit s, leftmost 0, set
+ * for a shard with a batch in progress or {@link Position#behind() behind} at L) and {@code busy_tick_id}, the lowest
+ * effective tick of the busy shards (L when none). A shard's <em>effective tick</em> is
+ * {@code greatest(cursor.tick_id, ckpt.tick_id)} when the newest checkpoint has {@code outbox.shards} bits and the
+ * shard's bit is 0, {@code greatest(cursor.tick_id, ckpt.busy_tick_id)} when it is 1, else {@code cursor.tick_id}.
+ * Every step starts from it, and tick cleanup, the partition drop horizon and {@code outbox.shard.lag} go by it.
+ * Writing E for a shard's effective tick, every committed row of the shard visible in E is visible in its cursor's
+ * tick, so relayed (a batch in progress: up to {@code lastId}, rows past it lie above E). By induction over the
+ * checkpoints, from the first (E = the cursor's tick):
+ * <ol>
+ *   <li>A 0 bit: no batch was in progress, and no tick in (E', L] held the shard (by its {@code dirty}, null or
+ *       drawn from another shard count as all shards, the tick after a gap in ids as all shards too), E' its effective
+ *       tick at the read. By the proof in {@link Ticks}, the ticks after E' chain, so no row of the shard is visible in
+ *       L and not in E', and by induction none visible in E' and not in its cursor's tick: so none up to L.</li>
+ *   <li>A 1 bit: {@code busy_tick_id} is at most E', so a row visible in it is visible in E', and by induction in the
+ *       cursor's tick.</li>
+ *   <li>Cursors only move forward, so a cursor appended after the read keeps both. A step that read its cursor and
+ *       effective tick before the checkpoint started from E' or above, and reads the same rows as from the new
+ *       effective tick, because the range between them is empty for the shard: so a batch it left in progress also
+ *       goes on from the effective tick, above its cursor's tick, whose row cleanup may have deleted.</li>
+ *   <li>Every effective tick exists: the new ones are L, {@code busy_tick_id} (an effective tick at the read) or above,
+ *       a cursor's tick at or above them, and cleanup deletes only ticks below the lowest effective tick, which no
+ *       checkpoint lowers: each new effective tick is L or at least {@code busy_tick_id}, which is at least the lowest
+ *       effective tick at the read.</li>
+ * </ol>
+ * A run writes its checkpoint from its own read, in one statement that also deletes the one before (runs hold
+ * {@code LOCK_MAINTENANCE}, so one at a time), so readers see exactly one. A step reads its effective tick's row right
+ * after its cursor; a run that raises the effective tick and deletes the old one in between fails that step, which
+ * rolls back, and the next step starts from the new one.
  */
 public final class Cursors {
 
@@ -59,41 +89,75 @@ public final class Cursors {
         }
     }
 
+    /** A shard's latest cursor and its effective tick (see the class comment). */
+    public record Current(Cursor cursor, long effectiveTickId) {}
+
     /**
-     * A shard's latest cursor; {@code behind}: its tick is below the latest tick and a step has to move it up, as a
-     * tick in between has the shard's bit set in its {@code dirty} or none (null, or drawn from another shard count:
-     * every shard), or its tick is {@link ShardProcessor#IDLE_APPEND_AFTER} or more older than the latest (or newer:
-     * the database clock stepped back), so an idle step appends, or its tick is gone.
+     * A shard's latest cursor and effective tick; {@code behind}: no batch in progress, the effective tick is below the
+     * latest tick, and a tick in between may hold the shard's rows: its {@code dirty} has the shard's bit set or is
+     * null (or drawn from another shard count: every shard), or it follows a gap in tick ids (a tick deleted by hand:
+     * every shard), or the effective tick is not among the ticks read: gone, or below the newest checkpoint's tick,
+     * which only a shard busy at that checkpoint can be (so the read covers at most the ticks of one maintenance
+     * interval, however far a paused shard lags).
      */
-    public record Position(Cursor cursor, boolean behind) {}
+    public record Position(Cursor cursor, boolean behind, long effectiveTickId) {}
 
     private static final String COLUMNS =
             "shard, tick_id, target_tick_id, last_id, paused_until, failures, retry_due_at, parked_due_at";
 
     private final TableNames names;
+    private final int shards;
+    private final String latest;
     private final String positions;
+    private final String checkpoint;
 
-    public Cursors(TableNames names) {
+    /** {@code shards}: {@code outbox.shards}, the length of a checkpoint's {@code busy} bitmap. */
+    public Cursors(TableNames names, int shards) {
         this.names = names;
-        // the tick window of a shard is scanned only while its tick is younger than IDLE_APPEND_AFTER: a few seconds
-        // of ticks, however far a paused shard holds tick cleanup back
-        this.positions = "select c.*, c.tick_id < p.latest and case when l.created_at is null or t.created_at is null"
-                + " or l.created_at < t.created_at or l.created_at >= t.created_at + p.idle then true"
-                + " else exists (select 1 from " + names.tick() + " n where n.id > c.tick_id and n.id <= p.latest"
-                + " and case when n.dirty is null or length(n.dirty) <> p.shards then true"
-                + " else get_bit(n.dirty, c.shard) = 1 end) end"
-                + " from (select ?::bigint latest, ? * interval '1 microsecond' idle, ?::int shards) p"
-                + " cross join generate_series(0, p.shards - 1) s cross join lateral (select " + COLUMNS + " from "
-                + names.cursor() + " where shard = s order by seq desc limit 1) c"
-                + " left join " + names.tick() + " t on t.id = c.tick_id"
-                + " left join " + names.tick() + " l on l.id = p.latest order by s";
+        this.shards = shards;
+        var effective = effective(shards);
+        this.latest = "select c.*, " + effective + " from (select " + COLUMNS + " from " + names.cursor()
+                + " where shard = ? order by seq desc limit 1) c left join " + newestCheckpoint(names) + " k on true";
+        var ones = "repeat('1', " + shards + ")::varbit";
+        // one pass over the ticks after the lowest effective tick (not below the checkpoint's): for each tick, the
+        // shards that any tick after it up to the latest may hold rows of (a window bit_or, newest first); each shard
+        // looks up its effective tick's row. A shard below the window finds none: behind
+        this.positions = "with k as " + newestCheckpoint(names) + ","
+                + " c as (select c.*, " + effective + " eff from generate_series(0, " + shards + " - 1) s"
+                + " cross join lateral (select " + COLUMNS + " from " + names.cursor()
+                + " where shard = s order by seq desc limit 1) c left join k on true),"
+                + " w as (select id, bit_or(d) over (order by id desc rows between unbounded preceding and 1 preceding)"
+                + " after from (select id, case when dirty is null or lag(id) over (order by id) <> id - 1 then " + ones
+                + " when length(dirty) = 0 then repeat('0', " + shards + ")::varbit"
+                + " when length(dirty) <> " + shards + " then " + ones + " else dirty end d from " + names.tick()
+                + " where id <= ? and id >= (select greatest(min(eff) filter (where target_tick_id is null),"
+                + " (select tick_id from k where length(busy) = " + shards + ")) from c)) n)"
+                + " select c.*, c.target_tick_id is null and c.eff < ? and case when w.id is null then true"
+                + " when w.after is null then false else get_bit(w.after, c.shard) = 1 end"
+                + " from c left join w on w.id = c.eff order by c.shard";
+        this.checkpoint = "with gone as (delete from " + names.checkpoint() + ") insert into " + names.checkpoint()
+                + " (tick_id, busy, busy_tick_id) values (?, ?::varbit, ?)";
+    }
+
+    /** A subquery of the newest checkpoint's {@code tick_id, busy, busy_tick_id}, for {@link #effective}. */
+    static String newestCheckpoint(TableNames names) {
+        return "(select tick_id, busy, busy_tick_id from " + names.checkpoint() + " order by seq desc limit 1)";
+    }
+
+    /**
+     * The effective tick (see the class comment) of the cursor row {@code c} (its {@code shard} and {@code tick_id}),
+     * with the {@link #newestCheckpoint} left joined as {@code k}.
+     */
+    static String effective(int shards) {
+        return "case when length(k.busy) = " + shards + " then greatest(c.tick_id, case when get_bit(k.busy, c.shard)"
+                + " = 0 then k.tick_id else k.busy_tick_id end) else c.tick_id end";
     }
 
     /**
      * Latest cursor of shards {@code 0..shards-1}, in shard order: one index probe per shard. A shard without rows is
      * absent, so callers key results by {@link Cursor#shard()}, never by list position.
      */
-    public List<Cursor> latestAll(Connection c, int shards) throws SQLException {
+    public List<Cursor> latestAll(Connection c) throws SQLException {
         try (var ps = c.prepareStatement("select c.* from generate_series(0, ? - 1) s cross join lateral (select "
                 + COLUMNS + " from " + names.cursor() + " where shard = s order by seq desc limit 1) c order by s")) {
             ps.setInt(1, shards);
@@ -108,34 +172,76 @@ public final class Cursors {
     }
 
     /**
-     * {@link #latestAll} with each shard's {@link Position#behind()} up to the tick {@code latestTickId}: one statement,
-     * per shard an index probe for the cursor and its tick and, while that tick is young, a scan of the ticks after it.
+     * {@link #latestAll} with each shard's effective tick and {@link Position#behind()} up to the tick
+     * {@code latestTickId}: one statement, per shard an index probe for the cursor, then one scan of the ticks from
+     * the lowest effective tick of the shards without a batch in progress (at least the newest checkpoint's) to the
+     * latest.
      */
-    public List<Position> positions(Connection c, int shards, long latestTickId) throws SQLException {
+    public List<Position> positions(Connection c, long latestTickId) throws SQLException {
         try (var ps = c.prepareStatement(positions)) {
             ps.setLong(1, latestTickId);
-            ps.setLong(2, TimeUnit.MICROSECONDS.convert(ShardProcessor.IDLE_APPEND_AFTER));
-            ps.setInt(3, shards);
+            ps.setLong(2, latestTickId);
             try (var rs = ps.executeQuery()) {
                 var result = new ArrayList<Position>(shards);
                 while (rs.next()) {
-                    result.add(new Position(cursor(rs), rs.getBoolean(9)));
+                    result.add(new Position(cursor(rs), rs.getBoolean(10), rs.getLong(9)));
                 }
                 return result;
             }
         }
     }
 
-    /** Throws {@link IllegalStateException} when the shard has no cursor (bootstrap creates one per shard). */
-    public Cursor latest(Connection c, int shard) throws SQLException {
-        try (var ps = c.prepareStatement("select " + COLUMNS + " from " + names.cursor()
-                + " where shard = ? order by seq desc limit 1")) {
+    /** Busy at a checkpoint: {@link Position#behind() behind}, or a batch in progress. */
+    public static boolean busy(Position p) {
+        return p.behind() || p.cursor().targetTickId() != null;
+    }
+
+    /**
+     * The {@code busy_tick_id} of a checkpoint of {@code positions} read at the tick {@code latestTickId}: the lowest
+     * effective tick of the busy shards, {@code latestTickId} when none. Under that checkpoint it is the lowest
+     * effective tick of all shards, and the tick {@code outbox.shard.lag} measures from.
+     */
+    public static long busyTick(List<Position> positions, long latestTickId) {
+        long tick = latestTickId;
+        for (var p : positions) {
+            if (busy(p)) {
+                tick = Math.min(tick, p.effectiveTickId());
+            }
+        }
+        return tick;
+    }
+
+    /**
+     * The checkpoint of a maintenance run that read {@code positions} at the tick {@code latestTickId}, replacing the
+     * one before (see the class comment).
+     */
+    public void checkpoint(Connection c, long latestTickId, List<Position> positions) throws SQLException {
+        var busy = new StringBuilder("0".repeat(shards));
+        for (var p : positions) {
+            if (busy(p)) {
+                busy.setCharAt(p.cursor().shard(), '1');
+            }
+        }
+        try (var ps = c.prepareStatement(checkpoint)) {
+            ps.setLong(1, latestTickId);
+            ps.setString(2, busy.toString());
+            ps.setLong(3, busyTick(positions, latestTickId));
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * The shard's cursor and effective tick, in one statement with the newest checkpoint. Throws
+     * {@link IllegalStateException} when the shard has no cursor (bootstrap creates one per shard).
+     */
+    public Current latest(Connection c, int shard) throws SQLException {
+        try (var ps = c.prepareStatement(latest)) {
             ps.setInt(1, shard);
             try (var rs = ps.executeQuery()) {
                 if (!rs.next()) {
                     throw new IllegalStateException("no cursor for shard " + shard + " in " + names.cursor());
                 }
-                return cursor(rs);
+                return new Current(cursor(rs), rs.getLong(9));
             }
         }
     }
