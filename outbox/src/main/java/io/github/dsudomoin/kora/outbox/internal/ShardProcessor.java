@@ -566,12 +566,14 @@ public final class ShardProcessor implements AutoCloseable {
      * Goes on, for each shard whose read finished its batch below its limit while the latest tick is newer, into the
      * next fresh batch of the same step: chosen as {@link #chooseTargets} chooses a fresh one (the leading ticks that
      * do not mark the shard skipped, then {@link #chooseTarget} within {@code batchIds}), read for what is left of its
-     * limit and of the step's {@code batchSize}, its rows after the previous batch's in the step's one call. Under a
-     * steady load a shard is stepped about once per tick, and a batch is bounded by {@code batchIds}, about a tick's
-     * rows of the shard: without this a lagging shard would catch up a tick per step, and a relay that falls behind
-     * could never take more than a tick per step to catch up. Statements are shared by the shards of each round; the
-     * chain stops at a shard's limit, the latest tick, a cut read, {@link #MAX_SEGMENTS} batches or a quarter of
-     * {@code batchTimeout} spent.
+     * limit and of the step's {@code batchSize}, its rows after the previous batch's in the step's one call. A batch is
+     * bounded by {@code batchIds}; when ticks hold few rows of a shard but many of others (a shard catching up after an
+     * outage, rows unevenly spread), each batch is a tick of a few rows, and without this a lagging shard would catch
+     * up one such tick per step. It goes on only while the batch it just read would fit again in what is left: a batch
+     * cut by the limit is read again in full for its rest, which costs more than the step saves (bulk at 32 shards,
+     * batches of about 750 rows and a limit of 1000, lost 5 % of its throughput that way). Statements are shared by
+     * the shards of each round; the chain stops at a shard's limit, the latest tick, a cut read,
+     * {@link #MAX_SEGMENTS} batches or a quarter of {@code batchTimeout} spent.
      */
     private void chain(Connection c, List<Step> reads, long latestTickId, long started) throws SQLException {
         long budget = relay.batchSize() - reads.stream().mapToLong(s -> s.rows.size()).sum();
@@ -580,8 +582,11 @@ public final class ShardProcessor implements AutoCloseable {
             var afterIds = new HashMap<Integer, Long>();
             for (var s : reads) {
                 var last = s.segments.get(s.segments.size() - 1);
-                if (!s.probe && last.finished() && last.target().id() < latestTickId && s.rows.size() < s.limit
-                        && s.segments.size() < MAX_SEGMENTS) {
+                // the next batch is about as large as the last: going on only when that fits in what is left keeps
+                // batches whole, as a step of their own would read them (a batch cut by the limit is read again in
+                // full by the step after, for its rest)
+                if (!s.probe && last.finished() && last.target().id() < latestTickId
+                        && last.count() <= s.limit - s.rows.size() && s.segments.size() < MAX_SEGMENTS) {
                     more.add(s);
                     afterIds.put(s.shard, last.target().id());
                 }

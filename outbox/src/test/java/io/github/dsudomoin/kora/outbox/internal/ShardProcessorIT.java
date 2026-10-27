@@ -3191,19 +3191,35 @@ class ShardProcessorIT {
         config.shards(2).batchSize(150); // a batch spans at most 300 ids
         bootstrap();
         var keys = keysOnShard(0, 2);
-        lagTick(keys, "t1#", 50, 400);
+        lagTick(keys, "t1#", 20, 400);
         long t1 = tick();
-        lagTick(keys, "t2#", 50, 400);
+        lagTick(keys, "t2#", 75, 400); // larger than the first: it does not fit in the rest, and is cut there
         long t2 = tick();
 
-        // 100 rows of the first batch, then 50 of the second: the limit
+        // 40 rows of the first batch, then 110 of the second's 150: the limit
         assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 150, false));
         var ids = handler.delivered().stream().map(OutboxRecord::id).toList();
         assertThat(cursor(0)).isEqualTo(new Cursor(0, t1, t2, ids.get(149), null, 0, null, null));
 
-        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 50, true));
+        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 40, true));
         assertThat(cursor(0)).isEqualTo(new Cursor(0, t2, null, 0, null, 0, null, null));
-        assertThat(handler.delivered()).hasSize(200).extracting(OutboxRecord::messageId).doesNotHaveDuplicates();
+        assertThat(handler.delivered()).hasSize(190).extracting(OutboxRecord::messageId).doesNotHaveDuplicates();
+        assertIdOrderPerKey(handler.delivered());
+    }
+
+    @Test
+    void aStepDoesNotGoOnIntoABatchThatWouldNotFit() throws Exception {
+        config.shards(2).batchSize(1000);
+        bootstrap();
+        var keys = keysOnShard(0, 3);
+        for (int t = 1; t <= 3; t++) { // batches of 750 rows: a second would be cut and read again for its rest
+            lagTick(keys, "t" + t + "#", 250, 2100);
+            tick();
+        }
+
+        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 750, true));
+        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 750, true));
+        assertThat(processGroup(0)).containsExactly(new ShardResult(PROGRESS, 750, true));
         assertIdOrderPerKey(handler.delivered());
     }
 
