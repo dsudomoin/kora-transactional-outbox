@@ -725,7 +725,9 @@ public final class ShardProcessor implements AutoCloseable {
      * head of the key and takes its newer parked rows along as followers ({@link ParkedStore#toRetry}), which ends the
      * group, as does a row not handed. Never promotes. Unparks, re-parks and keeps go to {@link Pass#parkedWrites}:
      * such a row precedes the group's row that moves, if any, and a move carries only the key's newer parked rows,
-     * while no other group of the pass has its key, so the row is still parked when the pass writes it.
+     * while no other group of the pass moves a parked row of its key (a retry group writes the parked table only
+     * through {@link ParkedStore#fromRetry}, which inserts its own row), so the row is still parked when the pass
+     * writes it.
      */
     private void resolveParked(Connection c, int shard, Group group, Map<Long, Outcome> outcomes,
             List<OutboxRecord> delivered, Instant now, Pass pass) throws SQLException {
