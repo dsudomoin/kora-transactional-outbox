@@ -8,7 +8,7 @@ another process of the same account running, a process that ends on its own.
 |---|---|---|
 | Means | the target failed | the record is not ready; the target is fine |
 | Its key | waits: later records queue behind it in `<table>_retry` | goes on: later records are delivered while it waits |
-| Comes back | after backoff (1 s doubling to 5 min) or at `notBefore` | whichever comes first: right before the next new record of its key (in the same call), or its due time `now + outbox.relay.requeue.delay` (1 s); with `requeue(notBefore)`, `max(now + delay, notBefore)`, at most 24 h ahead |
+| Comes back | after backoff (1 s doubling to 5 min), or at `notBefore` if later | whichever comes first: right before the next new record of its key (in the same call), or its due time `now + outbox.relay.requeue.delay` (1 s); with `requeue(notBefore)`, `max(now + delay, notBefore)`, at most 24 h ahead |
 | Counts | `record.attempts()`, `relay.retry.maxAttempts` | `record.requeues()`, `relay.requeue.maxRequeues` |
 | Shard | pauses and backs off when nothing was delivered | no pause, no backoff, chunk size unchanged |
 
@@ -45,8 +45,9 @@ public final class AccountJobsHandler implements OutboxHandler {
         var outcomes = new ArrayList<Outcome>(records.size());
         var failedKeys = new HashSet<ByteBuffer>();
         for (var record : records) {
-            var key = ByteBuffer.wrap(record.key());
-            if (failedKeys.contains(key) || OutboxHandler.windDownRequested()) {
+            // an unkeyed record: its failure holds back nothing
+            var key = record.key() == null ? null : ByteBuffer.wrap(record.key());
+            if (key != null && failedKeys.contains(key) || OutboxHandler.windDownRequested()) {
                 outcomes.add(Outcome.notAttempted());
             } else if (processes.blocks(record)) { // e.g. a running WITHDRAW of the account blocks its FEE_RELEASE
                 outcomes.add(record.requeues() < GIVE_UP_AFTER
@@ -61,7 +62,9 @@ public final class AccountJobsHandler implements OutboxHandler {
                         Thread.currentThread().interrupt();
                     }
                     outcomes.add(Outcome.retry(e));
-                    failedKeys.add(key);
+                    if (key != null) {
+                        failedKeys.add(key);
+                    }
                 }
             }
         }

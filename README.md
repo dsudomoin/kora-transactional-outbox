@@ -585,7 +585,7 @@ httpClient.audit {
 @Component
 public final class AccountJobsHandler implements OutboxHandler {
 
-    private static final int GIVE_UP_AFTER = 1000; // отложена столько раз: в dead letters
+    private static final int GIVE_UP_AFTER = 1000; // столько раз отложена — дальше в dead letters
 
     private final AccountProcesses processes; // какие процессы счетов идут сейчас
     private final AccountJobs jobs;
@@ -605,8 +605,9 @@ public final class AccountJobsHandler implements OutboxHandler {
         var outcomes = new ArrayList<Outcome>(records.size());
         var failedKeys = new HashSet<ByteBuffer>();
         for (var record : records) {
-            var key = ByteBuffer.wrap(record.key());
-            if (failedKeys.contains(key) || OutboxHandler.windDownRequested()) {
+            // запись без ключа: её сбой не держит другие
+            var key = record.key() == null ? null : ByteBuffer.wrap(record.key());
+            if (key != null && failedKeys.contains(key) || OutboxHandler.windDownRequested()) {
                 outcomes.add(Outcome.notAttempted());
             } else if (processes.blocks(record)) { // идёт процесс того же счёта, который мешает этому событию
                 outcomes.add(record.requeues() < GIVE_UP_AFTER
@@ -621,7 +622,9 @@ public final class AccountJobsHandler implements OutboxHandler {
                         Thread.currentThread().interrupt();
                     }
                     outcomes.add(Outcome.retry(e));
-                    failedKeys.add(key);
+                    if (key != null) {
+                        failedKeys.add(key);
+                    }
                 }
             }
         }
