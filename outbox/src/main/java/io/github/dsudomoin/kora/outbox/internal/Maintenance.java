@@ -46,7 +46,8 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * at or above it is only obsolete, as the previous release's cleanup leaves it, and is replaced silently), the cursor anchors and due repairs
  * ({@link Cursors#anchors}: a cursor row at its effective tick for each shard idle at that checkpoint whose latest row
  * lies below it and is older than {@code outbox.relay.cursorAnchorInterval}, and one for each shard whose latest row
- * misses a due its {@code <retry>} or {@code <parked>} rows need; in one transaction under the shards' locks), drop of
+ * misses a due its {@code <retry>} or {@code <parked>} rows need; under the shards' locks, 128 shards per
+ * read-committed transaction), drop of
  * processed partitions, drop of ranges left detached but not dropped: by a crash of this library's maintenance once
  * relayed (one still holding rows at or above the horizon first has those moved back into the outbox as new messages,
  * {@link OrphanRestore}, unless {@code outbox.partitions.restoreOrphans} is off), by anyone else only when empty
@@ -72,6 +73,8 @@ public final class Maintenance {
     private static final long LOG_INTERVAL = TimeUnit.MINUTES.toNanos(1);
     /** Maintenance not completing for this many intervals is a WARN. */
     private static final int STALE_INTERVALS = 5;
+    /** Shards per anchor transaction, so one holds at most this many advisory locks. */
+    static final int ANCHOR_CHUNK = 128;
 
     private final JdbcConnectionFactory db;
     private final TableNames names;
@@ -87,6 +90,8 @@ public final class Maintenance {
     private final Cursors cursors;
     private final int shards;
     private final Duration anchorInterval;
+    /** Runs in each anchor transaction after its lock statement; a test's seam. */
+    volatile Runnable anchorLocked = () -> {};
     private final RetryStore retries;
     private final ParkedStore parked;
     final OrphanRestore orphanRestore; // for a test's seam
@@ -516,22 +521,32 @@ public final class Maintenance {
     }
 
     /**
-     * The anchors and due repairs of {@link Cursors#anchors}, in one transaction: the shards that need one, then each
-     * one's lock without waiting ({@code pg_try_advisory_xact_lock(internalNs, LOCK_SHARD_BASE + shard)}, a step's;
-     * a shard a step holds waits for the next run), then their rows read again after the lock, so from the cursor and
-     * tables a step left, and appended in one statement. Returns the rows appended.
+     * The anchors and due repairs of {@link Cursors#anchors}: the shards that need one, then, {@link #ANCHOR_CHUNK} at a
+     * time, one read-committed transaction each (whatever the session default: under repeatable read the snapshot
+     * would be taken by the lock statement, before the locks, so a step committing meanwhile would be missed by the
+     * re-read, and the row written from it would move that cursor back): each shard's lock without waiting
+     * ({@code pg_try_advisory_xact_lock(internalNs, LOCK_SHARD_BASE + shard)}, a step's; a shard a step holds waits for
+     * the next run), their rows read again by a statement after the lock, so from the cursor and tables a step left,
+     * and appended in one statement. Returns the rows appended.
      */
     private int anchor(Connection c) throws SQLException {
-        var wanted = cursors.anchors(c, IntStream.range(0, shards).boxed().toList(), anchorInterval);
-        if (wanted.isEmpty()) {
-            return 0;
+        var wanted = cursors.anchors(c, IntStream.range(0, shards).boxed().toList(), anchorInterval).stream()
+                .map(Cursor::shard).toList();
+        int appended = 0;
+        for (int from = 0; from < wanted.size(); from += ANCHOR_CHUNK) {
+            appended += anchor(c, wanted.subList(from, Math.min(wanted.size(), from + ANCHOR_CHUNK)));
         }
+        return appended;
+    }
+
+    private int anchor(Connection c, List<Integer> shards) throws SQLException {
         c.setAutoCommit(false);
         try {
+            execute(c, "set transaction isolation level read committed");
             List<Integer> locked;
             try (var ps = c.prepareStatement("select array(select s from unnest(?::int[]) s"
                     + " where pg_try_advisory_xact_lock(?, ? + s))")) {
-                ps.setArray(1, c.createArrayOf("int4", wanted.stream().map(Cursor::shard).toArray()));
+                ps.setArray(1, c.createArrayOf("int4", shards.toArray()));
                 ps.setInt(2, names.internalNamespace());
                 ps.setInt(3, TableNames.LOCK_SHARD_BASE);
                 try (var rs = ps.executeQuery()) {
@@ -539,6 +554,7 @@ public final class Maintenance {
                     locked = List.of((Integer[]) rs.getArray(1).getArray());
                 }
             }
+            anchorLocked.run();
             var rows = cursors.anchors(c, locked, anchorInterval); // a statement after the lock
             cursors.appendAll(c, rows);
             c.commit();

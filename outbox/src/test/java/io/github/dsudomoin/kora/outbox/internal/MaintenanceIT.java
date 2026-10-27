@@ -521,6 +521,68 @@ class MaintenanceIT {
     }
 
     @Test
+    void anAnchorUnderARepeatableReadDefaultNeverMovesACursorBack() throws Exception {
+        config.maintenanceInterval(Duration.ofSeconds(1)).cursorAnchorInterval(Duration.ofSeconds(1));
+        bootstrap(); // 4 shards, every cursor on the bootstrap tick
+        var props = new java.util.Properties();
+        props.setProperty("options", "-c default_transaction_isolation=repeatable\\ read"); // a role or pool default
+        var rr = TestDb.newDatabase(2, props);
+        pools.add(rr);
+        try (var c = rr.newConnection()) {
+            assertThat(queryString(c, "show default_transaction_isolation")).isEqualTo("repeatable read");
+        }
+        Thread.sleep(1100);
+        makeTick();
+        var maintenance = new Maintenance(rr, names, config, new OutboxMetrics(null));
+        var ahead = new AtomicLong();
+        var once = new AtomicBoolean();
+        // a step of shard 0 that commits after the anchor transaction's first statement, before its re-read (it took
+        // the shard's lock just before the anchor's try)
+        maintenance.anchorLocked = () -> {
+            if (once.compareAndSet(false, true)) {
+                try (var c = TestDb.connect()) {
+                    ahead.set(makeTick());
+                    var cursors = new Cursors(names, config.shards());
+                    cursors.append(c, cursors.latest(c, 0).cursor().withProgress(ahead.get(), null, 0));
+                } catch (SQLException e) {
+                    throw new RuntimeSqlException(e);
+                }
+            }
+        };
+
+        assertThat(maintenance.runOnce()).isTrue();
+
+        assertThat(once).isTrue();
+        assertThat(latestCursors()).extracting(Cursor::tickId).as("shard 0 kept the step's tick, the others anchored")
+                .containsExactly(ahead.get(), ahead.get() - 1, ahead.get() - 1, ahead.get() - 1);
+    }
+
+    @Test
+    void aShardHeldByAStepIsAnchoredByTheNextRun() throws Exception {
+        config.maintenanceInterval(Duration.ofSeconds(1)).cursorAnchorInterval(Duration.ofSeconds(1));
+        bootstrap(); // 4 shards, every cursor on the bootstrap tick
+        long bootstrapTick = latestCursors().get(0).tickId();
+        Thread.sleep(1100);
+        long latest = makeTick();
+        var maintenance = maintenance();
+        try (var step = TestDb.connect()) {
+            step.setAutoCommit(false);
+            execute(step, "select pg_advisory_xact_lock(" + names.internalNamespace() + ", "
+                    + (TableNames.LOCK_SHARD_BASE + 2) + ")");
+
+            assertThat(maintenance.runOnce()).isTrue();
+
+            assertThat(latestCursors()).extracting(Cursor::tickId).as("shard 2 held: not anchored")
+                    .containsExactly(latest, latest, bootstrapTick, latest);
+            step.commit();
+        }
+
+        assertThat(maintenance.runOnce()).isTrue();
+
+        assertThat(latestCursors()).extracting(Cursor::tickId).containsOnly(latest);
+    }
+
+    @Test
     void dueWorkIsRepairedOnIdleShards() throws Exception {
         bootstrap(); // 4 shards, every cursor on the bootstrap tick, no due in any
         var handler = new RecordingHandler();
