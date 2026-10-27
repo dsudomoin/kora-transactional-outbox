@@ -247,10 +247,14 @@ public final class Maintenance {
                 st.execute("set local lock_timeout = " + SHARDS_LOCK_TIMEOUT.toMillis()); // a transaction's: no leak
                 checkXidCounter(c);
                 c.commit();
-            } catch (SQLException e) {
-                c.rollback();
-                if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
-                    throw e;
+            } catch (Throwable t) { // an Error or RuntimeException too: setAutoCommit(true) would commit a half check
+                try {
+                    c.rollback();
+                } catch (SQLException cleanup) {
+                    t.addSuppressed(cleanup);
+                }
+                if (!(t instanceof SQLException e) || !LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                    throw t;
                 }
                 if (!xidChecked) {
                     halted = true;

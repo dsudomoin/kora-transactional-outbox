@@ -18,6 +18,8 @@ import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import io.github.dsudomoin.kora.outbox.testing.TestOutboxConfig;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -37,7 +39,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
+import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
+import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
@@ -279,6 +284,51 @@ class XidRecoveryIT {
                 release.shutdown();
             }
         }
+    }
+
+    /** A check failing past its reads, here at its commit, rolls back: autocommit restored would commit it. */
+    @Test
+    void aHaltCheckThatFailsUncheckedCommitsNothing() throws Exception {
+        bootstrap();
+        forgeRegression();
+        var failing = new AtomicBoolean(true);
+        var factory = new JdbcConnectionFactory() {
+            @Override
+            public <T> T withConnection(JdbcHelper.SqlFunction1<Connection, T> callback) {
+                return db.withConnection(callback);
+            }
+
+            @Override
+            public Connection currentConnection() {
+                return db.currentConnection();
+            }
+
+            @Override
+            public Connection newConnection() {
+                var c = db.newConnection();
+                return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(),
+                        new Class<?>[] {Connection.class}, (proxy, method, args) -> {
+                            if (method.getName().equals("commit") && failing.compareAndSet(true, false)) {
+                                throw new IllegalStateException("injected commit failure");
+                            }
+                            try {
+                                return method.invoke(c, args);
+                            } catch (InvocationTargetException e) {
+                                throw e.getCause();
+                            }
+                        });
+            }
+
+            @Override
+            public DataBaseTelemetry telemetry() {
+                return db.telemetry();
+            }
+        };
+        var maintenance = new Maintenance(factory, names, config, new OutboxMetrics(null));
+
+        assertThatThrownBy(maintenance::checkHalt).isInstanceOf(IllegalStateException.class)
+                .hasMessage("injected commit failure");
+        assertThat(haltRows()).as("the halt it recorded, rolled back").isZero();
     }
 
     @Test
