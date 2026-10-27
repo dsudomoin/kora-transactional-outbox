@@ -1338,32 +1338,24 @@ class MaintenanceIT {
     @Test
     void deadDueIndexIsBuiltConcurrently() throws Exception {
         bootstrap();
-        String index = names.dead() + "_due";
-        try (var c = TestDb.connect(); var holder = TestDb.connect(); var writer = TestDb.connect()) {
-            execute(c, "drop index " + index); // as bootstrap leaves an upgraded dead table with rows
-            execute(c, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
-                    + " select s, 0, gen_random_uuid(), 't', now(), 1 from generate_series(1, 200000) s");
-            execute(c, "update " + names.dead() + " set status = 'pending', due_at = now() where id <= 3");
-            // an open dead insert: the build waits for it
-            holder.setAutoCommit(false);
-            execute(holder, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
-                    + " values (300000, 0, gen_random_uuid(), 't', now(), 1)");
-            var run = CompletableFuture.supplyAsync(() -> maintenance().runOnce());
-            await(Duration.ofSeconds(10), () -> queryLong(c, "select count(*) from pg_stat_activity"
-                    + " where query like 'create index concurrently%' and wait_event_type = 'Lock'") == 1);
+        var maintenance = maintenance();
+        deadTableWithoutIndex(200000);
+        try (var c = TestDb.connect(); var holder = openDeadInsert(300000); var writer = TestDb.connect()) {
+            execute(c, "update " + names.dead() + " set status = 'pending', due_at = now() where id <= 1000003");
+
+            assertThat(maintenance.runOnce()).as("the build runs on its own thread").isTrue();
+            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1); // for the open insert
 
             // a plain CREATE INDEX waiting there would queue every new dead insert behind it
             long start = System.nanoTime();
             execute(writer, "set statement_timeout = '1s'");
-            execute(writer, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
-                    + " values (300001, 0, gen_random_uuid(), 't', now(), 1)");
+            insertDead(writer, 300001);
             assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(1));
 
             holder.commit();
-            assertThat(run.get(30, TimeUnit.SECONDS)).isTrue();
-            assertThat(queryString(c, "select indisvalid::text from pg_index where indexrelid = to_regclass(?)", index))
-                    .isEqualTo("true");
-            assertThat(queryString(c, "select pg_get_indexdef(to_regclass(?))", index))
+            awaitBuildEnd(maintenance);
+            assertThat(indexState()).endsWith(":true");
+            assertThat(queryString(c, "select pg_get_indexdef(to_regclass(?))", deadDue()))
                     .endsWith(" (due_at) WHERE (due_at IS NOT NULL)");
             assertThat(queryLong(c, "select count(*) from " + names.dead() + " where due_at is not null"))
                     .isEqualTo(3);
@@ -1373,65 +1365,208 @@ class MaintenanceIT {
     @Test
     void invalidDeadDueIndexIsRebuilt() throws Exception {
         bootstrap();
-        String index = names.dead() + "_due";
-        String state = "select indexrelid || ':' || indisvalid from pg_index where indexrelid = to_regclass(?)";
-        String invalid;
-        try (var c = TestDb.connect(); var holder = TestDb.connect()) {
-            execute(c, "drop index " + index);
-            deadLetter(1, "pending", "1 minute");
-            holder.setAutoCommit(false);
-            execute(holder, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
-                    + " values (2, 0, gen_random_uuid(), 't', now(), 1)");
-            execute(c, "set lock_timeout = '300ms'");
-            assertThatThrownBy(() -> execute(c, "create index concurrently " + names.unqualified(index) + " on "
-                    + names.dead() + " (due_at) where due_at is not null")).isInstanceOf(SQLException.class);
-            execute(c, "reset lock_timeout");
-            holder.rollback();
-            invalid = queryString(c, state, index);
-            assertThat(invalid).as("a cancelled concurrent build leaves it invalid").endsWith(":false");
-        }
+        String invalid = invalidDeadDue();
 
-        assertThat(maintenance().runOnce()).isTrue();
+        var maintenance = maintenance();
+        assertThat(maintenance.runOnce()).isTrue();
+        awaitBuildEnd(maintenance);
 
-        try (var c = TestDb.connect()) {
-            var rebuilt = queryString(c, state, index);
-            assertThat(rebuilt).endsWith(":true").isNotEqualTo(invalid.replace(":false", ":true"));
-        }
+        assertThat(indexState()).endsWith(":true").isNotEqualTo(invalid.replace(":false", ":true"));
     }
 
     @Test
     void aDeadDueIndexBuildThatTimesOutBacksOff() throws Exception {
         config.maintenanceInterval(Duration.ofSeconds(1));
         bootstrap();
-        String index = names.dead() + "_due";
-        String state = "select coalesce((select indexrelid || ':' || indisvalid from pg_index"
-                + " where indexrelid = to_regclass(?)), 'missing')";
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(300));
-        try (var c = TestDb.connect(); var holder = TestDb.connect()) {
-            execute(c, "drop index " + index);
-            deadLetter(1, "pending", "1 minute");
-            holder.setAutoCommit(false); // a long transaction on the dead table: the build's lock wait times out
-            execute(holder, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
-                    + " values (2, 0, gen_random_uuid(), 't', now(), 1)");
-
+        deadTableWithoutIndex(1);
+        try (var c = TestDb.connect(); var holder = openDeadInsert(2)) { // the build's lock wait times out
             String failed;
+            long failedAt;
             try (var err = new CapturedStderr()) {
                 assertThat(maintenance.runOnce()).isTrue();
-                failed = queryString(c, state, index);
+                awaitBuildEnd(maintenance);
+                failedAt = System.nanoTime();
+                failed = indexState();
                 assertThat(failed).as("left invalid by the timed-out build").endsWith(":false");
-                assertThat(err.text()).contains(index).contains("lock wait").contains("next try in 1 s");
+                assertThat(err.text()).contains(deadDue()).contains("55P03").contains("next try in 1 s");
             }
             try (var err = new CapturedStderr()) {
                 assertThat(maintenance.runOnce()).isTrue();
-                assertThat(queryString(c, state, index)).as("not tried again within the backoff").isEqualTo(failed);
-                assertThat(err.text()).doesNotContain(index);
+                assertThat(maintenance.deadIndex.running()).as("not tried again within the backoff").isFalse();
+                assertThat(indexState()).isEqualTo(failed);
+                assertThat(err.text()).doesNotContain(deadDue());
             }
 
             holder.rollback();
-            Thread.sleep(1100);
-            assertThat(maintenance.runOnce()).isTrue();
-            assertThat(queryString(c, state, index)).endsWith(":true");
+            await(Duration.ofSeconds(10), () -> {
+                maintenance.runOnce();
+                awaitBuildEnd(maintenance);
+                return indexState().endsWith(":true");
+            });
+            assertThat(Duration.ofNanos(System.nanoTime() - failedAt)).isGreaterThanOrEqualTo(Duration.ofSeconds(1));
         }
+    }
+
+    @Test
+    void aCancelledDeadDueIndexBuildBacksOffToo() throws Exception {
+        config.maintenanceInterval(Duration.ofMinutes(10));
+        bootstrap();
+        var maintenance = maintenance();
+        deadTableWithoutIndex(1);
+        try (var c = TestDb.connect(); var holder = openDeadInsert(2); var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+            execute(c, "select pg_cancel_backend(pid) from pg_stat_activity where query like 'create index"
+                    + " concurrently%'");
+            awaitBuildEnd(maintenance);
+            assertThat(err.text()).contains(deadDue()).contains("57014").contains("next try in 600 s");
+            String failed = indexState();
+            holder.rollback();
+
+            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(maintenance.deadIndex.running()).isFalse();
+            assertThat(indexState()).isEqualTo(failed);
+        }
+    }
+
+    @Test
+    void onlyOneInstanceBuildsTheDeadDueIndex() throws Exception {
+        bootstrap();
+        var first = maintenance();
+        var second = maintenance();
+        deadTableWithoutIndex(1);
+        try (var c = TestDb.connect(); var holder = openDeadInsert(2)) {
+            assertThat(first.runOnce()).isTrue();
+            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+
+            assertThat(second.runOnce()).isTrue();
+            awaitBuildEnd(second); // its thread did not get LOCK_DEAD_INDEX
+            assertThat(first.deadIndex.running()).isTrue();
+            assertThat(queryLong(c, "select count(*) from pg_stat_activity where query like 'create index"
+                    + " concurrently%' or query like 'drop index concurrently%'")).isEqualTo(1);
+
+            holder.commit();
+            awaitBuildEnd(first);
+            assertThat(indexState()).endsWith(":true");
+        }
+    }
+
+    @Test
+    void closeCancelsABuildInFlight() throws Exception {
+        bootstrap();
+        var maintenance = maintenance();
+        deadTableWithoutIndex(1);
+        try (var c = TestDb.connect(); var holder = openDeadInsert(2)) {
+            assertThat(maintenance.runOnce()).isTrue();
+            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+
+            long start = System.nanoTime();
+            maintenance.close(Duration.ofSeconds(10));
+            assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(2));
+            assertThat(maintenance.deadIndex.running()).isFalse();
+            assertThat(queryLong(c, "select count(*) from pg_stat_activity where query like 'create index"
+                    + " concurrently%' and state = 'active'")).isZero();
+            assertThat(indexState()).as("the leftover").endsWith(":false");
+            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(maintenance.deadIndex.running()).as("closed: no new build").isFalse();
+            holder.rollback();
+        }
+        var next = maintenance();
+        assertThat(next.runOnce()).isTrue();
+        awaitBuildEnd(next);
+        assertThat(indexState()).endsWith(":true");
+    }
+
+    @Test
+    void aStartupQueuedForTheMaintenanceLockDoesNotDeadlockWithTheBuild() throws Exception {
+        bootstrap();
+        var maintenance = maintenance();
+        deadTableWithoutIndex(1000);
+        try (var c = TestDb.connect(); var holder = openDeadInsert(2); var run = TestDb.connect();
+                var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+
+            // another maintenance run in progress; a startup queues behind it, its statement's snapshot open
+            String lock = "(" + names.internalNamespace() + ", " + TableNames.LOCK_MAINTENANCE + ")";
+            execute(run, "select pg_advisory_lock" + lock);
+            var startup = CompletableFuture.runAsync(() -> {
+                try {
+                    new OutboxSchema(db, config).init();
+                } catch (SQLException e) {
+                    throw new RuntimeSqlException(e);
+                }
+            });
+            await(Duration.ofSeconds(4), () -> queryLong(c, "select count(*) from pg_stat_activity"
+                    + " where wait_event = 'advisory' and query like '%pg_advisory_lock%'") == 1);
+            holder.commit(); // the build goes on to wait for older snapshots, the queued startup's among them
+            Thread.sleep(1500); // past deadlock_timeout (1 s), so a cycle would be found
+            assertThat(maintenance.deadIndex.running()).as("the build waits for the queued startup's snapshot")
+                    .isTrue();
+            assertThat(startup).isNotDone();
+            execute(run, "select pg_advisory_unlock" + lock);
+
+            startup.get(10, TimeUnit.SECONDS);
+            awaitBuildEnd(maintenance);
+            assertThat(indexState()).endsWith(":true");
+            assertThat(err.text()).doesNotContain("40P01").doesNotContain("deadlock");
+        }
+    }
+
+    private static final String BUILD_WAITING = "select count(*) from pg_stat_activity"
+            + " where query like 'create index concurrently%' and wait_event_type = 'Lock'";
+
+    private String deadDue() {
+        return names.dead() + "_due";
+    }
+
+    /** {@code <oid>:<indisvalid>} of {@code <dead>_due}, {@code missing} without it. */
+    private String indexState() throws SQLException {
+        try (var c = TestDb.connect()) {
+            return queryString(c, "select coalesce((select indexrelid || ':' || indisvalid from pg_index"
+                    + " where indexrelid = to_regclass(?)), 'missing')", deadDue());
+        }
+    }
+
+    /** The dead table as bootstrap leaves an upgraded one with rows: {@code rows} kept letters, no index. */
+    private void deadTableWithoutIndex(int rows) throws SQLException {
+        try (var c = TestDb.connect()) {
+            execute(c, "drop index if exists " + deadDue());
+            execute(c, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts) select"
+                    + " 1000000 + s, 0, gen_random_uuid(), 't', now(), 1 from generate_series(1, " + rows + ") s");
+        }
+    }
+
+    private void insertDead(java.sql.Connection c, long id) throws SQLException {
+        execute(c, "insert into " + names.dead() + " (id, shard, message_id, topic, created_at, attempts)"
+                + " values (" + id + ", 0, gen_random_uuid(), 't', now(), 1)");
+    }
+
+    /** A connection with an open transaction that inserted dead letter {@code id}: a concurrent build waits for it. */
+    private java.sql.Connection openDeadInsert(long id) throws SQLException {
+        var c = TestDb.connect();
+        c.setAutoCommit(false);
+        insertDead(c, id);
+        return c;
+    }
+
+    /** As a concurrent build cancelled by its lock timeout leaves it: invalid; returns its {@link #indexState}. */
+    private String invalidDeadDue() throws SQLException {
+        deadTableWithoutIndex(1);
+        try (var c = TestDb.connect(); var holder = openDeadInsert(2)) {
+            execute(c, "set lock_timeout = '300ms'");
+            assertThatThrownBy(() -> execute(c, "create index concurrently " + names.unqualified(deadDue()) + " on "
+                    + names.dead() + " (due_at) where due_at is not null")).isInstanceOf(SQLException.class);
+            holder.rollback();
+        }
+        var state = indexState();
+        assertThat(state).as("a cancelled concurrent build leaves it invalid").endsWith(":false");
+        return state;
+    }
+
+    private static void awaitBuildEnd(Maintenance maintenance) throws Exception {
+        await(Duration.ofSeconds(30), () -> !maintenance.deadIndex.running());
     }
 
     /** A dead letter of {@code status} that failed {@code age} ago (an interval), due now unless kept. */

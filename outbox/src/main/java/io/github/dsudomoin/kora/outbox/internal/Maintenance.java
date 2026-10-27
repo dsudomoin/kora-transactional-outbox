@@ -48,8 +48,9 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * {@code outbox.partitions.orphaned} counts the ones kept, with an ERROR each run, as their rows lie outside the
  * outbox), tick cleanup, cursor cleanup, deletion of kept dead letters older than
  * {@code outbox.deadLetters.retention} (by {@code failed_at}; none when it is 0, pending or scheduled ones never) and
- * of redrive counts older than {@code outbox.deadLetters.redriveHistory}, the dead table's {@code <dead>_due} built
- * concurrently when missing or invalid, gauges; when none failed, the run is recorded
+ * of redrive counts older than {@code outbox.deadLetters.redriveHistory}, the start of the dead table's
+ * {@code <dead>_due} build when it is missing or invalid ({@link DeadIndexBuilder}: on its own thread, off the
+ * maintenance lock; never a failed step), gauges; when none failed, the run is recorded
  * as the last success. One long-lived instance per outbox table: it registers the gauges {@code outbox.shard.lag},
  * {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.dead.pending} (letters waiting for the hook),
  * {@code outbox.dead.pending.oldest} (seconds since the oldest of them failed, 0 when none),
@@ -64,9 +65,6 @@ public final class Maintenance {
     private static final long LOG_INTERVAL = TimeUnit.MINUTES.toNanos(1);
     /** Maintenance not completing for this many intervals is a WARN. */
     private static final int STALE_INTERVALS = 5;
-    private static final String LOCK_NOT_AVAILABLE = "55P03";
-    /** The longest backoff of the dead-letter index build after a lock wait timed out. */
-    static final Duration DEAD_INDEX_MAX_BACKOFF = Duration.ofHours(24);
 
     private final JdbcConnectionFactory db;
     private final TableNames names;
@@ -101,10 +99,7 @@ public final class Maintenance {
     private final AtomicLong strandedLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private volatile boolean halted;
     private volatile boolean stepFailed; // in the current run, under LOCK_MAINTENANCE
-    private final Duration maintenanceInterval;
-    /** The dead-letter index build's backoff, per instance: lock-wait failures in a row, and the next try. */
-    private volatile int deadIndexFailures;
-    private volatile long deadIndexRetryAt = System.nanoTime();
+    final DeadIndexBuilder deadIndex; // for tests
 
     private volatile double lag = Double.NaN;
     private volatile double retrySize = Double.NaN;
@@ -145,8 +140,8 @@ public final class Maintenance {
                 + names.maintenance();
         this.succeeded = "insert into " + names.maintenance() + " (succeeded_at) values (clock_timestamp())"
                 + " on conflict (id) do update set succeeded_at = excluded.succeeded_at";
-        this.maintenanceInterval = config.partitions().maintenanceInterval();
-        this.staleAfter = maintenanceInterval.multipliedBy(STALE_INTERVALS);
+        this.staleAfter = config.partitions().maintenanceInterval().multipliedBy(STALE_INTERVALS);
+        this.deadIndex = new DeadIndexBuilder(db, names, config.partitions().maintenanceInterval(), detachLockTimeout);
         this.deadRetention = config.deadLetters().retention();
         this.redriveHistory = config.deadLetters().redriveHistory();
         // ponytail: one statement per run, a scan of the dead table; chunk it if a first retention ever meets millions
@@ -171,6 +166,14 @@ public final class Maintenance {
             var at = lastSuccess;
             return at == null ? Double.NaN : (System.nanoTime() - at) / 1e9;
         });
+    }
+
+    /**
+     * Cancels a dead-letter index build in flight and waits for its thread up to {@code timeout}; no build starts
+     * afterwards. The relay calls it on release.
+     */
+    public void close(Duration timeout) {
+        deadIndex.close(timeout);
     }
 
     /** How long the tail swap waits for relay steps in flight, which it keeps out meanwhile: batchTimeout + 5 s. */
@@ -462,7 +465,7 @@ public final class Maintenance {
         }
         step("redrive history cleanup", () -> deleteOlder(c, deleteOldRedrives, redriveHistory));
         step("dead-letter index", () -> {
-            ensureDeadDueIndex(c);
+            deadIndex.startIfDue(c);
             return null;
         });
         step("gauges", () -> {
@@ -495,59 +498,6 @@ public final class Maintenance {
         }
         stepFailed = true; // no success recorded while rows lie outside the outbox
         return false;
-    }
-
-    /**
-     * Builds {@code <dead>_due} when bootstrap left it to this run (a dead table with rows) or an interrupted build left
-     * it invalid, which is dropped first. Concurrently, on this autocommit connection: SHARE UPDATE EXCLUSIVE, which
-     * dead inserts pass. No {@code statement_timeout}, as the scan takes as long as the table needs, all under the
-     * maintenance lock; each lock wait, the build's wait for older transactions included, under
-     * {@code detachLockTimeout}. A lock wait that times out (a long transaction: the build then fails at its end, its
-     * scan wasted) is a WARN and backs the next try off by 1, 2, 4… maintenance intervals, at most
-     * {@link #DEAD_INDEX_MAX_BACKOFF}, kept in memory: a restart tries at its first run.
-     */
-    private void ensureDeadDueIndex(Connection c) throws SQLException {
-        // ponytail: per-instance backoff, so each instance repeats the wasted scan once per backoff step while a
-        // transaction stays open past detachLockTimeout; share the next try in a table if many instances make it costly
-        String index = names.dead() + "_due";
-        Boolean valid;
-        try (var ps = c.prepareStatement("select indisvalid from pg_index where indexrelid = to_regclass(?)")) {
-            ps.setString(1, index);
-            try (var rs = ps.executeQuery()) {
-                valid = rs.next() ? rs.getBoolean(1) : null;
-            }
-        }
-        if (Boolean.TRUE.equals(valid) || System.nanoTime() - deadIndexRetryAt < 0) {
-            return;
-        }
-        long start = System.nanoTime();
-        try {
-            if (valid != null) {
-                PartitionDdl.execute(c, detachLockTimeout, "drop index concurrently if exists " + index);
-                log.info("outbox maintenance dropped {}, left invalid by an interrupted concurrent build", index);
-            }
-            PartitionDdl.execute(c, detachLockTimeout, Duration.ZERO, "create index concurrently if not exists "
-                    + names.unqualified(index) + " on " + names.dead() + " (due_at) where due_at is not null");
-        } catch (SQLException e) {
-            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
-                throw e;
-            }
-            int failures = ++deadIndexFailures;
-            var backoff = maintenanceInterval.multipliedBy(1L << Math.min(failures - 1, 20));
-            if (backoff.compareTo(DEAD_INDEX_MAX_BACKOFF) > 0) {
-                backoff = DEAD_INDEX_MAX_BACKOFF;
-            }
-            deadIndexRetryAt = System.nanoTime() + backoff.toNanos();
-            // not a failed step: the WARN says it, and the pass works without the index
-            log.warn("outbox maintenance could not build {} concurrently: a lock wait went past {} ms after {} ms (a"
-                    + " transaction open on the database, see pg_stat_activity, oldest xact_start); dead letters are"
-                    + " claimed by a scan meanwhile; next try in {} s (failure {} in a row): {}", index,
-                    detachLockTimeout.toMillis(), (System.nanoTime() - start) / 1_000_000, backoff.toSeconds(),
-                    failures, e.getMessage());
-            return;
-        }
-        deadIndexFailures = 0;
-        log.info("outbox maintenance built {} concurrently in {} ms", index, (System.nanoTime() - start) / 1_000_000);
     }
 
     /** {@code delete} with the one parameter: {@code age} in seconds; returns the rows deleted. */

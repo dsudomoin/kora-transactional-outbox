@@ -50,6 +50,7 @@ public final class OutboxSchema implements Lifecycle {
     /** {@code LOCK_TIMEOUT} each: a minute for other instances' bootstraps, which take milliseconds each. */
     private static final int SCHEMA_LOCK_ATTEMPTS = 12;
     private static final String LOCK_NOT_AVAILABLE = "55P03";
+    private static final String DUPLICATE_TABLE = "42P07";
     /** Bound of {@code deadLetters.retention} and {@code redriveHistory}: 10 years, an age maintenance compares. */
     private static final Duration MAX_DEAD_LETTER_AGE = Duration.ofDays(3650);
 
@@ -423,6 +424,10 @@ public final class OutboxSchema implements Lifecycle {
         }
         try (var st = c.createStatement()) {
             st.execute("create index " + spelled.unqualified(index) + " on " + definition);
+        } catch (SQLException e) {
+            if (!DUPLICATE_TABLE.equals(e.getSQLState())) { // made meanwhile, by a dead-index build
+                throw e;
+            }
         }
     }
 

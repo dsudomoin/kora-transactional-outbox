@@ -50,8 +50,8 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * the phase until the next pass; any other failure, and any failure of a hand-over (a lock timeout writing the hook's
  * decisions included: the hook is called again for them), propagates. Hook failures have a WARN of their own, at
  * most once a minute too. Until {@code <dead>_due} exists (an upgraded dead table with rows gets it from
- * {@link Maintenance}) the claim and the other {@code due_at} queries are as correct on a scan of the dead table, only
- * slower.
+ * {@link Maintenance}) the claim and the other {@code due_at} queries are as correct, only slower: each pass scans the
+ * whole dead table.
  */
 public final class DeadLetterPass {
 

@@ -172,7 +172,8 @@ public final class OutboxRelay implements Lifecycle {
      * Graceful shutdown: workers take no further shards, in-flight batches get {@code shutdownTimeout} to
      * finish, then the workers are interrupted and their uncommitted batches are redelivered later. A dead-letter hook
      * call in flight is interrupted at once ({@link DeadLetterPass#close()}): its letters roll back, costing no
-     * attempt, and are handed again later.
+     * attempt, and are handed again later. A dead-letter index build in flight is cancelled
+     * ({@link Maintenance#close}); the next one drops what it left.
      */
     @Override
     public void release() {
@@ -208,6 +209,8 @@ public final class OutboxRelay implements Lifecycle {
             if (s != null && !s.awaitTermination(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
                 s.shutdownNow();
             }
+            // after the scheduler: no maintenance run starts a build any more
+            maintenance.close(Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
         } catch (InterruptedException e) {
             interrupted = true;
             for (var t : workers) {
