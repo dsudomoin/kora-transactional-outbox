@@ -16,8 +16,8 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlFunction0;
 import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
 
 /**
- * Partition maintenance and log cleanup. Every run first checks the xid counter ({@link #halted()}),
- * then reads, from {@code <base>_maintenance}, when a run last completed every step on any instance
+ * Partition maintenance and log cleanup. Every run first checks the xid counter ({@link #halted()}), then reads, from
+ * {@code <base>_maintenance}, when a run last completed every step on any instance
  * ({@code outbox.maintenance.since_success}, seconds; unless halted, a WARN at most once a minute once that is over 5 ×
  * {@code maintenanceInterval}); neither needs a lock, so every instance does both, and a failed read is a WARN. The
  * rest needs a connection that keeps one server session: behind a transaction-pooling proxy
@@ -31,8 +31,9 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * still runs): finish a pending detach, premade partitions (the extension swaps the tail in one transaction, a tail
  * with rows becoming a range in it, the library's one ACCESS EXCLUSIVE on the parent besides the recovery's: writers
  * stall for its lock wait, at most {@code outbox.partitions.swapLockTimeout}, and the milliseconds it holds the lock;
- * before it, a wait of up to {@code batchTimeout} + 5 s for relay steps in flight blocks no writer), drop of processed
- * partitions, drop of ranges left detached but not dropped: by a crash of this library's maintenance once relayed
+ * before it, a wait of up to {@code batchTimeout} + 5 s for relay steps in flight, which blocks no writer but pauses
+ * every shard; a step running longer, as one may, defers the swap to the next run), drop of processed partitions,
+ * drop of ranges left detached but not dropped: by a crash of this library's maintenance once relayed
  * (one still holding rows at or above the horizon first has those moved back into the outbox as new messages,
  * {@link OrphanRestore}, unless {@code outbox.partitions.restoreOrphans} is off), by anyone else only when empty
  * (and ranges the xid-regression recovery set aside, {@code <base>_o<digits>}, likewise:
@@ -59,7 +60,11 @@ public final class Maintenance {
     private final TableNames names;
     private final int shards;
     private final Duration detachLockTimeout;
-    /** How long the tail swap waits for relay steps in flight: a step's handler call runs up to batchTimeout. */
+    /**
+     * How long the tail swap waits for relay steps in flight, every shard paused meanwhile. No bound on a step: its
+     * retry pass may run about 2 × batchTimeout and its main pass's call another batchTimeout. A step running longer
+     * defers the swap to the next run, with premake / 2 ranges of xids left before rows reach the tail.
+     */
     private final Duration quiesceTimeout;
     private final XidPartitions partitions;
     private final Ticks ticks;

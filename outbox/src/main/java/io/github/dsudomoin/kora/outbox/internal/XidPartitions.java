@@ -45,13 +45,15 @@ public final class XidPartitions {
      * Who would hold the swap's ACCESS EXCLUSIVE back: a description of the first, else null; and the virtual
      * transactions of lock holders whose age is hidden. Snapshots do not count: a detach that is not concurrent waits
      * for no snapshot. A relay step (it holds {@code LOCK_SWAP} shared) does not count either: the quiesce waits for
-     * it, without blocking writers. Of the rest, short holders are fine, the swap waits them out; a lock awaited on
-     * the parent counts at any age (the swap would queue behind it), as do a prepared transaction's and a pg_dump's.
-     * A visible holder counts once its transaction is older than the threshold; one without {@code xact_start} was
-     * between transactions when {@code pg_stat_activity} was read, so the lock seen is in a transaction that has
-     * ended or begun since: young either way. A holder logged in as another role (without {@code pg_read_all_stats})
-     * or with {@code track_activities = off} has its {@code state} and age hidden: it is returned for a second sample
-     * instead ({@link #swapBlocker}). {@code pg_locks} is read once, so a step's two locks are seen together.
+     * it, up to {@code batchTimeout} + 5 s from maintenance, without blocking writers (every shard pauses meanwhile);
+     * one running longer defers the swap to the next run. Of the rest, short holders are fine, the swap waits them out;
+     * a lock awaited on the parent counts at any age (the swap would queue behind it), as do a prepared transaction's
+     * and a pg_dump's. A visible holder counts once its transaction is older than the threshold; one without
+     * {@code xact_start} was between transactions when {@code pg_stat_activity} was read, so the lock seen is in a
+     * transaction that has ended or begun since: young either way. A holder logged in as another role (without
+     * {@code pg_read_all_stats}) or with {@code track_activities = off} has its {@code state} and age hidden: it is
+     * returned for a second sample instead ({@link #swapBlocker}). {@code pg_locks} is read once, so a step's two locks
+     * are seen together.
      */
     private static final String SWAP_BLOCKERS = """
             with p as materialized (select * from pg_locks
@@ -174,15 +176,18 @@ public final class XidPartitions {
      * Not while ({@link #swapBlocker}) a transaction open for 20 s holds a lock on the parent, or a lock on the parent
      * is awaited: the swap would stall writers for {@code swapLockTimeout} and time out. The run then leaves the
      * extension to the next one with a WARN; if the margin runs out first, rows go to the attached tail. Otherwise it
-     * makes {@code <base>_tail_next} anew and waits up to {@code quiesceTimeout} for relay steps in flight, which hold
-     * {@code LOCK_SWAP} shared, by taking it exclusively ({@code pg_advisory_lock(internalNs, LOCK_SWAP)}, released
-     * after the swap). Writers stall while the swap waits for its lock, at most {@code swapLockTimeout}, and the
-     * milliseconds it holds it. A hot tail (it holds rows, which sets {@link #overflow()}, or the current xid is within
-     * one range of its lower bound) becomes a range itself, rows and all ({@link #convert}); bootstrap leaves that to
-     * maintenance. A tail left detached, detach-pending (an operator's {@code DETACH CONCURRENTLY}) or missing is
-     * finished first: dropped when empty, attached back when it holds rows; ranges and a new tail are then attached
-     * without a swap, nothing being attached above the last range. Lock timeouts surface as {@link SQLException}
-     * (SQLState 55P03), the tail still attached; the next run retries.
+     * makes {@code <base>_tail_next} anew and waits up to {@code quiesceTimeout} ({@code batchTimeout} + 5 s from
+     * maintenance) for relay steps in flight, which hold {@code LOCK_SWAP} shared, by taking it exclusively
+     * ({@code pg_advisory_lock(internalNs, LOCK_SWAP)}, released after the swap). Writers go on meanwhile, but every
+     * shard pauses: no step starts while the request is queued. That is no bound on a step (its retry pass may run
+     * about 2 × {@code batchTimeout} and its main pass's call another {@code batchTimeout}): a step running longer
+     * times the wait out, and the swap is left to the next run. Writers stall while the swap waits for its lock, at
+     * most {@code swapLockTimeout}, and the milliseconds it holds it. A hot tail (it holds rows, which sets
+     * {@link #overflow()}, or the current xid is within one range of its lower bound) becomes a range itself, rows and
+     * all ({@link #convert}); bootstrap leaves that to maintenance. A tail left detached, detach-pending (an operator's
+     * {@code DETACH CONCURRENTLY}) or missing is finished first: dropped when empty, attached back when it holds rows;
+     * ranges and a new tail are then attached without a swap, nothing being attached above the last range. Lock
+     * timeouts surface as {@link SQLException} (SQLState 55P03), the tail still attached; the next run retries.
      */
     public void ensurePremade(Connection autocommit) throws SQLException {
         ensurePremade(autocommit, PartitionDdl.DETACH_LOCK_TIMEOUT, PartitionDdl.DETACH_LOCK_TIMEOUT);
@@ -367,7 +372,9 @@ public final class XidPartitions {
 
     /**
      * Runs {@code action} holding {@code LOCK_SWAP} exclusively, taken within {@code quiesceTimeout}: relay steps in
-     * flight, which hold it shared, have ended, and new ones skip until it is released, whatever fails.
+     * flight, which hold it shared, have ended, and new ones skip from the request on (Postgres grants no shared lock
+     * past a queued exclusive request) until it is released, whatever fails. A step in flight past
+     * {@code quiesceTimeout} fails it with SQLState 55P03.
      */
     private <T> T quiesced(Connection c, Duration quiesceTimeout, SqlFunction0<T> action) throws SQLException {
         Throwable failure = null;
