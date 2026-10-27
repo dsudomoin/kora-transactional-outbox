@@ -22,11 +22,6 @@ configure(published.map { project(":$it") }) {
     }
 
     dependencies {
-        "api"(platform("ru.tinkoff.kora:kora-parent:$koraVersion"))
-        "annotationProcessor"(platform("ru.tinkoff.kora:kora-parent:$koraVersion"))
-        "testAnnotationProcessor"(platform("ru.tinkoff.kora:kora-parent:$koraVersion"))
-        "annotationProcessor"("ru.tinkoff.kora:config-annotation-processor")
-
         "testImplementation"(platform("org.junit:junit-bom:5.12.2"))
         "testImplementation"("org.junit.jupiter:junit-jupiter")
         "testRuntimeOnly"("org.junit.platform:junit-platform-launcher")
@@ -75,5 +70,40 @@ configure(published.map { project(":$it") }) {
                 }
             }
         }
+    }
+}
+
+// Kora's platform and config processor reach the Kora adapters only: the core, Kafka and Micrometer modules stay
+// framework-free (verifyFrameworkFree)
+configure(listOf("outbox-kora", "outbox-kafka-kora", "outbox-admin-kora").map { project(":$it") }) {
+    dependencies {
+        "api"(platform("ru.tinkoff.kora:kora-parent:$koraVersion"))
+        "annotationProcessor"(platform("ru.tinkoff.kora:kora-parent:$koraVersion"))
+        "testAnnotationProcessor"(platform("ru.tinkoff.kora:kora-parent:$koraVersion"))
+        "annotationProcessor"("ru.tinkoff.kora:config-annotation-processor")
+    }
+}
+
+// Fails when a framework reaches a framework-free module's compile or runtime classpath
+mapOf(
+    "outbox-core" to listOf("ru.tinkoff.kora", "io.micrometer", "io.opentelemetry"),
+    "outbox-kafka" to listOf("ru.tinkoff.kora"),
+    "outbox-micrometer" to listOf("ru.tinkoff.kora"),
+).forEach { (name, banned) ->
+    project(":$name") {
+        val classpaths = listOf("compileClasspath", "runtimeClasspath").map { configurations[it] }
+        val verifyFrameworkFree by tasks.registering {
+            description = "Fails when ${banned.joinToString()} is on the compile or runtime classpath"
+            doLast {
+                classpaths.forEach { classpath ->
+                    val found = classpath.incoming.resolutionResult.allComponents.mapNotNull { it.moduleVersion }
+                        .filter { module -> banned.any { module.group.startsWith(it) } }
+                    if (found.isNotEmpty()) {
+                        throw GradleException("$path ${classpath.name} must stay framework-free: ${found.joinToString()}")
+                    }
+                }
+            }
+        }
+        tasks.named("check") { dependsOn(verifyFrameworkFree) }
     }
 }
