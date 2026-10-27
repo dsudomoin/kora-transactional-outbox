@@ -1232,7 +1232,7 @@ class OutboxRelayIT {
                                 var ps = (PreparedStatement) result;
                                 return Proxy.newProxyInstance(PreparedStatement.class.getClassLoader(),
                                         new Class<?>[] {PreparedStatement.class}, (p, m, a) -> {
-                                            if (m.getName().equals("setInt") && (int) a[0] == 2) { // the lock key
+                                            if (m.getName().equals("setInt") && (int) a[0] == 4) { // the shard key
                                                 steps.computeIfAbsent((int) a[1] - TableNames.LOCK_SHARD_BASE,
                                                         shard -> new AtomicInteger()).incrementAndGet();
                                             }

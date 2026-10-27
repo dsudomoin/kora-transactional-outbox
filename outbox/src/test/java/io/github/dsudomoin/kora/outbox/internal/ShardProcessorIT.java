@@ -52,6 +52,9 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -923,6 +926,86 @@ class ShardProcessorIT {
 
         holder.commit();
         assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+    }
+
+    @Test
+    void stepDoesNotRunWhileTheSwapLockIsHeld() throws Exception {
+        bootstrap();
+        script = answering(Map.of("p#1", Outcome.requeue()));
+        send(msg("t", "p", "p#1"));
+        tick();
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true)); // p#1 parked
+        script = answering(Map.of());
+        send(msg("t", "a", "a#1"));
+        tick();
+        now = now.plus(REQUEUE_DELAY); // p#1 due as well
+        var swap = TestDb.connect();
+        open.add(swap);
+        swapLock(swap, "pg_advisory_lock");
+        var cursor = cursor();
+        long cursorRows = cursorRows();
+        calls.clear();
+
+        assertThat(process()).isEqualTo(new ShardResult(NOT_LOCKED, 0, false));
+        assertThat(process(true)).as("a drain's step").isEqualTo(new ShardResult(NOT_LOCKED, 0, false));
+        assertThat(calls).isEmpty();
+        assertThat(cursorRows()).isEqualTo(cursorRows);
+        assertThat(cursor()).isEqualTo(cursor);
+
+        swapLock(swap, "pg_advisory_unlock");
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
+        assertThat(delivered()).containsExactly("p#1", "a#1");
+    }
+
+    @Test
+    void swapLockWaitsForTheStepInFlightWithoutBlockingWriters() throws Exception {
+        bootstrap();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        script = records -> {
+            entered.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return records.stream().map(r -> Outcome.delivered()).toList();
+        };
+        send(msg("t", "a", "a#1"));
+        tick();
+        var swap = TestDb.connect();
+        open.add(swap);
+        var step = new FutureTask<>(this::process);
+        var quiesce = new FutureTask<Void>(() -> {
+            swapLock(swap, "pg_advisory_lock");
+            return null;
+        });
+        try {
+            new Thread(step).start();
+            assertThat(entered.await(5, TimeUnit.SECONDS)).as("the handler is called").isTrue();
+            new Thread(quiesce).start();
+
+            assertThatThrownBy(() -> quiesce.get(1, TimeUnit.SECONDS)).isInstanceOf(TimeoutException.class);
+            var insert = new FutureTask<>(() -> send(msg("t", "b", "b#1")));
+            new Thread(insert).start();
+            assertThat(insert.get(1, TimeUnit.SECONDS)).as("a writer commits meanwhile").hasSize(1);
+
+            release.countDown();
+            assertThat(step.get(5, TimeUnit.SECONDS)).isEqualTo(new ShardResult(PROGRESS, 1, true));
+            quiesce.get(5, TimeUnit.SECONDS);
+        } finally {
+            release.countDown();
+        }
+        swapLock(swap, "pg_advisory_unlock");
+    }
+
+    /** {@code function(internalNs, LOCK_SWAP)} on {@code c}, as maintenance quiesces the relay for a tail swap. */
+    private void swapLock(Connection c, String function) throws SQLException {
+        try (var ps = c.prepareStatement("select " + function + "(?, ?)")) {
+            ps.setInt(1, names.internalNamespace());
+            ps.setInt(2, TableNames.LOCK_SWAP);
+            ps.execute();
+        }
     }
 
     @Test

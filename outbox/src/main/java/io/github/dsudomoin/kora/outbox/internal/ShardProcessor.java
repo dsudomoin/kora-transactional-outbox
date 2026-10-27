@@ -56,18 +56,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * One relay step for one shard, inside the caller's transaction: take the shard lock, re-read the cursor, deliver
- * due retry heads and due parked rows, then the next chunk of the batch {@code (tickId, target]} with the parked rows
- * of its keys first in its call, classify and append the new cursor. A failed attempt halves the rows the shard's next
- * step reads and a delivery doubles them (up to {@code batchSize}), so a record that fails its whole call deep in a
- * chunk is soon read alone; a requeue is neither. After {@code headFailuresBeforeDivert} failed attempts in a row the
- * shard probes: it reads the head row alone and merges no parked row into its call, so a slow or poison head is
- * diverted as a single failing key, and a down target loses at most one row to the retry table per (backed-off)
- * probe. Handler calls run on this processor's own bounded pool of daemon threads, each bounded by
- * {@code batchTimeout}. A call that throws (an Error included) or
- * returns an invalid outcome list fails each of its records transiently, so a poison record takes that same path and
- * no handler failure reaches the caller. The caller commits on return and rolls back on an exception (SQL), so a
- * failed step is redelivered, and a record it parked stays where it was.
+ * One relay step for one shard, inside the caller's transaction: take the shard lock and the tail swap's lock shared
+ * ({@link #tryLock}), re-read the cursor, deliver due retry heads and due parked rows, then the next chunk of the batch
+ * {@code (tickId, target]} with the parked rows of its keys first in its call, classify and append the new cursor. A
+ * failed attempt halves the rows the shard's next step reads and a delivery doubles them (up to {@code batchSize}), so
+ * a record that fails its whole call deep in a chunk is soon read alone; a requeue is neither. After
+ * {@code headFailuresBeforeDivert} failed attempts in a row the shard probes: it reads the head row alone and merges no
+ * parked row into its call, so a slow or poison head is diverted as a single failing key, and a down target loses at
+ * most one row to the retry table per (backed-off) probe. Handler calls run on this processor's own bounded pool of
+ * daemon threads, each bounded by {@code batchTimeout}. A call that throws (an Error included) or returns an invalid
+ * outcome list fails each of its records transiently, so a poison record takes that same path and no handler failure
+ * reaches the caller. The caller commits on return and rolls back on an exception (SQL), so a failed step is
+ * redelivered, and a record it parked stays where it was.
  */
 public final class ShardProcessor implements AutoCloseable {
 
@@ -413,13 +413,22 @@ public final class ShardProcessor implements AutoCloseable {
         return now - last >= fullCheckInterval && fullChecked.compareAndSet(shard, last, now);
     }
 
+    /**
+     * {@code LOCK_SWAP} shared and the shard's lock, both until the step's commit, or the step does not run: the tail
+     * swap ({@link XidPartitions#ensurePremade}) takes {@code LOCK_SWAP} exclusively, so it waits for the steps in
+     * flight, and steps skip while it holds or awaits it. Every step of every caller (workers, {@code drain()}) starts
+     * here, before its first read. Either lock taken alone is released at the step's commit, which is immediate.
+     */
     private boolean tryLock(Connection c, int shard) throws SQLException {
-        try (var ps = c.prepareStatement("select pg_try_advisory_xact_lock(?, ?)")) {
+        try (var ps = c.prepareStatement(
+                "select pg_try_advisory_xact_lock_shared(?, ?), pg_try_advisory_xact_lock(?, ?)")) {
             ps.setInt(1, internalNamespace);
-            ps.setInt(2, TableNames.LOCK_SHARD_BASE + shard);
+            ps.setInt(2, TableNames.LOCK_SWAP);
+            ps.setInt(3, internalNamespace);
+            ps.setInt(4, TableNames.LOCK_SHARD_BASE + shard);
             try (var rs = ps.executeQuery()) {
                 rs.next();
-                return rs.getBoolean(1);
+                return rs.getBoolean(1) & rs.getBoolean(2);
             }
         }
     }
