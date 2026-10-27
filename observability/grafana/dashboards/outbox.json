@@ -1135,6 +1135,169 @@
       ]
     },
     {
+      "type": "timeseries",
+      "id": 31,
+      "title": "Requeues per second",
+      "description": "outbox.messages.requeued rate: records the handler set aside with Outcome.requeue, every requeue counted. No failure: no pause, no attempt spent.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: msg/s",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#3987e5"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "requeued"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(outbox_messages_requeued_total[$__rate_interval]))",
+          "legendFormat": "requeued",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 32,
+      "title": "Parked records",
+      "description": "Rows in outbox_parked (outbox.parked.size): requeued records waiting for the next record of their key or their due time. outbox.shard.lag does not see them: a level that does not return to its baseline means records requeued over and over.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 34,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#3987e5"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false,
+            "axisPlacement": "auto"
+          },
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "parked"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(outbox_parked_size)",
+          "legendFormat": "parked",
+          "range": true
+        }
+      ]
+    },
+    {
       "type": "state-timeline",
       "id": 13,
       "title": "Tail overflow",
@@ -1145,7 +1308,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 34,
+        "y": 42,
         "w": 24,
         "h": 4
       },
@@ -1212,7 +1375,7 @@
       "id": 14,
       "gridPos": {
         "x": 0,
-        "y": 38,
+        "y": 46,
         "w": 24,
         "h": 1
       },
@@ -1229,7 +1392,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 39,
+        "y": 47,
         "w": 8,
         "h": 8
       },
@@ -1335,7 +1498,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 39,
+        "y": 47,
         "w": 8,
         "h": 8
       },
@@ -1450,7 +1613,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 39,
+        "y": 47,
         "w": 8,
         "h": 8
       },
@@ -1531,7 +1694,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 47,
+        "y": 55,
         "w": 12,
         "h": 8
       },
@@ -1612,7 +1775,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 47,
+        "y": 55,
         "w": 12,
         "h": 8
       },
@@ -1715,7 +1878,7 @@
       "id": 20,
       "gridPos": {
         "x": 0,
-        "y": 55,
+        "y": 63,
         "w": 24,
         "h": 1
       },
@@ -1732,7 +1895,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 56,
+        "y": 64,
         "w": 8,
         "h": 4
       },
@@ -1799,7 +1962,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 56,
+        "y": 64,
         "w": 8,
         "h": 4
       },
@@ -1866,7 +2029,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 56,
+        "y": 64,
         "w": 8,
         "h": 4
       },
@@ -1933,7 +2096,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 60,
+        "y": 68,
         "w": 12,
         "h": 8
       },
@@ -2039,7 +2202,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 60,
+        "y": 68,
         "w": 12,
         "h": 8
       },
@@ -2117,7 +2280,7 @@
       "id": 26,
       "gridPos": {
         "x": 0,
-        "y": 68,
+        "y": 76,
         "w": 24,
         "h": 1
       },
@@ -2134,7 +2297,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 69,
+        "y": 77,
         "w": 6,
         "h": 8
       },
@@ -2240,7 +2403,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 69,
+        "y": 77,
         "w": 6,
         "h": 8
       },
@@ -2346,7 +2509,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 69,
+        "y": 77,
         "w": 6,
         "h": 8
       },
@@ -2478,7 +2641,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 69,
+        "y": 77,
         "w": 6,
         "h": 8
       },

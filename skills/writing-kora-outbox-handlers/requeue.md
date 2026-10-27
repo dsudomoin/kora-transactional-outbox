@@ -44,15 +44,20 @@ public final class AccountJobsHandler implements OutboxHandler {
     public List<Outcome> handleBatch(List<OutboxRecord> records) {
         var outcomes = new ArrayList<Outcome>(records.size());
         var failedKeys = new HashSet<ByteBuffer>();
+        var heldTypes = new HashMap<ByteBuffer, Set<String>>(); // per key, the job types held back in this call
         for (var record : records) {
             // an unkeyed record: its failure holds back nothing
             var key = record.key() == null ? null : ByteBuffer.wrap(record.key());
             if (key != null && failedKeys.contains(key) || OutboxHandler.windDownRequested()) {
                 outcomes.add(Outcome.notAttempted());
-            } else if (processes.blocks(record)) { // e.g. a running WITHDRAW of the account blocks its FEE_RELEASE
+            } else if (key != null && heldTypes.getOrDefault(key, Set.of()).contains(jobs.type(record))
+                    || processes.blocks(record)) { // e.g. a running WITHDRAW of the account blocks its FEE_RELEASE
                 outcomes.add(record.requeues() < GIVE_UP_AFTER
                         ? Outcome.requeue()
                         : Outcome.permanent(new IllegalStateException("blocked " + record.requeues() + " times")));
+                if (key != null) { // a later FEE_RELEASE of this account in the call waits too
+                    heldTypes.computeIfAbsent(key, k -> new HashSet<>()).add(jobs.type(record));
+                }
             } else {
                 try {
                     handle(record);
@@ -75,12 +80,16 @@ public final class AccountJobsHandler implements OutboxHandler {
 
 - The `handleBatch` contract still holds: once a key fails in the call, its later records are `notAttempted()`. A
   `requeue` there is not applied: the record follows the failed one into `<table>_retry`.
+- Once a record of a key is requeued in a call, requeue that key's later records of the same type in the call too, or
+  FEE_RELEASE#2 overtakes a requeued FEE_RELEASE#1 when the blocking process ends mid-call; other types still go
+  through (a requeued SYNCHRONIZE#2 does not hold back FEE_RELEASE).
 - Use `requeue(notBefore)` when the handler knows when the blocking process ends.
 - Give up either in the handler (`Outcome.permanent(e)` past a `record.requeues()` bound, per route) or globally
   with `outbox.relay.requeue.maxRequeues` (default 0 = unlimited): the requeue past it moves the record to
   `<table>_dead` with the error «requeue limit reached», attempts unchanged. Every hand-back answered with `requeue`
   counts, a merge ahead of a new record of the key included, so a busy key spends requeues faster than one per
-  `delay`: bound by count, not by expected time.
+  `delay`, at a rate you cannot predict. To give up after a time instead, use `record.createdAt()`:
+  `Duration.between(record.createdAt(), Instant.now())` past a limit → `Outcome.permanent(e)`.
 
 ## Order
 

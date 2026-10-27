@@ -24,8 +24,9 @@ a live database). **Never improvise SQL against the library's tables.**
 | `outbox.maintenance.transaction_pooling` = 1 | Maintenance skipped behind a transaction pooler | «Соединения: без transaction pooling» |
 | ERROR «outbox relay halted» | xid regression after a logical restore: stop writers | «Восстановление после регрессии xid (xid regression recovery)» |
 
-Also watch `outbox.delivery.delay` p99 and `outbox.messages.failed{outcome}`. Every meter and its Prometheus name:
-[metrics.md](metrics.md). Dashboard: `observability/grafana/dashboards/outbox.json` in the library repo.
+Also watch `outbox.delivery.delay` p99, `outbox.messages.failed{outcome}`, `outbox.parked.size`. Every meter and its
+Prometheus name: [metrics.md](metrics.md). Dashboard: `observability/grafana/dashboards/outbox.json` in the library
+repo.
 
 ## Never
 

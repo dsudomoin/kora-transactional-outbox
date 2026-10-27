@@ -586,7 +586,9 @@ httpClient.audit {
 @Component
 public final class AccountJobsHandler implements OutboxHandler {
 
-    private static final int GIVE_UP_AFTER = 1000; // столько раз отложена — дальше в dead letters
+    // столько раз отложена — дальше в dead letters; предел по времени вместо числа:
+    // Duration.between(record.createdAt(), Instant.now()) больше порога → Outcome.permanent
+    private static final int GIVE_UP_AFTER = 1000;
 
     private final AccountProcesses processes; // какие процессы счетов идут сейчас
     private final AccountJobs jobs;
@@ -605,15 +607,20 @@ public final class AccountJobsHandler implements OutboxHandler {
     public List<Outcome> handleBatch(List<OutboxRecord> records) { // один топик, ключ = id счёта
         var outcomes = new ArrayList<Outcome>(records.size());
         var failedKeys = new HashSet<ByteBuffer>();
+        var heldTypes = new HashMap<ByteBuffer, Set<String>>(); // по ключу: типы задач, придержанные в этом вызове
         for (var record : records) {
             // запись без ключа: её сбой не держит другие
             var key = record.key() == null ? null : ByteBuffer.wrap(record.key());
             if (key != null && failedKeys.contains(key) || OutboxHandler.windDownRequested()) {
                 outcomes.add(Outcome.notAttempted());
-            } else if (processes.blocks(record)) { // идёт процесс того же счёта, который мешает этому событию
+            } else if (key != null && heldTypes.getOrDefault(key, Set.of()).contains(jobs.type(record))
+                    || processes.blocks(record)) { // идёт процесс того же счёта, который мешает этому событию
                 outcomes.add(record.requeues() < GIVE_UP_AFTER
                         ? Outcome.requeue()
                         : Outcome.permanent(new IllegalStateException("blocked " + record.requeues() + " times")));
+                if (key != null) { // более поздняя задача счёта того же типа в этом вызове тоже ждёт
+                    heldTypes.computeIfAbsent(key, k -> new HashSet<>()).add(jobs.type(record));
+                }
             } else {
                 try {
                     handle(record);
@@ -635,6 +642,10 @@ public final class AccountJobsHandler implements OutboxHandler {
 ```
 
 Тот же предел без кода — `outbox.relay.requeue.maxRequeues`; в обоих случаях запись уходит в dead letters.
+
+Отложив запись ключа, откладывайте и более поздние записи этого ключа того же типа в том же вызове, иначе
+FEE_RELEASE#2 обгонит отложенную FEE_RELEASE#1, если блокирующий процесс закончится посреди вызова; записи других
+типов идут дальше (отложенная SYNCHRONIZE#2 не держит FEE_RELEASE).
 
 **Дедлайны.** Каждый вызов выполняется на потоке обработчика relay и ограничен `outbox.relay.batchTimeout` (по
 умолчанию 30 с):
@@ -1157,6 +1168,7 @@ premake / 2 × xidsPerPartition  ≥  пиковое число transaction id �
 | `outbox.maintenance.transaction_pooling` = 1 | Обслуживание пропускается: обнаружен transaction pooler. |
 | `outbox.shard.lag` растёт | Самый медленный шард отстаёт (цель недоступна, медленный обработчик, мало воркеров). |
 | `outbox.dead.size` > 0 | Есть dead letters, которые нужно разобрать. |
+| `outbox.parked.size` не возвращается к обычному уровню или растёт | Записи откладываются снова и снова: блокирующий их процесс не заканчивается. `outbox.shard.lag` отложенных записей не видит. Предел задаёт обработчик или `relay.requeue.maxRequeues` ([Свой обработчик](#свой-обработчик)). |
 | ERROR «outbox relay halted» | Регрессия xid («xid regression recovery»). |
 | WARN «outbox tick made without its shard set» | Проба шардов при записи тика не прошла, чаще всего потому, что партицию держит ACCESS EXCLUSIVE (ALTER TABLE, VACUUM FULL, TRUNCATE, LOCK вручную). Тики идут дальше без набора шардов, и relay шагает по всем шардам; пока партиция заблокирована, шаги ждут её, и растёт `outbox.shard.lag`. Не чаще раза в минуту. |
 
@@ -1470,9 +1482,11 @@ Inbox это не затрагивает: он партиционирован п
 - **Переход на версию с `Outcome.requeue`.** Первый новый инстанс создаёт `<base>_parked` и один раз добавляет столбцы
   `<base>_cursor.parked_due_at` и `<base>_retry.requeues` (только метаданные; `ALTER` ждёт идущих шагов relay не
   больше 5 с, иначе старт падает, и его можно повторить). Пока рядом работают инстансы прежней версии, их строки
-  курсора не несут `parked_due_at`, поэтому отложенная запись может ждать возвращения до `maintenanceInterval`. После
-  отката на версию без requeue отложенные записи лежат в `<base>_parked` недоставленными, пока снова не запустится
-  версия с ним.
+  курсора не несут `parked_due_at`, поэтому отложенная запись может ждать возвращения до `maintenanceInterval`. В это
+  время не действует и правило «перед следующей записью своего ключа»: новые записи ключа уходят без отложенных, а на
+  шарде без трафика ожидание может превысить `maintenanceInterval` ещё до 5 с (такой шард получает шаг раз в 5 с).
+  После отката на версию без requeue отложенные записи лежат в `<base>_parked` недоставленными, пока снова не
+  запустится версия с ним.
 - **Остановка** мягкая: воркеры перестают брать шарды, выполняющиеся вызовы обработчика получают
   `relay.shutdownTimeout`, затем прерываются, а их незакоммиченные батчи позже доставляются снова — другим инстансом
   или после рестарта (дубликаты, а не потери).

@@ -29,6 +29,11 @@ Outbox gauges are refreshed by maintenance every `outbox.partitions.maintenanceI
 it; another instance keeps its previous values (NaN before its first run). `since_success` is read by every instance.
 Gauges register once per name: after a hot config reload that rebuilds outbox components they freeze, so restart.
 
+Alert on `outbox.parked.size` that does not return to its usual level or keeps growing. `outbox.shard.lag` does not
+see parked rows, so a record requeued forever (a blocking process that never ends, `relay.requeue.maxRequeues` 0)
+shows only here; `outbox.messages.requeued{topic}` shows which topic requeues. Bound it in the handler or with
+`maxRequeues` ([requeue.md](../writing-kora-outbox-handlers/requeue.md)).
+
 Kafka producer client metrics of the outbox are not bound to Micrometer (JMX only).
 
 Logs: logger `io.github.dsudomoin.kora.outbox`. WARN for diverted keys, shard pauses, deferred partition extensions

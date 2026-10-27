@@ -49,7 +49,7 @@ Records a `handleBatch` override set aside with `Outcome.requeue()` (writing-kor
 | Key | Default | Rule and meaning |
 |---|---|---|
 | `delay` | `1s` | > 0. A requeued record comes back after this unless a new record of its key brings it back first; `requeue(notBefore)` not before `notBefore` (capped at 24 h). A parked record handed back and not attempted waits at least this too. |
-| `maxRequeues` | `0` | ≥ 0. The requeue past this moves the record to `<table>_dead` with «requeue limit reached», attempts unchanged. Every hand-back answered with `requeue` counts, merges ahead of a new record of the key included. `0` = unlimited. Global; a handler can bound per route with `record.requeues()`. |
+| `maxRequeues` | `0` | ≥ 0. The requeue past this moves the record to `<table>_dead` with «requeue limit reached», attempts unchanged. Every hand-back answered with `requeue` counts, merges ahead of a new record of the key included. `0` = unlimited. Global; a handler can bound per route with `record.requeues()`, or by time, since merges spend requeues at an unpredictable rate: `Duration.between(record.createdAt(), now)` past a limit → `permanent`. |
 
 ## `outbox.partitions`
 
