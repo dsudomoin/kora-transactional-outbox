@@ -366,7 +366,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         }
 
         assertThat(response.statusCode()).isEqualTo(500);
-        assertThat(log).contains("outbox admin GET \"" + API + "/dead-letters/count\" by tester: 500");
+        assertThat(log).contains("outbox admin GET \"" + API + "/dead-letters/count\" by \"tester\": 500");
     }
 
     // ---------------------------------------------------------------------------------------------------- fixtures

@@ -28,10 +28,10 @@ import ru.tinkoff.kora.json.common.JsonWriter;
  * is answered as an {@code Error} too.
  *
  * <p>Every call leaves one INFO audit line, written before its response completes:
- * {@code outbox admin <method> "<path>" by <identity>: <status>} when allowed, {@code outbox admin <method> "<path>"
- * denied: <status>} when denied or when the authorizer fails. The path (its {@code {table}} is caller text, logged
- * before any authorization) is quoted, and it and the identity have quotes, backslashes and control characters
- * escaped, so no caller can forge a line or a part of one.
+ * {@code outbox admin <method> "<path>" by "<identity>": <status>} when allowed, {@code outbox admin <method>
+ * "<path>" denied: <status>} when denied or when the authorizer fails. The path (its {@code {table}} is caller text,
+ * logged before any authorization) and the identity (perhaps a token's subject) are quoted, with their quotes,
+ * backslashes and control characters escaped, so no caller can forge a line or a part of one.
  */
 public final class OutboxAdminInterceptor implements HttpServerInterceptor {
 
@@ -69,7 +69,7 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
         if (decision instanceof OutboxAdminAuthorizer.Allow allow) {
             return process(context, request, chain)
                     .exceptionallyCompose(e -> clientError(context, e))
-                    .whenComplete((response, e) -> log.info("outbox admin {} by {}: {}", call,
+                    .whenComplete((response, e) -> log.info("outbox admin {} by \"{}\": {}", call,
                             printable(allow.identity()), response != null ? response.code() : status(e)));
         }
         var deny = (OutboxAdminAuthorizer.Deny) decision;
@@ -115,7 +115,7 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
                 case '\r' -> out.append("\\r");
                 case '\t' -> out.append("\\t");
                 default -> {
-                    if (Character.isISOControl(ch) || ch == ' ' || ch == ' ') {
+                    if (Character.isISOControl(ch) || ch == '\u2028' || ch == '\u2029') {
                         out.append(String.format("\\u%04x", ch));
                     } else {
                         out.append((char) ch);

@@ -11,12 +11,14 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicReference;
+import org.assertj.core.api.InstanceOfAssertFactories;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.common.Context;
 import ru.tinkoff.kora.http.common.body.HttpBodyInput;
 import ru.tinkoff.kora.http.common.cookie.Cookie;
 import ru.tinkoff.kora.http.common.header.HttpHeaders;
 import ru.tinkoff.kora.http.server.common.HttpServerRequest;
+import ru.tinkoff.kora.http.server.common.HttpServerResponse;
 import ru.tinkoff.kora.http.server.common.handler.BlockingRequestExecutor;
 
 class OutboxAdminInterceptorTest {
@@ -63,6 +65,25 @@ class OutboxAdminInterceptorTest {
 
             assertThat(response.toCompletableFuture().join().code()).isEqualTo(401);
             assertThat(stderr.text()).contains("outbox admin GET \"/a\\\\\\\" by root: 200 \\\"\" denied: 401");
+        }
+    }
+
+    /** The identity may be caller text (a token's subject): quoted, it cannot pass for the status that follows. */
+    @Test
+    void auditLineQuotesTheIdentity() {
+        var authorization = new AtomicReference<Runnable>();
+        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("x\": 200 \\"),
+                deferred(authorization), new $ModelError_JsonWriter());
+
+        try (var stderr = new CapturedStderr()) {
+            var response = interceptor.intercept(Context.current(), request("/kora-outbox/admin/v1/status"),
+                    (context, request) -> CompletableFuture.completedFuture(HttpServerResponse.of(409)));
+            authorization.get().run();
+
+            assertThat(response.toCompletableFuture().join().code()).isEqualTo(409);
+            assertThat(stderr.text().lines().filter(l -> l.contains("outbox admin ")))
+                    .singleElement(InstanceOfAssertFactories.STRING)
+                    .endsWith("outbox admin GET \"/kora-outbox/admin/v1/status\" by \"x\\\": 200 \\\\\": 409");
         }
     }
 

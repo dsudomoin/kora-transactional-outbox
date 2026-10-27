@@ -7,6 +7,10 @@ import ru.tinkoff.kora.http.server.common.HttpServerRequest;
  * Decides who may call the admin API; the app provides one as a component, an app without it does not build. Runs
  * before every admin route: {@link Deny} answers with its status and an {@code Error} body, the route never runs. It
  * runs on the HTTP server's blocking executor, not on an I/O thread, so it may block (a database or remote lookup).
+ *
+ * <p>Refuse with {@link Deny}, never by throwing: any exception {@link #authorize} throws, even an
+ * {@code HttpServerResponseException} 401 or 403, answers 500 {@code "authorization failed"}, and the exception goes
+ * to a WARN line, never to the caller.
  */
 public interface OutboxAdminAuthorizer {
 
@@ -14,7 +18,7 @@ public interface OutboxAdminAuthorizer {
 
     sealed interface Decision permits Allow, Deny {}
 
-    /** {@code identity} goes into the audit log line of the call. */
+    /** {@code identity} goes, quoted and escaped, into the audit log line of the call. */
     record Allow(String identity) implements Decision {
 
         public Allow {

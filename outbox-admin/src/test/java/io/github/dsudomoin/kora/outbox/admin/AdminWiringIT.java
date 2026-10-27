@@ -89,7 +89,7 @@ class AdminWiringIT implements KoraAppTestConfigModifier {
                 .as("one audit line per call").containsExactly(
                         "outbox admin GET \"" + STATUS + "\" denied: 401",
                         "outbox admin GET \"" + STATUS + "\" denied: 403",
-                        "outbox admin GET \"" + STATUS + "\" by tester: 200");
+                        "outbox admin GET \"" + STATUS + "\" by \"tester\": 200");
     }
 
     /** The caller, not yet authenticated, learns nothing of why: the WARN line has the exception. */
