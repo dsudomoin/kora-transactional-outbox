@@ -1,6 +1,7 @@
 package io.github.dsudomoin.kora.outbox;
 
 import jakarta.annotation.Nullable;
+import java.time.Instant;
 import java.util.List;
 
 /**
@@ -14,7 +15,9 @@ import java.util.List;
  * ahead of the current xid ({@code outbox.partitions.premade}); {@code xidsLeft}: xids before inserts fail, null while
  * the tail is attached ({@code outbox.partitions.xids_left}); {@code maintenanceSinceSuccessSeconds}: since a
  * maintenance run last completed on any instance, null without that record ({@code outbox.maintenance.since_success});
- * {@code shards}: {@code outbox.shards}.
+ * {@code shards}: this instance's shard count, as the bootstrap resolved {@code outbox.shards}; {@code instances}: the
+ * instances' heartbeats, by id (a crashed instance's row stays until unseen for an hour, or 10 ×
+ * {@code maintenanceInterval} when longer).
  */
 public record OutboxStatus(
         boolean halted,
@@ -27,12 +30,20 @@ public record OutboxStatus(
         int premade,
         @Nullable Long xidsLeft,
         @Nullable Double maintenanceSinceSuccessSeconds,
-        int shards) {
+        int shards,
+        List<Instance> instances) {
 
     public OutboxStatus {
         deadLetters = List.copyOf(deadLetters);
         orphans = List.copyOf(orphans);
+        instances = List.copyOf(instances);
     }
+
+    /**
+     * A running instance, by its heartbeat: {@code id} {@code <host>/<pid>/<8 hex>}, its shard count, when it was last
+     * seen (database clock, every {@code maintenanceInterval}) and whether it has an active dead-letter hook.
+     */
+    public record Instance(String id, int shards, Instant lastSeen, boolean hookActive) {}
 
     public record DeadLetterCount(String topic, DeadLetter.Status status, long count) {}
 

@@ -99,6 +99,17 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         letter(3, "a", "3", "boom", T0, PENDING);
         letter(4, "b", "4", "boom", T0, SCHEDULED);
         var orphan = foreignOrphan();
+        // this app's own heartbeat, its first beat at start, the next one maintenanceInterval (30 s) later
+        try (var c = TestDb.connect()) {
+            long deadline = System.nanoTime() + 10_000_000_000L;
+            while (queryLong(c, "select count(*) from " + names().instance()) == 0) {
+                assertThat(System.nanoTime()).as("the heartbeat's row").isLessThan(deadline);
+                Thread.sleep(20);
+            }
+        }
+        execute("delete from " + names().instance());
+        execute("insert into " + names().instance() + " (instance_id, shards, last_seen, hook_active) values"
+                + " ('host-b/7/0000beef', 2, '2026-01-15T10:00:00Z', true)");
 
         var response = call("GET", "/status", null);
 
@@ -109,7 +120,9 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
                 + "{\"topic\":\"a\",\"status\":\"pending\",\"count\":1},"
                 + "{\"topic\":\"b\",\"status\":\"scheduled\",\"count\":1}],"
                 + "\"orphans\":[{\"table\":\"" + orphan + "\",\"kind\":\"foreign\"}],\"tailOverflow\":false,"
-                + "\"premade\":2,\"maintenanceSinceSuccessSeconds\":S,\"shards\":2}");
+                + "\"premade\":2,\"maintenanceSinceSuccessSeconds\":S,\"shards\":2,\"instances\":[{\"id\":"
+                + "\"host-b/7/0000beef\",\"shards\":2,\"lastSeen\":\"2026-01-15T10:00:00.000Z\","
+                + "\"hookActive\":true}]}");
     }
 
     @Test

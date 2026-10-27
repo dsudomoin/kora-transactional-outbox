@@ -5,6 +5,7 @@ import io.github.dsudomoin.kora.outbox.internal.Cursors;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.kora.outbox.internal.Cursors.Position;
 import io.github.dsudomoin.kora.outbox.internal.DeadLetterPass;
+import io.github.dsudomoin.kora.outbox.internal.Heartbeat;
 import io.github.dsudomoin.kora.outbox.internal.Maintenance;
 import io.github.dsudomoin.kora.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.kora.outbox.internal.OutboxSchema;
@@ -81,6 +82,7 @@ public final class OutboxRelay implements Lifecycle {
     private final Cursors cursors;
     private final ShardProcessor processor;
     private final DeadLetterPass deadLetters;
+    private final Heartbeat heartbeat;
     private final long idleNanos;
     private final long minTickNanos;
     /**
@@ -165,6 +167,8 @@ public final class OutboxRelay implements Lifecycle {
         this.cursors = new Cursors(schema.names(), config.shards());
         this.deadLetters = deadLetters;
         this.processor = new ShardProcessor(schema.names(), config, handler, metrics, tracer, deadLetters.active());
+        this.heartbeat = new Heartbeat(db, schema.names(), config.shards(), deadLetters.active(),
+                config.partitions().maintenanceInterval());
         this.idleNanos = relay.idlePollInterval().toNanos();
         this.minTickNanos = relay.minTickInterval().toNanos();
         this.idleTickAge = Duration.ofNanos(Math.max(minTickNanos, idleNanos - idleNanos / 4));
@@ -185,6 +189,7 @@ public final class OutboxRelay implements Lifecycle {
     /** Starts the workers, the dead-letter thread and maintenance, unless {@code relay.enabled} is false. */
     @Override
     public void init() {
+        heartbeat.start(); // with the relay disabled too: the reshard guard counts writers
         if (!relay.enabled()) {
             log.info("outbox relay disabled (outbox.relay.enabled = false); messages are delivered only by drain()");
             return;
@@ -268,6 +273,7 @@ public final class OutboxRelay implements Lifecycle {
             // after the scheduler, and on an interrupted release too: no maintenance run starts a build any more
             maintenance.close(Duration.ofNanos(Math.max(0, deadline - System.nanoTime())));
             processor.close();
+            heartbeat.stop();
         }
         if (interrupted) {
             Thread.currentThread().interrupt();
@@ -375,8 +381,7 @@ public final class OutboxRelay implements Lifecycle {
 
     private void requireNotHalted() {
         if (maintenance.halted()) {
-            throw new IllegalStateException("outbox halted: maintenance found the xid counter below a tick's xmax"
-                    + " (see its ERROR log and README \"xid regression recovery\")");
+            throw new IllegalStateException(maintenance.haltReason());
         }
     }
 

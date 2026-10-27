@@ -2,10 +2,13 @@ package io.github.dsudomoin.kora.outbox.internal;
 
 import io.github.dsudomoin.kora.outbox.OutboxConfig;
 import jakarta.annotation.Nullable;
+import java.sql.Array;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,9 +21,11 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * premade xid partitions with the tail, one initial tick and one cursor per shard, all under
  * {@code pg_advisory_lock(internalNs, LOCK_SCHEMA)}; like every lock namespace, {@code internalNs} comes from the table
  * the configured name resolves to ({@link TableNames#resolve}), which {@link #names()} hands to the other components.
- * Fails fast with {@link IllegalStateException} when {@code shards} differs from the shards in the cursor table and
- * when an identity sequence of the outbox, tick or cursor table has {@code CACHE > 1}. An xid regression (the counter
- * below a tick's xmax) never fails it: it is recorded in {@code <base>_halt} and, with
+ * The shard count ({@link #config()}): {@code outbox.shards} when set, else the cursors' count when there are cursors
+ * (with an INFO), else {@link OutboxConfig#DEFAULT_SHARDS}. A set {@code outbox.shards} other than the cursors' count
+ * reshards ({@link #reshard}), which fails startup unless every check passes. Fails fast with
+ * {@link IllegalStateException} when an identity sequence of the outbox, tick or cursor table has {@code CACHE > 1}.
+ * An xid regression (the counter below a tick's xmax) never fails it: it is recorded in {@code <base>_halt} and, with
  * {@code outbox.recovery.xidRegression = auto} and at most {@code outbox.recovery.maxRows} rows to re-send, recovered
  * before any relay starts ({@link XidRecovery}, under {@code LOCK_MAINTENANCE}, taken after {@code LOCK_SCHEMA});
  * otherwise, or while another session holds that lock, startup goes on halted (the relay delivers nothing, writes go
@@ -54,6 +59,11 @@ public final class OutboxSchema implements Lifecycle {
     private static final String DUPLICATE_TABLE = "42P07";
     /** Bound of {@code deadLetters.retention} and {@code redriveHistory}: 10 years, an age maintenance compares. */
     private static final Duration MAX_DEAD_LETTER_AGE = Duration.ofDays(3650);
+    /**
+     * Added to twice the longer of {@code idlePollInterval} and {@code minTickInterval}: a reshard is refused while the
+     * newest tick is younger than that, as every running relay ticks at least that often, idle or not.
+     */
+    private static final Duration TICK_MARGIN = Duration.ofSeconds(5);
 
     private final JdbcConnectionFactory db;
     private final OutboxConfig config;
@@ -61,6 +71,8 @@ public final class OutboxSchema implements Lifecycle {
     private final int schemaLockAttempts;
     @Nullable
     private volatile TableNames names;
+    @Nullable
+    private volatile OutboxConfig resolved;
 
     /**
      * Validates the whole outbox config: every other outbox component starts after this one, so a bad value fails
@@ -89,7 +101,9 @@ public final class OutboxSchema implements Lifecycle {
         var requeue = relay.requeue();
         var partitions = config.partitions();
         var deadLetters = config.deadLetters();
-        validateShards(config.shards());
+        if (config.shards() != null) {
+            validateShards(config.shards());
+        }
         require(relay.workers() >= 1, "outbox.relay.workers must be at least 1: " + relay.workers());
         require(relay.batchSize() >= 1, "outbox.relay.batchSize must be at least 1: " + relay.batchSize());
         require(relay.maxTicksPerBatch() >= 1,
@@ -169,6 +183,53 @@ public final class OutboxSchema implements Lifecycle {
                     + spelled.base() + " come from the table it resolves to");
         }
         return n;
+    }
+
+    /**
+     * The config every other component runs with: this one with {@code shards} as {@link #init()} resolved it, never
+     * null.
+     */
+    public OutboxConfig config() {
+        var r = resolved;
+        if (r == null) {
+            throw new IllegalStateException("OutboxSchema.init() has not run: the shard count of " + spelled.base()
+                    + " comes from its cursors when outbox.shards is not set");
+        }
+        return r;
+    }
+
+    /** {@code config} with the shard count resolved at bootstrap. */
+    private record Resolved(OutboxConfig config, Integer shards) implements OutboxConfig {
+
+        @Override
+        public String table() {
+            return config.table();
+        }
+
+        @Override
+        public RelayConfig relay() {
+            return config.relay();
+        }
+
+        @Override
+        public PartitionsConfig partitions() {
+            return config.partitions();
+        }
+
+        @Override
+        public InboxConfig inbox() {
+            return config.inbox();
+        }
+
+        @Override
+        public DeadLettersConfig deadLetters() {
+            return config.deadLetters();
+        }
+
+        @Override
+        public RecoveryConfig recovery() {
+            return config.recovery();
+        }
     }
 
     @Override
@@ -370,28 +431,194 @@ public final class OutboxSchema implements Lifecycle {
                       table_name text primary key,
                       at         timestamptz not null default now()
                     )""");
+            // Heartbeat: the instances running, by the database clock, for the reshard guard and the admin status
+            st.execute("create table if not exists " + n.instance() + """
+                     (
+                      instance_id text primary key,
+                      shards      int not null,
+                      last_seen   timestamptz not null default now(),
+                      hook_active boolean not null default false
+                    )""");
 
             checkSequenceCache(c, n);
-            long shardsPresent = queryLong(st, "select count(distinct shard) from " + n.cursor());
-            if (shardsPresent != 0 && shardsPresent != config.shards()) {
-                throw new IllegalStateException("outbox.shards = " + config.shards() + " but " + n.cursor()
-                        + " holds cursors for " + shardsPresent + " shards; resharding requires an empty outbox"
-                        + " (see README)");
+            int present = (int) queryLong(st, "select count(distinct shard) from " + n.cursor());
+            int shards;
+            if (config.shards() == null) {
+                shards = present == 0 ? OutboxConfig.DEFAULT_SHARDS : present;
+                if (present != 0) {
+                    log.info("outbox.shards is not set: {} holds cursors for {} shards, which this instance uses",
+                            n.cursor(), present);
+                }
+            } else {
+                shards = config.shards();
+                if (present != 0 && present != shards) {
+                    reshard(c, n, present, shards);
+                }
             }
-            checkXidCounter(c, n);
+            var r = new Resolved(config, shards);
+            checkXidCounter(c, n, r);
 
             ensurePartitions(c, n);
 
             st.execute("insert into " + n.tick() + " (snapshot, max_id) select pg_current_snapshot(), "
                     + Ticks.maxIdQuery(c, n) + " where not exists (select 1 from " + n.tick() + ")");
             // not after a recovery, which makes them
-            try (var ps = c.prepareStatement("insert into " + n.cursor() + " (shard, tick_id) select s, (select max(id)"
-                    + " from " + n.tick() + ") from generate_series(0, ? - 1) s where not exists (select 1 from "
-                    + n.cursor() + ")")) {
-                ps.setInt(1, config.shards());
+            try (var ps = c.prepareStatement(insertCursors(n) + " where not exists (select 1 from " + n.cursor()
+                    + ")")) {
+                ps.setInt(1, shards);
                 ps.executeUpdate();
             }
+            resolved = r;
         }
+    }
+
+    /** One cursor per shard {@code 0..?-1} at the latest tick. */
+    private static String insertCursors(TableNames n) {
+        return "insert into " + n.cursor() + " (shard, tick_id) select s, (select max(id) from " + n.tick()
+                + ") from generate_series(0, ? - 1) s";
+    }
+
+    /**
+     * The emergency reshard from the cursors' {@code from} shards to {@code to}, under the schema lock, so one at a
+     * time; the procedure for the team: stop writers, wait for {@code outbox.shard.lag} 0, stop all instances, start
+     * with the new value. Refused while an instance with another shard count was seen within 2 ×
+     * {@code maintenanceInterval} (its {@link Heartbeat}), and while the newest tick is younger than 2 × the longer of
+     * {@code idlePollInterval} and {@code minTickInterval} plus {@link #TICK_MARGIN} (a relay of a release without the
+     * heartbeat still runs). Then one transaction: {@code SHARE} on the outbox, so no write commits between the checks
+     * and the switch (writers wait, at most the session's {@code lock_timeout} for it, and go on after the commit); the
+     * drain checks: the retry and parked tables empty, no batch in progress, no committed row that its shard's
+     * effective tick ({@link Cursors}) does not see, no standalone range, no xid regression. All pass: the cursors and
+     * checkpoints are replaced by one cursor per new shard at a new tick, with an INFO; otherwise startup fails naming
+     * every failed check with its count. Dead letters keep their shard: a redrive computes it again.
+     */
+    private void reshard(Connection c, TableNames n, int from, int to) throws SQLException {
+        var keep = " To keep the current count, start with outbox.shards = " + from + " or leave it unset.";
+        var seen = config.partitions().maintenanceInterval().multipliedBy(2);
+        var live = new ArrayList<String>();
+        try (var ps = c.prepareStatement("select instance_id, shards, round(extract(epoch from clock_timestamp()"
+                + " - last_seen))::bigint from " + n.instance() + " where shards <> ? and last_seen > clock_timestamp()"
+                + " - make_interval(secs => ?) order by instance_id")) {
+            ps.setInt(1, to);
+            ps.setDouble(2, seen.toNanos() / 1e9);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    live.add(rs.getString(1) + " (" + rs.getInt(2) + " shards, seen " + rs.getLong(3) + " s ago)");
+                }
+            }
+        }
+        if (!live.isEmpty()) {
+            throw new IllegalStateException("outbox.shards = " + to + " but " + n.cursor() + " holds cursors for "
+                    + from + " shards, and instances with another shard count were seen within 2 ×"
+                    + " outbox.partitions.maintenanceInterval: " + String.join(", ", live) + ". A reshard needs every"
+                    + " instance stopped: stop writers, wait for outbox.shard.lag 0, stop all instances, start with the"
+                    + " new value." + keep);
+        }
+        var relay = config.relay();
+        var quiet = max(relay.idlePollInterval(), relay.minTickInterval()).multipliedBy(2).plus(TICK_MARGIN);
+        try (var st = c.createStatement(); var rs = st.executeQuery("select round(extract(epoch from"
+                + " clock_timestamp() - max(created_at)) * 1000)::bigint from " + n.tick())) {
+            rs.next();
+            long ago = rs.getLong(1);
+            if (!rs.wasNull() && ago < quiet.toMillis()) {
+                throw new IllegalStateException("outbox.shards = " + to + " but " + n.cursor() + " holds cursors for "
+                        + from + " shards, and a relay is still running (latest tick " + ago + " ms ago): a reshard"
+                        + " needs every instance stopped, those of releases without the heartbeat too, and no tick for "
+                        + quiet.toMillis() + " ms. Stop writers, wait for outbox.shard.lag 0, stop all instances,"
+                        + " start with the new value." + keep);
+            }
+        }
+        c.setAutoCommit(false);
+        try {
+            try (var st = c.createStatement()) {
+                st.execute("lock table " + n.base() + " in share mode"); // held writes wait for the commit
+            }
+            var failed = drainChecks(c, n, from);
+            if (!failed.isEmpty()) {
+                throw new IllegalStateException("outbox.shards = " + to + " but " + n.cursor() + " holds cursors for "
+                        + from + " shards, and " + n.base() + " is not drained, so its rows would be skipped or read"
+                        + " under their old shard: " + String.join("; ", failed) + ". To reshard: stop writers, wait for"
+                        + " outbox.shard.lag 0, stop all instances, start with the new value (README «Решардинг»)."
+                        + keep);
+            }
+            try (var st = c.createStatement()) {
+                st.execute("delete from " + n.cursor());
+                st.execute("delete from " + n.checkpoint());
+                st.execute("insert into " + n.tick() + " (snapshot, max_id) select pg_current_snapshot(), "
+                        + Ticks.maxIdQuery(c, n));
+            }
+            try (var ps = c.prepareStatement(insertCursors(n))) {
+                ps.setInt(1, to);
+                ps.executeUpdate();
+            }
+            c.commit();
+        } catch (SQLException | RuntimeException e) {
+            try {
+                c.rollback();
+            } catch (SQLException cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            throw e;
+        } finally {
+            c.setAutoCommit(true);
+        }
+        log.info("outbox resharded {} from {} to {} shards: it was drained, and every shard's cursor starts at a new"
+                + " tick; dead letters keep their old shard until redriven", n.base(), from, to);
+    }
+
+    /**
+     * The checks a reshard needs, each failed one with its count; under {@code SHARE} on the outbox. The unrelayed rows
+     * are the README query's: a scan of the outbox (writers are stopped by then).
+     */
+    private List<String> drainChecks(Connection c, TableNames n, int from) throws SQLException {
+        var failed = new ArrayList<String>();
+        try (var st = c.createStatement()) {
+            for (var table : List.of(n.retry(), n.parked())) {
+                long rows = queryLong(st, "select count(*) from " + table);
+                if (rows > 0) {
+                    failed.add(rows + " rows in " + table);
+                }
+            }
+            try (var rs = st.executeQuery("select count(*), array_agg(shard order by shard) from (select distinct on"
+                    + " (shard) shard, target_tick_id from " + n.cursor() + " order by shard, seq desc) c"
+                    + " where target_tick_id is not null")) {
+                rs.next();
+                if (rs.getLong(1) > 0) {
+                    failed.add(rs.getLong(1) + " shards with a batch in progress (" + shardList(rs.getArray(2))
+                            + ")");
+                }
+            }
+            try (var rs = st.executeQuery("select count(*), array_agg(distinct o.shard order by o.shard) from "
+                    + n.base() + " o left join (select c.shard, " + Cursors.effective(from) + " tick_id from (select"
+                    + " distinct on (shard) shard, tick_id from " + n.cursor() + " order by shard, seq desc) c"
+                    + " left join " + Cursors.newestCheckpoint(n) + " k on true) e on e.shard = o.shard left join " + n.tick()
+                    + " t on t.id = e.tick_id where t.snapshot is null or o.xid >= pg_snapshot_xmin(t.snapshot)"
+                    + " and not pg_visible_in_snapshot(o.xid, t.snapshot)")) {
+                rs.next();
+                if (rs.getLong(1) > 0) {
+                    failed.add(rs.getLong(1) + " committed rows not relayed (shards " + shardList(rs.getArray(2))
+                            + ")");
+                }
+            }
+        }
+        var standalone = XidPartitions.forBootstrap(n, config.partitions()).orphans(c).stream()
+                .map(XidPartitions.Orphan::table).toList();
+        if (!standalone.isEmpty()) {
+            failed.add(standalone.size() + " standalone ranges (" + standalone + "), whose rows lie outside the outbox:"
+                    + " restore or drop them first (OutboxAdmin.status() lists them)");
+        }
+        if (new XidRecovery(n, new Resolved(config, from)).check(c).halted()) {
+            failed.add("1 xid regression (the xid counter is below a tick's xmax): start with the current count, so"
+                    + " the relay recovers it first");
+        }
+        return failed;
+    }
+
+    private static String shardList(Array shards) throws SQLException {
+        return Arrays.toString((Object[]) shards.getArray());
+    }
+
+    private static Duration max(Duration a, Duration b) {
+        return a.compareTo(b) >= 0 ? a : b;
     }
 
     /**
@@ -502,8 +729,8 @@ public final class OutboxSchema implements Lifecycle {
      * {@code lock_timeout}; else an ERROR, and startup goes on halted. A halt whose ticks were repaired is left for
      * {@link Maintenance}'s check to lift.
      */
-    private void checkXidCounter(Connection c, TableNames n) throws SQLException {
-        var recovery = new XidRecovery(n, config);
+    private void checkXidCounter(Connection c, TableNames n, OutboxConfig resolved) throws SQLException {
+        var recovery = new XidRecovery(n, resolved);
         var check = recovery.check(c);
         if (!check.halted()) {
             return;

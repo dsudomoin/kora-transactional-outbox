@@ -1,5 +1,6 @@
 package io.github.dsudomoin.kora.outbox;
 
+import jakarta.annotation.Nullable;
 import java.time.Duration;
 import ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor;
 
@@ -11,8 +12,17 @@ public interface OutboxConfig {
         return "outbox";
     }
 
-    default int shards() {
-        return 32;
+    /** The shard count of a new outbox when {@link #shards()} is not set. */
+    int DEFAULT_SHARDS = 32;
+
+    /**
+     * Null when not set: an existing outbox keeps the shard count of its cursors, a new one gets
+     * {@link #DEFAULT_SHARDS}. A set value that differs from the cursors' reshards at bootstrap, which refuses unless
+     * the outbox is drained and no other instance runs ({@code OutboxSchema}).
+     */
+    @Nullable
+    default Integer shards() {
+        return null;
     }
 
     default RelayConfig relay() {

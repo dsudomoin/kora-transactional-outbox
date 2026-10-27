@@ -306,7 +306,8 @@ components:
   schemas:
     Status:
       type: object
-      required: [halted, lagSeconds, retrySize, parkedSize, deadLetters, orphans, tailOverflow, premade, shards]
+      required: [halted, lagSeconds, retrySize, parkedSize, deadLetters, orphans, tailOverflow, premade, shards,
+        instances]
       properties:
         halted:
           type: boolean
@@ -351,7 +352,31 @@ components:
         shards:
           type: integer
           format: int32
-          description: outbox.shards
+          description: This instance's shard count, outbox.shards as the bootstrap resolved it
+        instances:
+          type: array
+          description: >-
+            The instances' heartbeats, by id; a crashed instance's row stays until unseen for an hour (or 10 ×
+            outbox.partitions.maintenanceInterval when longer)
+          items:
+            $ref: '#/components/schemas/Instance'
+    Instance:
+      type: object
+      required: [id, shards, lastSeen, hookActive]
+      properties:
+        id:
+          type: string
+          description: <host>/<pid>/<8 hex>, new on every start
+        shards:
+          type: integer
+          format: int32
+        lastSeen:
+          type: string
+          format: date-time
+          description: Its last heartbeat, by the database clock, every outbox.partitions.maintenanceInterval
+        hookActive:
+          type: boolean
+          description: It has an active dead-letter hook
     DeadLetterCount:
       type: object
       required: [topic, status, count]

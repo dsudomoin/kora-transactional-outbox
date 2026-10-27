@@ -148,7 +148,7 @@ class MaintenanceIT {
             assertThat(lastSuccess()).as("a run with a failed step is no success").isEqualTo(succeeded);
             assertThat(ranges()).as("still listed, attached or detach-pending").containsAll(processed);
             assertThat(queryLong(reader, "select count(*) from " + names.cursor()))
-                    .as("the steps after the drop still ran: cursor cleanup").isEqualTo(config.shards());
+                    .as("the steps after the drop still ran: cursor cleanup").isEqualTo((long) config.shards());
             reader.commit();
         }
 
@@ -434,7 +434,7 @@ class MaintenanceIT {
         assertThat(ranges()).as("ranges the lagging shard has not passed").containsAll(between);
         assertThat(latestCursors()).isEqualTo(cursorsBefore);
         try (var c = TestDb.connect()) {
-            assertThat(queryLong(c, "select count(*) from " + names.cursor())).isEqualTo(config.shards());
+            assertThat(queryLong(c, "select count(*) from " + names.cursor())).isEqualTo((long) config.shards());
         }
     }
 

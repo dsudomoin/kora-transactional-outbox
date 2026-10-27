@@ -25,7 +25,11 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * Partition maintenance and log cleanup. Every run first checks the xid counter ({@link #halted()}), then reads, from
  * {@code <base>_maintenance}, when a run last completed every step on any instance
  * ({@code outbox.maintenance.since_success}, seconds; unless halted, a WARN at most once a minute once that is over 5 ×
- * {@code maintenanceInterval}); neither needs a lock, so every instance does both, and a failed read is a WARN. The
+ * {@code maintenanceInterval}); neither needs a lock, so every instance does both, and a failed read is a WARN. Then it
+ * compares the cursors' shard count ({@code max(shard) + 1}, an index probe: bootstrap and a reshard make the cursors
+ * of shards 0..n-1 together) with {@code outbox.shards}: a mismatch, as another instance's reshard leaves it, halts
+ * this instance ({@link #halted()}) until they match again, with an ERROR at most once a minute, and the run stops
+ * there, taking no lock. The
  * rest needs a connection that keeps one server session: behind a transaction-pooling proxy
  * ({@link PartitionDdl#backendChanges}) the run stops there, with an ERROR at most once a minute and
  * {@code outbox.maintenance.transaction_pooling} at 1 (0 otherwise). It runs on at most one instance at a time: it
@@ -75,6 +79,8 @@ public final class Maintenance {
     private static final int STALE_INTERVALS = 5;
     /** Shards per anchor transaction, so one holds at most this many advisory locks. */
     static final int ANCHOR_CHUNK = 128;
+    private static final Duration SHARDS_LOCK_TIMEOUT = Duration.ofMillis(100);
+    private static final String LOCK_NOT_AVAILABLE = "55P03";
 
     private final JdbcConnectionFactory db;
     private final TableNames names;
@@ -111,7 +117,12 @@ public final class Maintenance {
     private final AtomicLong haltLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong checkpointLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong strandedLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    private final AtomicLong mismatchLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    private final String cursorShards;
     private volatile boolean halted;
+    /** The cursors' shard count when it differs from {@link #shards}, else null. */
+    @Nullable
+    private volatile Integer mismatch;
     private volatile boolean stepFailed; // in the current run, under LOCK_MAINTENANCE
     final DeadIndexBuilder deadIndex; // for tests
 
@@ -157,6 +168,7 @@ public final class Maintenance {
         this.succeeded = "insert into " + names.maintenance() + " (succeeded_at) values (clock_timestamp())"
                 + " on conflict (id) do update set succeeded_at = excluded.succeeded_at";
         this.staleAfter = config.partitions().maintenanceInterval().multipliedBy(STALE_INTERVALS);
+        this.cursorShards = "select max(shard) + 1 from " + names.cursor();
         this.deadIndex = new DeadIndexBuilder(db, names, config.partitions().maintenanceInterval(), detachLockTimeout);
         this.deadRetention = config.deadLetters().retention();
         this.redriveHistory = config.deadLetters().redriveHistory();
@@ -204,23 +216,78 @@ public final class Maintenance {
      * restarts. The counter catching up does not end it (cursors still sit on pre-regression ticks and would skip the
      * rows written meanwhile): only ticks repaired below the recorded xmax with a consistent counter do, as the
      * recovery ({@link XidRecovery}) leaves them, or an operator deleting the row. While halted an ERROR at most once a
-     * minute says why no recovery ran.
+     * minute says why no recovery ran. Also true, on this instance only, while the cursors' shard count differs from
+     * {@code outbox.shards} (see the class comment): its steps would read and write shards that no longer exist.
      */
     public boolean halted() {
-        return halted;
+        return halted || mismatch != null;
+    }
+
+    /** Why {@link #halted()}, for the relay's {@code drain()}. */
+    public String haltReason() {
+        var m = mismatch;
+        return m != null ? "outbox halted: " + mismatchText(m)
+                : "outbox halted: maintenance found the xid counter below a tick's xmax (see its ERROR log and README"
+                        + " \"xid regression recovery\")";
     }
 
     /**
-     * The xid-regression check alone, without the maintenance lock: refreshes {@link #halted()} and returns it; never
-     * recovers, and leaves the ERROR to the run that says why it did not.
+     * The xid-regression check and the shard count check alone, without the maintenance lock: refreshes
+     * {@link #halted()} and returns it; never recovers, and leaves the ERROR to the run that says why it did not.
      */
     public boolean checkHalt() {
         try (var c = db.newConnection()) {
             c.setAutoCommit(true);
-            return checkXidCounter(c) != null;
+            checkXidCounter(c);
+            checkShards(c);
+            return halted();
         } catch (SQLException e) {
             throw new RuntimeSqlException(e);
         }
+    }
+
+    /**
+     * Refreshes {@link #mismatch} and returns it: the cursors' shard count while it differs from this instance's. Its
+     * read waits at most {@link #SHARDS_LOCK_TIMEOUT} for a lock on the cursor table (a recovery holds one): after
+     * that the last answer stands until the next run.
+     */
+    @Nullable
+    private Integer checkShards(Connection c) throws SQLException {
+        Integer present;
+        c.setAutoCommit(false);
+        try (var st = c.createStatement()) {
+            st.execute("set local lock_timeout = " + SHARDS_LOCK_TIMEOUT.toMillis()); // a transaction's: no leak
+            try (var rs = st.executeQuery(cursorShards)) {
+                rs.next();
+                present = rs.getObject(1, Integer.class);
+            }
+            c.commit();
+        } catch (SQLException e) {
+            c.rollback();
+            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                throw e;
+            }
+            return mismatch;
+        } finally {
+            c.setAutoCommit(true);
+        }
+        var found = present == null || present == shards ? null : present;
+        var before = mismatch;
+        mismatch = found;
+        if (found == null && before != null) {
+            mismatchLogged.set(System.nanoTime() - LOG_INTERVAL); // a later mismatch is logged at once
+            log.info("outbox relay resumed: {} holds cursors for {} shards again, as outbox.shards", names.cursor(),
+                    shards);
+        }
+        return found;
+    }
+
+    private String mismatchText(int present) {
+        return names.cursor() + " holds cursors for " + present + " shards, but this instance runs with outbox.shards = "
+                + shards + ": another instance resharded " + names.base() + " since this one started, or this"
+                + " one runs an old config. Its relay takes no shards and its maintenance runs no step until they"
+                + " match; restart it with outbox.shards = " + present + " or unset, which takes the cursors' count"
+                + " (its writes go on meanwhile, sharded by " + shards + ")";
     }
 
     /**
@@ -233,6 +300,13 @@ public final class Maintenance {
             c.setAutoCommit(true);
             var check = checkXidCounter(c); // first: nothing may keep it from running
             readLastSuccess(c, check != null);
+            var present = checkShards(c);
+            if (present != null) {
+                if (due(mismatchLogged)) {
+                    log.error(mismatchText(present) + "; this ERROR repeats at most once a minute");
+                }
+                return true;
+            }
             if (check != null && !autoRecovery) {
                 logHalt(check, XidRecovery.HALT_MODE);
                 return true;

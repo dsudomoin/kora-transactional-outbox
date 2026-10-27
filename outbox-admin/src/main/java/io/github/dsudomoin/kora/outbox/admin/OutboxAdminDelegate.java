@@ -41,6 +41,7 @@ import io.github.dsudomoin.kora.outbox.admin.model.DeadLetterPage;
 import io.github.dsudomoin.kora.outbox.admin.model.DeadLetterStatus;
 import io.github.dsudomoin.kora.outbox.admin.model.Filter;
 import io.github.dsudomoin.kora.outbox.admin.model.Header;
+import io.github.dsudomoin.kora.outbox.admin.model.Instance;
 import io.github.dsudomoin.kora.outbox.admin.model.ModelError;
 import io.github.dsudomoin.kora.outbox.admin.model.Orphan;
 import io.github.dsudomoin.kora.outbox.admin.model.OrphanKind;
@@ -187,7 +188,9 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
                 s.deadLetters().stream().map(c -> new DeadLetterCount(c.topic(), status(c.status()), c.count()))
                         .toList(),
                 s.orphans().stream().map(o -> new Orphan(o.table(), kind(o.kind()))).toList(),
-                s.tailOverflow(), s.premade(), s.xidsLeft(), s.maintenanceSinceSuccessSeconds(), s.shards());
+                s.tailOverflow(), s.premade(), s.xidsLeft(), s.maintenanceSinceSuccessSeconds(), s.shards(),
+                s.instances().stream().map(i -> new Instance(i.id(), i.shards(), utc(i.lastSeen()), i.hookActive()))
+                        .toList());
     }
 
     private static DeadLetter letter(io.github.dsudomoin.kora.outbox.DeadLetter l) {

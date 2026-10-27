@@ -14,7 +14,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
         OutboxConfig.RequeueConfig, OutboxConfig.PartitionsConfig, OutboxConfig.RecoveryConfig {
 
     private String table = TestDb.uniqueTable();
-    private int shards = 4;
+    private Integer shards = 4;
     private boolean relayEnabled = true;
     private int workers = 2;
     private int batchSize = 100;
@@ -61,11 +61,12 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     }
 
     @Override
-    public int shards() {
+    public Integer shards() {
         return shards;
     }
 
-    public TestOutboxConfig shards(int shards) {
+    /** Null: not set, as {@link OutboxConfig#shards()}. */
+    public TestOutboxConfig shards(Integer shards) {
         this.shards = shards;
         return this;
     }

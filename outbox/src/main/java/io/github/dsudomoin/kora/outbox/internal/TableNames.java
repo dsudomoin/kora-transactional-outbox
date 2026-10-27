@@ -103,6 +103,11 @@ public record TableNames(
         return base + "_checkpoint";
     }
 
+    /** One row per running instance, upserted by its {@link Heartbeat}. */
+    public String instance() {
+        return base + "_instance";
+    }
+
     /** Requeued records, waiting for the next record of their key or their due time; they block nothing. */
     public String parked() {
         return base + "_parked";

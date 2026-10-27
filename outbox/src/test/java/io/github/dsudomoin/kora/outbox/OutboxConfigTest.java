@@ -146,7 +146,7 @@ class OutboxConfigTest {
 
     private static void assertDefaults(OutboxConfig config) {
         assertThat(config.table()).isEqualTo("outbox");
-        assertThat(config.shards()).isEqualTo(32);
+        assertThat(config.shards()).as("not set: an existing outbox keeps its count").isNull();
 
         var relay = config.relay();
         assertThat(relay.enabled()).isTrue();

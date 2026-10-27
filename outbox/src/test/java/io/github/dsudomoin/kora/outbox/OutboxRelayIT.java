@@ -1641,6 +1641,8 @@ class OutboxRelayIT {
         var relay = start(handler);
         awaitParked();
         var names = schema.names();
+        // the start's maintenance run is past its checkpoint step, so it cannot replace the one written below
+        await(Duration.ofSeconds(5), () -> checkpointTick() > 0);
         long next = ticksMade() + 1;
         try (var c = TestDb.connect()) { // as a partial restore leaves it once new ticks pass its id: every shard idle
             execute(c, "delete from " + names.checkpoint());

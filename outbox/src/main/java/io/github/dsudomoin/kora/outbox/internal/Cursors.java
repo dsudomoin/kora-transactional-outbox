@@ -44,8 +44,8 @@ import java.util.concurrent.TimeUnit;
  *       {@link Ticks}, the ticks after E' chain, so no row of the shard is visible in L and not in E', and by induction
  *       none visible in E' and not in its cursor's tick: so none up to L. (A bitmap of another length, from an
  *       instance with another shard count, reads as all shards, but an empty one reads as none: instances with
- *       different shard counts on one table are not supported, and the bootstrap refuses cursors of another
- *       count.)</li>
+ *       different shard counts on one table are not supported: the bootstrap reshards only a drained outbox with no
+ *       other instance running, and maintenance halts an instance whose count differs from the cursors'.)</li>
  *   <li>A 1 bit: {@code busy_tick_id} is at most E', so a row visible in it is visible in E', and by induction in the
  *       cursor's tick.</li>
  *   <li>Cursors only move forward, so a cursor appended after the read keeps both. A step that read its cursor and
