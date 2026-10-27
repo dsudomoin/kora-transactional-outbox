@@ -184,8 +184,9 @@ public final class XidRecovery {
      * retry, parked and dead tables; every partition dropped; ticks, cursors, dropping markers and the halt deleted;
      * ranges from the one holding the oldest running xid (a writer waiting for the lock may hold it) and a tail above
      * the current xid ({@link XidPartitions#ensurePremade}, its fresh-table path); one tick and one cursor per shard at
-     * it, due for a retry check where the shard holds retry rows and at its earliest parked {@code due_at} where it
-     * holds parked rows; the saved rows inserted in {@code created_at, id} order, which gives the ids, as no
+     * it, due at its earliest {@code next_attempt_at} where the shard holds retry heads and at its earliest parked
+     * {@code due_at} where it holds parked rows; the saved rows inserted in {@code created_at, id} order, which gives the
+     * ids, as no
      * {@code send} gets in before the commit.
      *
      * @throws IllegalStateException when {@code outbox.shards} differs from the shards of the cursors: saved rows keep
@@ -247,11 +248,12 @@ public final class XidRecovery {
             makeRanges(c);
             long tick = insertTick(c);
             // a step reads the retry or parked table only when its cursor says it is due (null: no rows) or on its
-            // full check, so new cursors carry them: retry due now, parked at the earliest due_at, as steps store it
+            // full check, so new cursors carry them, as steps store them: the earliest next_attempt_at of the retry
+            // heads (RetryStore.minDue), the earliest due_at of the parked rows
             try (var ps = c.prepareStatement("insert into " + names.cursor() + " (shard, tick_id, retry_due_at,"
-                    + " parked_due_at) select s, ?, case when exists (select 1 from " + names.retry() + " r where"
-                    + " r.shard = s) then now() end, (select min(due_at) from " + names.parked() + " p where p.shard"
-                    + " = s) from generate_series(0, ? - 1) s")) {
+                    + " parked_due_at) select s, ?, (select min(next_attempt_at) from " + names.retry() + " r where"
+                    + " r.shard = s and r.next_attempt_at is not null), (select min(due_at) from " + names.parked()
+                    + " p where p.shard = s) from generate_series(0, ? - 1) s")) {
                 ps.setLong(1, tick);
                 ps.setInt(2, shards);
                 ps.executeUpdate();

@@ -255,12 +255,17 @@ public final class TestDb {
                     c.commit();
                     try (var other = connect(); var st = other.createStatement()) {
                         st.execute("select pg_terminate_backend(" + pid + ")");
+                        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
                         while (true) {
                             try (var rs = st.executeQuery("select count(*) from pg_stat_activity where pid = " + pid)) {
                                 rs.next();
                                 if (rs.getInt(1) == 0) {
                                     break;
                                 }
+                            }
+                            if (System.nanoTime() - deadline > 0) {
+                                throw new IllegalStateException("backend " + pid + " still alive 10 s after"
+                                        + " pg_terminate_backend");
                             }
                             Thread.sleep(5);
                         }

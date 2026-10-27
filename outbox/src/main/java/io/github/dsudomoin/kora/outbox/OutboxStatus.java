@@ -7,9 +7,9 @@ import java.util.List;
  * The outbox at a glance ({@link OutboxAdmin#status()}), read from the database at the call, so every instance gives
  * the same answer. {@code halted}: an xid-regression halt is recorded, and no relay delivers; {@code lagSeconds}: from
  * the slowest shard's tick to the latest ({@code outbox.shard.lag}); {@code retrySize}: rows of blocked keys waiting
- * for a retry ({@code outbox.retry.size}); {@code parkedSize}: rows in {@code <base>_parked}, 0 without that table;
- * {@code deadLetters}: dead letters by topic and status; {@code orphans}: standalone ranges whose rows lie outside the
- * outbox, which the relay cannot deliver; {@code tailOverflow}: rows went to the partition tail
+ * for a retry ({@code outbox.retry.size}); {@code parkedSize}: rows in {@code <base>_parked}; {@code deadLetters}:
+ * dead letters by topic and status; {@code orphans}: standalone ranges whose rows lie outside the outbox, which the
+ * relay cannot deliver; {@code tailOverflow}: rows went to the partition tail
  * ({@code outbox.partitions.overflow}); {@code premade}: ranges ahead of the current xid
  * ({@code outbox.partitions.premade}); {@code xidsLeft}: xids before inserts fail, null while the tail is attached
  * ({@code outbox.partitions.xids_left}); {@code maintenanceSinceSuccessSeconds}: since a maintenance run last

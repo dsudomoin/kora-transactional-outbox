@@ -270,8 +270,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         try {
             log.info("outbox admin {} on {} returned {}, the rows re-sent", call, names.base(), sent.get());
             if (cleanup != null) {
-                log.warn("outbox admin {} on {}: the recovery committed, then releasing the maintenance lock or"
-                        + " resetting idle_session_timeout failed: {}", call, names.base(),
+                log.warn("outbox admin {} on {}: the recovery committed, then releasing the maintenance lock,"
+                        + " resetting idle_session_timeout or closing the connection failed: {}", call, names.base(),
                         printable(cleanup.toString()));
             }
             try {

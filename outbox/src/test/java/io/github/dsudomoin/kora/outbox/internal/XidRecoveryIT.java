@@ -461,6 +461,28 @@ class XidRecoveryIT {
     }
 
     @Test
+    void recoveryCursorsAreDueWhenTheRetryHeadIs() throws Exception {
+        bootstrap();
+        try (var c = TestDb.connect()) { // a retry head of shard 1 due in an hour, with a follower
+            execute(c, "insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at, attempts,"
+                    + " next_attempt_at) values (1000000000, 1, gen_random_uuid(), 't', 'r', now(), 1,"
+                    + " now() + interval '1 hour'), (1000000001, 1, gen_random_uuid(), 't', 'r', now(), 0, null)");
+        }
+        forgeRegression();
+
+        assertThat(maintenance().runOnce()).isTrue();
+
+        assertThat(haltRows()).isZero();
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select string_agg(c.shard || ':' || (c.retry_due_at = r.due)::text, ','"
+                    + " order by c.shard) from (select distinct on (shard) shard, retry_due_at from " + names.cursor()
+                    + " order by shard, seq desc) c left join (select shard, min(next_attempt_at) due from "
+                    + names.retry() + " group by shard) r using (shard) where c.retry_due_at is not null"))
+                    .as("due when the head is, as steps store it, not at once").isEqualTo("1:true");
+        }
+    }
+
+    @Test
     void anXidTakenWhileTheCounterCrossesARangeBoundaryFindsItsRange() throws Exception {
         config.xidsPerPartition(1000).premake(4);
         bootstrap();
