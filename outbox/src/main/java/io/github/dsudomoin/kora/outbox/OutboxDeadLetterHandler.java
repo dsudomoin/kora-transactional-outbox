@@ -18,7 +18,8 @@ public interface OutboxDeadLetterHandler {
      * letters pending: each is called again after a backoff ({@code outbox.relay.retry.initialDelay} doubling to
      * {@code maxDelay}) with {@link DeadLetter#handlerAttempts()} one higher. A crash between the call and the commit
      * calls it again too. So an alert sent from here is never lost but may be sent twice; key it by
-     * {@link DeadLetter#messageId()}.
+     * {@link DeadLetter#messageId()}. Honour {@link Thread#interrupt()}: a call that ignores it past the timeout holds
+     * the one hook thread, and no letter is decided on this instance until it returns.
      *
      * <p>Runs on the daemon thread {@code outbox-dead-letter-hook}, on no relay thread and in no relay transaction, so
      * a slow or failing hook never delays delivery; meanwhile its letters stay locked in a transaction of their own

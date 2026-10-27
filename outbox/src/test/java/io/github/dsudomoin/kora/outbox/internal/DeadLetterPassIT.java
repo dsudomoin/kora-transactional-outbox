@@ -260,6 +260,62 @@ class DeadLetterPassIT {
         assertThat(lastHandlerError(id)).contains("timeout");
     }
 
+    /** The one hook thread stays held: an ERROR says so once, and calls are decided again once it returns. */
+    @Test
+    void aHookIgnoringItsInterruptIsAnErrorOnce() throws Exception {
+        config.deadLettersTimeout(Duration.ofMillis(300));
+        long id = letter("t", "k", "p", List.of());
+        var release = new CountDownLatch(1);
+        var calls = new AtomicInteger();
+        var pass = pass(letters -> {
+            if (calls.incrementAndGet() == 1) {
+                while (release.getCount() > 0) {
+                    try {
+                        release.await();
+                    } catch (InterruptedException ignored) { // as a hook swallowing it in a blocking client would
+                    }
+                }
+            }
+            return all(letters, keep());
+        });
+
+        String log;
+        try (var err = new CapturedStderr()) {
+            pass.runOnce();
+            execute("update " + names.dead() + " set due_at = now() where id = " + id);
+            pass.runOnce(); // queued behind the first call, cut again
+            log = err.text();
+        }
+
+        assertThat(log.lines().filter(l -> l.contains("ERROR") && l.contains("hook ignores interrupts")))
+                .as("once").hasSize(1);
+        assertThat(status(id)).isEqualTo("pending");
+        release.countDown();
+        await(Duration.ofSeconds(5), () -> {
+            execute("update " + names.dead() + " set due_at = now() where id = " + id);
+            pass.runOnce();
+            return "kept".equals(status(id));
+        });
+    }
+
+    /** From the claim, a backoff shorter than the call would be past already: handed straight back at the next wake. */
+    @Test
+    void aCutCallsBackoffRunsFromItsFailure() throws Exception {
+        config.deadLettersTimeout(Duration.ofMillis(500)).retry(Duration.ofMillis(300), Duration.ofSeconds(5), 0);
+        long id = letter("t", "k", "p", List.of());
+        var pass = pass(letters -> {
+            Thread.sleep(10_000);
+            return all(letters, discard());
+        });
+        var before = dbNow();
+
+        pass.runOnce();
+
+        assertThat(dueAt(id)).as("cut at 500 ms, then 300 ms of backoff")
+                .isAfterOrEqualTo(before.plusMillis(800));
+        assertThat(pass.untilNextDue()).as("not due at once").isNotNull();
+    }
+
     @Test
     void aCrashBetweenHookAndCommitCallsTheHookAgain() throws Exception {
         long id = letter("t", "k", "p", List.of());

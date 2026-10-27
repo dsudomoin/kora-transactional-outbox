@@ -14,6 +14,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -21,6 +22,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -58,6 +60,8 @@ public final class DeadLetterPass {
     private static final Logger log = LoggerFactory.getLogger(DeadLetterPass.class);
     private static final long WARN_INTERVAL = TimeUnit.MINUTES.toNanos(1);
     private static final String LOCK_NOT_AVAILABLE = "55P03";
+    /** How long a call cut at the timeout gets to end on its interrupt before the hook counts as ignoring it. */
+    private static final Duration INTERRUPT_GRACE = Duration.ofSeconds(1);
 
     private final JdbcConnectionFactory db;
     @Nullable
@@ -83,6 +87,8 @@ public final class DeadLetterPass {
     private final Warnings hookFailures = new Warnings();
     private final Warnings lockTimeouts = new Warnings();
     private volatile boolean closed;
+    /** A cut call outlived {@link #INTERRUPT_GRACE} and its ERROR is out; cleared once a call returns in time. */
+    private final AtomicBoolean ignoresInterrupts = new AtomicBoolean();
 
     /** A committed hand-over: the letters claimed; the call's failure, or the decisions it committed. */
     private record Batch(int claimed, @Nullable Throwable failure, List<DeadLetterDecision> decisions) {}
@@ -105,8 +111,9 @@ public final class DeadLetterPass {
         keep = "update " + dead + " set status = 'kept', due_at = null where id = any(?)";
         schedule = "update " + dead + " set status = 'scheduled',"
                 + " due_at = least(greatest(?, now()), now() + interval '7 days') where id = ?";
+        // from the failure, not the claim (now()): a call cut at the timeout took that long already
         fail = "update " + dead + " set handler_attempts = handler_attempts + 1, last_handler_error = ?,"
-                + " due_at = now() + make_interval(secs => ?) where id = ?";
+                + " due_at = clock_timestamp() + make_interval(secs => ?) where id = ?";
         // only letters still due: one another pass decided since the batch rolled back keeps its decision
         defer = "update " + dead + " set due_at = now() + make_interval(secs => ?) where id = any(?)"
                 + " and due_at <= now()";
@@ -363,11 +370,14 @@ public final class DeadLetterPass {
 
     /**
      * Calls the hook on its thread within {@code timeout}; the answer is read and checked there, so a lazy list runs
-     * hook code inside the deadline too and an invalid one fails as the hook's {@link ExecutionException}.
+     * hook code inside the deadline too and an invalid one fails as the hook's {@link ExecutionException}. A call cut
+     * at the timeout that still runs {@link #INTERRUPT_GRACE} after its interrupt holds the one hook thread: an ERROR,
+     * once until a call returns in time, as no letter is decided on this instance meanwhile.
      */
     private List<DeadLetterDecision> call(List<DeadLetter> letters)
             throws InterruptedException, ExecutionException, TimeoutException {
         Future<List<DeadLetterDecision>> call;
+        var ended = new CountDownLatch(1);
         try {
             call = executor.submit(() -> {
                 try {
@@ -381,18 +391,32 @@ public final class DeadLetterPass {
                     return decisions;
                 } finally {
                     ru.tinkoff.kora.common.Context.clear(); // nothing leaks into the next call on this thread
+                    ended.countDown();
                 }
             });
         } catch (RejectedExecutionException e) {
             throw new IllegalStateException("outbox dead-letter pass is closed", e);
         }
+        List<DeadLetterDecision> decisions;
         try {
-            return call.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
+            decisions = call.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
         } catch (TimeoutException | InterruptedException e) {
             call.cancel(true);
             executor.purge(); // a hook ignoring the interrupt holds the thread: calls cut behind it do not pile up
+            // never started, as one queued behind a call still running, counts too: that call holds the thread
+            if (e instanceof TimeoutException && !ended.await(INTERRUPT_GRACE.toNanos(), TimeUnit.NANOSECONDS)
+                    && ignoresInterrupts.compareAndSet(false, true)) {
+                log.error("outbox dead-letter hook ignores interrupts: its call cut at outbox.deadLetters.timeout {}"
+                        + " still runs {} later and holds the hook thread outbox-dead-letter-hook, so dead letters are"
+                        + " not decided on this instance until it returns or the instance restarts (each pass waits"
+                        + " out the timeout and counts a failed call). The hook must honour Thread.interrupt(): use"
+                        + " interruptible calls or timeouts of its own. This ERROR is logged once until a call returns"
+                        + " in time", timeout, INTERRUPT_GRACE);
+            }
             throw e;
         }
+        ignoresInterrupts.set(false);
+        return decisions;
     }
 
     /** Every letter of a failed call stays pending, due after a backoff by its failed calls so far. */

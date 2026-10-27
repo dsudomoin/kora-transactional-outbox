@@ -43,6 +43,9 @@ it by message id within their window.
   with `handlerAttempts` one higher; a crash between the call and the commit repeats it too, and a shutdown
   interrupts it and hands the letters to another instance or the next start. So an alert sent from the hook may go
   twice: make every side effect idempotent by `letter.messageId()`.
+- **Honour the interrupt.** Use interruptible calls or client timeouts shorter than `deadLetters.timeout`. The hook
+  has one thread: a call that ignores the interrupt holds it past the timeout, and the instance decides no letter
+  until that call returns (one ERROR «hook ignores interrupts»).
 - **Stop redrive loops with `redrives`.** `DeadLetter.redrives()` counts how often the message was redriven before
   this death, by the hook and by admin calls, remembered in `<table>_redriven` for `outbox.deadLetters.redriveHistory`
   (30 d). A hook that always redrives a record that always fails loops forever; bound it:
