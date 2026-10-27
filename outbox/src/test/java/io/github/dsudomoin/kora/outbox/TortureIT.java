@@ -246,8 +246,8 @@ class TortureIT {
      * messages rise; and for each pair A committed before B, A never requeued and B not dead, B was first delivered
      * after A's first delivery, or after A's first permanent failure when A is dead. {@code requeued}: the messages
      * that parked before their first delivery or first permanent failure, which their key may pass. {@code passed}:
-     * pairs [A, B] where the handler itself delivered B after answering requeue for A in a call that then crashed,
-     * which discards the answer, so A never parked. One line per diverging key.
+     * pairs [A, B] where the handler itself first delivered B after answering requeue for A in a call that then
+     * crashed, which discards the answer, so A never parked. One line per diverging key.
      */
     private static List<String> orderViolations(Map<UUID, Row> order, Set<UUID> dead, Set<UUID> requeued,
             Set<List<UUID>> passed, Map<UUID, Delivery> first, Map<UUID, Long> permanentAt) {
@@ -292,9 +292,6 @@ class TortureIT {
     }
 
     private static String describe(UUID id, Map<UUID, Row> order, Map<UUID, Delivery> first) {
-        if (id == null) {
-            return "nothing";
-        }
         var delivery = first.get(id);
         return id + " (n " + order.get(id).n() + (delivery == null ? ", never delivered)"
                 : ", outbox id " + delivery.outboxId() + ", delivery #" + delivery.sequence() + ")");
@@ -560,7 +557,7 @@ class TortureIT {
          * before it. A requeue answer the relay did not apply (its call crashed or paused the shard) parks nothing.
          */
         final Set<UUID> requeued = ConcurrentHashMap.newKeySet();
-        /** Pairs [M, R]: a call that then crashed delivered R after answering requeue for M, of R's key. */
+        /** Pairs [M, R]: a call that then crashed first delivered R after answering requeue for M, of R's key. */
         final Set<List<UUID>> passedRequeue = ConcurrentHashMap.newKeySet();
         final AtomicInteger requeueAnswers = new AtomicInteger();
         final AtomicInteger transientFailures = new AtomicInteger();
@@ -631,10 +628,12 @@ class TortureIT {
                     continue;
                 }
                 try {
+                    // a message is in one call at a time: no other call delivers it before handle() below does
+                    boolean firstDelivery = !first.containsKey(record.messageId());
                     handle(record);
                     outcomes.add(Outcome.delivered());
                     anyDelivered = true;
-                    if (crashing) {
+                    if (crashing && firstDelivery) {
                         for (var m : answeredRequeue.getOrDefault(key, List.of())) {
                             passedRequeue.add(List.of(m, record.messageId()));
                         }
