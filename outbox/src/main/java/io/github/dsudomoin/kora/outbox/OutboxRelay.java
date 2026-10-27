@@ -24,6 +24,8 @@ import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
@@ -105,9 +107,9 @@ public final class OutboxRelay implements Lifecycle {
      */
     private final AtomicIntegerArray isolated;
     /**
-     * Per shard, the rows its next step is expected to read: {@code batchSize} while its batch is unfinished, after a
-     * step that left it untouched (unread behind a cut, or not attempted) and after a step in which it kept the call
-     * or the read from shards after it; else the rows its last batch delivered (0 before it delivered any). A group
+     * Per shard, the rows its next step is expected to read: {@code batchSize} while its batch is unfinished and after
+     * a step that left it untouched (unread behind a cut, or not attempted); else the rows its last batch delivered (0
+     * before it delivered any). A group
      * takes shards until their rows would pass {@code batchSize}, which a group's read and call share, so a busy or
      * slow shard is stepped alone (a cut read leaves the shards after it untouched and its own rest to be read again)
      * while many shards with a few rows each share one step. In memory, per relay instance; {@link #batchRows}: what
@@ -129,6 +131,8 @@ public final class OutboxRelay implements Lifecycle {
     private final ReentrantLock roundLock = new ReentrantLock();
     /** Incremented by every step that put shards back into a round; parked workers wake on it. */
     private final AtomicLong requeued = new AtomicLong();
+    /** The workers parked in {@link Worker#awaitWork}: a put-back wakes one of them, not one blocked elsewhere. */
+    private final Set<Thread> awaiting = ConcurrentHashMap.newKeySet();
 
     // tick scheduling, shared by the workers: at most one attempt per minTickInterval for wake-ups, per idle period else
     private final Object tickState = new Object();
@@ -450,12 +454,6 @@ public final class OutboxRelay implements Lifecycle {
 
     /** Updates {@link #expected} from the results of one step of {@code group}. */
     private void learn(List<Integer> group, List<ShardResult> results) {
-        int lastUntouched = -1;
-        for (int i = 0; i < results.size(); i++) {
-            if (untouched(results.get(i))) {
-                lastUntouched = i;
-            }
-        }
         for (int i = 0; i < group.size(); i++) {
             var result = results.get(i);
             int shard = group.get(i);
@@ -466,12 +464,10 @@ public final class OutboxRelay implements Lifecycle {
                 expected.set(shard, rows); // its batch ended
                 batchRows.set(shard, 0);
             } // else nothing new about its rows: nothing to do, paused or locked elsewhere
-            // PROGRESS (an untouched shard is caught by the first test) or PAUSED: the 3-key stop pauses the first
-            boolean worked = result.status() == ShardStatus.PROGRESS || result.status() == ShardStatus.PAUSED;
-            if (untouched(result) || worked && i < lastUntouched) {
-                // unread, or it kept the call or the read from shards after it (a call wound down at the soft
-                // deadline behind it, a hot shard filling the read): alone next, until it delivers a small batch
-                // alone; a later round re-sorts by effective tick and would put it at their head again
+            if (untouched(result)) {
+                // unread behind a cut or not attempted: alone next, not in a group cut again; a shard that kept the
+                // call or the read from shards after it ends its batch or moves to the latest tick, so they sort ahead
+                // of it in the next round
                 expected.set(shard, relay.batchSize());
             }
         }
@@ -483,14 +479,11 @@ public final class OutboxRelay implements Lifecycle {
         }
     }
 
-    /** Unparks one parked worker, if any. */
+    /** Unparks one worker parked for work ({@link Worker#awaitWork}), if any. */
     private void wakeOne() {
-        for (var t : workers) {
-            var state = t.getState();
-            if (state == Thread.State.WAITING || state == Thread.State.TIMED_WAITING) {
-                LockSupport.unpark(t);
-                return;
-            }
+        for (var t : awaiting) {
+            LockSupport.unpark(t);
+            return;
         }
     }
 
@@ -598,11 +591,11 @@ public final class OutboxRelay implements Lifecycle {
      * The candidates of one read of every shard's cursor for the latest tick {@link #latest}, shared by the workers of
      * this relay whose pass sees that tick: each takes the next group of shards in candidate order
      * ({@link Worker#candidates}, {@link #take}). A shard a step left with work (not caught up to the step's tick)
-     * goes back to the end of the round current when the step ends, those the step left untouched ahead of the others.
-     * A shard that kept a group's call or read to itself (a slow call wound down at the soft deadline, a hot shard
-     * filling the read, the default handler's stop after 3 failing keys) is stepped alone after that
-     * ({@link #expected}), so the shards it left unread do not wait behind it again in the next round, which sorts by
-     * effective tick afresh. A new tick ends the round: the next pass reads the cursors again.
+     * goes back to the end of the round current when the step ends, those the step left untouched ahead of the others
+     * and alone ({@link #expected}). A shard that kept a group's call or read to itself (a slow call wound down at the
+     * soft deadline, a hot shard filling the read, the default handler's stop after 3 failing keys) is behind them:
+     * it ends its batch or moves on, so in the next round, which sorts by effective tick afresh, the shards it left
+     * unread sort ahead of it. A new tick ends the round: the next pass reads the cursors again.
      */
     private final class Round {
 
@@ -641,12 +634,11 @@ public final class OutboxRelay implements Lifecycle {
             while (group.size() < groupSize && !queue.isEmpty()) {
                 int shard = queue.peekFirst();
                 if (inFlight.get(shard) == 1) {
-                    wanted.set(shard, 1);
+                    wanted.set(shard, 1); // a want left over when the step ended meanwhile costs one spare put-back
                     if (inFlight.get(shard) == 1) { // else its step ended meanwhile, maybe without seeing wanted
                         drop(shard);
                         continue;
                     }
-                    wanted.set(shard, 0);
                 }
                 if (!back.get(shard) && stepStarted.get(shard) - read > 0 && steppedTick.get(shard) >= latest) {
                     drop(shard);
@@ -656,11 +648,10 @@ public final class OutboxRelay implements Lifecycle {
                 if (!group.isEmpty() && (alone || rows + expected.get(shard) > relay.batchSize())) {
                     break;
                 }
-                drop(shard);
-                if (!inFlight.compareAndSet(shard, 0, 1)) { // taken from another round just now
-                    wanted.set(shard, 1);
+                if (!inFlight.compareAndSet(shard, 0, 1)) { // taken from another round just now: the check above
                     continue;
                 }
+                drop(shard);
                 group.add(shard);
                 rows += expected.get(shard);
                 if (alone) {
@@ -741,6 +732,16 @@ public final class OutboxRelay implements Lifecycle {
          * into one pass per commit and worker.
          */
         private void awaitWork(long seen, long seenTicks, long seenRequeued) {
+            var self = Thread.currentThread();
+            awaiting.add(self);
+            try {
+                awaitWork0(seen, seenTicks, seenRequeued);
+            } finally {
+                awaiting.remove(self);
+            }
+        }
+
+        private void awaitWork0(long seen, long seenTicks, long seenRequeued) {
             while (true) {
                 park(nextTickDue(), true, seen, seenTicks, seenRequeued);
                 long woken = wakeups.get();
