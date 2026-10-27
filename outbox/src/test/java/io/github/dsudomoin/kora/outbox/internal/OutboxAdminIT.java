@@ -450,6 +450,51 @@ class OutboxAdminIT {
     }
 
     @Test
+    void restoreOrphanChunksEndAFrozenHoldersSession() throws Exception {
+        var orphan = foreignOrphan();
+        orphanRow(orphan, 1, 10, "row");
+        var seen = TestDb.uniqueTable(); // what each chunk's delete saw
+        execute("create table " + seen + " (setting text)");
+        execute("create function " + seen + "_f() returns trigger language plpgsql as $$ begin insert into " + seen
+                + " values (current_setting('idle_in_transaction_session_timeout')); return null; end $$");
+        execute("create trigger " + seen + "_t after delete on " + orphan + " for each statement execute function "
+                + seen + "_f()");
+
+        assertThat(admin.restoreOrphan(orphan, 0)).isOne();
+
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select string_agg(setting, ',') from " + seen))
+                    .as("the lock timeout, 30 s, + 30 s").isEqualTo("1min");
+        }
+    }
+
+    @Test
+    void namesWhoseDigitsFitNoLongAreLeftAlone() throws Exception {
+        var digits = "99999999999999999999"; // 20 digits
+        var strangers = List.of(names.partitionPrefix() + digits, names.setAsidePrefix() + digits);
+        try (var c = TestDb.connect()) {
+            for (var table : strangers) {
+                PartitionDdl.create(c, names.base(), table, Duration.ofSeconds(5));
+            }
+        }
+
+        try (var err = new CapturedStderr()) {
+            assertThat(admin.status().orphans()).isEmpty();
+
+            assertThat(err.text()).contains("WARN").contains(strangers.get(0)).contains(strangers.get(1))
+                    .contains("fit no bigint");
+        }
+        for (var table : strangers) {
+            assertThatThrownBy(() -> admin.restoreOrphan(table, 0)).as(table)
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+        assertThat(new Maintenance(db, names, config, new OutboxMetrics(null)).runOnce()).isTrue();
+        for (var table : strangers) {
+            assertThat(exists(table)).as("empty, yet not dropped as a foreign orphan would be").isTrue();
+        }
+    }
+
+    @Test
     void refusesInsideInTx() throws Exception {
         long id = letter("t", "k");
         var filter = filter("t", null, null, null, null, null);

@@ -52,7 +52,8 @@ public final class OrphanRestore {
      * Moves the rows of {@code table} with an xid at or above {@code fromXid} back into the outbox, then drops it:
      * <b>its rows below {@code fromXid} go with the table</b>. First {@code create index if not exists <table>_id};
      * then chunks of {@link #CHUNK} rows in id order, each one read-committed transaction that holds ACCESS EXCLUSIVE
-     * on {@code table} alone, never on the outbox, waited for at most {@code lockTimeout}: it inserts the rows and
+     * on {@code table} alone, never on the outbox, waited for at most {@code lockTimeout}, idle in it at most
+     * {@code lockTimeout} + 30 s ({@code idle_in_transaction_session_timeout}): it inserts the rows and
      * deletes them from {@code table} together, so a restore that dies loses and repeats nothing, and the next call
      * resumes it. Its key locks are waited for at most {@code keyLockTimeout} each: while it waits for one, writers of
      * the keys it already holds wait too. The chunk that finds fewer rows, the last, also drops {@code table} and
@@ -85,6 +86,10 @@ public final class OrphanRestore {
                 // first in the transaction: read committed, so the read takes its snapshot after the lock
                 st.execute("set transaction isolation level read committed");
                 st.execute("set local lock_timeout = " + lockTimeout.toMillis());
+                // as relay steps do: Postgres ends a frozen holder's session, and with it the table's lock and a
+                // session lock it holds (the maintenance lock of a restoreOrphan call)
+                st.execute("set local idle_in_transaction_session_timeout = "
+                        + lockTimeout.plusSeconds(30).toMillis());
                 st.execute("set local statement_timeout = " + lockTimeout.plus(PartitionDdl.DDL_MARGIN).toMillis());
                 st.execute("lock table " + table + " in access exclusive mode");
                 try (var ps = c.prepareStatement(chunk)) {

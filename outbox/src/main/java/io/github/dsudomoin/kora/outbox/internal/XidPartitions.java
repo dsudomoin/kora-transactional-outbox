@@ -116,6 +116,7 @@ public final class XidPartitions {
     private final String bounded;
     private final AtomicLong deferLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong overflowLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    private final AtomicLong strangersLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private volatile boolean overflow;
     /** For tests: runs inside the swap transaction right after the tail's detach, to fail the swap there. */
     @Nullable
@@ -561,7 +562,8 @@ public final class XidPartitions {
     /**
      * The standalone ranges {@link #dropOrphans} looks at, read only: {@code <base>_x<lower>} in no partition tree but
      * those at or above the tail's lower bound, which the extension makes for its next swap, and set-aside
-     * {@code <base>_o<digits>}; {@code ours} when recorded in {@code <base>_dropping}.
+     * {@code <base>_o<digits>}; {@code ours} when recorded in {@code <base>_dropping}. A name whose digits fit no long
+     * is no table of the library's: left out (so never dropped or restored), with a WARN at most once a minute.
      */
     List<Orphan> orphans(Connection c) throws SQLException {
         var marked = new HashSet<String>();
@@ -578,13 +580,24 @@ public final class XidPartitions {
         int prefix = names.unqualified(names.partitionPrefix()).length();
         var setAsidePrefix = names.unqualified(names.setAsidePrefix());
         var orphans = new ArrayList<Orphan>();
+        var strangers = new ArrayList<String>();
         for (var table : PartitionDdl.standalone(c, names.base(), "_[xo][0-9]+")) {
             var range = names.unqualified(table);
+            var lower = xidOf(range.substring(prefix));
+            if (lower == null) {
+                strangers.add(table);
+                continue;
+            }
             boolean setAside = range.startsWith(setAsidePrefix);
-            if (!setAside && Long.parseLong(range.substring(prefix)) >= tailLower) {
+            if (!setAside && lower >= tailLower) {
                 continue;
             }
             orphans.add(new Orphan(table, !setAside && marked.contains(range), setAside));
+        }
+        if (!strangers.isEmpty() && due(strangersLogged)) {
+            log.warn("outbox tables {} are named like ranges of {}, but their digits fit no bigint, so no table of the"
+                    + " library's: left alone, neither dropped nor restorable. This WARN repeats at most once a minute",
+                    strangers, names.base());
         }
         return orphans;
     }
@@ -746,6 +759,19 @@ public final class XidPartitions {
             log.warn("outbox rows went to the partition tail {}: maintenance fell behind; the next extension turns it"
                     + " into a range (gauge outbox.partitions.overflow). This WARN repeats at most once a minute",
                     names.tail());
+        }
+    }
+
+    /**
+     * The xid the digits of a range name give, or null when they fit no long: no table of the library's, as xids stay
+     * far below 2^63.
+     */
+    @Nullable
+    static Long xidOf(String digits) {
+        try {
+            return Long.parseLong(digits);
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 

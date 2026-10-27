@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import ru.tinkoff.kora.database.jdbc.JdbcHelper.SqlConsumer;
 
 /**
  * Recovery from an xid regression: the xid counter below the xmax of a tick, as after a logical restore or migration
@@ -63,6 +64,12 @@ public final class XidRecovery {
     final String xidCheck; // for a test of its plan
     private final String haltInsert;
     private final String holding;
+    /** For tests: runs once the pending detach is finished, before the transaction. */
+    @Nullable
+    SqlConsumer<Connection> beforeTransaction;
+    /** For tests: runs in {@link #makeRanges} between its snapshot read and {@code ensurePremade}'s. */
+    @Nullable
+    SqlConsumer<Connection> betweenReads;
 
     public XidRecovery(TableNames names, OutboxConfig config) {
         this.names = names;
@@ -178,11 +185,15 @@ public final class XidRecovery {
      * {@code created_at, id} order, which gives the ids, as no {@code send} gets in before the commit.
      *
      * @throws IllegalStateException when {@code outbox.shards} differs from the shards of the cursors: saved rows keep
-     *     their shard
+     *     their shard; or when a detach became pending after the finish before the transaction: the next attempt
+     *     finishes it first
      */
     public long recover(Connection autocommit) throws SQLException {
         var c = autocommit;
         partitions.finishPendingDetach(c, LOCK_TIMEOUT);
+        if (beforeTransaction != null) {
+            beforeTransaction.accept(c);
+        }
         long sent;
         c.setAutoCommit(false);
         try (var st = c.createStatement()) {
@@ -206,6 +217,7 @@ public final class XidRecovery {
             }
             st.execute("create unlogged table " + holding + " as " + saved);
             setAside(c, st);
+            // parked rows: added after the requeue merge (the parked table's max id joins the greatest())
             try (var ps = c.prepareStatement("select setval(pg_get_serial_sequence(?, 'id'), greatest("
                     + "(select coalesce(max(id), 0) from " + names.base() + "),"
                     + " (select coalesce(max(id), 0) from " + names.retry() + "),"
@@ -247,18 +259,24 @@ public final class XidRecovery {
     }
 
     /**
-     * The tables outside the outbox's partition tree whose rows the parent does not show: a detach begun since the
-     * finish before the transaction is finalized (the parent hides the rows of a pending one, which a drop would
-     * lose), then every standalone range and a standalone tail is set aside.
+     * The tables outside the outbox's partition tree whose rows the parent does not show: every standalone range (but
+     * one whose digits fit no long, no table of the library's) and a standalone tail is set aside. A detach begun
+     * since the finish before the transaction rolls it back instead: the parent hides the rows of a pending one, which
+     * a drop would lose, and a FINALIZE here would wait for older snapshots, writers queued behind the outbox lock
+     * among them.
      */
     private void setAside(Connection c, Statement st) throws SQLException {
         var pending = PartitionDdl.pendingDetach(c, names.base());
         if (pending != null) {
-            st.execute("alter table " + names.base() + " detach partition " + pending + " finalize");
+            throw new IllegalStateException("the detach of " + pending + " became pending after the recovery of "
+                    + names.base() + " finished the one before it: rolled back, the next attempt finishes it first");
         }
         int prefix = names.unqualified(names.partitionPrefix()).length();
         for (var table : PartitionDdl.standalone(c, names.base(), "_x[0-9]+")) {
-            setAside(st, table, names.unqualified(table).substring(prefix));
+            var digits = names.unqualified(table).substring(prefix);
+            if (XidPartitions.xidOf(digits) != null) {
+                setAside(st, table, digits);
+            }
         }
         if (PartitionDdl.attachment(c, names.base(), names.tail()) == Attachment.STANDALONE) {
             setAside(st, names.tail(), null);
@@ -301,7 +319,8 @@ public final class XidRecovery {
 
     /**
      * From the range holding the oldest running xid, as a writer waiting for the outbox lock may have taken an xid
-     * below the current one's range, one range until the current one's, then the premade ranges and the tail.
+     * below the current one's range, one range until the current one's, or the oldest's own when they are one, then
+     * the premade ranges and the tail.
      */
     private void makeRanges(Connection c) throws SQLException {
         long xmin;
@@ -312,12 +331,15 @@ public final class XidRecovery {
             xmin = rs.getLong(1);
             current = rs.getLong(2);
         }
-        long from = Math.floorDiv(xmin, size) * size;
-        long to = Math.floorDiv(current, size) * size;
-        if (from < to) {
-            PartitionDdl.createAndAttach(c, names.base(), names.partitionPrefix() + from, Long.toString(from),
-                    Long.toString(to), PartitionDdl.CREATE_LOCK_TIMEOUT);
+        if (betweenReads != null) {
+            betweenReads.accept(c);
         }
+        long from = Math.floorDiv(xmin, size) * size;
+        // never none: ensurePremade reads the current xid again and, without a range, starts at that one's range, so
+        // a counter crossing a boundary in between would leave the range of xids taken meanwhile uncreated
+        long to = Math.max(Math.floorDiv(current, size) * size, from + size);
+        PartitionDdl.createAndAttach(c, names.base(), names.partitionPrefix() + from, Long.toString(from),
+                Long.toString(to), PartitionDdl.CREATE_LOCK_TIMEOUT);
         partitions.ensurePremade(c, LOCK_TIMEOUT, LOCK_TIMEOUT); // the tail is missing: no swap, nothing that commits
     }
 

@@ -410,6 +410,92 @@ class XidRecoveryIT {
         assertThat(wakes).hasValue(0);
     }
 
+    @Test
+    void rowsTheCursorTicksDoNotSeeAreSavedWithoutAClockMargin() throws Exception {
+        config.clockMargin(Duration.ZERO);
+        bootstrap();
+        var sent = send(outbox(null), messages("m", 20)); // never relayed: after every cursor's tick
+        // made after them, so T, its created_at, saves none of them: only the cursors' ticks not seeing them can
+        forgeRegression("now()");
+
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance().runOnce()).isTrue();
+
+            assertThat(err.text()).contains("recovered: 20 rows re-sent");
+        }
+        var handler = new RecordingHandler();
+        relay(handler, maintenance()).drain();
+        assertThat(delivered(handler)).containsAll(sent);
+    }
+
+    @Test
+    void anXidTakenWhileTheCounterCrossesARangeBoundaryFindsItsRange() throws Exception {
+        config.xidsPerPartition(1000).premake(4);
+        bootstrap();
+        send(outbox(null), messages("m", 3));
+        forgeRegression();
+        TestDb.burnXids((int) (1000 - currentXid() % 1000) + 100); // the recovery's xids early in a range: no bridge
+        var recovery = new XidRecovery(names, config);
+        try (var writer = TestDb.connect(); var c = TestDb.connect()) {
+            writer.setAutoCommit(false);
+            recovery.betweenReads = rc -> {
+                long xid = queryLong(writer, "select pg_current_xact_id()::text::bigint");
+                while (currentXid() < xid / 1000 * 1000 + 1000) { // the next read sees the next range's xids
+                    TestDb.burnXids(200);
+                }
+            };
+
+            assertThat(recovery.recover(c)).isEqualTo(3);
+
+            execute(writer, "insert into " + names.base() + " (shard, message_id, topic) values (0, gen_random_uuid(),"
+                    + " 't')"); // no partition for its xid: SQLState 23514
+            writer.commit();
+        }
+        assertThat(count(names.base())).isEqualTo(4);
+    }
+
+    @Test
+    void aDetachPendingInsideTheTransactionRollsItBack() throws Exception {
+        bootstrap();
+        send(outbox(null), messages("m", 3));
+        long forged = forgeRegression();
+        var range = ranges().stream()
+                .filter(b -> b.to() != null)
+                .max(Comparator.comparingLong(b -> Long.parseLong(b.from())))
+                .orElseThrow();
+        var recovery = new XidRecovery(names, config);
+        recovery.beforeTransaction = rc -> detachPending(range.name()); // after the finish before the transaction
+
+        try (var c = TestDb.connect()) {
+            assertThatThrownBy(() -> recovery.recover(c)).isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("became pending");
+            assertThat(tickExists(forged)).as("rolled back").isTrue();
+            assertThat(detachPending(c, range.name())).isEqualTo("true");
+
+            recovery.beforeTransaction = null;
+            assertThat(recovery.recover(c)).as("the next attempt finishes it first").isEqualTo(3);
+
+            assertThat(PartitionDdl.pendingDetach(c, names.base())).isNull();
+        }
+        assertThat(haltRows()).isZero();
+    }
+
+    /** Leaves {@code range} detach-pending: its DETACH CONCURRENTLY times out waiting for an older snapshot. */
+    private void detachPending(String range) throws SQLException {
+        try (var holder = TestDb.connect(); var c = TestDb.connect()) {
+            holder.setAutoCommit(false);
+            queryLong(holder, "select count(*) from " + names.base());
+            execute(c, "set lock_timeout = '300ms'");
+            assertThatThrownBy(() -> execute(c, "alter table " + names.base() + " detach partition " + range
+                    + " concurrently")).isInstanceOf(SQLException.class);
+            holder.commit();
+        }
+    }
+
+    private static String detachPending(Connection c, String table) throws SQLException {
+        return queryString(c, "select inhdetachpending::text from pg_inherits where inhrelid = to_regclass(?)", table);
+    }
+
     private PgOutboxAdmin admin(Maintenance maintenance) {
         return new PgOutboxAdmin(db, names, config, maintenance, wakes::incrementAndGet);
     }
@@ -425,10 +511,15 @@ class XidRecoveryIT {
      * its id.
      */
     private long forgeRegression() throws SQLException {
+        return forgeRegression("now() - interval '1 minute'");
+    }
+
+    /** {@link #forgeRegression()} with the tick made at {@code createdAt}. */
+    private long forgeRegression(String createdAt) throws SQLException {
         try (var c = TestDb.connect()) {
             long xmax = currentXid() + 1_000_000_000L;
             return queryLong(c, "insert into " + names.tick() + " (snapshot, created_at) values ('" + xmax + ":" + xmax
-                    + ":'::pg_snapshot, now() - interval '1 minute') returning id");
+                    + ":'::pg_snapshot, " + createdAt + ") returning id");
         }
     }
 

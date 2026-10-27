@@ -54,7 +54,9 @@ class XidRegressionDumpRestoreIT {
 
     private final PostgreSQLContainer a = new PostgreSQLContainer("postgres:16-alpine");
     private final PostgreSQLContainer b = new PostgreSQLContainer("postgres:16-alpine");
-    private final TestOutboxConfig config = new TestOutboxConfig();
+    // B's writers insert before the recovery, so B's counter (about 1 000 after the restore) needs a range restored
+    // from A, which bootstraps at about 100 000: [0, 1 000 000) holds both, whatever the test default becomes
+    private final TestOutboxConfig config = new TestOutboxConfig().xidsPerPartition(1_000_000);
     private final List<OutboxRelay> relays = new ArrayList<>();
     private final List<JdbcDatabase> databases = new ArrayList<>();
     @TempDir
@@ -67,10 +69,16 @@ class XidRegressionDumpRestoreIT {
 
     @AfterEach
     void stop() {
-        relays.forEach(OutboxRelay::release);
-        databases.forEach(JdbcDatabase::release);
-        a.stop();
-        b.stop();
+        try {
+            relays.forEach(OutboxRelay::release);
+        } finally {
+            try {
+                databases.forEach(JdbcDatabase::release);
+            } finally {
+                a.stop();
+                b.stop();
+            }
+        }
     }
 
     @Test
@@ -84,11 +92,12 @@ class XidRegressionDumpRestoreIT {
         relayA.init();
         var outboxA = new PgOutbox(dbA, schemaA, config.shards(), relayA::wake, new OutboxMetrics(null));
         var first = send(dbA, outboxA, "first", 1000);
-        await(Duration.ofSeconds(10), () -> handlerA.delivered().size() >= 1000);
+        await(Duration.ofSeconds(10), () -> deliveries(handlerA).keySet().containsAll(first));
         relayA.release();
         var undelivered = send(dbA, outboxA, "undelivered", 500);
 
         dumpAndRestore();
+        assertRegressed(schemaA);
 
         var handlerB = new RecordingHandler();
         OutboxSchema schemaB;
@@ -102,7 +111,7 @@ class XidRegressionDumpRestoreIT {
                 assertThat(err.text()).contains("ERROR").contains("xid regression detected").contains("recovered: ")
                         .contains(" rows re-sent");
             }
-            assertThat(haltRows(schemaB)).isZero();
+            assertThat(haltRows(b, schemaB)).isZero();
             relay(dbB, schemaB, handlerB).init();
             int before = writers.written.size();
             await(Duration.ofSeconds(10), () -> writers.written.size() >= before + 50);
@@ -114,7 +123,7 @@ class XidRegressionDumpRestoreIT {
         var expected = new HashSet<>(undelivered);
         expected.addAll(writers.written);
         await(Duration.ofSeconds(30), () -> deliveries(handlerB).keySet().containsAll(expected));
-        assertThat(haltRows(schemaB)).isZero();
+        assertThat(haltRows(b, schemaB)).isZero();
         var all = new HashSet<>(expected);
         all.addAll(first);
         var deliveries = deliveries(handlerB);
@@ -125,20 +134,24 @@ class XidRegressionDumpRestoreIT {
 
     /**
      * {@code ./gradlew :outbox:test -Pbenchmark --tests '*XidRegressionDumpRestoreIT'}: the writer pause of a
-     * recovery that re-sends a million rows (key {@code u1..u10000}, payload 300 bytes), Postgres 16 defaults in a
+     * recovery that re-sends a million rows (key {@code u0..u9999}, payload 300 bytes), Postgres 16 defaults in a
      * container. One writer inserts a row per transaction meanwhile; its longest insert is the stall.
      */
     @Test
     @Tag("benchmark")
     void recoveryPausePerMillionRows() throws Exception {
         burnXids(a, 100_000);
-        bootstrap(database(a));
+        var schemaA = bootstrap(database(a));
         try (var c = connect(a)) {
             execute(c, "insert into " + config.table() + " (shard, message_id, topic, key, payload) select s % "
                     + config.shards() + ", gen_random_uuid(), 'orders', convert_to('u' || s % 10000, 'UTF8'),"
                     + " convert_to(repeat('p', 300), 'UTF8') from generate_series(1, 1000000) s");
         }
         dumpAndRestore();
+        try (var c = connect(b)) { // pg_restore leaves no statistics: plan the recovery as on a live table
+            execute(c, "vacuum analyze");
+        }
+        assertRegressed(schemaA);
         config.xidRegression("halt"); // bootstrap only records the halt: the recovery is the timed call below
         var schemaB = bootstrap(database(b));
         var recovery = new XidRecovery(schemaB.names(), config);
@@ -165,7 +178,7 @@ class XidRegressionDumpRestoreIT {
         assertThat(writer.errors).isEmpty();
         assertThat(rows).isGreaterThanOrEqualTo(1_000_000);
         assertThat(sent).isGreaterThanOrEqualTo(rows);
-        assertThat(haltRows(schemaB)).isZero();
+        assertThat(haltRows(b, schemaB)).isZero();
         System.out.printf("xid regression recovery: %d rows re-sent; recover %d ms, longest writer stall %d ms"
                 + " (rowsToSave counted %d rows in %d ms before it, under no lock)%n", sent,
                 TimeUnit.NANOSECONDS.toMillis(took), TimeUnit.NANOSECONDS.toMillis(writer.longest.get()), rows,
@@ -225,9 +238,18 @@ class XidRegressionDumpRestoreIT {
         return ids;
     }
 
-    private long haltRows(OutboxSchema schema) throws SQLException {
-        try (var c = connect(b)) {
+    private static long haltRows(PostgreSQLContainer pg, OutboxSchema schema) throws SQLException {
+        try (var c = connect(pg)) {
             return queryLong(c, "select count(*) from " + schema.names().halt());
+        }
+    }
+
+    /** B before its bootstrap: its xid counter below the highest xmax of the ticks restored from A. */
+    private void assertRegressed(OutboxSchema schemaA) throws SQLException {
+        try (var c = connect(b)) {
+            assertThat(queryLong(c, "select (pg_snapshot_xmax(pg_current_snapshot())::text::bigint < (select"
+                    + " max(pg_snapshot_xmax(snapshot)::text::bigint) from " + schemaA.names().tick() + "))::int"))
+                    .as("B's counter below A's ticks").isOne();
         }
     }
 
