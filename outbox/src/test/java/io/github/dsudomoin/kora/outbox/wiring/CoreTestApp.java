@@ -3,6 +3,7 @@ package io.github.dsudomoin.kora.outbox.wiring;
 import io.github.dsudomoin.kora.outbox.Inbox;
 import io.github.dsudomoin.kora.outbox.InboxModule;
 import io.github.dsudomoin.kora.outbox.Outbox;
+import io.github.dsudomoin.kora.outbox.OutboxAdmin;
 import io.github.dsudomoin.kora.outbox.OutboxModule;
 import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
 import ru.tinkoff.kora.common.KoraApp;
@@ -18,10 +19,10 @@ public interface CoreTestApp extends HoconConfigModule, JdbcDatabaseModule, Outb
     }
 
     /** Application code: Kora leaves components that no root depends on out of the graph. */
-    record AppCode(Outbox outbox, Inbox inbox) {}
+    record AppCode(Outbox outbox, Inbox inbox, OutboxAdmin admin) {}
 
     @Root
-    default AppCode appCode(Outbox outbox, Inbox inbox) {
-        return new AppCode(outbox, inbox);
+    default AppCode appCode(Outbox outbox, Inbox inbox, OutboxAdmin admin) {
+        return new AppCode(outbox, inbox, admin);
     }
 }

@@ -94,9 +94,10 @@ public final class XidPartitions {
             limit 1""";
 
     /**
-     * A standalone range {@link #dropOrphans} kept; {@code ours} when maintenance detached it as relayed, and then
-     * {@link Maintenance} moves its rows back ({@link OrphanRestore}) unless {@code restoreOrphans} is off;
-     * {@code setAside} when the xid-regression recovery set it aside ({@link XidRecovery}).
+     * A standalone range {@link #orphans} lists and {@link #dropOrphans} kept; {@code ours} when maintenance detached
+     * it as relayed, and then {@link Maintenance} moves its rows back ({@link OrphanRestore}) unless
+     * {@code restoreOrphans} is off; {@code setAside} when the xid-regression recovery set it aside
+     * ({@link XidRecovery}).
      */
     record Orphan(String table, boolean ours, boolean setAside) {}
 
@@ -541,6 +542,28 @@ public final class XidPartitions {
             ps.setString(1, names.base());
             ps.executeUpdate();
         }
+        var kept = new ArrayList<Orphan>();
+        for (var orphan : orphans(c)) {
+            var table = orphan.table();
+            // anyone else's detach may have come before the relay reached its rows: only an empty one goes
+            boolean dropped = orphan.ours()
+                    ? PartitionDdl.dropUnlessFound(c, table, ROW_AT_OR_ABOVE, Long.toString(minCursorXmin), lockTimeout)
+                    : PartitionDdl.dropUnlessFound(c, table, "select 1 from {table} limit 1", null, lockTimeout);
+            if (!dropped) {
+                kept.add(orphan);
+            } else if (orphan.ours()) {
+                marker(c, unmarkDropping, names.unqualified(table));
+            }
+        }
+        return kept;
+    }
+
+    /**
+     * The standalone ranges {@link #dropOrphans} looks at, read only: {@code <base>_x<lower>} in no partition tree but
+     * those at or above the tail's lower bound, which the extension makes for its next swap, and set-aside
+     * {@code <base>_o<digits>}; {@code ours} when recorded in {@code <base>_dropping}.
+     */
+    List<Orphan> orphans(Connection c) throws SQLException {
         var marked = new HashSet<String>();
         try (var st = c.createStatement(); var rs = st.executeQuery("select table_name from " + names.dropping())) {
             while (rs.next()) {
@@ -554,25 +577,16 @@ public final class XidPartitions {
                 .orElse(Long.MAX_VALUE);
         int prefix = names.unqualified(names.partitionPrefix()).length();
         var setAsidePrefix = names.unqualified(names.setAsidePrefix());
-        var kept = new ArrayList<Orphan>();
+        var orphans = new ArrayList<Orphan>();
         for (var table : PartitionDdl.standalone(c, names.base(), "_[xo][0-9]+")) {
             var range = names.unqualified(table);
             boolean setAside = range.startsWith(setAsidePrefix);
             if (!setAside && Long.parseLong(range.substring(prefix)) >= tailLower) {
                 continue;
             }
-            boolean ours = !setAside && marked.contains(range);
-            // anyone else's detach may have come before the relay reached its rows: only an empty one goes
-            boolean dropped = ours
-                    ? PartitionDdl.dropUnlessFound(c, table, ROW_AT_OR_ABOVE, Long.toString(minCursorXmin), lockTimeout)
-                    : PartitionDdl.dropUnlessFound(c, table, "select 1 from {table} limit 1", null, lockTimeout);
-            if (!dropped) {
-                kept.add(new Orphan(table, ours, setAside));
-            } else if (ours) {
-                marker(c, unmarkDropping, range);
-            }
+            orphans.add(new Orphan(table, !setAside && marked.contains(range), setAside));
         }
-        return kept;
+        return orphans;
     }
 
     private static void execute(Connection c, String sql) throws SQLException {

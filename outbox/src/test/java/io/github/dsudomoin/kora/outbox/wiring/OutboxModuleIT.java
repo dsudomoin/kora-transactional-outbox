@@ -1,11 +1,13 @@
 package io.github.dsudomoin.kora.outbox.wiring;
 
+import static io.github.dsudomoin.kora.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.kora.outbox.testing.TestSql.queryString;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.kora.outbox.Inbox;
 import io.github.dsudomoin.kora.outbox.Outbox;
+import io.github.dsudomoin.kora.outbox.OutboxAdmin;
 import io.github.dsudomoin.kora.outbox.OutboxMessage;
 import io.github.dsudomoin.kora.outbox.OutboxRecord;
 import io.github.dsudomoin.kora.outbox.OutboxRelay;
@@ -13,6 +15,7 @@ import io.github.dsudomoin.kora.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.kora.outbox.testing.TestDb;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.List;
 import java.util.UUID;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Nested;
@@ -82,6 +85,20 @@ class OutboxModuleIT implements KoraAppTestConfigModifier {
 
         assertThat(db.inTx((SqlFunction0<Boolean>) () -> inbox.tryAccept(id))).isTrue();
         assertThat(db.inTx((SqlFunction0<Boolean>) () -> inbox.tryAccept(id))).isFalse();
+    }
+
+    @Test
+    void adminRedriveWakesTheRelay(@TestComponent OutboxAdmin admin) throws Exception {
+        send();
+        await(() -> handler.delivered().size() == 1);
+        try (var c = TestDb.connect()) { // a dead letter as the relay writes one
+            execute(c, "insert into " + table + "_dead (id, shard, message_id, topic, key, payload, created_at,"
+                    + " attempts) values (1, 0, gen_random_uuid(), 'orders', 'k', 'p', now(), 3)");
+        }
+
+        assertThat(admin.redriveDeadLetters(List.of(1L))).isOne();
+
+        await(() -> handler.delivered().size() == 2); // the idle poll is 30 s: the wake-up delivers
     }
 
     @Nested

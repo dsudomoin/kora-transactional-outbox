@@ -4,6 +4,7 @@ import io.github.dsudomoin.kora.outbox.internal.Maintenance;
 import io.github.dsudomoin.kora.outbox.internal.OutboxMetrics;
 import io.github.dsudomoin.kora.outbox.internal.OutboxSchema;
 import io.github.dsudomoin.kora.outbox.internal.PgOutbox;
+import io.github.dsudomoin.kora.outbox.internal.PgOutboxAdmin;
 import io.opentelemetry.api.trace.Tracer;
 import jakarta.annotation.Nullable;
 import ru.tinkoff.kora.common.annotation.Root;
@@ -43,6 +44,12 @@ public interface OutboxModule extends OutboxCommonModule {
     default Outbox outbox(JdbcConnectionFactory db, OutboxSchema schema, OutboxConfig config, OutboxRelay relay,
             OutboxMetrics metrics) {
         return new PgOutbox(db, schema, config.shards(), relay::wake, metrics);
+    }
+
+    /** For the service's own code; nothing runs unless it is called. */
+    default OutboxAdmin outboxAdmin(JdbcConnectionFactory db, OutboxSchema schema, OutboxConfig config,
+            Maintenance maintenance, OutboxRelay relay) {
+        return new PgOutboxAdmin(db, schema.names(), config, maintenance, relay::wake);
     }
 
     /** {@link TypedOutbox} for every {@code T} the app has an {@link OutboxSerializer} for. */

@@ -6,7 +6,6 @@ import io.github.dsudomoin.kora.outbox.OutboxConfig;
 import io.github.dsudomoin.kora.outbox.OutboxDeadLetterHandler;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
-import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
@@ -16,10 +15,6 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Locale;
-import java.util.Objects;
-import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -56,38 +51,28 @@ public final class DeadLetterPass {
     private static final Logger log = LoggerFactory.getLogger(DeadLetterPass.class);
     private static final long WARN_INTERVAL = TimeUnit.MINUTES.toNanos(1);
     private static final String LOCK_NOT_AVAILABLE = "55P03";
-    private static final String COLUMNS = "id, message_id, topic, key, payload, headers, created_at, attempts,"
-            + " failed_at, error, status, redrives, handler_attempts, due_at";
 
     private final JdbcConnectionFactory db;
     @Nullable
     private final OutboxDeadLetterHandler hook;
     private final OutboxMetrics metrics;
-    private final Resender resender;
+    private final DeadLetters rows;
     private final String dead;
     private final int batchSize;
     private final Duration timeout;
     private final Duration initialDelay;
     private final Duration maxDelay;
-    private final int keyNamespace;
-    private final String redriveLockTimeout;
     private final String claim;
     private final String keep;
     private final String schedule;
     private final String fail;
-    private final String delete;
     private final String defer;
-    private final String heldKeys;
-    private final String remember;
     private final String keepPending;
     private final String nextDue;
     private final ThreadPoolExecutor executor;
     /** When a WARN was last logged ({@code nanoTime}), and how many went unlogged since. */
     private final AtomicLong warned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
     private final AtomicInteger suppressed = new AtomicInteger();
-
-    /** A claimed letter with its headers in the stored encoding, as a redrive inserts them. */
-    private record Claimed(DeadLetter letter, @Nullable byte[] headers) {}
 
     /** A committed hand-over: the letters claimed; the call's failure, or the decisions it committed. */
     private record Batch(int claimed, @Nullable Throwable failure, List<DeadLetterDecision> decisions) {}
@@ -98,30 +83,20 @@ public final class DeadLetterPass {
         this.db = db;
         this.hook = hook;
         this.metrics = metrics;
-        this.resender = new Resender(names, config.shards());
+        this.rows = new DeadLetters(names, config);
         this.dead = names.dead();
         this.batchSize = config.deadLetters().batchSize();
         this.timeout = config.deadLetters().timeout();
         this.initialDelay = config.relay().retry().initialDelay();
         this.maxDelay = config.relay().retry().maxDelay();
-        this.keyNamespace = names.keyNamespace();
-        this.redriveLockTimeout = "set local lock_timeout = '"
-                + config.partitions().swapLockTimeout().toMillis() + "ms'";
-        claim = "select " + COLUMNS + " from " + dead + " where status = ? and due_at <= now() order by due_at, id"
-                + " limit ? for update skip locked";
+        claim = "select " + DeadLetters.COLUMNS + " from " + dead + " where status = ? and due_at <= now()"
+                + " order by due_at, id limit ? for update skip locked";
         keep = "update " + dead + " set status = 'kept', due_at = null where id = any(?)";
         schedule = "update " + dead + " set status = 'scheduled',"
                 + " due_at = least(greatest(?, now()), now() + interval '7 days') where id = ?";
         fail = "update " + dead + " set handler_attempts = handler_attempts + 1, last_handler_error = ?,"
                 + " due_at = now() + make_interval(secs => ?) where id = ?";
-        delete = "delete from " + dead + " where id = any(?)";
         defer = "update " + dead + " set due_at = now() + make_interval(secs => ?) where id = any(?)";
-        // one row whatever the driver's fetch size, so every hash is tried (see Resender.LOCK_ALL); never waits
-        heldKeys = "select array_agg(h) filter (where not pg_try_advisory_xact_lock(?, h)) from unnest(?::int[]) h";
-        // one row per message, should two of its letters be redriven together
-        remember = "insert into " + names.redriven() + " (message_id, redrives)"
-                + " select m, max(r) from unnest(?::uuid[], ?::int[]) u(m, r) group by m"
-                + " on conflict (message_id) do update set redrives = excluded.redrives, at = now()";
         // due_at is set on every pending letter: the partial index finds them, not a scan of all the kept ones
         keepPending = "update " + dead + " set status = 'kept', due_at = null where id in (select id from " + dead
                 + " where status = 'pending' and due_at is not null for update skip locked)";
@@ -219,7 +194,7 @@ public final class DeadLetterPass {
         }
         List<DeadLetterDecision> decisions;
         try {
-            decisions = call(claimed.stream().map(Claimed::letter).toList());
+            decisions = call(claimed.stream().map(DeadLetters.Claimed::letter).toList());
         } catch (ExecutionException e) {
             return failed(tx, claimed, e.getCause());
         } catch (TimeoutException e) {
@@ -256,8 +231,8 @@ public final class DeadLetterPass {
                 ps.executeBatch();
             }
         }
-        byIds(tx, keep, kept);
-        byIds(tx, delete, discarded);
+        DeadLetters.byIds(tx, keep, kept);
+        rows.delete(tx, discarded);
         return new Batch(claimed.size(), null, decisions);
     }
 
@@ -282,39 +257,10 @@ public final class DeadLetterPass {
     private int redriveBatch(Connection tx, List<Long> ids) throws SQLException {
         var claimed = claim(tx, "scheduled");
         claimed.forEach(c -> ids.add(c.letter().id()));
-        var hashes = claimed.stream()
-                .map(c -> c.letter().key() == null ? null : Hashing.keyHash(c.letter().topic(), c.letter().key()))
-                .toList();
-        var held = held(tx, hashes);
-        var ready = new ArrayList<Claimed>();
-        var deferred = new ArrayList<Long>();
-        for (int i = 0; i < claimed.size(); i++) {
-            if (hashes.get(i) != null && held.contains(hashes.get(i))) {
-                deferred.add(claimed.get(i).letter().id());
-            } else {
-                ready.add(claimed.get(i));
-            }
-        }
-        defer(tx, deferred);
-        redrive(tx, ready); // its own key locks are ours already: Resender takes them again without waiting
-        return ready.size();
-    }
-
-    /** Tries the key lock of each distinct hash without waiting; returns the hashes another transaction holds. */
-    private Set<Integer> held(Connection tx, List<Integer> hashes) throws SQLException {
-        var distinct = hashes.stream().filter(Objects::nonNull).distinct().toArray(Integer[]::new);
-        if (distinct.length == 0) {
-            return Set.of();
-        }
-        try (var ps = tx.prepareStatement(heldKeys)) {
-            ps.setInt(1, keyNamespace);
-            ps.setArray(2, tx.createArrayOf("int4", distinct));
-            try (var rs = ps.executeQuery()) {
-                rs.next();
-                var held = rs.getArray(1);
-                return held == null ? Set.of() : Set.of((Integer[]) held.getArray());
-            }
-        }
+        var split = rows.tryKeyLocks(tx, claimed);
+        defer(tx, split.held().stream().map(c -> c.letter().id()).toList());
+        rows.redrive(tx, split.ready()); // its key locks are ours already: Resender takes them again without waiting
+        return split.ready().size();
     }
 
     /**
@@ -389,7 +335,7 @@ public final class DeadLetterPass {
     }
 
     /** Every letter of a failed call stays pending, due after a backoff by its failed calls so far. */
-    private Batch failed(Connection tx, List<Claimed> claimed, Throwable failure) throws SQLException {
+    private Batch failed(Connection tx, List<DeadLetters.Claimed> claimed, Throwable failure) throws SQLException {
         var error = RetryStore.errorText(failure.toString());
         try (var ps = tx.prepareStatement(fail)) {
             for (var c : claimed) {
@@ -403,65 +349,17 @@ public final class DeadLetterPass {
         return new Batch(claimed.size(), failure, List.of());
     }
 
-    /** Back into the outbox, the redrive counted in {@code <redriven>}, the dead rows deleted. */
-    private void redrive(Connection tx, List<Claimed> letters) throws SQLException {
-        if (letters.isEmpty()) {
-            return;
-        }
-        try (var st = tx.createStatement()) {
-            st.execute(redriveLockTimeout); // after the claim: the insert waits for a lock no longer than the swap
-        }
-        resender.insertAll(tx, letters.stream().map(c -> new Resender.Row(c.letter().messageId(),
-                c.letter().topic(), c.letter().key(), c.letter().payload(), c.headers())).toList());
-        try (var ps = tx.prepareStatement(remember)) {
-            ps.setArray(1, tx.createArrayOf("uuid", letters.stream().map(c -> c.letter().messageId()).toArray()));
-            ps.setArray(2, tx.createArrayOf("int4", letters.stream().map(c -> c.letter().redrives() + 1).toArray()));
-            ps.executeUpdate();
-        }
-        byIds(tx, delete, letters.stream().map(c -> c.letter().id()).toList());
-    }
-
-    private List<Claimed> claim(Connection tx, String status) throws SQLException {
+    private List<DeadLetters.Claimed> claim(Connection tx, String status) throws SQLException {
         try (var ps = tx.prepareStatement(claim)) {
             ps.setString(1, status);
             ps.setInt(2, batchSize);
             try (var rs = ps.executeQuery()) {
-                var claimed = new ArrayList<Claimed>();
+                var claimed = new ArrayList<DeadLetters.Claimed>();
                 while (rs.next()) {
-                    claimed.add(claimed(rs));
+                    claimed.add(DeadLetters.read(rs));
                 }
                 return claimed;
             }
-        }
-    }
-
-    private static Claimed claimed(ResultSet rs) throws SQLException {
-        var headers = rs.getBytes(6);
-        var dueAt = rs.getObject(14, OffsetDateTime.class);
-        return new Claimed(new DeadLetter(
-                rs.getLong(1),
-                rs.getObject(2, UUID.class),
-                rs.getString(3),
-                rs.getBytes(4),
-                rs.getBytes(5),
-                HeaderCodec.decode(headers),
-                rs.getObject(7, OffsetDateTime.class).toInstant(),
-                rs.getInt(8),
-                rs.getObject(9, OffsetDateTime.class).toInstant(),
-                rs.getString(10),
-                DeadLetter.Status.valueOf(rs.getString(11).toUpperCase(Locale.ROOT)),
-                rs.getInt(12),
-                rs.getInt(13),
-                dueAt == null ? null : dueAt.toInstant()), headers);
-    }
-
-    private static void byIds(Connection tx, String sql, List<Long> ids) throws SQLException {
-        if (ids.isEmpty()) {
-            return;
-        }
-        try (var ps = tx.prepareStatement(sql)) {
-            ps.setArray(1, tx.createArrayOf("bigint", ids.toArray()));
-            ps.executeUpdate();
         }
     }
 

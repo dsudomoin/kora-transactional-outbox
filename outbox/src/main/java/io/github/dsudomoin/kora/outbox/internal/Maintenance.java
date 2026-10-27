@@ -177,12 +177,12 @@ public final class Maintenance {
 
     /** While halted, the halt ERROR says why no run completes, so the stale WARN keeps quiet. */
     private void readLastSuccess(Connection c, boolean halted) {
-        double age;
-        try (var st = c.createStatement(); var rs = st.executeQuery(sinceSuccess)) {
-            if (!rs.next()) {
+        Double age;
+        try {
+            age = secondsSinceSuccess(c);
+            if (age == null) {
                 return; // the row is made at bootstrap; an operator deleted it
             }
-            age = rs.getDouble(1);
         } catch (SQLException e) { // the run goes on; outbox.maintenance.since_success grows from the last read
             if (due(staleLogged)) {
                 log.warn("outbox maintenance of {} cannot read its last success from {} (SQLState {}): {}; the run"
@@ -200,6 +200,26 @@ public final class Maintenance {
                     + " = {} and objid = {} and objsubid = 2", names.base(), Math.round(age), STALE_INTERVALS,
                     Integer.toUnsignedLong(names.internalNamespace()), TableNames.LOCK_MAINTENANCE);
         }
+    }
+
+    /**
+     * Seconds since a run last completed every step on any instance, by the database clock; null without the row.
+     * Also for {@link PgOutboxAdmin#status()}.
+     */
+    @Nullable
+    Double secondsSinceSuccess(Connection c) throws SQLException {
+        try (var st = c.createStatement(); var rs = st.executeQuery(sinceSuccess)) {
+            return rs.next() ? rs.getDouble(1) : null;
+        }
+    }
+
+    /** {@code outbox.shard.lag} read now, for {@link PgOutboxAdmin#status()}. */
+    double lagSeconds(Connection c) throws SQLException {
+        return lagSeconds(slowestTick(c), ticks.latest(c));
+    }
+
+    private static double lagSeconds(Tick slowest, Tick latest) {
+        return Duration.between(slowest.createdAt(), latest.createdAt()).toNanos() / 1e9;
     }
 
     private boolean sessionStable(Connection c) throws SQLException {
@@ -355,8 +375,7 @@ public final class Maintenance {
     }
 
     private void refreshGauges(Connection c, @Nullable Tick slowest) throws SQLException {
-        lag = slowest == null ? Double.NaN
-                : Duration.between(slowest.createdAt(), ticks.latest(c).createdAt()).toNanos() / 1e9;
+        lag = slowest == null ? Double.NaN : lagSeconds(slowest, ticks.latest(c));
         retrySize = retries.size(c);
         deadSize = retries.deadSize(c);
         parkedSize = parked.size(c);
