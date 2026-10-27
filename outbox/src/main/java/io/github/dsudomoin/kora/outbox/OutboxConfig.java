@@ -13,7 +13,7 @@ public interface OutboxConfig {
     }
 
     /** The shard count of a new outbox when {@link #shards()} is not set. */
-    int DEFAULT_SHARDS = 32;
+    int DEFAULT_SHARDS = 256;
 
     /**
      * Null when not set: an existing outbox keeps the shard count of its cursors, a new one gets
