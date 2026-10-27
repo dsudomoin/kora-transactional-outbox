@@ -1,11 +1,11 @@
 package io.github.dsudomoin.outbox.kora;
 
 import io.github.dsudomoin.outbox.Inbox;
+import io.github.dsudomoin.outbox.InboxRuntime;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.OutboxTransactions;
-import io.github.dsudomoin.outbox.internal.PgInbox;
 import ru.tinkoff.kora.application.graph.LifecycleWrapper;
 
 /**
@@ -19,8 +19,13 @@ import ru.tinkoff.kora.application.graph.LifecycleWrapper;
  */
 public interface InboxModule extends OutboxCommonModule {
 
-    default LifecycleWrapper<Inbox> inbox(OutboxTransactions db, OutboxConfig config, OutboxTelemetry telemetry) {
-        var inbox = new PgInbox(db, config, telemetry);
-        return new LifecycleWrapper<>(inbox, i -> inbox.start(), i -> inbox.close());
+    default LifecycleWrapper<InboxRuntime> inboxRuntime(OutboxTransactions db, OutboxConfig config,
+            OutboxTelemetry telemetry) {
+        var runtime = InboxRuntime.builder(config, db).telemetry(telemetry).build();
+        return new LifecycleWrapper<>(runtime, InboxRuntime::start, InboxRuntime::close);
+    }
+
+    default Inbox inbox(InboxRuntime runtime) {
+        return runtime.inbox();
     }
 }

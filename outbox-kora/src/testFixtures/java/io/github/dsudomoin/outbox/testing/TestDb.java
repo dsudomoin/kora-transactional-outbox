@@ -13,7 +13,6 @@ import java.util.Properties;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import org.testcontainers.postgresql.PostgreSQLContainer;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetryFactory;
 import ru.tinkoff.kora.database.jdbc.ConnectionContext;
@@ -29,25 +28,16 @@ public final class TestDb {
 
     private TestDb() {}
 
-    private static final class Pg {
-        static final PostgreSQLContainer INSTANCE = new PostgreSQLContainer("postgres:16-alpine")
-                .withCommand("postgres", "-c", "fsync=off", "-c", "max_connections=500");
-
-        static {
-            INSTANCE.start();
-        }
-    }
-
     public static String jdbcUrl() {
-        return Pg.INSTANCE.getJdbcUrl();
+        return TestDataSources.jdbcUrl();
     }
 
     public static String user() {
-        return Pg.INSTANCE.getUsername();
+        return TestDataSources.user();
     }
 
     public static String password() {
-        return Pg.INSTANCE.getPassword();
+        return TestDataSources.password();
     }
 
     /** Kora pool over the test container; the caller closes it with {@code release()}. */

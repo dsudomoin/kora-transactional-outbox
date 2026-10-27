@@ -3,7 +3,6 @@ package io.github.dsudomoin.outbox.kora;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.OutboxTransactions;
-import io.github.dsudomoin.outbox.internal.GuardedTelemetry;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.opentelemetry.api.trace.Tracer;
@@ -28,6 +27,6 @@ public interface OutboxCommonModule {
     }
 
     default OutboxTelemetry outboxTelemetry(@Nullable MeterRegistry registry, @Nullable Tracer tracer) {
-        return GuardedTelemetry.of(new KoraOutboxTelemetry(new OutboxMetrics(registry), tracer));
+        return new KoraOutboxTelemetry(new OutboxMetrics(registry), tracer);
     }
 }
