@@ -1367,18 +1367,18 @@ Relay находит новые сообщения, сравнивая иден�
 
    ```sql
    create table outbox_unrelayed as
-   with k as (select tick_id, busy, busy_tick_id from outbox_checkpoint order by seq desc limit 1),
-        c as (select distinct on (shard) shard, tick_id from outbox_cursor order by shard, seq desc),
-        e as (select c.shard, case when length(k.busy) = (select count(*) from c)  -- эффективный тик шарда
-                then greatest(c.tick_id, case when get_bit(k.busy, c.shard) = 0 then k.tick_id
-                                              else k.busy_tick_id end)
-                else c.tick_id end tick_id
-                from c left join k on true)
    select o.id, o.shard, o.created_at, o.message_id, o.topic, o.key, o.payload, o.headers
      from outbox o
-     join e on e.shard = o.shard
-     join outbox_tick t on t.id = e.tick_id
-    where (not pg_visible_in_snapshot(o.xid, t.snapshot)
+     left join (select c.shard, case when length(k.busy) = count(*) over ()  -- эффективный тик шарда
+                      then greatest(c.tick_id, case when get_bit(k.busy, c.shard) = 0 then k.tick_id
+                                                    else k.busy_tick_id end)
+                      else c.tick_id end tick_id
+                 from (select distinct on (shard) shard, tick_id from outbox_cursor order by shard, seq desc) c
+                 left join (select tick_id, busy, busy_tick_id from outbox_checkpoint
+                             order by seq desc limit 1) k on true) e on e.shard = o.shard
+     left join outbox_tick t on t.id = e.tick_id
+    where (t.snapshot is null                                      -- шард без курсора или без тика: все его строки
+           or not pg_visible_in_snapshot(o.xid, t.snapshot)
            or o.created_at >= timestamptz '<T>' - interval '10 minutes')  -- записаны после бэкапа или переключения
       and not exists (select 1 from outbox_retry r where r.id = o.id and r.message_id = o.message_id)
       and not exists (select 1 from outbox_parked p where p.id = o.id and p.message_id = o.message_id)
@@ -1462,17 +1462,17 @@ Inbox это не затрагивает: он партиционирован п
    select count(*) from (select distinct on (shard) shard, target_tick_id from outbox_cursor
                           order by shard, seq desc) c
     where c.target_tick_id is not null;                          -- незавершённый батч
-   with k as (select tick_id, busy, busy_tick_id from outbox_checkpoint order by seq desc limit 1),
-        c as (select distinct on (shard) shard, tick_id from outbox_cursor order by shard, seq desc),
-        e as (select c.shard, case when length(k.busy) = (select count(*) from c)  -- эффективный тик шарда
-                then greatest(c.tick_id, case when get_bit(k.busy, c.shard) = 0 then k.tick_id
-                                              else k.busy_tick_id end)
-                else c.tick_id end tick_id
-                from c left join k on true)
    select count(*) from outbox o
-     join e using (shard)
-     join outbox_tick t on t.id = e.tick_id
-    where o.xid >= pg_snapshot_xmin(t.snapshot)
+     left join (select c.shard, case when length(k.busy) = count(*) over ()  -- эффективный тик шарда
+                      then greatest(c.tick_id, case when get_bit(k.busy, c.shard) = 0 then k.tick_id
+                                                    else k.busy_tick_id end)
+                      else c.tick_id end tick_id
+                 from (select distinct on (shard) shard, tick_id from outbox_cursor order by shard, seq desc) c
+                 left join (select tick_id, busy, busy_tick_id from outbox_checkpoint
+                             order by seq desc limit 1) k on true) e on e.shard = o.shard
+     left join outbox_tick t on t.id = e.tick_id
+    where t.snapshot is null                                       -- шард без курсора или без тика: все его строки
+       or o.xid >= pg_snapshot_xmin(t.snapshot)
       and not pg_visible_in_snapshot(o.xid, t.snapshot);         -- закоммиченные строки, которые не прошёл ни один шард
    select count(*) from pg_class c where relname ~ '^outbox_x[0-9]+$' and relkind = 'r'
       and not exists (select 1 from pg_inherits where inhrelid = c.oid);  -- осиротевшие диапазоны: сначала восстановите их

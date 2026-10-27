@@ -1,5 +1,6 @@
 package io.github.dsudomoin.kora.outbox.internal;
 
+import io.github.dsudomoin.kora.outbox.internal.Ticks.Tick;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.ResultSet;
@@ -26,10 +27,13 @@ import java.util.List;
  * tick, so relayed (a batch in progress: up to {@code lastId}, rows past it lie above E). By induction over the
  * checkpoints, from the first (E = the cursor's tick):
  * <ol>
- *   <li>A 0 bit: no batch was in progress, and no tick in (E', L] held the shard (by its {@code dirty}, null or
- *       drawn from another shard count as all shards, the tick after a gap in ids as all shards too), E' its effective
- *       tick at the read. By the proof in {@link Ticks}, the ticks after E' chain, so no row of the shard is visible in
- *       L and not in E', and by induction none visible in E' and not in its cursor's tick: so none up to L.</li>
+ *   <li>A 0 bit: no batch was in progress, and no tick in (E', L] held the shard (by its {@code dirty}, null as all
+ *       shards, the tick after a gap in ids as all shards too), E' its effective tick at the read. By the proof in
+ *       {@link Ticks}, the ticks after E' chain, so no row of the shard is visible in L and not in E', and by induction
+ *       none visible in E' and not in its cursor's tick: so none up to L. (A bitmap of another length, from an
+ *       instance with another shard count, reads as all shards, but an empty one reads as none: instances with
+ *       different shard counts on one table are not supported, and the bootstrap refuses cursors of another
+ *       count.)</li>
  *   <li>A 1 bit: {@code busy_tick_id} is at most E', so a row visible in it is visible in E', and by induction in the
  *       cursor's tick.</li>
  *   <li>Cursors only move forward, so a cursor appended after the read keeps both. A step that read its cursor and
@@ -42,9 +46,9 @@ import java.util.List;
  *       effective tick at the read.</li>
  * </ol>
  * A run writes its checkpoint from its own read, in one statement that also deletes the one before (runs hold
- * {@code LOCK_MAINTENANCE}, so one at a time), so readers see exactly one. A step reads its effective tick's row right
- * after its cursor; a run that raises the effective tick and deletes the old one in between fails that step, which
- * rolls back, and the next step starts from the new one.
+ * {@code LOCK_MAINTENANCE}, so one at a time), so readers see exactly one. A step reads its effective tick's row in
+ * the statement that reads its cursor and the checkpoint ({@link #latest}): with one snapshot, the checkpoint it sees
+ * is the one cleanup went by when that snapshot also sees the cleanup, so the row is there.
  */
 public final class Cursors {
 
@@ -89,13 +93,16 @@ public final class Cursors {
         }
     }
 
-    /** A shard's latest cursor and its effective tick (see the class comment). */
-    public record Current(Cursor cursor, long effectiveTickId) {}
+    /**
+     * A shard's latest cursor, its effective tick (see the class comment) and that tick's row, read in one statement,
+     * so with one snapshot of the checkpoint and the tick table: null only when the tick was deleted by hand.
+     */
+    public record Current(Cursor cursor, long effectiveTickId, @Nullable Tick tick) {}
 
     /**
      * A shard's latest cursor and effective tick; {@code behind}: no batch in progress, the effective tick is below the
      * latest tick, and a tick in between may hold the shard's rows: its {@code dirty} has the shard's bit set or is
-     * null (or drawn from another shard count: every shard), or it follows a gap in tick ids (a tick deleted by hand:
+     * null (or of another non-zero length: every shard), or it follows a gap in tick ids (a tick deleted by hand:
      * every shard), or the effective tick is not among the ticks read: gone, or below the newest checkpoint's tick,
      * which only a shard busy at that checkpoint can be (so the read covers at most the ticks of one maintenance
      * interval, however far a paused shard lags).
@@ -116,16 +123,19 @@ public final class Cursors {
         this.names = names;
         this.shards = shards;
         var effective = effective(shards);
-        this.latest = "select c.*, " + effective + " from (select " + COLUMNS + " from " + names.cursor()
-                + " where shard = ? order by seq desc limit 1) c left join " + newestCheckpoint(names) + " k on true";
+        // every statement opens the cursor table, then the checkpoint, then the tick table, as XidRecovery locks them
+        this.latest = "select c.*, e.eff, t.snapshot::text, t.created_at, t.max_id from (select " + COLUMNS + " from "
+                + names.cursor() + " where shard = ? order by seq desc limit 1) c left join " + newestCheckpoint(names)
+                + " k on true cross join lateral (select " + effective + " eff) e left join " + names.tick()
+                + " t on t.id = e.eff";
         var ones = "repeat('1', " + shards + ")::varbit";
         // one pass over the ticks after the lowest effective tick (not below the checkpoint's): for each tick, the
         // shards that any tick after it up to the latest may hold rows of (a window bit_or, newest first); each shard
         // looks up its effective tick's row. A shard below the window finds none: behind
-        this.positions = "with k as " + newestCheckpoint(names) + ","
-                + " c as (select c.*, " + effective + " eff from generate_series(0, " + shards + " - 1) s"
-                + " cross join lateral (select " + COLUMNS + " from " + names.cursor()
-                + " where shard = s order by seq desc limit 1) c left join k on true),"
+        this.positions = "with c0 as (select c.* from generate_series(0, " + shards + " - 1) s cross join lateral"
+                + " (select " + COLUMNS + " from " + names.cursor() + " where shard = s order by seq desc limit 1) c),"
+                + " k as " + newestCheckpoint(names) + ","
+                + " c as (select c.*, " + effective + " eff from c0 c left join k on true),"
                 + " w as (select id, bit_or(d) over (order by id desc rows between unbounded preceding and 1 preceding)"
                 + " after from (select id, case when dirty is null or lag(id) over (order by id) <> id - 1 then " + ones
                 + " when length(dirty) = 0 then repeat('0', " + shards + ")::varbit"
@@ -154,28 +164,11 @@ public final class Cursors {
     }
 
     /**
-     * Latest cursor of shards {@code 0..shards-1}, in shard order: one index probe per shard. A shard without rows is
-     * absent, so callers key results by {@link Cursor#shard()}, never by list position.
-     */
-    public List<Cursor> latestAll(Connection c) throws SQLException {
-        try (var ps = c.prepareStatement("select c.* from generate_series(0, ? - 1) s cross join lateral (select "
-                + COLUMNS + " from " + names.cursor() + " where shard = s order by seq desc limit 1) c order by s")) {
-            ps.setInt(1, shards);
-            try (var rs = ps.executeQuery()) {
-                var result = new ArrayList<Cursor>(shards);
-                while (rs.next()) {
-                    result.add(cursor(rs));
-                }
-                return result;
-            }
-        }
-    }
-
-    /**
-     * {@link #latestAll} with each shard's effective tick and {@link Position#behind()} up to the tick
-     * {@code latestTickId}: one statement, per shard an index probe for the cursor, then one scan of the ticks from
-     * the lowest effective tick of the shards without a batch in progress (at least the newest checkpoint's) to the
-     * latest.
+     * The latest cursor of shards {@code 0..shards-1}, in shard order (a shard without rows is absent, so callers key
+     * results by {@link Cursor#shard()}, never by list position), with its effective tick and {@link Position#behind()}
+     * up to the tick {@code latestTickId}: one statement, per shard an index probe for the cursor, then one scan of the
+     * ticks from the lowest effective tick of the shards without a batch in progress (at least the newest
+     * checkpoint's) to the latest.
      */
     public List<Position> positions(Connection c, long latestTickId) throws SQLException {
         try (var ps = c.prepareStatement(positions)) {
@@ -188,6 +181,15 @@ public final class Cursors {
                 }
                 return result;
             }
+        }
+    }
+
+    /** The newest checkpoint's tick, null without one. */
+    @Nullable
+    public Long checkpointTick(Connection c) throws SQLException {
+        try (var st = c.createStatement(); var rs = st.executeQuery("select tick_id from " + newestCheckpoint(names)
+                + " k")) {
+            return rs.next() ? rs.getLong(1) : null;
         }
     }
 
@@ -231,7 +233,7 @@ public final class Cursors {
     }
 
     /**
-     * The shard's cursor and effective tick, in one statement with the newest checkpoint. Throws
+     * The shard's cursor, effective tick and that tick's row, in one statement with the newest checkpoint. Throws
      * {@link IllegalStateException} when the shard has no cursor (bootstrap creates one per shard).
      */
     public Current latest(Connection c, int shard) throws SQLException {
@@ -241,7 +243,10 @@ public final class Cursors {
                 if (!rs.next()) {
                     throw new IllegalStateException("no cursor for shard " + shard + " in " + names.cursor());
                 }
-                return new Current(cursor(rs), rs.getLong(9));
+                var snapshot = rs.getString(10);
+                return new Current(cursor(rs), rs.getLong(9), snapshot == null ? null : new Tick(rs.getLong(9),
+                        PgSnapshot.parse(snapshot), rs.getObject(11, OffsetDateTime.class).toInstant(),
+                        rs.getObject(12, Long.class)));
             }
         }
     }

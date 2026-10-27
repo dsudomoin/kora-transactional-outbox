@@ -30,10 +30,10 @@ class CursorsIT {
     }
 
     @Test
-    void latestAllReturnsNewestPerShard() throws Exception {
+    void positionsHoldTheNewestCursorPerShard() throws Exception {
         var cursors = new Cursors(bootstrap(), 4);
         try (var c = TestDb.connect()) {
-            var initial = cursors.latestAll(c);
+            var initial = all(cursors, c);
             assertThat(initial).extracting(Cursor::shard).containsExactly(0, 1, 2, 3);
             assertThat(initial.get(0).targetTickId()).isNull();
             assertThat(initial.get(0).pausedUntil()).isNull();
@@ -48,10 +48,13 @@ class CursorsIT {
             var newest2 = initial.get(2).withProgress(7, 8L, 42).withPause(T1, 1).withRetryDueAt(T2);
             cursors.append(c, newest2);
 
-            assertThat(cursors.latestAll(c)).containsExactly(newest0, initial.get(1), newest2, initial.get(3));
-            assertThat(cursors.latest(c, 0)).as("no checkpoint: the cursor's tick")
-                    .isEqualTo(new Cursors.Current(newest0, 9));
-            assertThat(cursors.latest(c, 2)).isEqualTo(new Cursors.Current(newest2, 7));
+            assertThat(all(cursors, c)).containsExactly(newest0, initial.get(1), newest2, initial.get(3));
+            assertThat(cursors.latest(c, 0)).as("no checkpoint: the cursor's tick, here without a row")
+                    .isEqualTo(new Cursors.Current(newest0, 9, null));
+            assertThat(cursors.latest(c, 2)).isEqualTo(new Cursors.Current(newest2, 7, null));
+            var bootstrapped = cursors.latest(c, 1);
+            assertThat(bootstrapped.tick()).as("the tick's row, read with the cursor").usingRecursiveComparison()
+                    .isEqualTo(new Ticks(TableNames.of(config.table()), 4).get(c, bootstrapped.effectiveTickId()));
             assertThat(newest0).isEqualTo(new Cursor(0, 9, null, 0, null, 0, T1, T2));
             assertThat(newest2.parkedDueAt()).isNull();
         }
@@ -74,23 +77,23 @@ class CursorsIT {
     void deleteSupersededKeepsLatest() throws Exception {
         var cursors = new Cursors(bootstrap(), 4);
         try (var c = TestDb.connect()) {
-            var initial = cursors.latestAll(c);
+            var initial = all(cursors, c);
             for (int i = 1; i <= 3; i++) {
                 cursors.append(c, initial.get(0).withProgress(i, null, 0));
                 cursors.append(c, initial.get(3).withProgress(i, null, 0));
             }
-            var before = cursors.latestAll(c);
+            var before = all(cursors, c);
 
             assertThat(cursors.deleteSuperseded(c)).isEqualTo(6);
 
-            assertThat(cursors.latestAll(c)).isEqualTo(before);
+            assertThat(all(cursors, c)).isEqualTo(before);
             assertThat(queryLong(c, "select count(*) from " + TableNames.of(config.table()).cursor())).isEqualTo(4);
             assertThat(cursors.deleteSuperseded(c)).isZero();
         }
     }
 
     @Test
-    void latestAllIsFastWithLongHistory() throws Exception {
+    void positionsAreFastWithLongHistory() throws Exception {
         config.shards(32);
         var names = bootstrap();
         var cursors = new Cursors(names, config.shards());
@@ -102,19 +105,19 @@ class CursorsIT {
             c.setAutoCommit(true);
 
             for (int i = 0; i < 5; i++) {
-                cursors.latestAll(c);
+                all(cursors, c);
             }
             long[] nanos = new long[20];
             for (int i = 0; i < nanos.length; i++) {
                 long start = System.nanoTime();
-                var all = cursors.latestAll(c);
+                var all = all(cursors, c);
                 nanos[i] = System.nanoTime() - start;
                 assertThat(all).hasSize(32);
                 assertThat(all.get(0).lastId()).isEqualTo(50000);
             }
             Arrays.sort(nanos);
 
-            assertThat(nanos[nanos.length / 2] / 1_000_000.0).as("median latestAll ms").isLessThanOrEqualTo(20.0);
+            assertThat(nanos[nanos.length / 2] / 1_000_000.0).as("median positions ms").isLessThanOrEqualTo(20.0);
         }
     }
 
@@ -142,7 +145,7 @@ class CursorsIT {
             cursors.append(c, s2);
             var positions = cursors.positions(c, t3);
             assertThat(behind(positions)).containsExactly(false, false, false, true);
-            assertThat(positions).extracting(Cursors.Position::cursor).isEqualTo(cursors.latestAll(c));
+            assertThat(positions).extracting(Cursors.Position::cursor).isEqualTo(all(cursors, c));
             assertThat(positions).extracting(Cursors.Position::effectiveTickId).containsExactly(first, t2, t1, first);
             assertThat(positions.get(1).cursor()).isEqualTo(s1);
             assertThat(positions.get(2).cursor()).isEqualTo(s2);
@@ -244,6 +247,11 @@ class CursorsIT {
         return queryLong(c, "insert into " + names.tick() + " (snapshot, max_id, dirty, created_at)"
                 + " select pg_current_snapshot(), 0, " + dirty + "::varbit, min(created_at) + interval '"
                 + millis + " milliseconds' from " + names.tick() + " returning id");
+    }
+
+    /** Every shard's latest cursor, from {@link Cursors#positions}. */
+    private static List<Cursor> all(Cursors cursors, Connection c) throws Exception {
+        return cursors.positions(c, Long.MAX_VALUE).stream().map(Cursors.Position::cursor).toList();
     }
 
     private static List<Boolean> behind(List<Cursors.Position> positions) {

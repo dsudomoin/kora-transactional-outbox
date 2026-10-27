@@ -236,13 +236,12 @@ public final class ShardProcessor implements AutoCloseable {
         Tick prev = null;
         Tick target = null;
         if (cursor.targetTickId() != null) {
-            // read right away: maintenance deletes ticks below the effective ticks it reads, which may soon be higher
-            prev = ticks.get(inTx, cursor.tickId());
+            prev = effectiveTick(current);
             // never re-chosen mid-batch: rows of a long transaction below lastId committing after the old target
             // would be skipped
             target = ticks.get(inTx, cursor.targetTickId());
         } else if (latestTickId > cursor.tickId()) {
-            prev = ticks.get(inTx, cursor.tickId());
+            prev = effectiveTick(current);
             var candidates = ticks.between(inTx, cursor.tickId(),
                     Math.min(latestTickId, cursor.tickId() + relay.maxTicksPerBatch()));
             // a gap in tick ids (e.g. a rolled-back tick insert) must not stop the shard
@@ -255,7 +254,8 @@ public final class ShardProcessor implements AutoCloseable {
         // there stores min(next_attempt_at) as the cursor's retry_due_at. So retry_due_at == null means no retry rows,
         // and the table is read only when it is due or the step wrote to it, not on every step: under a held xmin
         // horizon each probe walks every dead version a mass divert left. Once per maintenanceInterval the step
-        // checks in full, for rows changed outside the relay.
+        // checks in full, for rows changed outside the relay: only hand edits change those tables outside a step, and
+        // a shard with no new rows and nothing due is not stepped, so such an edit waits for its next row or due time.
         boolean full = fullCheckDue(shard);
         var retryDue = cursor.retryDueAt();
         var heads = full || retryDue != null && !retryDue.isAfter(now)
@@ -366,6 +366,15 @@ public final class ShardProcessor implements AutoCloseable {
         metrics.batch(Duration.ofNanos(System.nanoTime() - started));
         return new ShardResult(status, delivered, status == ShardStatus.PROGRESS && next.targetTickId() == null,
                 deadLettered);
+    }
+
+    /** The row of the shard's effective tick, read with its cursor; a tick deleted by hand stops the shard. */
+    private static Tick effectiveTick(Cursors.Current current) {
+        if (current.tick() == null) {
+            throw new IllegalStateException("no tick " + current.effectiveTickId() + " for shard "
+                    + current.cursor().shard() + ": its effective tick was deleted");
+        }
+        return current.tick();
     }
 
     /**

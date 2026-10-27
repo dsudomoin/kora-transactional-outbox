@@ -212,7 +212,7 @@ class OutboxSchemaIT {
                     .isEqualTo(config.shards() + ":0");
             assertThat(queryString(c, "select id || ':' || attempts || ':' || requeues from " + n.retry()))
                     .isEqualTo("1:2:0");
-            assertThat(new Cursors(n, config.shards()).latestAll(c)).hasSize(config.shards());
+            assertThat(new Cursors(n, config.shards()).positions(c, Long.MAX_VALUE)).hasSize(config.shards());
         }
     }
 

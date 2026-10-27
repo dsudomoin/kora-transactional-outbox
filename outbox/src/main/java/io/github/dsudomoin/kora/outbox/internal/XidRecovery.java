@@ -176,18 +176,19 @@ public final class XidRecovery {
      * on; no {@code transaction_timeout}), for a caller holding {@code LOCK_MAINTENANCE}; returns the rows re-sent, or
      * 0 with no change when there is neither a regression nor a halt row. First, outside it, a detach left pending is
      * finished ({@link XidPartitions#finishPendingDetach}), so its wait for older snapshots stalls no writer. Then:
-     * ACCESS EXCLUSIVE on the cursor, checkpoint and tick tables, in the order relay steps read them (a step that
-     * read its cursor ends first, one that reads it later sees the new one), then on the outbox, which writers wait
-     * for, not fail; a detach found pending since that finish fails it at once (see the throws); the rows to re-send
-     * ({@link #saved}) copied into {@code <base>_recovery}; every standalone range, and a tail that is not attached,
-     * set aside as {@code <base>_o<digits>} when it holds rows (they lie outside the outbox and are never re-sent by
-     * themselves: {@code restoreOrphan} moves them back) and dropped when empty; the id sequence set above every id of
-     * the outbox, retry, parked and dead tables; every partition dropped; ticks, cursors, checkpoints, dropping
-     * markers and the halt deleted; ranges from the one holding the oldest running xid (a writer waiting for the lock
-     * may hold it) and a tail above the current xid ({@link XidPartitions#ensurePremade}, its fresh-table path); one
-     * tick and one cursor per shard at it, due at its earliest {@code next_attempt_at} where the shard holds retry
-     * heads and at its earliest parked {@code due_at} where it holds parked rows; the saved rows inserted in
-     * {@code created_at, id} order, which gives the ids, as no {@code send} gets in before the commit.
+     * ACCESS EXCLUSIVE on the cursor, checkpoint and tick tables, in the order every relay statement opens them, so no
+     * relay transaction holds one of them while waiting for an earlier one (a step that read its cursor ends first, one
+     * that reads it later sees the new one), then on the outbox, which writers wait for, not fail; a detach found
+     * pending since that finish fails it at once (see the throws); the rows to re-send ({@link #saved}) copied into
+     * {@code <base>_recovery}; every standalone range, and a tail that is not attached, set aside as
+     * {@code <base>_o<digits>} when it holds rows (they lie outside the outbox and are never re-sent by themselves:
+     * {@code restoreOrphan} moves them back) and dropped when empty; the id sequence set above every id of the outbox,
+     * retry, parked and dead tables; every partition dropped; ticks, cursors, checkpoints, dropping markers and the
+     * halt deleted; ranges from the one holding the oldest running xid (a writer waiting for the lock may hold it) and
+     * a tail above the current xid ({@link XidPartitions#ensurePremade}, its fresh-table path); one tick and one cursor
+     * per shard at it, due at its earliest {@code next_attempt_at} where the shard holds retry heads and at its
+     * earliest parked {@code due_at} where it holds parked rows; the saved rows inserted in {@code created_at, id}
+     * order, which gives the ids, as no {@code send} gets in before the commit.
      *
      * @throws IllegalStateException when {@code outbox.shards} differs from the shards of the cursors: saved rows keep
      *     their shard; or when a detach became pending after the finish before the transaction: the next attempt

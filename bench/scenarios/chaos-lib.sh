@@ -111,13 +111,12 @@ totals_all() {
   echo "${t[*]}"
 }
 
-# relay_lag: seconds since the tick that the slowest shard's cursor sits on was made (a shard stuck at its position
-# keeps growing it), empty when Postgres does not answer. An idle shard appends its cursor only every 5 s, so a quiet
-# shard alone reads up to about 5 s without any delay in delivery.
+# relay_lag: seconds since the slowest shard's effective tick was made (a shard stuck at its position keeps growing
+# it), empty when Postgres does not answer. An idle shard's effective tick moves only with maintenance's checkpoint, so
+# a quiet shard alone reads up to about maintenanceInterval (30 s by default) without any delay in delivery.
 relay_lag() {
   psql_q "select round(extract(epoch from clock_timestamp() - min(t.created_at))::numeric, 1)
-    from (select distinct on (shard) tick_id from ${TABLE}_cursor order by shard, seq desc) c
-    join ${TABLE}_tick t on t.id = c.tick_id" 2> /dev/null
+    from $(effective_ticks "$TABLE") e join ${TABLE}_tick t on t.id = e.tick_id" 2> /dev/null
 }
 
 # sample: every 5 s the relay lag (MAX_LAG), every 30 s a CSV row. Never fails the run (Postgres or Kafka may be down).
@@ -203,8 +202,8 @@ chaos_progress() {
 }
 
 # reconcile_orders TIMEOUT [BULK]: after every writer stopped (STOPPED_AT, a database timestamp), instances running.
-# Drained = Kafka group lag 0, no retry rows, no paused shard, every shard's cursor at a tick made after STOPPED_AT (the
-# relay has passed every commit), and (lost, phantom, inbox rows of the run) unchanged over a 10 s re-check. Then:
+# Drained = Kafka group lag 0, no retry rows, no paused shard, every shard's effective tick made after STOPPED_AT (the
+# relay has passed every commit; an idle shard's moves with maintenance's checkpoint, so up to maintenanceInterval), and (lost, phantom, inbox rows of the run) unchanged over a 10 s re-check. Then:
 #   lost       committed orders whose message_id has no inbox row                               must be 0
 #   phantom    bench_rolled_back ids (their transaction rolled back) that have an inbox row     must be 0
 #   order      bench_consumed rows whose seq does not exceed the user's previous one; counters  must be 0
@@ -221,8 +220,8 @@ reconcile_orders() {
     read -r retry paused passed <<< "$(psql_q "select (select count(*) from ${TABLE}_retry),
       (select count(*) from (select distinct on (shard) paused_until from ${TABLE}_cursor order by shard, seq desc) c
         where paused_until > now()),
-      (select coalesce(bool_and(c.tick_id >= t.id), false)
-        from (select distinct on (shard) tick_id from ${TABLE}_cursor order by shard, seq desc) c,
+      (select coalesce(bool_and(e.tick_id >= t.id), false)
+        from $(effective_ticks "$TABLE") e,
         (select min(id) as id from ${TABLE}_tick where created_at > '$STOPPED_AT') t)" 2> /dev/null | tr '|' ' ')" ||
       true
     cur=""
@@ -306,7 +305,7 @@ $TEXT. Экземпляров: $N, на таблице outbox \`$TABLE\` (у к�
 - нет}
 
 Сверка (SQL по бизнес-таблицам; консьюмер всё выбрал $drain после остановки): $RECON.
-Наибольший лаг relay (возраст тика под курсором самого медленного шарда, замер каждые 5 с; на простаивающем шарде до ~5 с): ${MAX_LAG} с${MAX_LAG_AT:+ в $MAX_LAG_AT}.
+Наибольший лаг relay (возраст эффективного тика самого медленного шарда, замер каждые 5 с; на простаивающем шарде до ~maintenanceInterval): ${MAX_LAG} с${MAX_LAG_AT:+ в $MAX_LAG_AT}.
 
 Проверки:${CHECKS:-
 - только сверка}

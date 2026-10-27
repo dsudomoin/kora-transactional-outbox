@@ -28,8 +28,10 @@ import org.slf4j.LoggerFactory;
  * when no shard gained rows: a superset of the shards whose batch (P, C] is not empty, so the relay steps only those
  * (see {@link Cursors#positions}), and maintenance's checkpoint moves every other shard past C without a write (see
  * {@link Cursors}). Null means every shard: the first tick, a tick made while the table held no tick, and ticks made
- * before the column existed or by an instance without it. Why no shard with rows in (P, C] is left out, from the facts
- * the batch reader relies on:
+ * before the column existed or by an instance without it. Readers take a bitmap of another length for every shard too,
+ * except an empty one, which they take for none: instances with different shard counts on one table are not supported
+ * (the bootstrap refuses cursors of another count). Why no shard with rows in (P, C] is left out, from the facts the
+ * batch reader relies on:
  * <ol>
  *   <li>A row the batch reader returns for (P, C] belongs to a committed transaction T visible in C and not in P (its
  *       {@code xid} column is T's top-level xid). Visible in C: {@code T < C.xmax} and T not in C.xip, so T had ended

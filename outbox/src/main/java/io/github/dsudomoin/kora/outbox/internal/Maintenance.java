@@ -35,7 +35,9 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * before it, a wait of up to {@code batchTimeout} + 5 s for relay steps in flight, which blocks no writer but pauses
  * every shard; a step running longer, as one may, defers the swap to the next run), the checkpoint ({@link Cursors}:
  * the latest tick and the shards busy at it, by which a shard without new rows moves on without a cursor row; the
- * drops and the tick cleanup go by its effective ticks, and a run that fails to write it does neither), drop of
+ * drops and the tick cleanup go by its effective ticks, and a run that fails to write it does neither; a checkpoint
+ * above the newest tick, as tick ids going backwards in a partial restore leave it, stops both, with an ERROR at most
+ * once a minute), drop of
  * processed partitions, drop of ranges left detached but not dropped: by a crash of this library's maintenance once
  * relayed (one still holding rows at or above the horizon first has those moved back into the outbox as new messages,
  * {@link OrphanRestore}, unless {@code outbox.partitions.restoreOrphans} is off), by anyone else only when empty
@@ -88,6 +90,7 @@ public final class Maintenance {
     private final AtomicLong poolingLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong staleLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong haltLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    private final AtomicLong checkpointLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private volatile boolean halted;
     private volatile boolean stepFailed; // in the current run, under LOCK_MAINTENANCE
 
@@ -254,9 +257,16 @@ public final class Maintenance {
     /**
      * One read of every shard's position at the latest tick L. {@code slowest}: the tick of the lowest effective tick
      * of the shards busy at L ({@link Cursors#busyTick}), L when none: the lag gauge's, and the lowest effective tick
-     * of all once the checkpoint of this read is written.
+     * of all once the checkpoint of this read is written. {@code checkpointTick}: the newest checkpoint's tick before
+     * this run's, null without one.
      */
-    private record Read(Tick latest, List<Position> positions, Tick slowest) {
+    private record Read(Tick latest, List<Position> positions, Tick slowest, @Nullable Long checkpointTick) {
+
+        /** The checkpoint is on a tick above L: tick ids went backwards under it. */
+        boolean checkpointAhead() {
+            return checkpointTick != null && checkpointTick > latest.id();
+        }
+
 
         /** {@code outbox.shard.lag}: from the slowest busy shard's effective tick to L, 0 when no shard is busy. */
         double lagSeconds() {
@@ -268,7 +278,8 @@ public final class Maintenance {
         var latest = ticks.latest(c);
         var positions = cursors.positions(c, latest.id());
         long slowest = Cursors.busyTick(positions, latest.id());
-        return new Read(latest, positions, slowest == latest.id() ? latest : ticks.get(c, slowest));
+        return new Read(latest, positions, slowest == latest.id() ? latest : ticks.get(c, slowest),
+                cursors.checkpointTick(c));
     }
 
     private boolean sessionStable(Connection c) throws SQLException {
@@ -342,8 +353,19 @@ public final class Maintenance {
             return null;
         });
         var read = step("cursor read", () -> read(c));
+        if (read != null && read.checkpointAhead()) {
+            stepFailed = true; // no success recorded: outbox.maintenance.since_success grows
+            if (due(checkpointLogged)) {
+                log.error("outbox checkpoint of {} is on tick {}, above the newest tick {}: tick ids went backwards"
+                        + " under it, as after restoring {} without {} (a partial restore). Every shard counts as"
+                        + " relayed up to the checkpoint's tick, so maintenance writes no checkpoint and drops no"
+                        + " partition or tick until it is fixed; once the cursors and ticks agree, delete it: delete"
+                        + " from {}; this ERROR repeats at most once a minute", names.base(), read.checkpointTick(),
+                        read.latest().id(), names.tick(), names.checkpoint(), names.checkpoint());
+            }
+        }
         // the drops and tick cleanup go by the effective ticks of this run's checkpoint: without it, none this run
-        var slowest = read == null ? null : step("checkpoint", () -> {
+        var slowest = read == null || read.checkpointAhead() ? null : step("checkpoint", () -> {
             cursors.checkpoint(c, read.latest().id(), read.positions());
             return read.slowest();
         });
@@ -434,7 +456,7 @@ public final class Maintenance {
     }
 
     private void refreshGauges(Connection c, @Nullable Read read) throws SQLException {
-        lag = read == null ? Double.NaN : read.lagSeconds();
+        lag = read == null || read.checkpointAhead() ? Double.NaN : read.lagSeconds();
         retrySize = retries.size(c);
         deadSize = retries.deadSize(c);
         try (var st = c.createStatement(); var rs = st.executeQuery(deadPending)) {

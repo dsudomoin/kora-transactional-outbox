@@ -173,6 +173,16 @@ group_lag() {
 
 psql_q() { docker exec -e PGOPTIONS='-c client_min_messages=warning' "$PG" psql -U outbox -d outbox -Atq -c "$1"; }
 
+# effective_ticks BASE: a derived table (shard, tick_id) of each shard's effective tick: its cursor's tick, or the
+# tick of maintenance's checkpoint when newer (Cursors; the README queries use the same SQL). Use it in a FROM clause.
+effective_ticks() {
+  echo "(select c.shard, case when length(k.busy) = count(*) over ()
+      then greatest(c.tick_id, case when get_bit(k.busy, c.shard) = 0 then k.tick_id else k.busy_tick_id end)
+      else c.tick_id end tick_id
+    from (select distinct on (shard) shard, tick_id from ${1}_cursor order by shard, seq desc) c
+    left join (select tick_id, busy, busy_tick_id from ${1}_checkpoint order by seq desc limit 1) k on true)"
+}
+
 # drop_outbox BASE: the outbox tables of one run (partitions go with the parent).
 drop_outbox() {
   psql_q "drop table if exists $1, ${1}_tick, ${1}_cursor, ${1}_checkpoint, ${1}_retry, ${1}_parked, ${1}_dead,

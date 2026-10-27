@@ -480,6 +480,38 @@ class MaintenanceIT {
     }
 
     @Test
+    void aCheckpointAboveTheNewestTickStopsTheCheckpointAndTheDrops() throws Exception {
+        bootstrap();
+        var registry = new SimpleMeterRegistry();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
+        long ahead;
+        try (var c = TestDb.connect()) { // as after restoring the tick table without the checkpoint
+            var ticks = new Ticks(names, config.shards());
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            ahead = ticks.latest(c).id() + 1000;
+            execute(c, "insert into " + names.checkpoint() + " (tick_id, busy, busy_tick_id) values (" + ahead
+                    + ", B'0000', " + ahead + ")");
+        }
+        var ticksBefore = tickIds();
+        String succeeded = lastSuccess();
+
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(maintenance.runOnce()).isTrue();
+
+            assertThat(err.text()).contains("ERROR").contains("above the newest tick");
+            assertThat(err.text().split("above the newest tick", -1)).as("logged once a minute").hasSize(2);
+        }
+        assertThat(tickIds()).as("no tick cleanup").isEqualTo(ticksBefore);
+        assertThat(lastSuccess()).as("no success recorded").isEqualTo(succeeded);
+        assertThat(gauge(registry, "outbox.shard.lag")).isNaN();
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select string_agg(tick_id::text, ',') from " + names.checkpoint()))
+                    .as("left as it is").isEqualTo(Long.toString(ahead));
+        }
+    }
+
+    @Test
     void lagIsZeroWhenIdle() throws Exception {
         bootstrap();
         var registry = new SimpleMeterRegistry();
@@ -1305,7 +1337,8 @@ class MaintenanceIT {
 
     private List<Cursor> latestCursors() throws SQLException {
         try (var c = TestDb.connect()) {
-            return new Cursors(names, config.shards()).latestAll(c);
+            return new Cursors(names, config.shards()).positions(c, Long.MAX_VALUE).stream()
+                    .map(Cursors.Position::cursor).toList();
         }
     }
 

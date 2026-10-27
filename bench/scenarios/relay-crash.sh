@@ -40,8 +40,8 @@ ready=$(now)
 load "$RATE" "$WRITERS"
 relay="" e2e=""
 while [ "$(now)" -lt $((launched + 600)) ] && { [ -z "$relay" ] || [ -z "$e2e" ]; }; do
-  if [ -z "$relay" ] && [ "$(psql_q "select coalesce(bool_and(c.tick_id >= t.id), false)
-      from (select distinct on (shard) tick_id from ${table}_cursor order by shard, seq desc) c,
+  if [ -z "$relay" ] && [ "$(psql_q "select coalesce(bool_and(e.tick_id >= t.id), false)
+      from $(effective_ticks "$table") e,
       (select min(id) as id from ${table}_tick where id > $last_tick) t")" = t ]; then
     relay=$(($(now) - launched))
   fi
