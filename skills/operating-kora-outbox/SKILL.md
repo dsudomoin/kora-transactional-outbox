@@ -29,6 +29,7 @@ against the library's tables**; run only SQL the README prints, on a staging cop
 | `outbox.dead.size` grows, `outbox.dead.pending` does not (kept letters) | «Dead letters» |
 | `outbox.partitions.orphaned` or `outbox.inbox.partitions.orphaned` > 0 | «Осиротевшие партиции» |
 | `outbox.partitions.overflow` = 1 past one extension cycle, `outbox.partitions.premade` < 2 | «Переполнение хвоста (tail overflow)» |
+| ERROR «outbox partition tail swap of ... timed out waiting for writers» | «Партиции», «Транзакции, которые держат outbox после `send`» |
 | `outbox.parked.size` not back to its level | «Алерты» |
 
 Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dashboards/outbox.json`.
@@ -54,5 +55,6 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
   `partitionInterval` on all instances at once.
 - **Rollback to the previous release** (5fc60dd): «Rolling-деплои», item «Обновление с предыдущего релиза (5fc60dd),
   смешанный парк и откат». The old release writes dead letters `kept`: list the window's kept letters afterwards.
+  Once no new instance runs, drop the hot tail's bound check the README gives (`<table>_tail_bounded`).
 - «Репликация, failover и PITR»: async failover can deliver events whose data is gone; PITR redelivers.
 - `relay.retry.maxAttempts = 0` (default): a key stuck on a broken target shows only as lag.
