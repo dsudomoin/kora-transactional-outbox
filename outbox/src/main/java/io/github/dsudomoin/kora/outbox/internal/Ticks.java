@@ -102,10 +102,15 @@ public final class Ticks {
      * The estimated cost of the probe's branch 2 above which a tick skips both branches and marks every shard: a range
      * probe per shard and cluster ({@link #PROBE_MICROS}) plus, inside the clusters' ranges, the estimated rows of
      * transactions committed before P ({@link #ROW_MICROS} each, at the rows per xid of {@link #SPLIT_ROWS}); with
-     * those rows per xid unknown, no estimate and no cap. The cost moves to the relays, which then step every shard
-     * once, in parallel and outside the tick lock; such ranges need a heavy load, under which branch 1 marks nearly
-     * every shard anyway. At 1024 shards a probe estimated just below the budget took about 5 ms (on a scratch
-     * Postgres 16, rows too fresh to be all-visible), a capped one 0.3 – 0.5 ms ({@code TickCostBenchmark}).
+     * those rows per xid unknown, no estimate and no cap. Many clusters trip it too, with no such rows at all. The
+     * cost moves to the relays rather than going away: with every shard marked, each shard's step reads its batch
+     * through {@link BatchReader}, whose second branch looks up every xid of E ({@code xid = any(...)}), so about
+     * shards × |E| index descents in all, roughly the work of the per-xid probe the clusters replaced (about 266 ms at
+     * 1024 shards and 400 ended xids), read-only, outside the tick lock and spread over the relay workers. The rows
+     * inside the ranges are not read: for a shard at P they are no candidates of the batch (P, C], being visible in P.
+     * That the heavy load such ranges need has branch 1 mark nearly every shard anyway is an expectation, not a
+     * measurement. At 1024 shards a probe estimated just below the budget took about 5 ms (on a scratch Postgres 16,
+     * rows too fresh to be all-visible), a capped one 0.3 – 0.5 ms ({@code TickCostBenchmark}).
      */
     static final int PROBE_BUDGET_MICROS = 4000;
 
@@ -190,7 +195,10 @@ public final class Ticks {
                     // for each xid inside a range that is not in E; one aggregate, as each costs even when E is empty
                     + " coalesce(sum(case when rho is null then null when first then " + PROBE_MICROS * shards
                     + " else " + ROW_MICROS + " * rho * (n - b - 1) end) > " + PROBE_BUDGET_MICROS + ", false) capped"
-                    // a cluster starts after a gap wider than SPLIT_ROWS allows, and ends before one
+                    // a cluster starts after a gap wider than SPLIT_ROWS allows, and ends before one. The two bounds
+                    // must stay the same expression: unnest(lo, hi) pairs the k-th start with the k-th end, and the
+                    // proof (every xid of E inside its cluster's range) needs each gap to end one cluster exactly
+                    // where it starts the next
                     + " from (select xid, i, n, b, rho, n - b > least(" + CLUSTER_GAP + ", 1 + "
                     + (long) shards * SPLIT_ROWS + " / nullif(rho, 0)) is not false first,"
                     + " a - n > least(" + CLUSTER_GAP + ", 1 + " + (long) shards * SPLIT_ROWS
