@@ -590,6 +590,35 @@ class MaintenanceIT {
     }
 
     @Test
+    void anObsoleteCheckpointIsReplacedWithoutAnAlarm() throws Exception {
+        bootstrap(); // 4 shards, every cursor on the bootstrap tick
+        var maintenance = maintenance();
+        long checkpointed = makeTick();
+        assertThat(maintenance.runOnce()).isTrue(); // the checkpoint on it
+        long ahead = makeTick();
+        try (var c = TestDb.connect()) { // every shard steps past it, then the previous release's cleanup in a mixed
+            // fleet deletes below the lowest cursor tick, the checkpoint's among them
+            var cursors = new Cursors(names, config.shards());
+            for (int shard = 0; shard < config.shards(); shard++) {
+                cursors.append(c, cursors.latest(c, shard).cursor().withProgress(ahead, null, 0));
+            }
+            execute(c, "delete from " + names.tick() + " where id < " + ahead);
+        }
+        long latest = makeTick();
+
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+
+            assertThat(err.text()).doesNotContain("ERROR").doesNotContain("another history");
+        }
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select string_agg(tick_id::text, ',') from " + names.checkpoint()))
+                    .as("replaced by the run's").isEqualTo(Long.toString(latest));
+        }
+        assertThat(checkpointed).isLessThan(ahead);
+    }
+
+    @Test
     void aClockSteppedBackAfterATickDoesNotVoidTheCheckpointOnIt() throws Exception {
         bootstrap(); // 4 shards, every cursor on the bootstrap tick
         var handler = new RecordingHandler();

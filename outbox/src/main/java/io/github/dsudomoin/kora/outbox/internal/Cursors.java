@@ -31,7 +31,9 @@ import java.util.concurrent.TimeUnit;
  * {@code created_at} on the database clock, the checkpoint's never below its tick's, so a clock stepped back between
  * the two cannot make it look older): one whose tick is gone, or newer than itself, belongs to another history
  * (tick ids went backwards under it, as in a partial restore, and new ticks may since have passed its id) and counts for
- * nothing, and the next maintenance run replaces it.
+ * nothing, and the next maintenance run replaces it (with an ERROR, unless its tick is gone and every latest cursor row
+ * is at or above it: then it is only obsolete, as the previous release's cleanup leaves it, see
+ * {@link #ignoredCheckpointTick}).
  * Every step starts from it, and tick cleanup, the partition drop horizon and {@code outbox.shard.lag} go by it.
  * Writing E for a shard's effective tick, every committed row of the shard visible in E is visible in its cursor's
  * tick, so relayed (a batch in progress: up to {@code lastId}, rows past it lie above E). By induction over the
@@ -300,14 +302,21 @@ public final class Cursors {
     }
 
     /**
-     * The newest checkpoint's tick when that checkpoint counts for nothing as from another history (its tick gone or
-     * made after it, see {@link #newestCheckpoint}); null when it counts, or there is none.
+     * The newest checkpoint's tick when that checkpoint counts for nothing as from another history (see
+     * {@link #newestCheckpoint}): a tick at its id made after it, or its tick gone while a shard's latest cursor row is
+     * below it. Null when it counts, when there is none, and when it is merely obsolete: its tick gone with every latest
+     * cursor row at or above it, as the previous release's cleanup leaves it in a mixed fleet (it deletes below the
+     * lowest cursor tick). An obsolete one counts for nothing too, harmlessly, as the cursors are past it, and the run
+     * replaces it.
      */
     @Nullable
     public Long ignoredCheckpointTick(Connection c) throws SQLException {
         try (var st = c.createStatement(); var rs = st.executeQuery("select n.tick_id from (select tick_id, created_at"
                 + " from " + names.checkpoint() + " order by seq desc limit 1) n where not exists (select 1 from "
-                + names.tick() + " v where v.id = n.tick_id and v.created_at <= n.created_at)")) {
+                + names.tick() + " v where v.id = n.tick_id and v.created_at <= n.created_at) and (exists (select 1"
+                + " from " + names.tick() + " v where v.id = n.tick_id) or exists (select 1 from generate_series(0, "
+                + shards + " - 1) s cross join lateral (select tick_id from " + names.cursor() + " where shard = s"
+                + " order by seq desc limit 1) l where l.tick_id < n.tick_id))")) {
             return rs.next() ? rs.getLong(1) : null;
         }
     }

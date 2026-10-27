@@ -42,7 +42,8 @@ import ru.tinkoff.kora.database.jdbc.RuntimeSqlException;
  * the latest tick and the shards busy at it, by which a shard without new rows moves on without a cursor row; the
  * drops and the tick cleanup go by its effective ticks, and a run that fails to write it does neither; a checkpoint
  * whose tick is gone or was made after it, as tick ids going backwards in a partial restore leave it, counts for
- * nothing and is replaced, with an ERROR at most once a minute), the cursor anchors and due repairs
+ * nothing and is replaced, with an ERROR at most once a minute; one whose tick is gone with every latest cursor row
+ * at or above it is only obsolete, as the previous release's cleanup leaves it, and is replaced silently), the cursor anchors and due repairs
  * ({@link Cursors#anchors}: a cursor row at its effective tick for each shard idle at that checkpoint whose latest row
  * lies below it and is older than {@code outbox.relay.cursorAnchorInterval}, and one for each shard whose latest row
  * misses a due its {@code <retry>} or {@code <parked>} rows need; in one transaction under the shards' locks), drop of

@@ -332,6 +332,31 @@ class CursorsIT {
     }
 
     @Test
+    void aCheckpointWhoseTickIsGoneIsObsoleteOnlyWhenEveryCursorIsPastIt() throws Exception {
+        var names = bootstrap(); // 4 shards, every cursor on the bootstrap tick
+        var cursors = new Cursors(names, config.shards());
+        try (var c = TestDb.connect()) {
+            long b = queryLong(c, "select max(id) from " + names.tick());
+            long t1 = tick(c, names, "B''", 10);
+            cursors.checkpoint(c, t1, cursors.positions(c, t1));
+            long t2 = tick(c, names, "B'1111'", 20);
+            for (int shard = 0; shard < 3; shard++) {
+                cursors.append(c, cursors.latest(c, shard).cursor().withProgress(t2, null, 0));
+            }
+            // shard 3's latest row is still on b, below t1: the previous release cleans up to b only, so t1 is gone
+            // only by hand or from another history
+            execute(c, "delete from " + names.tick() + " where id = " + t1);
+            assertThat(cursors.ignoredCheckpointTick(c)).as("a cursor below its tick: foreign").isEqualTo(t1);
+
+            cursors.append(c, cursors.latest(c, 3).cursor().withProgress(t1, null, 0)); // at its tick: past it too
+            assertThat(cursors.ignoredCheckpointTick(c)).as("every cursor at or above its tick: obsolete").isNull();
+            assertThat(cursors.positions(c, t2)).as("still ignored by the reads: the cursors' own ticks")
+                    .extracting(Cursors.Position::effectiveTickId).containsExactly(t2, t2, t2, t1);
+            assertThat(b).isLessThan(t1);
+        }
+    }
+
+    @Test
     void theTickAfterAGapInTickIdsCountsAsEveryShard() throws Exception {
         var names = bootstrap();
         var cursors = new Cursors(names, config.shards());
