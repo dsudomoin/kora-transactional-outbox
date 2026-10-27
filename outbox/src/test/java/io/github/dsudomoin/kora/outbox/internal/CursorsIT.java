@@ -125,10 +125,10 @@ class CursorsIT {
             assertThat(behind(cursors.positions(c, 4, first))).as("on the latest tick")
                     .containsExactly(false, false, false, false);
 
-            long t1 = tick(c, names, "'{1}'", 10);
-            long t2 = tick(c, names, "'{}'", 20);
+            long t1 = tick(c, names, "B'0100'", 10);
+            long t2 = tick(c, names, "B'0000'", 20);
             assertThat(behind(cursors.positions(c, 4, t2))).containsExactly(false, true, false, false);
-            long t3 = tick(c, names, "'{2,3}'", 30);
+            long t3 = tick(c, names, "B'0011'", 30);
             assertThat(behind(cursors.positions(c, 4, t3))).containsExactly(false, true, true, true);
             assertThat(behind(cursors.positions(c, 4, t1))).as("ticks above the latest passed in do not count")
                     .containsExactly(false, true, false, false);
@@ -146,6 +146,11 @@ class CursorsIT {
 
             long t4 = tick(c, names, "null", 40); // an older instance's tick: any shard may have rows
             assertThat(behind(cursors.positions(c, 4, t4))).containsExactly(true, true, true, true);
+            for (int s = 0; s < 4; s++) {
+                cursors.append(c, cursors.latest(c, s).withProgress(t4, null, 0));
+            }
+            long t5 = tick(c, names, "B'01'", 50); // drawn from another shard count: any shard may have rows
+            assertThat(behind(cursors.positions(c, 4, t5))).containsExactly(true, true, true, true);
         }
     }
 
@@ -154,10 +159,10 @@ class CursorsIT {
         var names = bootstrap();
         var cursors = new Cursors(names);
         try (var c = TestDb.connect()) {
-            assertThat(behind(cursors.positions(c, 4, tick(c, names, "'{}'", 4_999)))).containsOnly(false);
-            assertThat(behind(cursors.positions(c, 4, tick(c, names, "'{}'", 5_000)))).as("idle append due")
+            assertThat(behind(cursors.positions(c, 4, tick(c, names, "B'0000'", 4_999)))).containsOnly(false);
+            assertThat(behind(cursors.positions(c, 4, tick(c, names, "B'0000'", 5_000)))).as("idle append due")
                     .containsOnly(true);
-            assertThat(behind(cursors.positions(c, 4, tick(c, names, "'{}'", -1)))).as("the clock stepped back")
+            assertThat(behind(cursors.positions(c, 4, tick(c, names, "B'0000'", -1)))).as("the clock stepped back")
                     .containsOnly(true);
         }
     }
@@ -167,7 +172,7 @@ class CursorsIT {
         var names = bootstrap();
         var cursors = new Cursors(names);
         try (var c = TestDb.connect()) {
-            long latest = tick(c, names, "'{}'", 10);
+            long latest = tick(c, names, "B'0000'", 10);
             execute(c, "delete from " + names.tick() + " where id < " + latest);
 
             assertThat(behind(cursors.positions(c, 4, latest))).containsOnly(true);
@@ -175,12 +180,12 @@ class CursorsIT {
     }
 
     /**
-     * A tick with {@code shards} (SQL), made {@code millis} after the bootstrap tick by the database clock; returns its
+     * A tick with {@code dirty} (SQL), made {@code millis} after the bootstrap tick by the database clock; returns its
      * id.
      */
-    private static long tick(Connection c, TableNames names, String shards, long millis) throws Exception {
-        return queryLong(c, "insert into " + names.tick() + " (snapshot, max_id, shards, created_at)"
-                + " select pg_current_snapshot(), 0, " + shards + "::smallint[], min(created_at) + interval '"
+    private static long tick(Connection c, TableNames names, String dirty, long millis) throws Exception {
+        return queryLong(c, "insert into " + names.tick() + " (snapshot, max_id, dirty, created_at)"
+                + " select pg_current_snapshot(), 0, " + dirty + "::varbit, min(created_at) + interval '"
                 + millis + " milliseconds' from " + names.tick() + " returning id");
     }
 

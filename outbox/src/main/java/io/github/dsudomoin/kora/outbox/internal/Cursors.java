@@ -61,9 +61,9 @@ public final class Cursors {
 
     /**
      * A shard's latest cursor; {@code behind}: its tick is below the latest tick and a step has to move it up, as a
-     * tick in between has the shard in its {@code shards} or none (null), or its tick is
-     * {@link ShardProcessor#IDLE_APPEND_AFTER} or more older than the latest (or newer: the database clock stepped
-     * back), so an idle step appends, or its tick is gone.
+     * tick in between has the shard's bit set in its {@code dirty} or none (null, or drawn from another shard count:
+     * every shard), or its tick is {@link ShardProcessor#IDLE_APPEND_AFTER} or more older than the latest (or newer:
+     * the database clock stepped back), so an idle step appends, or its tick is gone.
      */
     public record Position(Cursor cursor, boolean behind) {}
 
@@ -80,7 +80,8 @@ public final class Cursors {
         this.positions = "select c.*, c.tick_id < p.latest and case when l.created_at is null or t.created_at is null"
                 + " or l.created_at < t.created_at or l.created_at >= t.created_at + p.idle then true"
                 + " else exists (select 1 from " + names.tick() + " n where n.id > c.tick_id and n.id <= p.latest"
-                + " and (n.shards is null or c.shard = any(n.shards))) end"
+                + " and case when n.dirty is null or length(n.dirty) <> p.shards then true"
+                + " else get_bit(n.dirty, c.shard) = 1 end) end"
                 + " from (select ?::bigint latest, ? * interval '1 microsecond' idle, ?::int shards) p"
                 + " cross join generate_series(0, p.shards - 1) s cross join lateral (select " + COLUMNS + " from "
                 + names.cursor() + " where shard = s order by seq desc limit 1) c"

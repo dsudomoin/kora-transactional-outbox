@@ -98,14 +98,14 @@ class TickShardSetIT {
             // per tick C with a set and the tick P before it: the shards holding a row visible in C and not in P
             var batches = " from " + names.tick() + " t cross join lateral (select snapshot from " + names.tick()
                     + " p where p.id < t.id order by p.id desc limit 1) p cross join generate_series(0, " + (SHARDS - 1)
-                    + ") s where t.shards is not null and exists (select 1 from " + names.base() + " o"
+                    + ") s where t.dirty is not null and exists (select 1 from " + names.base() + " o"
                     + " where o.shard = s and o.xid >= pg_snapshot_xmin(p.snapshot)"
                     + " and o.xid < pg_snapshot_xmax(t.snapshot) and pg_visible_in_snapshot(o.xid, t.snapshot)"
                     + " and not pg_visible_in_snapshot(o.xid, p.snapshot))";
             long needed = queryLong(c, "select count(*)" + batches);
-            long missing = queryLong(c, "select count(*)" + batches + " and not s = any(t.shards)");
-            long recorded = queryLong(c, "select coalesce(sum(cardinality(shards)), 0) from " + names.tick());
-            long ticks = queryLong(c, "select count(*) from " + names.tick() + " where shards is not null");
+            long missing = queryLong(c, "select count(*)" + batches + " and get_bit(t.dirty, s) = 0");
+            long recorded = queryLong(c, "select coalesce(sum(bit_count(dirty)), 0) from " + names.tick());
+            long ticks = queryLong(c, "select count(*) from " + names.tick() + " where dirty is not null");
             long inFlight = queryLong(c, "select count(*) from " + names.tick()
                     + " where cardinality(array(select pg_snapshot_xip(snapshot))) > 0");
             System.out.printf("%d ticks with a shard set (%d taken with transactions in flight): (tick, shard) pairs"

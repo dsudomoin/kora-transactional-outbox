@@ -173,18 +173,25 @@ class OutboxSchemaIT {
     }
 
     @Test
-    void bootstrapAddsShardsToAnOlderTickTable() throws Exception {
+    void tickColumnIsMigrated() throws Exception {
         new OutboxSchema(db, config).init();
         var n = TableNames.of(config.table());
         try (var c = TestDb.connect()) {
-            execute(c, "alter table " + n.tick() + " drop column shards"); // a tick table of an older version
+            // a tick table of an older version, with a tick whose shard set says no shard gained rows
+            execute(c, "alter table " + n.tick() + " drop column dirty, add column shards smallint[]");
+            long old = queryLong(c, "insert into " + n.tick() + " (snapshot, max_id, shards)"
+                    + " select pg_current_snapshot(), 0, '{}' returning id");
 
             new OutboxSchema(db, config).init();
+            new OutboxSchema(db, config).init(); // and once more, on the migrated table
 
-            assertThat(queryString(c, "select count(*) || ':' || count(shards) from " + n.tick())).isEqualTo("1:0");
+            assertThat(OutboxSchema.columnExists(c, n.tick(), "shards")).as("old column dropped").isFalse();
+            assertThat(queryString(c, "select count(*) || ':' || count(dirty) from " + n.tick())).isEqualTo("2:0");
+            assertThat(new Cursors(n).positions(c, config.shards(), old)).as("old ticks count as all shards")
+                    .extracting(Cursors.Position::behind).containsOnly(true).hasSize(config.shards());
             assertThat(new Ticks(n, config.shards()).make(c, Duration.ZERO)).isTrue();
-            assertThat(queryString(c, "select shards::text from " + n.tick() + " order by id desc limit 1"))
-                    .isEqualTo("{}");
+            assertThat(queryString(c, "select dirty::text from " + n.tick() + " order by id desc limit 1"))
+                    .isEqualTo("0".repeat(config.shards()));
         }
     }
 

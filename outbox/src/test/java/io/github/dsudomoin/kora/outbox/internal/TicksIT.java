@@ -14,7 +14,6 @@ import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -22,6 +21,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -279,6 +279,51 @@ class TicksIT {
     }
 
     @Test
+    void dirtySetIsABitmap() throws Exception {
+        var sixteen = new Ticks(names, 16);
+        try (var c = TestDb.connect()) {
+            assertThat(sixteen.make(c, Duration.ZERO)).isTrue();
+            insertRow(c, 3);
+            insertRow(c, 7);
+
+            assertThat(sixteen.make(c, Duration.ZERO)).isTrue();
+
+            assertThat(dirty(c)).as("bit s (leftmost 0) set for shard s").isEqualTo("0001000100000000");
+        }
+    }
+
+    @Test
+    void clusteredProbeFindsLongAndShortTransactions() throws Exception {
+        try (var longTx = TestDb.connect(); var first = TestDb.connect(); var last = TestDb.connect();
+                var c = TestDb.connect()) {
+            longTx.setAutoCommit(false);
+            insertRow(longTx, 1);
+            long longXid = xid(longTx);
+            execute(c, "do $$ begin for i in 1..100000 loop perform pg_current_xact_id(); commit; end loop; end $$");
+            first.setAutoCommit(false);
+            insertRow(first, 2);
+            insertRow(c, 4); // committed before P, between the two short ones: inside their cluster's range
+            last.setAutoCommit(false);
+            insertRow(last, 5);
+            xid(c); // a later xid completes: P's xmax passes the three
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue(); // P
+            long committed = queryLong(c, "select xid::text::bigint from " + names.base() + " where shard = 4");
+            assertThat(ticks.latest(c).snapshot().xip()).as("in flight at P")
+                    .contains(longXid, xid(first), xid(last)).doesNotContain(committed);
+            assertThat(xid(first)).as("a gap far above the cluster gap").isGreaterThan(longXid + 100_000);
+            assertThat(committed).isBetween(xid(first), xid(last));
+            assertThat(xid(last) - xid(first)).as("one cluster").isLessThanOrEqualTo(1024);
+            for (var tx : List.of(longTx, first, last)) {
+                tx.commit();
+            }
+
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue(); // C
+
+            assertThat(shards(c)).as("shard 4's row is visible in P").containsExactly(1, 2, 5);
+        }
+    }
+
+    @Test
     void aTransactionRunningAtThePreviousTickCountsInTheTickThatSeesItCommitted() throws Exception {
         try (var writer = TestDb.connect(); var c = TestDb.connect()) {
             writer.setAutoCommit(false);
@@ -451,15 +496,22 @@ class TicksIT {
                 + ", gen_random_uuid(), 't')");
     }
 
-    /** The newest tick's {@code shards}, null when it has none. */
+    /** The shards whose bit is set in the newest tick's {@code dirty}, null when it has none. */
     @Nullable
     private List<Integer> shards(Connection c) throws Exception {
-        try (var st = c.createStatement();
-                var rs = st.executeQuery("select shards from " + names.tick() + " order by id desc limit 1")) {
-            rs.next();
-            var array = rs.getArray(1);
-            return array == null ? null : Arrays.stream((Short[]) array.getArray()).map(Short::intValue).toList();
-        }
+        var dirty = dirty(c);
+        return dirty == null ? null
+                : IntStream.range(0, dirty.length()).filter(s -> dirty.charAt(s) == '1').boxed().toList();
+    }
+
+    /** The newest tick's {@code dirty} as text, leftmost bit shard 0. */
+    @Nullable
+    private String dirty(Connection c) throws Exception {
+        return queryString(c, "select dirty::text from " + names.tick() + " order by id desc limit 1");
+    }
+
+    private static long xid(Connection c) throws Exception {
+        return queryLong(c, "select pg_current_xact_id()::text::bigint");
     }
 
     private static void awaitLockWait(Connection observer, long pid) throws Exception {

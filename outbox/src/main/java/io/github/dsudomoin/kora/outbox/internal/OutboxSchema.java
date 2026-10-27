@@ -26,11 +26,12 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * populated table, fails startup with SQLState 57014 and is left to run by hand. The schema lock is retried for a
  * minute, then startup fails. On existing tables the bootstrap takes no lock that writers wait behind (index creation
  * is skipped when the index exists, partition extension is optional and left to maintenance when it times out). A tick
- * table made before {@code max_id} or {@code shards}, a cursor table made before {@code parked_due_at}, a retry table
- * made before {@code requeues} and a dead table made before the dead-letter hook's columns get each column once; that
- * ALTER waits for running relay transactions and fails startup on timeout. Ticks without {@code shards} (null) count as
- * holding rows of every shard; dead letters older than {@code status} are kept, the hook sees new ones only, and adding
- * its check scans the dead table once under the ALTER's lock.
+ * table made before {@code max_id} or {@code dirty}, a cursor table made before {@code parked_due_at}, a retry table
+ * made before {@code requeues} and a dead table made before the dead-letter hook's columns get each column once, and a
+ * tick table's {@code shards} (the shard sets {@code dirty} replaces) is dropped once; that ALTER waits for running
+ * relay transactions and fails startup on timeout. Ticks without {@code dirty} (null) count as holding rows of every
+ * shard; dead letters older than {@code status} are kept, the hook sees new ones only, and adding its check scans the
+ * dead table once under the ALTER's lock.
  */
 public final class OutboxSchema implements Lifecycle {
 
@@ -198,13 +199,14 @@ public final class OutboxSchema implements Lifecycle {
                       snapshot   pg_snapshot not null,
                       created_at timestamptz not null default clock_timestamp(),
                       max_id     bigint,
-                      shards     smallint[]
+                      dirty      bit varying
                     )""");
             if (!columnExists(c, n.tick(), "max_id")) { // a tick table made before max_id: a metadata-only change
                 st.execute("alter table " + n.tick() + " add column if not exists max_id bigint");
             }
-            if (!columnExists(c, n.tick(), "shards")) { // made before shards: likewise; its ticks stay null (all)
-                st.execute("alter table " + n.tick() + " add column if not exists shards smallint[]");
+            addColumn(c, n.tick(), "dirty", "bit varying"); // made before dirty: likewise; its ticks stay null (all)
+            if (columnExists(c, n.tick(), "shards")) { // the shard sets dirty replaces
+                st.execute("alter table " + n.tick() + " drop column if exists shards");
             }
             createIndex(c, n.tick() + "_xmax", n.tick() + " ((pg_snapshot_xmax(snapshot)))"); // Maintenance's xid check
             st.execute("create table if not exists " + n.cursor() + """

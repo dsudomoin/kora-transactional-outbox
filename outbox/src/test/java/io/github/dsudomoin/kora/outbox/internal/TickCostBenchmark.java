@@ -25,10 +25,10 @@ import ru.tinkoff.kora.database.jdbc.JdbcDatabase;
  * rows in 100 transactions over every shard. Per ended count E and round: E open transactions each take an xid (variant
  * {@code withRows}: and insert one row into a random shard), one later transaction ends (so P.xip lists the E), tick P
  * is made, the E commit, and tick C is timed twice: its probe alone, then the whole {@link Ticks#make}. The probe's
- * second branch looks up every xid of P.xip \ C.xip in each shard where the first found nothing. The probe alone is
- * the statement the tick runs, bound as it binds it, under the tick lock with the tick's settings, then rolled back:
- * read-only, so its time (one round trip included) does not depend on the WAL flush, unlike the whole make (about 7
- * round trips and a commit). Prints p50 and p99 of both per (shards, E, variant), after 10 untimed rounds.
+ * second branch scans each cluster of P.xip \ C.xip (here one) in each shard where the first found nothing. The probe
+ * alone is the statement the tick runs, bound as it binds it, under the tick lock with the tick's settings, then rolled
+ * back: read-only, so its time (one round trip included) does not depend on the WAL flush, unlike the whole make
+ * (about 7 round trips and a commit). Prints p50 and p99 of both per (shards, E, variant), after 10 untimed rounds.
  *
  * <p>Not part of the build: {@code ./gradlew :outbox:test -Pbenchmark --tests '*TickCostBenchmark'}. Properties:
  * {@code bench.jdbcUrl}, {@code bench.user}, {@code bench.password} (default: the test container), {@code bench.shards}

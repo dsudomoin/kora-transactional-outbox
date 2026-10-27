@@ -23,37 +23,44 @@ import org.slf4j.LoggerFactory;
  * {@code idle_in_transaction_session_timeout}, so Postgres terminates a frozen holder's session and frees the lock.
  * A tick also records the outbox id sequence's high-water mark, which sizes batches by data volume.
  *
- * <p>A tick C also records in {@code shards} the shards that gained rows since the newest tick P before it: a superset
- * of the shards whose batch (P, C] is not empty, so the relay steps only those (see {@link Cursors#positions}). Null
- * means every shard: the first tick, a tick made while the table held no tick, and ticks made before the column
- * existed or by an instance without it. Why no shard with rows in (P, C] is left out, from the facts the batch reader
- * relies on:
+ * <p>A tick C also records in {@code dirty} the shards that gained rows since the newest tick P before it, as a bitmap
+ * of {@code outbox.shards} bits (bit s, leftmost 0, set for shard s; 128 bytes at 1024 shards): a superset of the
+ * shards whose batch (P, C] is not empty, so the relay steps only those (see {@link Cursors#positions}). Null means
+ * every shard: the first tick, a tick made while the table held no tick, and ticks made before the column existed or
+ * by an instance without it. Why no shard with rows in (P, C] is left out, from the facts the batch reader relies on:
  * <ol>
  *   <li>A row the batch reader returns for (P, C] belongs to a committed transaction T visible in C and not in P (its
  *       {@code xid} column is T's top-level xid). Visible in C: {@code T < C.xmax} and T not in C.xip, so T had ended
  *       when C was taken. Not visible in P: {@code T >= P.xmax}, or T in P.xip. So T is in {@code [P.xmax, C.xmax)}
  *       and not in C.xip (branch 1), or in P.xip and not in C.xip (branch 2): exactly the two candidate sets of the
  *       batch query ({@link BatchReader}).</li>
+ *   <li>The probe scans both sets per shard. Branch 1 scans {@code [P.xmax, C.xmax)} less C.xip. Branch 2 scans, per
+ *       cluster of E = P.xip \ C.xip (its xids sorted, a new cluster where the gap to the previous xid exceeds
+ *       {@link #CLUSTER_GAP}), the range {@code [lo, hi]} from the cluster's first xid to its last, keeping the rows
+ *       not visible in P. Every xid of E lies in its cluster's range, so every row of E is scanned. And a row this
+ *       branch returns has its xid in {@code [lo, hi]}, within {@code [P.xmin, P.xmax)}, and not visible in P, so in
+ *       P.xip; the scan sees it, so it committed before C (next item): its xid is in E. So branch 2 finds the same
+ *       shards as a probe per xid of E would; the ranges add only rows of transactions committed before P, of at most
+ *       {@code CLUSTER_GAP - 1} xids per gap between consecutive xids of a cluster.</li>
  *   <li>The shard set is computed by the very statement that takes C (the probe, whose row the tick is then written
  *       from under the same lock): {@code pg_current_snapshot()} is that statement's snapshot, which is also the one
- *       its scans read with. T committed before C was taken, so the scans
- *       see T's rows, and every shard holding one of them gets into the set. Rows of rolled-back or still running
- *       transactions are invisible to the scans, so the set is in fact exact; a larger one would only cost an empty
- *       step.</li>
+ *       its scans read with. T committed before C was taken, so the scans see T's rows, and every shard holding one of
+ *       them gets its bit set. Rows of rolled-back or still running transactions are invisible to the scans, so the set
+ *       is in fact exact; a larger one would only cost an empty step.</li>
  *   <li>P is the newest tick the statement sees. The tick lock is held from before that statement to commit, and a
  *       tick's commit is visible before its lock is released, so P is the newest tick of all, and no tick can come
  *       between P and C later: ids grow in lock order ({@code CACHE 1}, checked at startup), and cleanup deletes only
  *       ticks below every cursor, while cursors only move up. So for a cursor on tick P0 the ticks above it chain, each
  *       made right after the one before it; visibility only grows from tick to tick, so the batch (P0, L] is the union
- *       of the batches between consecutive ticks up to L, and a shard with rows in it is in the set (or null) of one of
- *       those ticks.</li>
+ *       of the batches between consecutive ticks up to L, and a shard with rows in it has its bit set in (or a null
+ *       {@code dirty} on) one of those ticks.</li>
  * </ol>
  * A tick deleted by hand from above a cursor breaks the chain: the shards of its rows are then found only by the idle
  * append ({@link ShardProcessor#IDLE_APPEND_AFTER}), not lost.
  *
  * <p>The shard set is an optimisation, the tick is not: when the probing insert fails, the tick is made without it
- * ({@code shards} null, every shard), so a lock on any partition (an ALTER TABLE, VACUUM FULL or LOCK by hand, even on an
- * empty premade range) or an error in the probes costs the relay its shard filter, never its ticks.
+ * ({@code dirty} null, every shard), so a lock on any partition (an ALTER TABLE, VACUUM FULL or LOCK by hand, even on
+ * an empty premade range) or an error in the probes costs the relay its shard filter, never its ticks.
  */
 public final class Ticks {
 
@@ -67,6 +74,12 @@ public final class Ticks {
     private static final String LOCK_NOT_AVAILABLE = "55P03";
     private static final String SELECT = "select id, snapshot::text, created_at, max_id from ";
     private static final long WARN_INTERVAL = TimeUnit.MINUTES.toNanos(1);
+    /**
+     * The widest gap between consecutive ended xids that the probe's branch 2 scans as one range: wide enough that the
+     * transactions of a busy moment, xids drawn close together, make one cluster; a long transaction far below them
+     * makes its own.
+     */
+    static final int CLUSTER_GAP = 1024;
 
     private final TableNames names;
     private final int shards;
@@ -79,7 +92,7 @@ public final class Ticks {
     private final AtomicLong probeWarned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
     private final AtomicInteger probeUnwarned = new AtomicInteger();
 
-    /** {@code shards}: {@code outbox.shards}, the shards a tick's {@code shards} set is drawn from. */
+    /** {@code shards}: {@code outbox.shards}, the length of a tick's {@code dirty} bitmap. */
     public Ticks(TableNames names, int shards) {
         this.names = names;
         this.shards = shards;
@@ -105,32 +118,47 @@ public final class Ticks {
     }
 
     /**
-     * The tick probe: one row of the snapshot C (text), the id high-water mark and the shards with rows in (P, C] for
-     * the newest tick P (see the class comment), or no row while the newest tick is younger than the bound interval.
-     * It probes each shard's {@code (shard, xid)} index once for branch 1 and, only when that finds nothing, once per
-     * xid of P.xip \ C.xip for branch 2, each stopping at its first row (a lateral {@code union all ... limit 1}: an
+     * The tick probe: one row of the snapshot C (text), the id high-water mark and the {@code dirty} bitmap of (P, C]
+     * for the newest tick P (see the class comment), or no row while the newest tick is younger than the bound
+     * interval. It probes each shard's {@code (shard, xid)} index once for branch 1 and, only when that finds nothing,
+     * once per cluster of P.xip \ C.xip for branch 2 (a range scan, so the transactions that ended together cost a
+     * shard one probe, not one each), each stopping at its first row (a lateral {@code union all ... limit 1}: an
      * {@code exists} there may be planned as one hashed pass over every row of the range, which a busy tick makes
      * slow). Every {@code c.snapshot} is {@code pg_current_snapshot()}, stable, so the same snapshot in the whole
      * statement; as such it prunes the premade partitions above C.xmax when the executor starts (the redundant bound
-     * in branch 2 is there for that), and the probed xids prune the rest as the probes run.
+     * in branch 2 is there for that), and the probes' lower bounds (P.xmax, a cluster's first xid) prune the rest as
+     * the probes run.
      */
     String probe(Connection c) throws SQLException {
         var sql = probe;
         if (sql == null) {
             // a future created_at (the clock stepped back) counts as stale, so a wrong clock cannot stop ticks
             probe = sql = "select c.snapshot::text, " + maxIdQuery(c, names) + ", case when p.snapshot is not null then"
-                    + " coalesce((select array_agg(s::smallint order by s) from generate_series(0, ? - 1) s"
-                    + " cross join lateral ((select 1 from " + names.base() + " o where o.shard = s"
+                    // ordinality: the rows come in shard order, and the planner knows it, so the aggregate sorts
+                    // nothing
+                    + " (select string_agg(case when d.found is null then '0' else '1' end, '' order by g.i)::varbit"
+                    + " from generate_series(0, ? - 1) with ordinality g(s, i)"
+                    + " left join lateral ((select 1 found from " + names.base() + " o where o.shard = s"
                     + " and o.xid >= pg_snapshot_xmax(p.snapshot) and o.xid < pg_snapshot_xmax(c.snapshot)"
                     + " and o.xid <> all(x.running) limit 1)"
-                    + " union all (select 1 from unnest(x.ended) e(xid) cross join lateral (select 1 from "
-                    + names.base() + " o where o.shard = s and o.xid = e.xid"
-                    + " and o.xid < pg_snapshot_xmax(c.snapshot) limit 1) o limit 1) limit 1) d), '{}') end"
+                    + " union all (select 1 from unnest(x.lo, x.hi) k(lo, hi) cross join lateral (select 1 from "
+                    + names.base() + " o where o.shard = s and o.xid >= k.lo and o.xid <= k.hi"
+                    + " and o.xid < pg_snapshot_xmax(c.snapshot) and not pg_visible_in_snapshot(o.xid, p.snapshot)"
+                    + " limit 1) o limit 1) limit 1) d on true) end"
                     + " from (select pg_current_snapshot() snapshot) c"
                     + " left join lateral (select snapshot from " + names.tick() + " order by id desc limit 1) p"
                     + " on true"
+                    // the clusters of E = P.xip \ C.xip: lo[k] and hi[k] are the first and the last xid of cluster
+                    // k. E is the xids of P.xip visible in C (they are below P.xmax <= C.xmax), and P.xip lists them
+                    // ascending (pg_snapshot rejects any other order), so ordinality is xid order and nothing is sorted
                     + " cross join lateral (select array(select pg_snapshot_xip(c.snapshot)) running,"
-                    + " array(select pg_snapshot_xip(p.snapshot) except select pg_snapshot_xip(c.snapshot)) ended) x"
+                    + " array_agg(xid order by i) filter (where first) lo,"
+                    + " array_agg(xid order by i) filter (where last) hi"
+                    + " from (select xid, i, n - lag(n) over w > " + CLUSTER_GAP + " is not false first,"
+                    + " lead(n) over w - n > " + CLUSTER_GAP + " is not false last"
+                    + " from (select xid, i, xid::text::bigint n"
+                    + " from pg_snapshot_xip(p.snapshot) with ordinality e(xid, i)"
+                    + " where pg_visible_in_snapshot(xid, c.snapshot)) e window w as (order by i)) e) x"
                     + " where not exists (select 1 from (select created_at from " + names.tick()
                     + " order by id desc limit 1) t"
                     + " where t.created_at > clock_timestamp() - ? * interval '1 microsecond'"
@@ -206,7 +234,7 @@ public final class Ticks {
         boolean young = false;
         String snapshot = null;
         long maxId = 0;
-        String set = null;
+        String dirty = null;
         SQLException failed = null;
         try (var ps = c.prepareStatement(probe(c))) {
             ps.setInt(1, shards);
@@ -216,7 +244,7 @@ public final class Ticks {
                 if (!young) {
                     snapshot = rs.getString(1);
                     maxId = rs.getLong(2);
-                    set = rs.getString(3);
+                    dirty = rs.getString(3);
                 }
             }
         } catch (SQLException e) {
@@ -235,11 +263,11 @@ public final class Ticks {
             if (young) {
                 return false;
             }
-            try (var ps = c.prepareStatement("insert into " + names.tick() + " (snapshot, max_id, shards)"
-                    + " values (?::pg_snapshot, ?, ?::smallint[])")) {
+            try (var ps = c.prepareStatement("insert into " + names.tick() + " (snapshot, max_id, dirty)"
+                    + " values (?::pg_snapshot, ?, ?::varbit)")) {
                 ps.setString(1, snapshot);
                 ps.setLong(2, maxId);
-                ps.setString(3, set);
+                ps.setString(3, dirty);
                 ps.executeUpdate();
                 return true;
             }
