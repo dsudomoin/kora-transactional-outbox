@@ -125,6 +125,7 @@ final class DeadIndexBuilder {
                 return; // another instance builds it
             }
             boolean aborted = false;
+            Exception failure = null;
             try {
                 var valid = state(c);
                 if (Boolean.TRUE.equals(valid)) {
@@ -142,13 +143,21 @@ final class DeadIndexBuilder {
                     return;
                 }
             } catch (SQLException | RuntimeException e) {
+                failure = e;
                 if (isClosed()) { // its timeouts may still be set: the pool evicts it instead of reusing it
                     aborted = abort(c, e);
                 }
                 throw e;
             } finally {
                 if (!aborted) { // an aborted session took its lock with it
-                    advisory(c, "pg_advisory_unlock");
+                    try {
+                        advisory(c, "pg_advisory_unlock");
+                    } catch (SQLException e) { // the session died, and its lock with it: keep the cause on top
+                        if (failure == null) {
+                            throw e;
+                        }
+                        failure.addSuppressed(e);
+                    }
                 }
             }
             failures = 0;

@@ -1595,6 +1595,25 @@ class MaintenanceIT {
         }
     }
 
+    /** The unlock on the dead session fails too: the WARN names the build's cause, not the closed connection. */
+    @Test
+    void aTerminatedDeadDueIndexBuildNamesItsCause() throws Exception {
+        config.maintenanceInterval(Duration.ofMinutes(10));
+        bootstrap();
+        var maintenance = maintenance();
+        deadTableWithoutIndex(1);
+        try (var c = TestDb.connect(); var holder = openDeadInsert(2); var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+            await(Duration.ofSeconds(10), () -> queryLong(c, BUILD_WAITING) == 1);
+            execute(c, "select pg_terminate_backend(pid) from pg_stat_activity where query like 'create index"
+                    + " concurrently%'");
+            awaitBuildEnd(maintenance);
+            assertThat(err.text()).contains("could not build " + deadDue()).contains("(57P01: ")
+                    .doesNotContain("08003");
+            holder.rollback();
+        }
+    }
+
     @Test
     void onlyOneInstanceBuildsTheDeadDueIndex() throws Exception {
         bootstrap();
