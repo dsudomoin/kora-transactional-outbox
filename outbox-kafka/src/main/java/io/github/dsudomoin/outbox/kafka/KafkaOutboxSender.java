@@ -143,6 +143,8 @@ public final class KafkaOutboxSender implements AutoCloseable {
 
     /** Validates {@code user} and returns the producer configuration (fails at startup, not on the first send). */
     static ProducerConfig producerConfig(Properties user) {
+        // before kafka-clients 4, which has no default for it, rejects it as a ConfigException
+        require(user.get(BOOTSTRAP_SERVERS_CONFIG) != null, BOOTSTRAP_SERVERS_CONFIG + " is required");
         require(!user.containsKey(TRANSACTIONAL_ID_CONFIG), TRANSACTIONAL_ID_CONFIG + " is not supported");
         require(!user.containsKey(PARTITIONER_CLASS_CONFIG),
                 PARTITIONER_CLASS_CONFIG + " is not supported: ordering and the cooldown need Kafka's key hashing");
