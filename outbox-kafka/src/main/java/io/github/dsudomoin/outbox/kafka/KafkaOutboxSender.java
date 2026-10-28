@@ -25,8 +25,8 @@ import jakarta.annotation.Nullable;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -37,6 +37,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Function;
@@ -82,14 +83,18 @@ import org.slf4j.LoggerFactory;
  * cooldowns. Unkeyed records are left to Kafka's partitioner unless a partition of their topic cools; then the sender
  * picks one partition per call among those with a leader that do not cool.
  *
- * <p>The records of a call still unacknowledged when one of its producer batches expires ({@link TimeoutException} from
- * Kafka's I/O thread) are remembered by message id, the last 10 000, until delivered or until a restart; a call sends
- * each of them alone: it hands it over once every record it handed before has completed, and the next one once it has
- * completed. Thus a record the broker refuses becomes {@code Permanent} even when it shared a producer batch: Kafka
- * splits a batch the broker refuses as too large, and kafka-clients before 4.2 splits it by {@code batch.size}, which
- * rebuilds a batch that fits {@code batch.size} as it was, until {@code delivery.timeout.ms} expires all its records;
- * alone, the refused record fails with {@link RecordTooLargeException}. Its refusal closes nothing, as nothing is in
- * flight with it, so the call goes on. Other records are batched as before.
+ * <p>The records of a call still unacknowledged when a producer batch of their partition expires
+ * ({@link TimeoutException} from Kafka's I/O thread), and those whose partition Kafka chose, are remembered by message
+ * id: at most 10 000, each until a call that sends it alone settles it (delivered or refused) or for 10 minutes. While
+ * any is remembered, a call sends each of them alone in its producer batch, which holds one partition: it hands one
+ * over once no record of its partition is in flight and holds back the later records of its partition until it
+ * completes, while other partitions go on; such a call also picks the partition of unkeyed records itself, one per
+ * topic. Thus a record the broker refuses becomes {@code Permanent} even when it shared a producer batch: Kafka splits
+ * a batch the broker refuses as too large, and kafka-clients before 4.2 splits it by {@code batch.size}, which rebuilds
+ * a batch that fits {@code batch.size} as it was, until {@code delivery.timeout.ms} expires all its records; alone, the
+ * refused record fails with {@link RecordTooLargeException}. A failure of a record sent alone closes nothing, as
+ * nothing of its partition is in flight with it: after a refusal the call goes on, after any other failure it skips the
+ * rest of that partition. With none remembered, a call batches as before and looks nothing up.
  *
  * <p>Producer properties are {@code driverProperties} with byte-array serializers, {@code enable.idempotence=true} and
  * {@code acks=all} forced; {@code max.block.ms} defaults to 5000, {@code enable.metrics.push} to false,
@@ -110,6 +115,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
     private static final Duration WAIT_SLACK = Duration.ofSeconds(5);
     private static final Duration RELEASE_TIMEOUT = Duration.ofSeconds(5);
     private static final int EXPIRED_REMEMBERED = 10_000;
+    private static final Duration REMEMBERED_FOR = Duration.ofMinutes(10);
     private static final Logger log = LoggerFactory.getLogger(KafkaOutboxSender.class);
 
     private final Supplier<Producer<byte[], byte[]>> factory;
@@ -119,14 +125,9 @@ public final class KafkaOutboxSender implements AutoCloseable {
     private final Deque<Pooled> pool = new ConcurrentLinkedDeque<>();
     private final Cooldown<TopicPartition> cooldown;
     private final Cooldown<String> topicCooldown;
-    /** Message ids of records unacknowledged when a batch of their call expired, oldest first: each is sent alone. */
-    private final Set<UUID> expired = Collections.newSetFromMap(Collections.synchronizedMap(
-            new LinkedHashMap<UUID, Boolean>() {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<UUID, Boolean> eldest) {
-                    return size() > EXPIRED_REMEMBERED;
-                }
-            }));
+    /** The records sent alone (see the class javadoc), by message id: when each was remembered. */
+    private final Map<UUID, Instant> expired = new ConcurrentHashMap<>();
+    private volatile Instant nextPurge = Instant.MIN;
     private volatile boolean released;
 
     public KafkaOutboxSender(KafkaOutboxConfig config) {
@@ -228,13 +229,13 @@ public final class KafkaOutboxSender implements AutoCloseable {
         if (pooled == null) {
             pooled = new Pooled(factory.get());
         }
-        var call = new Call(pooled.producer, records.size());
+        var call = new Call(pooled.producer, records.size(), anyRemembered());
         try {
-            var partitions = sendAll(call, records, deadline, pooled);
-            if (!call.await(0, deadline)) {
+            sendAll(call, records, deadline, pooled);
+            if (!call.await(deadline)) {
                 call.close(Thread.currentThread().isInterrupted() ? "interrupted" : "not acknowledged within " + wait);
             }
-            return new Sent(outcomes(call, records, partitions), call.closedByRefusal());
+            return new Sent(outcomes(call, records), call.closedByRefusal());
         } catch (RuntimeException | Error e) {
             call.close("aborted by " + e); // unknown state: never reuse the producer
             throw e;
@@ -243,6 +244,23 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 giveBack(pooled);
             }
         }
+    }
+
+    /**
+     * Whether a record is remembered to be sent alone, once those remembered for {@link #REMEMBERED_FOR} are dropped
+     * (a look at most once a second); one look at an empty map while none is.
+     */
+    private boolean anyRemembered() {
+        if (expired.isEmpty()) {
+            return false;
+        }
+        var now = clock.instant();
+        if (!now.isBefore(nextPurge)) {
+            nextPurge = now.plusSeconds(1);
+            var oldest = now.minus(REMEMBERED_FOR);
+            expired.values().removeIf(at -> !at.isAfter(oldest));
+        }
+        return !expired.isEmpty();
     }
 
     private void giveBack(Pooled pooled) {
@@ -267,16 +285,17 @@ public final class KafkaOutboxSender implements AutoCloseable {
         }
     }
 
-    /** Steps 1–3; returns the partition of each record the sender chose or computed (null: Kafka chooses). */
-    private TopicPartition[] sendAll(Call call, List<OutboxRecord> records, long deadline, Pooled pooled) {
-        var partitions = new TopicPartition[records.size()];
+    /** Steps 1–3; notes in {@code call} the partition of each record the sender chose or computed (null: Kafka's). */
+    private void sendAll(Call call, List<OutboxRecord> records, long deadline, Pooled pooled) {
+        var partitions = call.partitions;
         var partitionInfos = new HashMap<String, List<PartitionInfo>>();
         var unkeyed = new HashMap<String, Optional<TopicPartition>>(); // per topic, sticky for the call
         // decided once per topic and partition: another worker's success must not unblock a key whose earlier record
         // we skipped
         var coolingUntil = new HashMap<Object, Optional<Instant>>();
         var refused = new HashSet<Object>(); // topics and (topic, key)s whose record Kafka refused before appending it
-        boolean anyExpired = !expired.isEmpty(); // one look per call while none expired
+        // per partition, in order, the records held back behind one sent alone
+        var held = new LinkedHashMap<TopicPartition, ArrayDeque<Integer>>();
         // the rest stays unsent (NotAttempted); an interrupt closes the producer only if records are in flight
         for (int i = 0; i < records.size() && !call.closed && !Thread.currentThread().isInterrupted()
                 && System.nanoTime() < deadline; i++) {
@@ -323,7 +342,8 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 var topicPartitions = infos;
                 var partition = record.key() != null
                         ? new TopicPartition(topic, BuiltInPartitioner.partitionForKey(record.key(), infos.size()))
-                        : unkeyed.computeIfAbsent(topic, t -> unkeyedPartition(topic, topicPartitions, coolingUntil))
+                        : unkeyed.computeIfAbsent(topic,
+                                t -> unkeyedPartition(topic, topicPartitions, coolingUntil, call.isolating()))
                                 .orElse(null);
                 if (partition != null) {
                     partitions[i] = partition;
@@ -334,36 +354,93 @@ public final class KafkaOutboxSender implements AutoCloseable {
                         continue;
                     }
                 }
-                var explicit = record.key() == null && partition != null ? partition.partition() : null;
-                boolean alone = anyExpired && expired.contains(record.messageId());
-                if (alone && !call.awaitAlone(i, deadline)) { // no record handed before it shares its batch
-                    call.complete(i, Outcome.notAttempted(), false); // the loop ends: deadline, interrupt or close
-                    continue;
+                if (call.isolating() && partition != null) {
+                    var queue = held.get(partition);
+                    var lane = queue != null ? Lane.HOLD
+                            : call.admit(i, partition, expired.containsKey(record.messageId()));
+                    if (lane == Lane.HOLD) {
+                        held.computeIfAbsent(partition, p -> new ArrayDeque<>()).add(i);
+                        continue;
+                    }
+                    if (lane == Lane.SKIP) {
+                        call.complete(i, Outcome.notAttempted(), false);
+                        continue;
+                    }
                 }
-                call.producer.send(producerRecord(record, explicit), call.callback(i));
-                if (call.refused != null) {
-                    refuse(call, i, record, call.refused, false, coolingUntil, refused);
-                    call.refused = null;
-                }
-                if (alone) {
-                    call.await(0, deadline); // nor one handed after it; on the deadline or an interrupt the loop ends
-                }
+                hand(call, i, record, partition, coolingUntil, refused);
             } catch (InterruptException e) { // waiting for metadata or buffer space: the record joined no batch
                 call.complete(i, Outcome.notAttempted(), false);
             } catch (RuntimeException e) {
                 call.failed(i, e, null);
             }
         }
-        return partitions;
+        if (!held.isEmpty()) {
+            handHeld(call, records, held, deadline, coolingUntil, refused);
+        }
     }
 
     /**
-     * I1: empty while no partition of {@code topic} has a cooldown entry, so Kafka's partitioner picks one; otherwise
-     * a random partition with a leader that does not cool, or, when all of them cool, the one cooling least long.
+     * Hands over the records held back, in order per partition, as their partitions free up ({@link Call#admit}),
+     * waiting for completions meanwhile. Those still held at the deadline, an interrupt or a close are not attempted.
+     */
+    private void handHeld(Call call, List<OutboxRecord> records, Map<TopicPartition, ArrayDeque<Integer>> held,
+            long deadline, Map<Object, Optional<Instant>> coolingUntil, Set<Object> refused) {
+        while (!held.isEmpty() && !call.closed && !Thread.currentThread().isInterrupted()
+                && System.nanoTime() < deadline) {
+            long seen = call.completions();
+            for (var queues = held.values().iterator(); queues.hasNext(); ) {
+                var queue = queues.next();
+                for (Integer i; (i = queue.peek()) != null; ) {
+                    var record = records.get(i);
+                    var lane = refused.contains(record.topic()) || refused.contains(BatchClassifier.orderingKey(record))
+                            ? Lane.SKIP
+                            : call.admit(i, call.partitions[i], expired.containsKey(record.messageId()));
+                    if (lane == Lane.HOLD) {
+                        break;
+                    }
+                    queue.poll();
+                    if (lane == Lane.SKIP) {
+                        call.complete(i, Outcome.notAttempted(), false);
+                        continue;
+                    }
+                    try {
+                        hand(call, i, record, call.partitions[i], coolingUntil, refused);
+                    } catch (InterruptException e) {
+                        call.complete(i, Outcome.notAttempted(), false);
+                    } catch (RuntimeException e) {
+                        call.failed(i, e, null);
+                    }
+                }
+                if (queue.isEmpty()) {
+                    queues.remove();
+                }
+            }
+            if (!held.isEmpty()) {
+                call.awaitCompletion(seen, deadline);
+            }
+        }
+        held.values().forEach(queue -> queue.forEach(i -> call.complete(i, Outcome.notAttempted(), false)));
+    }
+
+    /** Hands record {@code i} over; a refusal before the append goes to {@link #refuse}. */
+    private void hand(Call call, int i, OutboxRecord record, @Nullable TopicPartition partition,
+            Map<Object, Optional<Instant>> coolingUntil, Set<Object> refused) {
+        var explicit = record.key() == null && partition != null ? partition.partition() : null;
+        call.producer.send(producerRecord(record, explicit), call.callback(i));
+        if (call.refused != null) {
+            refuse(call, i, record, call.refused, false, coolingUntil, refused);
+            call.refused = null;
+        }
+    }
+
+    /**
+     * I1: empty while no partition of {@code topic} has a cooldown entry, so Kafka's partitioner picks one, unless
+     * {@code pick} (a call that sends records alone needs the partition of each); otherwise a random partition with a
+     * leader that does not cool, or, when all of them cool, the one cooling least long.
      */
     private Optional<TopicPartition> unkeyedPartition(String topic, List<PartitionInfo> infos,
-            Map<Object, Optional<Instant>> coolingUntil) {
-        if (infos.stream().noneMatch(p -> cooldown.contains(new TopicPartition(topic, p.partition())))) {
+            Map<Object, Optional<Instant>> coolingUntil, boolean pick) {
+        if (!pick && infos.stream().noneMatch(p -> cooldown.contains(new TopicPartition(topic, p.partition())))) {
             return Optional.empty();
         }
         TopicPartition earliest = null;
@@ -426,8 +503,9 @@ public final class KafkaOutboxSender implements AutoCloseable {
     }
 
     /** Steps 5–6. */
-    private List<Outcome> outcomes(Call call, List<OutboxRecord> records, TopicPartition[] partitions) {
+    private List<Outcome> outcomes(Call call, List<OutboxRecord> records) {
         var now = clock.instant();
+        var partitions = call.partitions;
         var result = new ArrayList<Outcome>(partitions.length);
         var failed = new HashSet<TopicPartition>();
         var failedTopics = new HashSet<String>();
@@ -447,9 +525,11 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 result.add(outcome);
                 var partition = partitions[i] != null ? partitions[i] : call.partitionChosenByKafka(i);
                 if (call.stalled[i] && outcome != Outcome.delivered()) {
-                    expired.add(records.get(i).messageId());
-                } else if (call.alone[i] && outcome == Outcome.delivered()) {
-                    expired.remove(records.get(i).messageId());
+                    if (expired.size() < EXPIRED_REMEMBERED) {
+                        expired.put(records.get(i).messageId(), now);
+                    }
+                } else if (call.alone[i] && (outcome == Outcome.delivered() || outcome instanceof Outcome.Permanent)) {
+                    expired.remove(records.get(i).messageId()); // settled
                 }
                 // a refusal from the broker shows, like a delivery, that the partition answers
                 if (outcome == Outcome.delivered() || call.ownFailure[i] && outcome instanceof Outcome.Permanent) {
@@ -561,18 +641,33 @@ public final class KafkaOutboxSender implements AutoCloseable {
         }
     }
 
+    /** What {@link Call#admit} decides for a record in a call that sends records alone. */
+    private enum Lane { SEND, HOLD, SKIP }
+
     /** State of one {@link #send} call, shared with the producer's callbacks. */
     private static final class Call {
         final Producer<byte[], byte[]> producer;
         final Thread caller = Thread.currentThread();
-        // guarded by this, like ownFailure, metadata, alone, stalled, pending, started, closeReason, closedBy
+        /** The partition of each record the sender chose or computed (null: Kafka's); written by the caller. */
+        final TopicPartition[] partitions;
+        // guarded by this, like ownFailure, metadata, alone, stalled, pending, started, completions, closeReason,
+        // closedBy and, in a call that sends records alone, lanes, inFlight, aloneInFlight and skipped
         final Outcome[] outcomes;
         final boolean[] ownFailure;
         final RecordMetadata[] metadata;
         final boolean[] alone; // sent alone in its producer batch
-        final boolean[] stalled; // not acknowledged when a batch of the call expired
+        final boolean[] stalled; // not acknowledged when a batch of its partition expired
+        @Nullable
+        final TopicPartition[] lanes; // the partition of each record admitted; null: the call sends none alone
+        @Nullable
+        final Map<TopicPartition, Integer> inFlight; // admitted records not completed, per partition
+        @Nullable
+        final Set<TopicPartition> aloneInFlight;
+        @Nullable
+        final Set<TopicPartition> skipped; // where a record sent alone failed: the rest is not attempted
         int pending;
         int started; // records 0 until started were handed to the loop body, in order
+        long completions;
         volatile boolean closed; // written under this
         String closeReason = "";
         @Nullable
@@ -581,13 +676,48 @@ public final class KafkaOutboxSender implements AutoCloseable {
         Exception refused; // caller thread only: what send() reported through the callback before appending
         boolean metadataTimedOut; // caller thread only
 
-        Call(Producer<byte[], byte[]> producer, int size) {
+        /** {@code isolating}: records are remembered, so this call sends them alone. */
+        Call(Producer<byte[], byte[]> producer, int size, boolean isolating) {
             this.producer = producer;
+            this.partitions = new TopicPartition[size];
             this.outcomes = new Outcome[size];
             this.ownFailure = new boolean[size];
             this.metadata = new RecordMetadata[size];
             this.alone = new boolean[size];
             this.stalled = new boolean[size];
+            this.lanes = isolating ? new TopicPartition[size] : null;
+            this.inFlight = isolating ? new HashMap<>() : null;
+            this.aloneInFlight = isolating ? new HashSet<>() : null;
+            this.skipped = isolating ? new HashSet<>() : null;
+        }
+
+        boolean isolating() {
+            return lanes != null;
+        }
+
+        /**
+         * Whether record {@code i} may go out on {@code partition} now, in a call that sends records alone: not after
+         * one sent alone failed there (SKIP), nor while one sent alone is in flight there, nor, when {@code alone},
+         * while any record is (HOLD). A record sent counts as in flight there until it completes.
+         */
+        synchronized Lane admit(int i, TopicPartition partition, boolean alone) {
+            if (skipped.contains(partition)) {
+                return Lane.SKIP;
+            }
+            if (aloneInFlight.contains(partition) || alone && inFlight.containsKey(partition)) {
+                return Lane.HOLD;
+            }
+            lanes[i] = partition;
+            inFlight.merge(partition, 1, Integer::sum);
+            if (alone) {
+                this.alone[i] = true;
+                aloneInFlight.add(partition);
+            }
+            return Lane.SEND;
+        }
+
+        synchronized long completions() {
+            return completions;
         }
 
         synchronized void started() {
@@ -606,7 +736,29 @@ public final class KafkaOutboxSender implements AutoCloseable {
                 ownFailure[i] = own;
                 metadata[i] = kafka;
                 pending--;
+                completions++;
+                if (lanes != null && lanes[i] != null) {
+                    inFlight.computeIfPresent(lanes[i], (p, n) -> n == 1 ? null : n - 1);
+                    if (alone[i]) {
+                        aloneInFlight.remove(lanes[i]);
+                    }
+                }
                 notifyAll();
+            }
+        }
+
+        /**
+         * Holds this. A batch of record {@code i}'s partition expired: marks the records still in flight there or in
+         * a partition Kafka chose, its batch-mates among them (the call returns before Kafka fails them).
+         */
+        private void stall(int i, @Nullable RecordMetadata kafka) {
+            var expiredIn = partitions[i] != null ? partitions[i]
+                    : kafka != null && kafka.partition() >= 0 ? new TopicPartition(kafka.topic(), kafka.partition())
+                    : null;
+            for (int j = 0; j < started; j++) {
+                var p = partitions[j];
+                stalled[j] |= outcomes[j] == null && (lanes == null || lanes[j] != null)
+                        && (p == null || expiredIn == null || p.equals(expiredIn));
             }
         }
 
@@ -645,24 +797,28 @@ public final class KafkaOutboxSender implements AutoCloseable {
         /**
          * Records the failure and marks the call closed in one step, so the caller never sees the outcome without the
          * close and never pools the producer. The record's own failure is one the I/O thread reports before our close
-         * (after it, an abort); one thrown on the caller thread cools nothing.
+         * (after it, an abort); one thrown on the caller thread cools nothing. A record sent alone that fails on the
+         * I/O thread closes nothing, as nothing of its partition is in flight with it; unless it was refused, the rest
+         * of its partition is skipped.
          */
         void failed(int i, Exception e, @Nullable RecordMetadata kafka) {
-            boolean closeProducer;
+            boolean closeProducer = false;
             synchronized (this) {
                 boolean io = Thread.currentThread() != caller;
-                if (io && e instanceof TimeoutException && !closed) { // a batch expired: its records are among these
-                    for (int j = 0; j < started; j++) {
-                        stalled[j] = outcomes[j] == null; // the caller returns before Kafka fails the batch-mates
-                    }
+                if (io && e instanceof TimeoutException && !closed) {
+                    stall(i, kafka);
                 }
                 var outcome = outcome(e);
                 record(i, outcome, !closed && io, kafka);
-                // nothing is in flight with a record sent alone, so its refusal has nothing to abort
-                closeProducer = !(alone[i] && outcome instanceof Outcome.Permanent)
-                        && markClosed("an earlier send failed: " + e);
-                if (closeProducer) {
-                    closedBy = e;
+                if (io && alone[i]) {
+                    if (!(outcome instanceof Outcome.Permanent)) {
+                        skipped.add(lanes[i]);
+                    }
+                } else {
+                    closeProducer = markClosed("an earlier send failed: " + e);
+                    if (closeProducer) {
+                        closedBy = e;
+                    }
                 }
             }
             if (closeProducer) {
@@ -696,33 +852,39 @@ public final class KafkaOutboxSender implements AutoCloseable {
             return true;
         }
 
-        /**
-         * Marks record {@code i} sent alone and waits until it is the only started record not completed; false on
-         * deadline, interrupt (flag kept) or close.
-         */
-        synchronized boolean awaitAlone(int i, long deadlineNanos) {
-            alone[i] = true;
-            return await(1, deadlineNanos) && !closed;
-        }
-
-        /**
-         * True once at most {@code incomplete} started records are not completed, or the call closed; false on
-         * deadline or interrupt (flag kept).
-         */
-        synchronized boolean await(int incomplete, long deadlineNanos) {
-            while (pending > incomplete && !closed) {
-                long left = deadlineNanos - System.nanoTime();
-                if (left <= 0) {
-                    return false;
-                }
-                try {
-                    NANOSECONDS.timedWait(this, left);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
+        /** True once every started record completed or the call closed; false on deadline or interrupt (flag kept). */
+        synchronized boolean await(long deadlineNanos) {
+            while (pending > 0 && !closed) {
+                if (!waitAWhile(deadlineNanos)) {
                     return false;
                 }
             }
             return true;
+        }
+
+        /** True once a record completed after {@code seen} completions or the call closed; false as {@link #await}. */
+        synchronized boolean awaitCompletion(long seen, long deadlineNanos) {
+            while (completions == seen && !closed) {
+                if (!waitAWhile(deadlineNanos)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /** Holds this. Waits for a notification; false on deadline or interrupt (flag kept). */
+        private boolean waitAWhile(long deadlineNanos) {
+            long left = deadlineNanos - System.nanoTime();
+            if (left <= 0) {
+                return false;
+            }
+            try {
+                NANOSECONDS.timedWait(this, left);
+                return true;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
         }
     }
 }
