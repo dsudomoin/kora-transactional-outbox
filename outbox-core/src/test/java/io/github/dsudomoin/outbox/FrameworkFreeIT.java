@@ -131,29 +131,27 @@ class FrameworkFreeIT {
     @Test
     void maintenanceExtendsThePartitionsWithoutErrors() throws Exception {
         var handler = new RecordingHandler();
-        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(2)
-                .maintenanceInterval(Duration.ofMillis(200)).cursorAnchorInterval(Duration.ofMillis(200));
+        int range = 1000;
+        // runs 2 s apart: the burn below goes between two of them with a wide margin
+        var config = new TestOutboxConfig().xidsPerPartition(range).premake(2)
+                .maintenanceInterval(Duration.ofSeconds(2)).cursorAnchorInterval(Duration.ofSeconds(2));
         // A run that sees the xid cross a range boundary between its extension and its gauges logs the premade ERROR,
-        // so no boundary is crossed while a run goes, wherever the xid starts: the runtime starts at the first xid of
-        // a range (its start takes a few dozen xids while its first run goes), and the burn below goes in steps
+        // so the runtime starts at the first xid of a range, wherever the xid stands: its start takes a few dozen xids
+        // while its first run goes
         try (var c = transactions.newConnection(); var st = c.createStatement();
-                var rs = st.executeQuery("select pg_current_xact_id()::text::bigint % 1000")) {
+                var rs = st.executeQuery("select pg_current_xact_id()::text::bigint % " + range)) {
             rs.next();
-            burnXids(999 - rs.getInt(1));
+            burnXids(range - 1 - rs.getInt(1));
         }
         try (var err = new CapturedStderr()) {
             var runtime = start(OutboxRuntime.builder(config, transactions, handler).build());
-            await(Duration.ofSeconds(10), () -> runtime.admin().status().maintenanceSinceSuccessSeconds() != null);
+            awaitMaintenanceRun(runtime, System.nanoTime()); // after start: the bootstrap's success row is older
 
-            // 3000 xids, past the premade ranges: maintenance extends them, swapping the tail if rows overflowed.
-            // Half a range at a time, each right after a run, so done before the next run starts (200 ms after it)
-            long since = System.nanoTime();
-            for (int burnt = 0; burnt < 3000; burnt += 500) {
-                awaitMaintenanceRun(runtime, since);
-                burnXids(500);
-                since = System.nanoTime();
-            }
+            // past the premade ranges, right after a run: the message goes to the tail, and the next run makes the
+            // tail a range, rows and all, and extends
+            burnXids(3 * range);
             var id = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", bytes("p"))));
+            assertThat(runtime.admin().status().tailOverflow()).as("the message went to the tail").isTrue();
 
             await(Duration.ofSeconds(30), () -> {
                 var status = runtime.admin().status();
