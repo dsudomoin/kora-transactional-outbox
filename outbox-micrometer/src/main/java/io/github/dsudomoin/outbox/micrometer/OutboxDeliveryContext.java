@@ -4,6 +4,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.Outcome;
+import io.micrometer.common.KeyValues;
 import io.micrometer.observation.transport.Kind;
 import io.micrometer.observation.transport.ReceiverContext;
 import jakarta.annotation.Nullable;
@@ -20,6 +21,9 @@ public final class OutboxDeliveryContext extends ReceiverContext<OutboxRecord> {
     @Nullable
     private volatile Outcome outcome;
     private volatile boolean failed;
+    /** The default convention's high cardinality values, once computed; the relay thread starts and stops it. */
+    @Nullable
+    KeyValues highCardinality;
 
     OutboxDeliveryContext(OutboxRecord record, Instant now) {
         super((carrier, key) -> {

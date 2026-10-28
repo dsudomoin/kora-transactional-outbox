@@ -3,6 +3,8 @@ package io.github.dsudomoin.outbox.micrometer;
 import io.github.dsudomoin.outbox.Outcome;
 import io.micrometer.common.KeyValues;
 import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * {@code outbox.deliver}, span {@code outbox deliver <topic>}. Low cardinality: {@code messaging.destination.name}
@@ -16,6 +18,9 @@ public class DefaultOutboxDeliveryObservationConvention implements OutboxDeliver
     public static final DefaultOutboxDeliveryObservationConvention INSTANCE =
             new DefaultOutboxDeliveryObservationConvention();
 
+    /** Per topic: names and values that do not change per record (as many as the meters' {@code topic} tags). */
+    private final Map<String, Topic> topics = new ConcurrentHashMap<>();
+
     @Override
     public String getName() {
         return "outbox.deliver";
@@ -23,28 +28,39 @@ public class DefaultOutboxDeliveryObservationConvention implements OutboxDeliver
 
     @Override
     public String getContextualName(OutboxDeliveryContext context) {
-        return "outbox deliver " + context.record().topic();
+        return topic(context).name();
     }
 
     @Override
     public KeyValues getLowCardinalityKeyValues(OutboxDeliveryContext context) {
-        var topic = KeyValues.of("messaging.destination.name", context.record().topic());
+        var topic = topic(context);
         var outcome = context.outcome();
         if (outcome != null) {
-            return topic.and("outbox.outcome", name(outcome));
+            return topic.withOutcome(name(outcome));
         }
-        return context.failed() ? topic.and("outbox.outcome", "failed") : topic;
+        return context.failed() ? topic.withOutcome("failed") : topic.values();
     }
 
+    /** Computed once per record: the observation asks at start and at stop, and the record and the clock are fixed. */
     @Override
     public KeyValues getHighCardinalityKeyValues(OutboxDeliveryContext context) {
+        var cached = context.highCardinality;
+        if (cached != null) {
+            return cached;
+        }
         var r = context.record();
         var delay = Duration.between(r.createdAt(), context.now());
         var values = KeyValues.of(
                 "outbox.message_id", r.messageId().toString(),
                 "outbox.attempt", Long.toString(r.attempts() + 1L),
                 "outbox.delay_ms", Long.toString(delay.isNegative() ? 0 : delay.toMillis()));
-        return r.shard() < 0 ? values : values.and("outbox.shard", Integer.toString(r.shard()));
+        values = r.shard() < 0 ? values : values.and("outbox.shard", Integer.toString(r.shard()));
+        context.highCardinality = values;
+        return values;
+    }
+
+    private Topic topic(OutboxDeliveryContext context) {
+        return topics.computeIfAbsent(context.record().topic(), Topic::of);
     }
 
     private static String name(Outcome outcome) {
@@ -58,5 +74,20 @@ public class DefaultOutboxDeliveryObservationConvention implements OutboxDeliver
             return "requeued";
         }
         return "delivered";
+    }
+
+    /** The contextual name and the low cardinality values, without an outcome and with each outcome seen. */
+    private record Topic(String name, KeyValues values, Map<String, KeyValues> byOutcome) {
+        static Topic of(String topic) {
+            return new Topic("outbox deliver " + topic, KeyValues.of("messaging.destination.name", topic),
+                    new ConcurrentHashMap<>());
+        }
+
+        /** Made on the first use of a name, so every outcome name has its values. */
+        KeyValues withOutcome(String outcome) {
+            var cached = byOutcome.get(outcome);
+            return cached != null ? cached
+                    : byOutcome.computeIfAbsent(outcome, o -> values.and("outbox.outcome", o));
+        }
     }
 }

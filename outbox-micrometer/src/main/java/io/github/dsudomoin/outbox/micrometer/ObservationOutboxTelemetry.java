@@ -206,11 +206,12 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
         private final Observation[] started;
         private final OutboxDeliveryContext[] contexts;
         /** The observation of each record the handler may get: the stored ones and the handed ones. */
-        private final Map<OutboxRecord, Observation> byRecord = new IdentityHashMap<>();
+        private final Map<OutboxRecord, Observation> byRecord;
 
         ObservedDelivery(List<OutboxRecord> records, Observation[] started, OutboxDeliveryContext[] contexts) {
             this.started = started;
             this.contexts = contexts;
+            this.byRecord = new IdentityHashMap<>(2 * started.length); // sized once: stored and handed records
             for (int i = 0; i < started.length; i++) {
                 byRecord.put(records.get(i), started[i]);
             }
