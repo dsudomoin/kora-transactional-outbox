@@ -33,4 +33,23 @@ class PartitionDdlIT {
             reader.rollback();
         }
     }
+
+    /** The same for a standalone table: {@code ::regclass} prints one dropped since the snapshot as its bare oid. */
+    @Test
+    void aStandaloneTableDroppedAfterTheSnapshotIsLeftOut() throws Exception {
+        var parent = TestSql.uniqueTable();
+        try (var reader = TestDataSources.newDataSource().getConnection();
+                var other = TestDataSources.newDataSource().getConnection()) {
+            TestSql.execute(other, "create table " + parent + " (xid xid8 not null) partition by range (xid)");
+            TestSql.execute(other, "create table " + parent + "_x1 (like " + parent + ")");
+            TestSql.execute(other, "create table " + parent + "_x2 (like " + parent + ")");
+            reader.setAutoCommit(false);
+            reader.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+            TestSql.queryLong(reader, "select 1"); // the snapshot
+            TestSql.execute(other, "drop table " + parent + "_x1");
+
+            assertThat(PartitionDdl.standalone(reader, parent, "_x[0-9]+")).containsExactly(parent + "_x2");
+            reader.rollback();
+        }
+    }
 }

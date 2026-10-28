@@ -115,7 +115,7 @@ public final class PartitionDdl {
 
     /**
      * Partitions of {@code parent} in no particular order, including ones whose detach is still pending, but not one
-     * another session dropped after this query's snapshot.
+     * another session dropped after this query's snapshot ({@link #dropped}).
      */
     public static List<Bound> listRanges(Connection c, String parent) throws SQLException {
         var bounds = new ArrayList<Bound>();
@@ -124,7 +124,7 @@ public final class PartitionDdl {
             ps.setString(1, parent);
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    if (rs.getString(2) == null) { // dropped meanwhile: pg_get_expr reads the current catalog
+                    if (dropped(rs.getString(1)) || rs.getString(2) == null) { // pg_get_expr: null once dropped
                         continue;
                     }
                     var m = BOUNDS.matcher(rs.getString(2));
@@ -145,7 +145,7 @@ public final class PartitionDdl {
                 + " where inhparent = to_regclass(?) and inhdetachpending")) {
             ps.setString(1, parent);
             try (var rs = ps.executeQuery()) {
-                return rs.next() ? rs.getString(1) : null;
+                return rs.next() && !dropped(rs.getString(1)) ? rs.getString(1) : null;
             }
         }
     }
@@ -226,7 +226,8 @@ public final class PartitionDdl {
 
     /**
      * Tables in {@code parent}'s schema named {@code <parent><suffix>} ({@code suffix} a regex) that are no partition:
-     * what a run leaves when it dies, or its DROP fails, after its detach went through. Usable in DDL as is.
+     * what a run leaves when it dies, or its DROP fails, after its detach went through. Usable in DDL as is; not one
+     * another session dropped after this query's snapshot ({@link #dropped}).
      */
     static List<String> standalone(Connection c, String parent, String suffix) throws SQLException {
         var tables = new ArrayList<String>();
@@ -238,11 +239,22 @@ public final class PartitionDdl {
             ps.setString(2, "^" + parent.substring(parent.indexOf('.') + 1) + suffix + "$");
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    tables.add(rs.getString(1));
+                    if (!dropped(rs.getString(1))) {
+                        tables.add(rs.getString(1));
+                    }
                 }
             }
         }
         return tables;
+    }
+
+    /**
+     * Whether {@code regclass}, an {@code oid::regclass::text} of a catalog row this query's snapshot still shows,
+     * names a relation another session has dropped since: {@code regclass} reads the current catalog and prints such
+     * an oid bare, while a live relation's name never is digits alone (it would be quoted).
+     */
+    static boolean dropped(String regclass) {
+        return !regclass.isEmpty() && regclass.chars().allMatch(Character::isDigit);
     }
 
     /**
