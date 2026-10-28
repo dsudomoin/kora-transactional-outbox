@@ -43,9 +43,11 @@ public interface OutboxTelemetry {
     default void requeued(String topic) {}
 
     /**
-     * A relay step began on the thread that steps, holding the locks of {@code shards}; its database work and handler
-     * calls run on this thread (the handler itself on a handler thread) until {@link RelayStep#finished()} or
-     * {@link RelayStep#failed}.
+     * A relay step found work, on the thread that steps: called at the first locked shard with work, so only for the
+     * steps {@link #stepFinished} measures; a step that locks nothing or finds nothing to do calls neither.
+     * {@code shards} is a copy of the shards whose locks the step holds, those without work included. The step's
+     * cursor read and target choice come before this call; its further database work and handler calls run on this
+     * thread (the handler itself on a handler thread) until {@link RelayStep#finished()} or {@link RelayStep#failed}.
      */
     default RelayStep stepStarted(List<Integer> shards) {
         return RelayStep.NONE;

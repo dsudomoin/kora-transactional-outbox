@@ -287,25 +287,26 @@ public final class ShardProcessor implements AutoCloseable {
                 results[lockable.get(k)] = new ShardResult(ShardStatus.NOT_LOCKED, 0, false);
             }
         }
-        var step = lockedShards.isEmpty() ? OutboxTelemetry.RelayStep.NONE : telemetry.stepStarted(lockedShards);
+        var step = new OutboxTelemetry.RelayStep[] {OutboxTelemetry.RelayStep.NONE}; // started by stepLocked
         List<ShardResult> stepped;
         try {
-            stepped = stepLocked(inTx, shards, lockable, lockedShards, results, latestTickId, now, started);
+            stepped = stepLocked(inTx, shards, lockable, lockedShards, results, latestTickId, now, started, step);
         } catch (Throwable t) {
-            step.failed(t);
+            step[0].failed(t);
             throw t;
         }
-        step.finished();
+        step[0].finished();
         return stepped;
     }
 
     /**
      * {@link #tryProcess(Connection, List, long, Instant)} past its locks: {@code lockable} are the positions in
-     * {@code shards} it tried to lock, {@code lockedShards} the shards it holds, {@code results} has the rest.
+     * {@code shards} it tried to lock, {@code lockedShards} the shards it holds, {@code results} has the rest. Starts
+     * the step's telemetry into {@code step} at the first shard with work, the steps {@code stepFinished} measures.
      */
     private List<ShardResult> stepLocked(Connection inTx, List<Integer> shards, List<Integer> lockable,
-            List<Integer> lockedShards, ShardResult[] results, long latestTickId, Instant now, long started)
-            throws SQLException, InterruptedException {
+            List<Integer> lockedShards, ShardResult[] results, long latestTickId, Instant now, long started,
+            OutboxTelemetry.RelayStep[] step) throws SQLException, InterruptedException {
         var steps = new ArrayList<Step>(lockable.size());
         // a statement after the locks: sees the previous holders' commits
         var currents = cursors.latest(inTx, lockedShards);
@@ -365,6 +366,9 @@ public final class ShardProcessor implements AutoCloseable {
                 results[s.index] = waits ? new ShardResult(ShardStatus.PROGRESS, 0, cursor.targetTickId() == null)
                         : new ShardResult(ShardStatus.NO_WORK, 0, true, false, true);
                 continue;
+            }
+            if (work.isEmpty()) { // the first shard with work: the step is observed from here
+                step[0] = telemetry.stepStarted(List.copyOf(lockedShards));
             }
             anyCall |= !heads.isEmpty() || !dueParked.isEmpty();
             var pass = retryPass(inTx, shard, heads, dueParked, now);

@@ -15,10 +15,14 @@ import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
+import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardResult;
 import io.github.dsudomoin.outbox.kora.OutboxTracing;
+import io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry;
+import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
+import io.github.dsudomoin.outbox.micrometer.OutboxStepContext;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
@@ -27,6 +31,9 @@ import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestTelemetry;
 import io.github.dsudomoin.outbox.testing.TestTracing;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.micrometer.observation.Observation;
+import io.micrometer.observation.ObservationHandler;
+import io.micrometer.observation.ObservationRegistry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
@@ -1065,6 +1072,37 @@ class ShardProcessorIT {
             ps.setInt(2, TableNames.LOCK_SWAP);
             ps.execute();
         }
+    }
+
+    /**
+     * The step observation starts once the step has a locked shard with work, the steps {@code stepFinished} measures:
+     * a step that locks a shard with nothing to do is not observed.
+     */
+    @Test
+    void aStepIsObservedOnlyOnceItHasWork() throws Exception {
+        var started = new CopyOnWriteArrayList<Observation.Context>();
+        var observations = ObservationRegistry.create();
+        observations.observationConfig().observationHandler(new ObservationHandler<>() {
+            @Override
+            public void onStart(Observation.Context context) {
+                started.add(context);
+            }
+
+            @Override
+            public boolean supportsContext(Observation.Context context) {
+                return true;
+            }
+        });
+        bootstrap(ObservationOutboxTelemetry.builder(observations, new OutboxMetrics(meters)).build());
+
+        assertThat(process()).as("no tick since bootstrap").isEqualTo(new ShardResult(NO_WORK, 0, true));
+        assertThat(started).extracting(Observation.Context::getName).doesNotContain("outbox.relay.step");
+
+        send(msg("t", "a", "a1"));
+        tick();
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(started).filteredOn(c -> "outbox.relay.step".equals(c.getName())).singleElement()
+                .isInstanceOfSatisfying(OutboxStepContext.class, step -> assertThat(step.shards()).containsExactly(0));
     }
 
     @Test
@@ -3344,6 +3382,10 @@ class ShardProcessorIT {
     }
 
     private void bootstrap() throws Exception {
+        bootstrap(TestTelemetry.kora(meters, tracer));
+    }
+
+    private void bootstrap(OutboxTelemetry telemetry) throws Exception {
         var schema = new OutboxSchema(db, config);
         schema.start();
         names = schema.names();
@@ -3363,7 +3405,7 @@ class ShardProcessorIT {
                 return s == null ? handler.handleBatch(records) : s.apply(records);
             }
         };
-        processor = new ShardProcessor(names, config, scripted, TestTelemetry.kora(meters, tracer), false);
+        processor = new ShardProcessor(names, config, scripted, telemetry, false);
     }
 
     /** One worker {@code tryProcess} of shard 0 at the test clock in its own transaction, rolled back on failure. */

@@ -22,12 +22,13 @@ import java.util.function.DoubleSupplier;
 
 /**
  * The outbox on Micrometer Observation: an {@code outbox.enqueue} observation per {@code send}/{@code sendAll} call,
- * whose trace context the call's messages store; an {@code outbox.relay.step} observation per relay step, current on
- * the thread that steps (a relay worker, or the caller of {@code OutboxRelay.drain()}) while the step runs; and an
- * {@code outbox.deliver} observation per delivered record whose stored trace is sampled (every record with
- * {@link Builder#observeUnsampled}), parented by that stored context, whose own context the record handed to the
- * handler carries. The other events and the gauges are {@link OutboxMetrics}' meters. Names and key values come from
- * the conventions; meter names and tags can be changed with a {@code MeterFilter}.
+ * whose trace context the call's messages store; an {@code outbox.relay.step} observation per relay step that finds
+ * work, current on the thread that steps (a relay worker, or the caller of {@code OutboxRelay.drain()}) from the first
+ * shard with work to the end of the step; and an {@code outbox.deliver} observation per delivered record whose stored
+ * trace is sampled (every record with {@link Builder#observeUnsampled}), parented by that stored context, whose own
+ * context the record handed to the handler carries. The other events and the gauges are {@link OutboxMetrics}'
+ * meters. Names and key values come from the conventions; meter names and tags can be changed with a
+ * {@code MeterFilter}.
  *
  * <p>The enqueue observation is a sender one and the delivery observation a receiver one, so the application's
  * propagating tracing handlers inject and extract the context; the delivery span is therefore of kind CONSUMER. A

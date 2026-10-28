@@ -7,8 +7,9 @@ name (`outbox_shard_lag`, `outbox_dead_size`).
 
 Without Kora the same meters come from `OutboxMetrics` (`outbox-micrometer`) passed to
 `OutboxRuntime.builder(...).telemetry(...)`. `ObservationOutboxTelemetry` adds three Micrometer observations on top:
-`outbox.enqueue` per send call, `outbox.relay.step` per relay step (span `outbox relay step`, a trace root;
-high-cardinality `outbox.shards`) and `outbox.deliver` per record (span kind CONSUMER, parented by the stored trace;
+`outbox.enqueue` per send call, `outbox.relay.step` per relay step that finds work, the steps
+`outbox.batch.duration` times (span `outbox relay step`, a trace root on a relay worker; high-cardinality
+`outbox.shards`) and `outbox.deliver` per record (span kind CONSUMER, parented by the stored trace;
 tags `messaging.destination.name`, `outbox.outcome`; high-cardinality `outbox.shard`). Rename them with an
 `Outbox*ObservationConvention`, rename meters with a `MeterFilter`; README «Наблюдаемость» → «Контракт по этапам».
 

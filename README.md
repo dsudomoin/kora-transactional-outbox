@@ -2609,9 +2609,10 @@ var runtime = OutboxRuntime.builder(config, transactions, handler).telemetry(tel
 - `outbox.enqueue` (span `outbox enqueue`) — одно наблюдение на `send`/`sendAll`. Это наблюдение отправителя
   (`SenderContext`): propagating-обработчик приложения кладёт его контекст в заголовки сообщений; сообщение со своими
   заголовками трассы оставляет их.
-- `outbox.relay.step` (span `outbox relay step`) — одно наблюдение на шаг relay, взявший блокировку хотя бы одного
-  шарда; ключ с высокой кардинальностью `outbox.shards` (шарды шага через запятую). Пока шаг идёт, наблюдение текущее
-  на потоке шага.
+- `outbox.relay.step` (span `outbox relay step`) — одно наблюдение на шаг relay, который нашёл работу хотя бы в одном
+  заблокированном шарде: это те же шаги, что меряет `outbox.batch.duration`. Шаг, который ничего не заблокировал или
+  не нашёл работы (например, шард уже прошёл другой инстанс), наблюдения не создаёт. Ключ с высокой кардинальностью
+  `outbox.shards` — заблокированные шарды шага через запятую. Пока шаг идёт, наблюдение текущее на потоке шага.
 - `outbox.deliver` (span `outbox deliver <topic>`) — одно наблюдение на доставляемую запись сэмплированной трассы
   (с `observeUnsampled(true)` — на каждую, см. ниже). Это наблюдение получателя
   (`ReceiverContext`): родитель — контекст, сохранённый при отправке, поэтому span имеет kind `CONSUMER` (в Kora —
@@ -2655,7 +2656,7 @@ relay-воркер `outbox-relay-N` или поток, вызвавший `Outbo
 | Этап | Когда и где | Observation: наблюдение и span | Kora: span | Метры |
 |---|---|---|---|---|
 | Запись | Одно на вызов `send`/`sendAll`, на потоке писателя, внутри его транзакции | `outbox.enqueue`, span `outbox enqueue`, kind `PRODUCER` (`SenderContext`), без ключей. Propagating-обработчик приложения кладёт его контекст в заголовки сообщений (`traceparent`, `tracestate`); сообщение со своими заголовками трассы оставляет их. Вне любого span-а это корневой span, и контекст всё равно сохраняется | Нет. Сохраняется трасса текущего контекста Kora, если она есть, а у сообщения нет своего `traceparent` | `outbox.messages.enqueued{topic}` на сообщение, включая откатившиеся |
-| Шаг relay | Одно на шаг, взявший блокировку хотя бы одного шарда (relay шагает только по шардам, где по курсорам есть работа); на потоке шага, от взятия блокировок до конца работы шага, до его коммита | `outbox.relay.step`, span `outbox relay step`, kind `INTERNAL`, корень своей трассы. Высокая кардинальность: `outbox.shards` — заблокированные шарды через запятую; низкой нет. Пока шаг идёт, наблюдение текущее, и JDBC-наблюдения приложения для его запросов (если оно их пишет) становятся дочерними. Ошибка шага записывается в наблюдение | Нет | `outbox.batch.duration`, `outbox.relay.failures`, `outbox.shard.paused` |
+| Шаг relay | Одно на шаг, нашедший работу хотя бы в одном заблокированном шарде (те же шаги, что меряет `outbox.batch.duration`); шаг без работы наблюдения не создаёт. На потоке шага, от первого шарда с работой (чтение курсоров и выбор цели — раньше) до конца работы шага, до его коммита | `outbox.relay.step`, span `outbox relay step`, kind `INTERNAL`; на relay-воркере — корень своей трассы, у `drain()`, вызванного внутри наблюдения, — дочерний span. Высокая кардинальность: `outbox.shards` — заблокированные шарды через запятую; низкой нет. Пока шаг идёт, наблюдение текущее, и JDBC-наблюдения приложения для его запросов (если оно их пишет) становятся дочерними. Ошибка шага записывается в наблюдение; ошибка до первого шарда с работой наблюдения не создаёт | Нет | `outbox.batch.duration`, `outbox.shard.paused`; `outbox.relay.failures` считает и сбои вне шага (проход relay) |
 | Доставка записи | Одно на запись вызова обработчика: начинается на потоке шага перед вызовом, заканчивается с outcome записи | `outbox.deliver`, span `outbox deliver <topic>`, kind `CONSUMER` (`ReceiverContext`), родитель — сохранённый при записи контекст; по умолчанию его нет у записи, чья сохранённая W3C-трасса не сэмплирована (`observeUnsampled(true)` — есть у каждой). Низкая кардинальность: `messaging.destination.name`, `outbox.outcome`; высокая: `outbox.message_id`, `outbox.attempt` (эта попытка, с 1), `outbox.delay_ms`, `outbox.shard` (шард записи; нет, если неизвестен). С `tracing(...)` обработчик получает запись с заголовками этого span-а, а в `inRecordScope` наблюдение текущее | `outbox deliver <topic>`, kind `PRODUCER`, родитель — сохранённая трасса, без неё — корневой span. Атрибуты `messaging.destination.name`, `outbox.message_id`, `outbox.attempt`, `outbox.delay_ms`, `outbox.outcome`; `outbox.shard` нет. Обработчик получает запись с заголовками span-а, а `handle` — контекст Kora с ним | — |
 | Исходы | По одному на запись, когда relay разбирает outcomes вызова, до коммита шага | `outbox.outcome` = `delivered`, `retry`, `permanent`, `not_attempted`, `requeued`; `failed`, если вызов кончился без outcomes (прерван, relay закрывается). Ошибки `retry`, `permanent` и `failed` записываются в наблюдение | Те же значения `outbox.outcome`, кроме `failed`: прерванный вызов даёт span-ам статус ERROR с исключением. Ошибки `retry` и `permanent` — тоже ERROR | `outbox.messages.delivered{topic}`, `outbox.delivery.delay{topic}`, `outbox.messages.failed{topic,outcome}` (`retry`, `dead`), `outbox.messages.requeued{topic}`; решения хука — `outbox.dead.decisions{decision}`, его сбои — `outbox.dead.hook.failures` |
 | Курсор и лаг | Шаг шарда пишет строку курсора (прогресс или пауза); gauges обновляет обслуживание раз в `maintenanceInterval` на инстансе, который его выполняет | Нет | Нет | `outbox.shard.lag` (самый медленный шард, с), `outbox.retry.size`, `outbox.parked.size`, `outbox.dead.size`, `outbox.dead.pending`, `outbox.dead.pending.oldest`, gauges партиций и обслуживания |
@@ -2679,8 +2680,9 @@ relay-воркер `outbox-relay-N` или поток, вызвавший `Outbo
 `outbox relay step` шага, который её доставил, и попадает в его трассу
 (`KafkaTelemetryIT#aRecordWithoutTraceContextInsideAStep`). В Kora доставка такой строки — корневой span.
 
-**Сэмплирование.** Relay-воркер начинает шаг вне любой трассы, поэтому каждый span шага — корень своей трассы, и его
-сэмплирует корневой сэмплер приложения (для parent-based — сэмплер корней). Span-ы доставки следуют решению о трассе
+**Сэмплирование.** Relay-воркер начинает шаг вне любой трассы, поэтому span шага на relay-воркере — корень своей
+трассы, и его сэмплирует корневой сэмплер приложения (для parent-based — сэмплер корней); у `drain()`, вызванного
+внутри наблюдения, span шага — дочерний. Span-ы доставки следуют решению о трассе
 писателя: с parent-based сэмплером они сэмплированы, если сэмплирована трасса записи.
 
 **Шаг заканчивается до коммита.** Наблюдение шага останавливается, когда работа шага сделана, до коммита его
