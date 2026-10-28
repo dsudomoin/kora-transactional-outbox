@@ -1,4 +1,4 @@
-# kora-outbox
+# outbox
 
 Transactional outbox для сервисов на [Kora](https://github.com/Tinkoff/kora) 1.x с Postgres. Вы записываете сообщение
 в той же транзакции базы данных, что и бизнес-данные; relay внутри вашего сервиса доставляет его после коммита — в Kafka
@@ -17,8 +17,8 @@ Transactional outbox для сервисов на [Kora](https://github.com/Tink
 > (`annotation-processors` или `symbol-processors` для KSP) тоже на 1.2.23, чтобы сгенерированный код и runtime
 > совпадали.
 
-- Артефакты: `io.github.dsudomoin:kora-outbox`, `io.github.dsudomoin:kora-outbox-kafka` и
-  `io.github.dsudomoin:kora-outbox-admin`, `0.1.0-SNAPSHOT` (пока только через `mavenLocal()`).
+- Артефакты: `io.github.dsudomoin:outbox-core`, `io.github.dsudomoin:outbox-kafka` и
+  `io.github.dsudomoin:outbox-admin-kora`, `0.1.0-SNAPSHOT` (пока только через `mavenLocal()`).
 - Байткод Java 17; работает из Java и Kotlin. Блокирующий API: `send` выполняется внутри `JdbcConnectionFactory.inTx`.
 
 Общая схема: сообщение записывается одной транзакцией с бизнес-данными, relay на любом инстансе сервиса после коммита
@@ -134,7 +134,7 @@ flowchart LR
 - **Один primary.** Outbox лежит в той же базе, что и бизнес-данные, а relay подключается к тому же primary, что и
   писатели (на read-only реплике шаг не закоммитится). Привязывать инстансы к шардам или к ЦОДу не нужно: инстанс в
   дальнем ЦОДе платит сетевую задержку на каждом запросе шага, но не корректностью.
-- Клиент **Kafka** 3.9.2 (эту версию использует Kora 1.2.23) для `kora-outbox-kafka`. Настройки брокера — в разделе
+- Клиент **Kafka** 3.9.2 (эту версию использует Kora 1.2.23) для `outbox-kafka`. Настройки брокера — в разделе
   [Требования к Kafka](#требования-к-kafka).
 
 ### Роль в базе и привилегии
@@ -228,14 +228,14 @@ repositories {
 }
 
 dependencies {
-    implementation("io.github.dsudomoin:kora-outbox:0.1.0-SNAPSHOT")
-    implementation("io.github.dsudomoin:kora-outbox-kafka:0.1.0-SNAPSHOT") // обработчик Kafka; без Kafka не нужен
-    implementation("io.github.dsudomoin:kora-outbox-admin:0.1.0-SNAPSHOT") // админ-API по HTTP; без него — из кода
+    implementation("io.github.dsudomoin:outbox-core:0.1.0-SNAPSHOT")
+    implementation("io.github.dsudomoin:outbox-kafka:0.1.0-SNAPSHOT") // обработчик Kafka; без Kafka не нужен
+    implementation("io.github.dsudomoin:outbox-admin-kora:0.1.0-SNAPSHOT") // админ-API по HTTP; без него — из кода
 }
 ```
 
-`kora-outbox` приносит `database-jdbc`, `config-common`, `opentelemetry-common` и `micrometer-core` (1.12.13).
-`kora-outbox-kafka` добавляет `kafka-clients` 3.9.2. `kora-outbox-admin` добавляет `http-server-common` и
+`outbox-core` приносит `database-jdbc`, `config-common`, `opentelemetry-common` и `micrometer-core` (1.12.13).
+`outbox-kafka` добавляет `kafka-clients` 3.9.2. `outbox-admin-kora` добавляет `http-server-common` и
 `json-common`; HTTP-сервер (`http-server-undertow`) и JSON-модуль (`json-module`) подключает сервис
 ([Админ-API и HTTP](#админ-api-и-http)).
 
@@ -244,8 +244,8 @@ dependencies {
 
 | Модуль | Что нужно в вашем classpath |
 |---|---|
-| `io.github.dsudomoin.kora.outbox.json.OutboxJsonModule` | `ru.tinkoff.kora:json-common` (его приносит любой JSON-модуль Kora, например `json-module`) |
-| `io.github.dsudomoin.kora.outbox.protobuf.OutboxProtobufModule` | `com.google.protobuf:protobuf-java` 3.x или новее (его приносят классы, сгенерированные protobuf) |
+| `io.github.dsudomoin.outbox.json.OutboxJsonModule` | `ru.tinkoff.kora:json-common` (его приносит любой JSON-модуль Kora, например `json-module`) |
+| `io.github.dsudomoin.outbox.protobuf.OutboxProtobufModule` | `com.google.protobuf:protobuf-java` 3.x или новее (его приносят классы, сгенерированные protobuf) |
 
 ## Быстрый старт
 
@@ -1402,7 +1402,7 @@ Gauge показывает, сколько xid осталось, а обслуж
   транзакция, пропускаются без ожидания и не считаются: вызовите ещё раз. Пустой фильтр отвергается.
 - Каждый изменяющий вызов пишет одну строку INFO с аргументами и результатом.
 
-**HTTP.** `OutboxAdminHttpModule` из `kora-outbox-admin` отдаёт те же операции на публичном HTTP-сервере сервиса под
+**HTTP.** `OutboxAdminHttpModule` из `outbox-admin-kora` отдаёт те же операции на публичном HTTP-сервере сервиса под
 `/kora-outbox/admin/v1`, рядом с его собственными маршрутами. Контракт — OpenAPI 3,
 `openapi/kora-outbox-admin.yaml` в jar. Нужны HTTP-сервер Kora, JSON-модуль и ровно один компонент
 `OutboxAdminAuthorizer`: без него сервис не собирается, открытого по умолчанию доступа нет. Схем безопасности контракт
@@ -2141,7 +2141,7 @@ Gauges регистрируются один раз на имя, и побежд
 инстанс, чей запуск обнаружил, что блокировку обслуживания держит другой, сохраняет прежние значения (NaN до своего
 первого запуска). `since_success` читает каждый инстанс.
 
-Логи (SLF4J, `io.github.dsudomoin.kora.outbox`): INFO — старт, остановка и DDL партиций; WARN — отведённые ключи, паузы
+Логи (SLF4J, `io.github.dsudomoin.outbox`): INFO — старт, остановка и DDL партиций; WARN — отведённые ключи, паузы
 шардов, отложенные расширения, tail overflow, устаревшее обслуживание, сбои хука dead letters и оставленные Kafka DLQ
 письма; ERROR — dead letters, ошибки в обработчиках, застрявшие шарды, регрессия xid, `premade < 2`, отсоединённый
 хвост, сироты и transaction pooling. Повторяющиеся сообщения ограничены по частоте.
@@ -2418,17 +2418,17 @@ retry и dead пусты. Прогон на более ранней версии
 
 | Скилл | Когда агент его загружает |
 |---|---|
-| `using-kora-outbox` | Подключение, настройка и отправка; роль в базе, соединения, топики Kafka перед деплоем |
-| `writing-kora-outbox-handlers` | Свой `OutboxHandler`, `byTopic`, `batchSize` и `batchTimeout` под медленную цель, dead letters, `Outcome.requeue` |
-| `consuming-with-kora-outbox-inbox` | Потребитель с `Inbox`: дедупликация, scope, записи без заголовка `outbox-message-id` |
-| `testing-kora-outbox` | Интеграционные тесты с Testcontainers и `OutboxRelay.drain()`, тесты, не проверяющие доставку |
-| `operating-kora-outbox` | Метрики, алерты, dead letters, процедуры восстановления, решардинг, деплои |
+| `using-outbox` | Подключение, настройка и отправка; роль в базе, соединения, топики Kafka перед деплоем |
+| `writing-outbox-handlers` | Свой `OutboxHandler`, `byTopic`, `batchSize` и `batchTimeout` под медленную цель, dead letters, `Outcome.requeue` |
+| `consuming-with-outbox-inbox` | Потребитель с `Inbox`: дедупликация, scope, записи без заголовка `outbox-message-id` |
+| `testing-outbox` | Интеграционные тесты с Testcontainers и `OutboxRelay.drain()`, тесты, не проверяющие доставку |
+| `operating-outbox` | Метрики, алерты, dead letters, процедуры восстановления, решардинг, деплои |
 
-**Claude Code.** Репозиторий — маркетплейс с одним плагином `kora-outbox`:
+**Claude Code.** Репозиторий — маркетплейс с одним плагином `outbox`:
 
 ```
 /plugin marketplace add dsudomoin/kora-transactional-outbox
-/plugin install kora-outbox@kora-transactional-outbox
+/plugin install outbox@kora-transactional-outbox
 ```
 
 **Другие агенты.** Скопируйте каталоги из `skills/` в каталог скиллов агента. Codex и Cursor читают

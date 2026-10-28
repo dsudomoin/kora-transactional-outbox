@@ -38,6 +38,6 @@ kotlin {
 }
 
 application {
-    mainClass = "io.github.dsudomoin.kora.outbox.bench.BenchAppKt"
+    mainClass = "io.github.dsudomoin.outbox.bench.BenchAppKt"
     applicationDefaultJvmArgs = listOf("-Dfile.encoding=UTF-8")
 }

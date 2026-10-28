@@ -1,5 +1,5 @@
 {
-  "name": "kora-outbox",
+  "name": "outbox",
   "description": "Skills for kora-transactional-outbox in Kora 1.x services: sending events, writing handlers, inbox deduplication, testing and operations",
   "author": {
     "name": "d.sudomoin",

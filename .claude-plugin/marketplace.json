@@ -7,7 +7,7 @@
   },
   "plugins": [
     {
-      "name": "kora-outbox",
+      "name": "outbox",
       "source": "./",
       "description": "Skills for kora-transactional-outbox in Kora 1.x services: sending events, writing handlers, inbox deduplication, testing and operations"
     }

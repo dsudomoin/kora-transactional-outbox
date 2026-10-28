@@ -1,6 +1,6 @@
 val koraVersion: String by project
 
-configure(listOf(project(":outbox"), project(":outbox-kafka"), project(":outbox-admin"))) {
+configure(listOf(project(":outbox-core"), project(":outbox-kafka"), project(":outbox-admin-kora"))) {
     apply(plugin = "java-library")
     apply(plugin = "maven-publish")
 
@@ -49,11 +49,15 @@ configure(listOf(project(":outbox"), project(":outbox-kafka"), project(":outbox-
 
     configure<PublishingExtension> {
         publications.create<MavenPublication>("maven") {
-            artifactId = "kora-${project.name}"
+            artifactId = project.name
             from(components["java"])
             pom {
-                name = "kora-${project.name}"
-                description = "Transactional outbox for Kora 1.x on PostgreSQL"
+                name = project.name
+                description = if (project.name.endsWith("-kora")) {
+                    "Transactional outbox for PostgreSQL — Kora 1.x adapter"
+                } else {
+                    "Transactional outbox for PostgreSQL"
+                }
                 url = "https://github.com/dsudomoin/kora-transactional-outbox"
                 licenses {
                     license {
