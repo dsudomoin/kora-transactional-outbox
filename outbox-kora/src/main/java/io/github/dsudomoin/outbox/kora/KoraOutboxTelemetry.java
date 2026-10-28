@@ -117,7 +117,7 @@ public final class KoraOutboxTelemetry implements OutboxTelemetry {
         metrics.gauge(gauge, value);
     }
 
-    private static <T> T inKoraContext(OutboxRecord record, Callable<T> call) throws Exception {
+    static <T> T inKoraContext(OutboxRecord record, Callable<T> call) throws Exception {
         return OutboxTracing.withKoraContext(OutboxTracing.extract(record.headers()), call);
     }
 

@@ -93,7 +93,9 @@ public interface OutboxHandler {
      * Runs {@code call} in the scope of {@code record}, one of the records the relay handed to the {@link #handleBatch}
      * call running on this thread: whatever the application's telemetry binds to a record (with the Kora adapter, a
      * Kora context carrying the record's trace). The default {@code handleBatch} wraps each {@link #handle} in it; an
-     * override that delivers records itself calls it the same way. Outside a relay call it runs {@code call} alone.
+     * override that delivers records itself calls it the same way. Outside a relay call (a handler called directly,
+     * or on another thread) it runs {@code call} in the record's scope a framework adapter provides (the Kora
+     * adapter's: the record's trace), else alone.
      */
     static <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
         return RecordScope.run(record, call);
