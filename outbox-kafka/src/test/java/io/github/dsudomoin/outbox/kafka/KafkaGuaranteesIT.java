@@ -53,6 +53,8 @@ import org.junit.jupiter.api.Test;
 class KafkaGuaranteesIT {
 
     private static final Duration CONSUME_TIMEOUT = Duration.ofSeconds(60);
+    /** The sender's default {@code delivery.timeout.ms}. */
+    private static final Duration DELIVERY_TIMEOUT = Duration.ofSeconds(20);
 
     private final JdbcTransactions transactions = new JdbcTransactions(TestDataSources.newDataSource());
     private final List<AutoCloseable> closing = new ArrayList<>(); // senders and runtimes, closed last first
@@ -199,6 +201,39 @@ class KafkaGuaranteesIT {
         assertThat(dead).extracting(KafkaOutboxHeaders::messageId).containsOnly(poison);
         // the discard commits after the publish
         await(Duration.ofSeconds(10), () -> runtime.admin().countDeadLetters(DeadLetterFilter.any()) == 0);
+    }
+
+    /**
+     * The poison is smaller than the producer's {@code batch.size}, so it shares a producer batch with the records
+     * around it, of its key and of another key in its partition: the broker refuses the batch, not the record, and
+     * kafka-clients 3.9 splits it by {@code batch.size} into the same batch until {@code delivery.timeout.ms}. The
+     * poison still dies and reaches its dead-letter topic, and both keys go on, within two delivery timeouts and 30 s.
+     */
+    @Test
+    void aPoisonSmallerThanTheProducerBatchStillGoesToTheDeadLetterTopic() throws Exception {
+        var within = DELIVERY_TIMEOUT.multipliedBy(2).plusSeconds(30);
+        var topic = TestKafka.createTopic("t-" + UUID.randomUUID(), 1, Map.of("max.message.bytes", "1024"));
+        var dlq = TestKafka.createTopic(topic + ".dlq", 1, Map.of());
+        var sender = sender();
+        // one shard: the four records share one call, so they share one producer batch
+        var runtime = start(OutboxRuntime.builder(config().shards(1), transactions, new Handler(sender))
+                .deadLetterHandler(new KafkaDeadLetterHandler(sender, "{topic}.dlq")));
+        long started = System.nanoTime();
+
+        var ids = sendAll(runtime, List.of(
+                OutboxMessage.of(topic, "k", bytes("before")),
+                OutboxMessage.of(topic, "k", new byte[10 * 1024]),
+                OutboxMessage.of(topic, "k", bytes("after")),
+                OutboxMessage.of(topic, "other", bytes("other"))));
+        var poison = ids.get(1);
+        committed.get("k").remove(poison); // its place is the dead-letter topic
+
+        var dead = TestKafka.consumeUntil(dlq, within, r -> !r.isEmpty());
+        assertThat(dead).extracting(KafkaOutboxHeaders::messageId).containsOnly(poison);
+        var main = consumeCommitted(topic, r -> true);
+        assertThat(main).extracting(KafkaOutboxHeaders::messageId).doesNotContain(poison);
+        await(Duration.ofSeconds(10), () -> runtime.admin().countDeadLetters(DeadLetterFilter.any()) == 0);
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThanOrEqualTo(within);
     }
 
     @Test

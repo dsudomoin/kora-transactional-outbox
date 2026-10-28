@@ -388,6 +388,94 @@ class KafkaOutboxSenderTest {
         assertThat(producer.closed()).isTrue();
     }
 
+    /**
+     * A batch the broker refuses as too large that fits {@code batch.size} expires whole on kafka-clients 3.9, which
+     * splits it into the same batch until {@code delivery.timeout.ms}. The records unacknowledged then are sent alone
+     * next time, the batch-mates the close aborted too (the call returns before Kafka fails them): a refused one fails
+     * on its own, as Permanent, and closes nothing, so the rest of the call goes on. Delivered, they batch again.
+     */
+    @Test
+    void recordsUnacknowledgedWhenABatchExpiredAreSentAloneNextTime() throws Exception {
+        var clock = new TestClock();
+        var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
+        var before = record(1, "a");
+        var poison = record(2, "a");
+        var other = record(3, "b");
+        var first = sendAsync(sender, List.of(before, poison, other));
+        awaitSent(0, 3).errorNext(new TimeoutException("Expiring 3 record(s)"));
+        assertThat(first.get(5, SECONDS)).allSatisfy(o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
+        clock.advance(Duration.ofSeconds(1)); // a's partition cools for 1 s
+
+        var second = sendAsync(sender, List.of(before, poison, other, record(4, "c")));
+        var producer = awaitSent(1, 1);
+        assertStillSent(producer, 1); // the next one waits for this ack
+        producer.completeNext();
+        awaitSent(1, 2);
+        assertStillSent(producer, 2);
+        producer.errorNext(new RecordTooLargeException("broker says too large"));
+        awaitSent(1, 3);
+        assertStillSent(producer, 3); // a record that is not remembered still waits behind one sent alone
+        producer.completeNext();
+        awaitSent(1, 4).completeNext();
+
+        assertThat(second.get(5, SECONDS)).satisfiesExactly(
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
+                o -> assertThat(o).isInstanceOfSatisfying(Outcome.Permanent.class,
+                        p -> assertThat(p.error()).isInstanceOf(RecordTooLargeException.class)),
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
+                o -> assertThat(o).isEqualTo(Outcome.delivered()));
+        assertThat(producer.closed()).as("nothing was in flight with the refused record").isFalse();
+
+        var third = sendAsync(sender, List.of(before, other));
+        awaitSent(1, 6); // both handed over before an ack: delivered records are forgotten
+        producer.completeNext();
+        producer.completeNext();
+        assertThat(third.get(5, SECONDS)).containsExactly(Outcome.delivered(), Outcome.delivered());
+    }
+
+    /**
+     * A refusal from the broker shows that the partition answers: like a delivery, it ends the partition's cooldown,
+     * so a probe whose only record was refused does not hold the partition until its lease ends.
+     */
+    @Test
+    void brokerRefusalEndsThePartitionsCooldown() throws Exception {
+        var clock = new TestClock();
+        var onP = keyOnPartition(0);
+        var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
+        var first = sendAsync(sender, List.of(record(1, onP)));
+        awaitSent(0, 1).errorNext(new NotEnoughReplicasException("not enough"));
+        first.get(5, SECONDS);
+        clock.advance(Duration.ofSeconds(1)); // the 1 s cooldown ends
+
+        var probe = sendAsync(sender, List.of(record(2, onP)));
+        awaitSent(1, 1).errorNext(new RecordTooLargeException("broker says too large"));
+        assertThat(probe.get(5, SECONDS)).singleElement().isInstanceOf(Outcome.Permanent.class);
+
+        var next = sendAsync(sender, List.of(record(3, onP)));
+        awaitSent(2, 1).completeNext();
+        assertThat(next.get(5, SECONDS)).containsExactly(Outcome.delivered());
+    }
+
+    /** Only an expired batch makes records go alone: those of a call that failed otherwise are batched as before. */
+    @Test
+    void recordsOfACallThatFailedOtherwiseAreBatchedAsBefore() throws Exception {
+        var clock = new TestClock();
+        var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
+        var failed = record(1, "a");
+        var aborted = record(2, "b");
+        var first = sendAsync(sender, List.of(failed, aborted));
+        awaitSent(0, 2).errorNext(new NotEnoughReplicasException("not enough"));
+        assertThat(first.get(5, SECONDS)).allSatisfy(o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
+        clock.advance(Duration.ofSeconds(1)); // a's partition cools for 1 s
+
+        var second = sendAsync(sender, List.of(failed, aborted, record(3, "c")));
+        var producer = awaitSent(1, 3); // all handed over before an ack
+        producer.completeNext();
+        producer.completeNext();
+        producer.completeNext();
+        assertThat(second.get(5, SECONDS)).containsOnly(Outcome.delivered());
+    }
+
     @Test
     void invalidRecordIsPermanent() throws Exception {
         var sender = sender(DELIVERY_TIMEOUT);
@@ -1137,6 +1225,13 @@ class KafkaOutboxSenderTest {
             Thread.sleep(5);
         }
         return producers.get(producer);
+    }
+
+    /** {@code producer} has handed over no more than {@code records} a moment later: the sender waits for an ack. */
+    private static void assertStillSent(MockProducer<byte[], byte[]> producer, int records)
+            throws InterruptedException {
+        Thread.sleep(100);
+        assertThat(producer.history()).hasSize(records);
     }
 
     private static String keyOnPartition(int partition) {
