@@ -4,7 +4,7 @@ dependencies {
     api(project(":outbox-kora"))
 
     testImplementation(testFixtures(project(":outbox-kora")))
-    testImplementation("org.testcontainers:testcontainers-kafka:2.0.5")
+    testImplementation(testFixtures(project(":outbox-kafka")))
     testImplementation("ru.tinkoff.kora:config-hocon")
     testImplementation("ru.tinkoff.kora:test-junit5")
     testAnnotationProcessor("ru.tinkoff.kora:annotation-processors")
