@@ -55,6 +55,8 @@ public final class PgInbox implements Inbox, AutoCloseable {
     private static final Pattern CONSUMER = Pattern.compile("[A-Za-z0-9_.:-]{1,64}");
 
     private final OutboxTransactions db;
+    /** Where the startup and maintenance run: {@link #db}, or the owner's connections ({@link OwnerTransactions}). */
+    private final OutboxTransactions ddl;
     private final String notInTx;
     private final OutboxConfig config;
     private final OutboxTelemetry telemetry;
@@ -71,6 +73,12 @@ public final class PgInbox implements Inbox, AutoCloseable {
     private volatile ScheduledExecutorService scheduler;
 
     public PgInbox(OutboxTransactions db, OutboxConfig config, OutboxTelemetry telemetry) {
+        this(db, db, config, telemetry);
+    }
+
+    /** {@code ddl}: the transactions whose new connections run the startup and maintenance. */
+    public PgInbox(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config, OutboxTelemetry telemetry) {
+        this.ddl = ddl;
         this.db = db;
         this.notInTx = "Inbox.tryAccept and tryAcceptAll must be called inside " + db.transactionHint();
         this.config = config;
@@ -179,7 +187,12 @@ public final class PgInbox implements Inbox, AutoCloseable {
     }
 
     public void start() throws SQLException {
-        try (var c = db.newConnection()) {
+        try (var c = ddl.newConnection()) {
+            if (ddl != db) { // before any DDL
+                try (var app = db.newConnection()) {
+                    SchemaCheck.requireSameDatabase(app, c, names.base());
+                }
+            }
             c.setAutoCommit(true);
             PartitionDdl.requireSessionStable(c, "outbox inbox bootstrap of " + names.base());
             execute(c, "set lock_timeout = " + LOCK_TIMEOUT.toMillis());
@@ -245,7 +258,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
      * refresh.
      */
     public void runMaintenance() {
-        try (var c = db.newConnection()) {
+        try (var c = ddl.newConnection()) {
             c.setAutoCommit(true);
             if (sessionStable(c)) {
                 maintain(c);
@@ -266,7 +279,9 @@ public final class PgInbox implements Inbox, AutoCloseable {
                             + " consumer text not null default '', received_at timestamptz not null default now(),"
                             + " primary key (message_id, consumer)) partition by range (message_id)");
                 } else { // the application's migrations own it
-                    SchemaCheck.run(c, c, SchemaObjects.inbox(names), names.base(), "OutboxSql.inbox");
+                    try (var app = db.newConnection()) {
+                        SchemaCheck.run(app, c, SchemaObjects.inbox(names), names.base(), "OutboxSql.inbox");
+                    }
                 }
                 partitions.ensurePremade(c, System.currentTimeMillis());
             } finally {

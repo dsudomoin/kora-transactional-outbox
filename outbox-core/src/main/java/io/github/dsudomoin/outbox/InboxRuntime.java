@@ -1,7 +1,9 @@
 package io.github.dsudomoin.outbox;
 
 import io.github.dsudomoin.outbox.internal.GuardedTelemetry;
+import io.github.dsudomoin.outbox.internal.OwnerTransactions;
 import io.github.dsudomoin.outbox.internal.PgInbox;
+import jakarta.annotation.Nullable;
 import java.sql.SQLException;
 import java.util.Objects;
 
@@ -58,6 +60,8 @@ public final class InboxRuntime implements AutoCloseable {
         private final OutboxConfig config;
         private final OutboxTransactions transactions;
         private OutboxTelemetry telemetry = OutboxTelemetry.NONE;
+        @Nullable
+        private ConnectionSource owner;
 
         private Builder(OutboxConfig config, OutboxTransactions transactions) {
             this.config = Objects.requireNonNull(config, "config");
@@ -69,9 +73,22 @@ public final class InboxRuntime implements AutoCloseable {
             return this;
         }
 
+        /**
+         * Connections of the role that owns the inbox table, for its startup and maintenance (the range DDL);
+         * {@code transactions} then needs DML only. Requires {@code outbox.schema.bootstrap = false}.
+         */
+        public Builder ownerConnections(ConnectionSource owner) {
+            this.owner = Objects.requireNonNull(owner, "owner");
+            return this;
+        }
+
         /** Validates the inbox keys of the config; touches no database. */
         public InboxRuntime build() {
-            return new InboxRuntime(transactions, new PgInbox(transactions, config, GuardedTelemetry.of(telemetry)));
+            if (owner != null && config.schema().bootstrap()) {
+                throw new IllegalArgumentException(OutboxRuntime.OWNER_NEEDS_MIGRATIONS);
+            }
+            return new InboxRuntime(transactions, new PgInbox(transactions, OwnerTransactions.of(transactions, owner),
+                    config, GuardedTelemetry.of(telemetry)));
         }
     }
 }

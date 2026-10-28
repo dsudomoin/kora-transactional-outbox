@@ -71,6 +71,34 @@ final class SchemaCheck {
         }
     }
 
+    /**
+     * Fails unless {@code app} and {@code owner} reach one database of one server, where {@code table} names the same
+     * table (or none on both): an owner source pointed elsewhere would make partitions where the application never
+     * writes.
+     */
+    static void requireSameDatabase(Connection app, Connection owner, String table) throws SQLException {
+        var a = where(app, table);
+        var o = where(owner, table);
+        if (!a.equals(o)) {
+            throw new IllegalStateException("outbox owner connection source reaches another database than the"
+                    + " application's: owner " + o + ", application " + a + "; point both at the database of " + table
+                    + " (and, for an unqualified name, give both roles the same search_path)");
+        }
+    }
+
+    private static String where(Connection c, String table) throws SQLException {
+        try (var ps = c.prepareStatement("select current_database(), pg_postmaster_start_time(),"
+                + " to_regclass(?)::oid")) {
+            ps.setString(1, table);
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                var oid = rs.getString(3);
+                return "database " + rs.getString(1) + " of the server started " + rs.getString(2) + ", "
+                        + (oid == null ? "no table " + table : "table " + table + " oid " + oid);
+            }
+        }
+    }
+
     private static void columns(Connection c, long oid, SchemaObjects.Table t, String render, List<String> problems)
             throws SQLException {
         record Actual(String type, boolean notNull, boolean hasDefault, boolean identity) {}

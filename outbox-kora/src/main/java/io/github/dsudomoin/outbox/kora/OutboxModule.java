@@ -17,7 +17,9 @@ import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.opentelemetry.api.trace.Tracer;
 import jakarta.annotation.Nullable;
 import ru.tinkoff.kora.application.graph.LifecycleWrapper;
+import ru.tinkoff.kora.common.Tag;
 import ru.tinkoff.kora.common.annotation.Root;
+import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 
 /**
  * Wires the outbox into a Kora app; the app provides one {@link OutboxHandler} component.
@@ -32,16 +34,22 @@ import ru.tinkoff.kora.common.annotation.Root;
  * Config at {@code outbox}. The outbox is a root: started with the app, tables first, then the relay; with
  * {@code outbox.relay.enabled = false} the relay only serves {@link OutboxRelay#drain()}. Tracing is on when the app
  * has a {@link Tracer}. Dead letters go to the app's {@link OutboxDeadLetterHandler} component when it has one, and
- * are kept for humans otherwise. An app that only deduplicates uses {@link InboxModule} alone.
+ * are kept for humans otherwise. With a {@link OutboxOwner}-tagged {@code JdbcConnectionFactory} the outbox's DDL,
+ * session locks and recoveries run through that one ({@code outbox.schema.bootstrap = false}). An app that only
+ * deduplicates uses {@link InboxModule} alone.
  */
 public interface OutboxModule extends OutboxCommonModule {
 
     @Root
     default LifecycleWrapper<OutboxRuntime> outboxRuntime(OutboxConfig config, OutboxTransactions db,
-            OutboxHandler handler, @Nullable OutboxDeadLetterHandler hook, OutboxTelemetry telemetry) {
+            OutboxHandler handler, @Nullable OutboxDeadLetterHandler hook, OutboxTelemetry telemetry,
+            @Tag(OutboxOwner.class) @Nullable JdbcConnectionFactory owner) {
         var builder = OutboxRuntime.builder(config, db, handler).telemetry(telemetry);
         if (hook != null) {
             builder.deadLetterHandler(hook);
+        }
+        if (owner != null) {
+            builder.ownerConnections(owner::newConnection);
         }
         return new LifecycleWrapper<>(builder.build(), OutboxRuntime::start, OutboxRuntime::close);
     }

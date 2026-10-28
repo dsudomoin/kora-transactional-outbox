@@ -49,6 +49,11 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private static final String LOCK_NOT_AVAILABLE = "55P03";
 
     private final OutboxTransactions db;
+    /**
+     * Where {@link #status}, {@link #restoreOrphan} and {@link #recoverXidRegression} run: {@link #db}, or the owner's
+     * connections ({@link OwnerTransactions}): they read partitions directly or run DDL.
+     */
+    private final OutboxTransactions ddl;
     private final TableNames names;
     private final int shards;
     private final Maintenance maintenance;
@@ -78,7 +83,13 @@ public final class PgOutboxAdmin implements OutboxAdmin {
 
     public PgOutboxAdmin(OutboxTransactions db, TableNames names, OutboxConfig config, Maintenance maintenance,
             Runnable wakeRelay) {
+        this(db, db, names, config, maintenance, wakeRelay);
+    }
+
+    public PgOutboxAdmin(OutboxTransactions db, OutboxTransactions ddl, TableNames names, OutboxConfig config,
+            Maintenance maintenance, Runnable wakeRelay) {
         this.db = db;
+        this.ddl = ddl;
         this.names = names;
         this.shards = config.shards();
         this.maintenance = maintenance;
@@ -96,7 +107,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     @Override
     public OutboxStatus status() {
         requireOwnTransactions();
-        try (var conn = db.newConnection()) {
+        try (var conn = ddl.newConnection()) { // the tail check reads the tail itself
             return read(conn, c -> new OutboxStatus(
                     queryBoolean(c, "select exists (select 1 from " + names.halt() + ")"),
                     maintenance.lagSeconds(c),
@@ -213,7 +224,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         var call = printable("restoreOrphan(" + table + ", " + fromXid + ")");
         long moved;
         var restoring = new AtomicBoolean();
-        try (var c = db.newConnection()) {
+        try (var c = ddl.newConnection()) {
             c.setAutoCommit(true);
             moved = underMaintenanceLock(c, call, () -> {
                 var name = names.unqualified(table);
@@ -260,7 +271,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         var recovering = new AtomicBoolean();
         var sent = new AtomicLong(-1); // the rows re-sent, once the recovery committed
         Exception cleanup = null;
-        try (var c = db.newConnection()) {
+        try (var c = ddl.newConnection()) {
             c.setAutoCommit(true);
             underMaintenanceLock(c, call, () -> {
                 var check = recovery.check(c);

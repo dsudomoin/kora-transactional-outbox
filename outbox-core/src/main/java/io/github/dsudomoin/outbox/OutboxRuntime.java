@@ -4,6 +4,7 @@ import io.github.dsudomoin.outbox.internal.DeadLetterPass;
 import io.github.dsudomoin.outbox.internal.GuardedTelemetry;
 import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
+import io.github.dsudomoin.outbox.internal.OwnerTransactions;
 import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.PgOutboxAdmin;
 import jakarta.annotation.Nullable;
@@ -25,11 +26,16 @@ import java.util.Objects;
  */
 public final class OutboxRuntime implements AutoCloseable {
 
+    static final String OWNER_NEEDS_MIGRATIONS = "outbox.schema.bootstrap must be false when an owner connection source"
+            + " is set: objects it created would leave the application role without rights on them";
+
     private final OutboxConfig config;
     private final OutboxTransactions transactions;
     private final OutboxHandler handler;
     private final OutboxDeadLetterHandler deadLetterHandler;
     private final OutboxTelemetry telemetry;
+    /** The transactions with the owner's new connections, or {@link #transactions} without an owner source. */
+    private final OutboxTransactions ddl;
     @Nullable
     private volatile Parts parts;
 
@@ -39,6 +45,7 @@ public final class OutboxRuntime implements AutoCloseable {
         this.handler = builder.handler;
         this.deadLetterHandler = builder.deadLetterHandler;
         this.telemetry = GuardedTelemetry.of(builder.telemetry);
+        this.ddl = OwnerTransactions.of(transactions, builder.owner);
     }
 
     public static Builder builder(OutboxConfig config, OutboxTransactions transactions, OutboxHandler handler) {
@@ -81,7 +88,7 @@ public final class OutboxRuntime implements AutoCloseable {
         if (parts != null) {
             throw new IllegalStateException("OutboxRuntime.start() has run already");
         }
-        var schema = new OutboxSchema(transactions, config);
+        var schema = new OutboxSchema(transactions, ddl, config);
         try {
             schema.start();
         } catch (SQLException e) {
@@ -90,11 +97,11 @@ public final class OutboxRuntime implements AutoCloseable {
         try {
             var resolved = schema.config(); // with the shard count the bootstrap resolved
             var names = schema.names();
-            var maintenance = new Maintenance(transactions, names, resolved, telemetry);
+            var maintenance = new Maintenance(ddl, names, resolved, telemetry);
             var deadLetters = new DeadLetterPass(transactions, names, resolved, deadLetterHandler, telemetry);
             var relay = new OutboxRelay(transactions, resolved, schema, handler, telemetry, maintenance, deadLetters);
             var outbox = new PgOutbox(transactions, schema, resolved.shards(), relay::wake, telemetry);
-            var admin = new PgOutboxAdmin(transactions, names, resolved, maintenance, relay::wake);
+            var admin = new PgOutboxAdmin(transactions, ddl, names, resolved, maintenance, relay::wake);
             relay.start();
             parts = new Parts(schema, maintenance, deadLetters, relay, outbox, admin);
         } catch (RuntimeException | Error e) {
@@ -134,6 +141,8 @@ public final class OutboxRuntime implements AutoCloseable {
         private final OutboxHandler handler;
         private OutboxDeadLetterHandler deadLetterHandler = OutboxDeadLetterHandler.NONE;
         private OutboxTelemetry telemetry = OutboxTelemetry.NONE;
+        @Nullable
+        private ConnectionSource owner;
 
         private Builder(OutboxConfig config, OutboxTransactions transactions, OutboxHandler handler) {
             this.config = Objects.requireNonNull(config, "config");
@@ -152,9 +161,23 @@ public final class OutboxRuntime implements AutoCloseable {
             return this;
         }
 
+        /**
+         * Connections of the role that owns the tables, for everything that runs DDL or holds the session locks: the
+         * startup, maintenance (partitions, orphans, the xid-regression recovery), {@link OutboxAdmin#status()},
+         * {@link OutboxAdmin#restoreOrphan} and {@link OutboxAdmin#recoverXidRegression()}; {@code transactions} then
+         * needs DML only. Requires {@code outbox.schema.bootstrap = false}: the migrations own the base tables.
+         */
+        public Builder ownerConnections(ConnectionSource owner) {
+            this.owner = Objects.requireNonNull(owner, "owner");
+            return this;
+        }
+
         /** Validates the config; touches no database. */
         public OutboxRuntime build() {
             OutboxSchema.validate(config);
+            if (owner != null && config.schema().bootstrap()) {
+                throw new IllegalArgumentException(OWNER_NEEDS_MIGRATIONS);
+            }
             return new OutboxRuntime(this);
         }
     }

@@ -73,6 +73,8 @@ public final class OutboxSchema implements AutoCloseable {
     static final int LIVE_INTERVALS = 3;
 
     private final OutboxTransactions db;
+    /** Where the bootstrap runs: {@link #db}, or the owner's connections ({@link OwnerTransactions}). */
+    private final OutboxTransactions ddl;
     private final OutboxConfig config;
     private final TableNames spelled;
     private final int schemaLockAttempts;
@@ -92,12 +94,22 @@ public final class OutboxSchema implements AutoCloseable {
      * startup before any DDL or relay thread.
      */
     public OutboxSchema(OutboxTransactions db, OutboxConfig config) {
-        this(db, config, SCHEMA_LOCK_ATTEMPTS);
+        this(db, db, config);
+    }
+
+    /** {@code ddl}: the transactions whose new connections run the bootstrap, the owner's ones when it has its own. */
+    public OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config) {
+        this(db, ddl, config, SCHEMA_LOCK_ATTEMPTS);
     }
 
     OutboxSchema(OutboxTransactions db, OutboxConfig config, int schemaLockAttempts) {
+        this(db, db, config, schemaLockAttempts);
+    }
+
+    private OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config, int schemaLockAttempts) {
         validate(config);
         this.db = db;
+        this.ddl = ddl;
         this.config = config;
         this.spelled = TableNames.of(config.table());
         this.schemaLockAttempts = schemaLockAttempts;
@@ -284,7 +296,12 @@ public final class OutboxSchema implements AutoCloseable {
     }
 
     public void start() throws SQLException {
-        try (var c = db.newConnection()) {
+        try (var c = ddl.newConnection()) {
+            if (ddl != db) { // before any DDL
+                try (var app = db.newConnection()) {
+                    SchemaCheck.requireSameDatabase(app, c, spelled.base());
+                }
+            }
             boolean autoCommit = c.getAutoCommit();
             c.setAutoCommit(true);
             try (var st = c.createStatement()) {
@@ -330,7 +347,9 @@ public final class OutboxSchema implements AutoCloseable {
             if (config.schema().bootstrap()) {
                 createBaseObjects(c, n);
             } else { // the application's migrations own them: only checked, and nothing created when one is missing
-                SchemaCheck.run(c, c, SchemaObjects.outbox(n), spelled.base(), "OutboxSql.outbox");
+                try (var app = db.newConnection()) {
+                    SchemaCheck.run(app, c, SchemaObjects.outbox(n), spelled.base(), "OutboxSql.outbox");
+                }
             }
             // when a maintenance run last completed every step, on any instance; until the first one, bootstrap time
             st.execute("insert into " + n.maintenance() + " (succeeded_at) values (now()) on conflict (id) do nothing");
