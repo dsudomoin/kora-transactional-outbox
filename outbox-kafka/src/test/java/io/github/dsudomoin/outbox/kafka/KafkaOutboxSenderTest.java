@@ -40,6 +40,7 @@ import org.apache.kafka.clients.producer.BufferExhaustedException;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.MockProducer;
+import org.apache.kafka.clients.producer.Partitioner;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
@@ -81,6 +82,24 @@ class KafkaOutboxSenderTest {
                     .toList(),
             Set.of(), Set.of());
     private static final Duration DELIVERY_TIMEOUT = Duration.ofSeconds(20);
+    /**
+     * Kafka's key hashing, which a {@link MockProducer} applies only through a partitioner given to it (kafka-clients
+     * 4 dropped the constructors that brought one); an unkeyed record goes to partition 0.
+     */
+    private static final Partitioner KEY_HASH = new Partitioner() {
+        @Override
+        public int partition(String topic, Object key, byte[] keyBytes, Object value, byte[] valueBytes,
+                Cluster cluster) {
+            return keyBytes == null ? 0
+                    : BuiltInPartitioner.partitionForKey(keyBytes, cluster.partitionCountForTopic(topic));
+        }
+
+        @Override
+        public void configure(Map<String, ?> configs) {}
+
+        @Override
+        public void close() {}
+    };
     private static final KafkaOutboxConfig CONFIG = () -> props("bootstrap.servers", "localhost:9092");
 
     private final List<MockProducer<byte[], byte[]>> producers = new CopyOnWriteArrayList<>();
@@ -431,7 +450,8 @@ class KafkaOutboxSenderTest {
     void unkeyedRecordsAvoidACoolingPartition() throws Exception {
         var scheduler = Executors.newSingleThreadScheduledExecutor();
         var requested = new CopyOnWriteArrayList<Optional<Integer>>(); // ProducerRecord.partition() as the sender set it
-        var sender = sender(() -> new MockProducer<>(CLUSTER, true, new ByteArraySerializer(), new ByteArraySerializer()) {
+        var sender = sender(() -> new MockProducer<>(CLUSTER, true, KEY_HASH, new ByteArraySerializer(),
+                new ByteArraySerializer()) {
             private int next; // stands in for Kafka's partitioner
 
             @Override
@@ -1066,7 +1086,7 @@ class KafkaOutboxSenderTest {
         private final Function<ProducerRecord<byte[], byte[]>, RuntimeException> failure;
 
         TestProducer(boolean autoComplete, Function<ProducerRecord<byte[], byte[]>, RuntimeException> failure) {
-            super(CLUSTER, autoComplete, new ByteArraySerializer(), new ByteArraySerializer());
+            super(CLUSTER, autoComplete, KEY_HASH, new ByteArraySerializer(), new ByteArraySerializer());
             this.failure = failure;
         }
 
