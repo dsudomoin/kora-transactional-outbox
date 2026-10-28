@@ -197,12 +197,12 @@ classpath, поэтому код по-прежнему компилируетс�
 ./gradlew build                                                        # объявленные версии, Postgres 16
 ./gradlew test -Doutbox.test.postgres=postgres:14-alpine               # так же 15, 17, 18
 ./gradlew :outbox-kafka:test :outbox-kafka-kora:test -Poutbox.test.kafkaClients=4.0.2   # так же 4.4.0
-./gradlew :outbox-micrometer:test -Poutbox.test.micrometer=1.17.2 \
-    -Poutbox.test.micrometerTracing=1.7.2 -Poutbox.test.opentelemetry=1.62.0
+./gradlew :outbox-micrometer:test :outbox-kafka:test \
+    -Poutbox.test.micrometer=1.17.2 -Poutbox.test.micrometerTracing=1.7.2 -Poutbox.test.opentelemetry=1.62.0
 ```
 
-micrometer-tracing 1.7.2 тянет OpenTelemetry 1.62.0, а `opentelemetry-sdk-testing` в тестах объявлен старше;
-`-Poutbox.test.opentelemetry=1.62.0` выравнивает все артефакты OpenTelemetry на одну версию.
+micrometer-tracing 1.7.2 тянет OpenTelemetry 1.62.0, а `opentelemetry-sdk-testing` в тестах объявлен 1.31.0,
+старее; `-Poutbox.test.opentelemetry=1.62.0` выравнивает все артефакты OpenTelemetry на одну версию.
 
 ### Роль в базе и привилегии
 
@@ -1042,8 +1042,9 @@ final class AppTransactions implements OutboxTransactions {
 
 1. `build()` проверяет конфиг и в базу не ходит.
 2. `start()` вызывается до того, как начнут работать писатели. Он создаёт или проверяет таблицы, затем запускает relay,
-   обслуживание и проход dead letters; с `outbox.relay.enabled = false` relay и обслуживание не запускаются, а
-   `OutboxRelay.drain()` работает. `start()` вызывается один раз. `outbox()`, `relay()` и `admin()` доступны после
+   обслуживание и проход dead letters; с `outbox.relay.enabled = false` не запускаются ни relay, ни обслуживание, ни
+   проход dead letters (хук на этом инстансе не вызывается), а `OutboxRelay.drain()` работает и заканчивается одним
+   проходом dead letters. `start()` вызывается один раз. `outbox()`, `relay()` и `admin()` доступны после
    него, до него они бросают `IllegalStateException`.
 3. Писатели отправляют в своих транзакциях.
 4. Остановка идёт в обратном порядке. Сначала писатели (входящие запросы, потребители), затем `runtime.close()`:
@@ -1119,9 +1120,9 @@ sender.close();
 ```
 
 - Какие настройки продюсера навязываются, отвергаются и выставляются по умолчанию — в [Требованиях к
-  Kafka](#требования-к-kafka). В Kora модуль пишет при старте WARN, если `outbox.relay.batchTimeout` меньше
-  `delivery.timeout.ms + 5 s + max.block.ms`; без Kora этого предупреждения нет, держите неравенство сами (30 с по
-  умолчанию = 20 + 5 + 5).
+  Kafka](#требования-к-kafka). В Kora модуль пишет при старте WARN, если `outbox.relay.batchTimeout` (или, с Kafka
+  DLQ, `outbox.deadLetters.timeout`) меньше `delivery.timeout.ms + 5 s + max.block.ms`; без Kora этих предупреждений
+  нет, держите неравенства сами (30 с по умолчанию = 20 + 5 + 5).
 - Продюсеры через фабрику клиентов приложения: `new KafkaOutboxSender(kafkaConfig, properties -> ...)`
   ([Установка](#установка)).
 - Dead letters без хука остаются в dead-таблице, разбирайте их через `runtime.admin()` ([Dead letters](#dead-letters)).
@@ -1269,7 +1270,7 @@ flowchart TD
 
 | Ключ | По умолчанию | Значение |
 |---|---|---|
-| `enabled` | `true` | `false`: этот инстанс не запускает relay-воркеров **и обслуживание партиций**; `OutboxRelay.drain()` и heartbeat инстанса по-прежнему работают. Держите хотя бы один инстанс с включённым relay ([Обслуживание работает там же, где relay](#обслуживание-работает-там-же-где-relay)). |
+| `enabled` | `true` | `false`: этот инстанс не запускает relay-воркеров, проход dead letters **и обслуживание партиций**; `OutboxRelay.drain()` и heartbeat инстанса по-прежнему работают. Держите хотя бы один инстанс с включённым relay ([Обслуживание работает там же, где relay](#обслуживание-работает-там-же-где-relay)). |
 | `workers` | `4` | Число потоков relay на инстанс (`outbox-relay-N`), ≥ 1. Каждый держит соединение с БД, пока работает. |
 | `batchSize` | `1000` | ≥ 1. Максимум строк на одно чтение чанка и на один вызов обработчика. Вызов с чанком несёт сверх него до текущего лимита чанка (не больше `batchSize`) отложенных записей ключей чанка, то есть всего до `2 × batchSize` записей. Новый батч охватывает около `batchSize × shards` id, а проход по retry-таблице передаёт не больше `batchSize` строк за шаг (головы со следующими за ними строками и отложенные записи, срок которых наступил). |
 | `maxTicksPerBatch` | `100` | ≥ 1. Наибольшее число тиков, которое может охватить один батч. |
@@ -1439,7 +1440,7 @@ drain, может сам вызывать `Maintenance.runOnce()` каждые `
   - отказ брокера заканчивает cooldown партиции, как доставка: брокер ответил.
 
   Рекомендация: `batch.size` не больше `max.message.bytes` топика. Тогда запись, которая не помещается в топик,
-  больше и `batch.size`, а такая запись всегда идёт в batch одна.
+  больше и `batch.size`, а такая запись без сжатия всегда идёт в batch одна.
 - **Частичные сбои.** Партиция (или топик), отправки в которую сбоят сами по себе, уходит на cooldown на 1 с,
   удваиваясь до 30 с, а успешная отправка его сбрасывает. Записи с ключом для неё получают `NotAttempted` с этим
   `notBefore`, поэтому их ключи ждут в retry-таблице, пока остальной топик идёт. Когда cooldown заканчивается, один
@@ -2630,7 +2631,11 @@ var runtime = OutboxRuntime.builder(config, transactions, handler).telemetry(tel
   `traceparent` записи — корректный W3C trace context со сброшенным флагом sampled. Учитывается только W3C: запись с
   сэмплированным, отсутствующим или некорректным `traceparent` или только с заголовками другого формата наблюдается
   всегда. Ненаблюдаемая запись уходит обработчику с сохранёнными заголовками (`traceparent`, `baggage` и остальные),
-  так что потребители продолжают её трассу, но код обработчика для неё идёт без её контекста трассы. Таймер
+  так что потребители продолжают её трассу, но код обработчика для неё идёт без её контекста трассы. Обработчик
+  работает на потоках обработчиков relay (`outbox-handler-N`), где ничего не текущее, если что-то не переносит
+  контекст в этот пул. Если переносит (например, агент, который распространяет контекст в пулы потоков), текущим может
+  оказаться span шага, и инструментированный клиент в своём обработчике запишет трассу шага. Kafka-путь библиотеки
+  копирует сохранённые заголовки и от этого не зависит. Таймер
   `outbox.deliver` обработчика метров считает только наблюдённые записи, метры `OutboxMetrics` — все.
   `observeUnsampled(true)` в билдере наблюдает каждую доставку; цена этого — ниже.
 - Остальные события и gauges — метры `OutboxMetrics` из таблицы выше.
@@ -2642,9 +2647,9 @@ var runtime = OutboxRuntime.builder(config, transactions, handler).telemetry(tel
   это 0,19 мкс и 0,6 КБ на запись, с `observeUnsampled(true)` — около 1,1 мкс и 5 КБ, у `KoraOutboxTelemetry` —
   0,25 мкс и 1,5 КБ. На стенде (`bench/RESULTS.md`, «Телеметрия по этапам: проверка регрессии и цена Micrometer
   Observation»; сэмплирование 10 %) при 1000 msg/s задержка, WAL и CPU у всех вариантов те же. На насыщении (bulk,
-  227–271 тыс. msg/s) пропускная способность и WAL тоже те же; по умолчанию задержка доставки p50 0,086–0,088 с и p99
+  220–271 тыс. msg/s) пропускная способность и WAL тоже те же; по умолчанию задержка доставки p50 0,086–0,088 с и p99
   0,148–0,149 с, как у Kora (0,086–0,091 с и 0,148–0,170 с, один выброс p99 0,216 с). С `observeUnsampled(true)`
-  приложение тратит на 0,5 ядра больше, а задержка p50 0,096–0,104 с и p99 0,174–0,232 с.
+  приложение тратит на 0,5 ядра больше, а задержка p50 0,096 с и p99 0,174 с (один прогон итогового кода).
 
 ### Контракт по этапам
 
@@ -2983,7 +2988,7 @@ retry и dead пусты. Прогон на более ранней версии
 - членов с аннотацией `@InternalApi` (`io.github.dsudomoin.outbox.InternalApi`). Они публичны только для адаптеров
   этого репозитория: `OutboxRuntime.schema()`, `maintenance()` и `deadLetterPass()`, конструктор `OutboxRelay`,
   `KafkaOutboxSender.warnIfLongerThan`, фабрики `OutboxModule` и `OutboxAdminHttpModule` для внутренних типов,
-  классы `OutboxAdminDelegate` и `OutboxAdminInterceptor`;
+  классы `OutboxAdminDelegate`, `OutboxAdminInterceptor`, `KoraRecordScope` и `OutboxTracing`;
 - пакетов `io.github.dsudomoin.outbox.admin.kora.api` и `io.github.dsudomoin.outbox.admin.kora.model`, сгенерированных
   из OpenAPI админки. Контракт админки — её HTTP-API ([Админ-API и HTTP](#админ-api-и-http)).
 
@@ -3009,6 +3014,11 @@ retry и dead пусты. Прогон на более ранней версии
   приложения собираются без правок. Несовместимые изменения — только в мажорной версии.
 - Снимок описывает только Java API. Имена метрик, span-ов и ключей конфигурации, таблицы и HTTP-контракт админки в
   него не входят.
+
+**`OutboxRecord` получил компонент `shard`.** Конструктор с 9 аргументами (шард -1, неизвестен) и аксессоры остались,
+так что код, который создаёт записи и читает их поля, собирается и работает без правок. Деконструирующие паттерны
+record (`case OutboxRecord(var id, ...)`) должны добавить новый компонент. `equals` и `hashCode` учитывают `shard`:
+две записи, отличающиеся только шардом, не равны.
 
 **Снимок API.** У каждого опубликованного модуля есть файл `api/<модуль>.txt` — сигнатура его публичного API
 (Metalava, вместе с компонентами records). `./gradlew apiCheck` входит в `check` и `build`: он падает при любом

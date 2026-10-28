@@ -9,9 +9,12 @@ Without Kora the same meters come from `OutboxMetrics` (`outbox-micrometer`) pas
 `OutboxRuntime.builder(...).telemetry(...)`. `ObservationOutboxTelemetry` adds three Micrometer observations on top:
 `outbox.enqueue` per send call, `outbox.relay.step` per relay step that finds work, the steps
 `outbox.batch.duration` times (span `outbox relay step`, a trace root on a relay worker; high-cardinality
-`outbox.shards`) and `outbox.deliver` per record (span kind CONSUMER, parented by the stored trace;
-tags `messaging.destination.name`, `outbox.outcome`; high-cardinality `outbox.shard`). Rename them with an
-`Outbox*ObservationConvention`, rename meters with a `MeterFilter`; README «Наблюдаемость» → «Контракт по этапам».
+`outbox.shards`) and `outbox.deliver` per observed record (span kind CONSUMER, parented by the stored trace;
+tags `messaging.destination.name`, `outbox.outcome`; high-cardinality `outbox.shard`). By default a record whose
+stored W3C trace is not sampled is not observed (`observeUnsampled(true)` observes every one), so with
+`DefaultMeterObservationHandler` the `outbox.deliver` timer counts only observed deliveries; the `outbox.*` meters
+below count every record. Rename them with an `Outbox*ObservationConvention`, rename meters with a `MeterFilter`;
+README «Наблюдаемость» → «Контракт по этапам».
 
 | Meter | Type | Tags | Meaning |
 |---|---|---|---|

@@ -23,7 +23,8 @@ public interface OutboxHandler {
      * Delivers one record. Throw {@link OutboxPermanentException} for a record that can never succeed; anything else
      * thrown, an {@link Error} included, means "retry later". The default {@link #handleBatch} runs it in the
      * record's scope ({@link #inRecordScope}), so clients called from here continue the record's trace when the
-     * telemetry binds one (the Kora adapter, the Micrometer Observation telemetry with tracing).
+     * telemetry binds one (the Kora adapter; the Micrometer Observation telemetry with tracing, for the records it
+     * observes).
      */
     void handle(OutboxRecord record) throws Exception;
 

@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.kora;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
+import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
@@ -14,7 +15,11 @@ import java.util.concurrent.Callable;
 import ru.tinkoff.kora.common.Context;
 import ru.tinkoff.kora.opentelemetry.common.OpentelemetryContext;
 
-/** W3C {@code traceparent}/{@code tracestate} headers, bridged to Kora's {@link OpentelemetryContext}. */
+/**
+ * W3C {@code traceparent}/{@code tracestate} headers, bridged to Kora's {@link OpentelemetryContext}. Internal type,
+ * unstable: for the adapters of this repository.
+ */
+@InternalApi
 public final class OutboxTracing {
 
     public static final String TRACEPARENT = "traceparent";

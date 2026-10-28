@@ -82,14 +82,5 @@ package io.github.dsudomoin.outbox.kora {
     method public default io.github.dsudomoin.outbox.protobuf.ProtobufOutbox! protobufOutbox(io.github.dsudomoin.outbox.Outbox!);
   }
 
-  public final class OutboxTracing {
-    method public static java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>! currentHeaders();
-    method public static io.opentelemetry.context.Context! extract(java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
-    method public static java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>! replaceTraceHeaders(java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!, io.opentelemetry.context.Context!);
-    method public static <T> T withKoraContext(io.opentelemetry.context.Context!, java.util.concurrent.Callable<T>!) throws java.lang.Exception;
-    field public static final String TRACEPARENT = "traceparent";
-    field public static final String TRACESTATE = "tracestate";
-  }
-
 }
 
