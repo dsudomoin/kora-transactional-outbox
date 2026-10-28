@@ -54,7 +54,8 @@ kill_cycle_end
 chaos_checks() {
   local maint created dropped swept pending leftover orphaned="" i v
   maint=$(grep -c 'идёт DDL обслуживания' <<< "$FAULTS" || true)
-  created=$(cat "$LOGS/chaos-$NAME-"*.log | grep -c "created partition ${TABLE}_x" || true)
+  created=$(cat "$LOGS/chaos-$NAME-"*.log | grep "swapped the partition tail of ${TABLE}:" \
+    | grep -o 'attached [0-9]* ranges' | awk '{ s += $2 } END { print s + 0 }')
   dropped=$(cat "$LOGS/chaos-$NAME-"*.log | grep -c "dropped partition ${TABLE}_x" || true)
   swept=$(cat "$LOGS/chaos-$NAME-"*.log | grep -c "dropped partition ${TABLE}_x.*detached earlier but never dropped" || true)
   for i in $(seq 1 "$N"); do # NaN on an instance that has not completed the orphan step (it lacks the maintenance lock)
@@ -67,8 +68,8 @@ chaos_checks() {
         and not exists (select 1 from pg_inherits i where i.inhrelid = c.oid))" | tr '|' ' ')"
   check "$([ "$maint" -ge 5 ] && echo 0 || echo 1)" "убийств во время DDL партиций этой таблицы: $maint (нужно 5)"
   check "$([ "$MAX_PARTS" -le "$PARTS_MAX" ] && [ "$created" -gt 0 ] && [ "$dropped" -gt 0 ] && echo 0 || echo 1)" \
-    "партиций создано $created, удалено $dropped (логи экземпляров); в замерах присоединено не больше $MAX_PARTS (граница \
-$PARTS_MAX)"
+    "диапазонов присоединено свопами хвоста $created, удалено $dropped (логи экземпляров); в замерах присоединено \
+не больше $MAX_PARTS (граница $PARTS_MAX)"
   check "$([ "$pending" = 0 ] && [ "$leftover" = 0 ] && echo 0 || echo 1)" \
     "после выборки: незавершённых detach $pending, оставшихся отсоединённых диапазонов и хвостов $leftover; \
 подобрано диапазонов, осиротевших из-за убийства между detach и drop: $swept (логи экземпляров)"
