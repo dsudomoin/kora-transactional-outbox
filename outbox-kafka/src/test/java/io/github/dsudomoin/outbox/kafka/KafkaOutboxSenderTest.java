@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -103,6 +104,8 @@ class KafkaOutboxSenderTest {
     private static final KafkaOutboxConfig CONFIG = () -> props("bootstrap.servers", "localhost:9092");
 
     private final List<MockProducer<byte[], byte[]>> producers = new CopyOnWriteArrayList<>();
+    /** The producers the sender made for its unbatched pool. */
+    private final Set<MockProducer<byte[], byte[]>> unbatched = ConcurrentHashMap.newKeySet();
     private final ExecutorService executor = Executors.newCachedThreadPool();
 
     @AfterEach
@@ -391,12 +394,13 @@ class KafkaOutboxSenderTest {
     /**
      * A batch the broker refuses as too large that fits {@code batch.size} expires whole on kafka-clients 3.9, which
      * splits it into the same batch until {@code delivery.timeout.ms}. The records of its partition unacknowledged
-     * then are sent alone next time, the batch-mates the close aborted too (the call returns before Kafka fails them):
-     * a refused one fails on its own, as Permanent, and closes nothing, so the rest of the call goes on. Settled,
-     * delivered or refused, they are forgotten and batch again.
+     * then are remembered, the batch-mates the close aborted too (the call returns before Kafka fails them). A call
+     * that holds one goes through the unbatched pool, where each record is a producer batch of its own: a refused one
+     * fails on its own, as Permanent, and closes the producer as any refusal does. Settled, delivered or refused, they
+     * are forgotten; once none is left the unbatched producers are closed and calls batch again.
      */
     @Test
-    void recordsUnacknowledgedWhenABatchExpiredAreSentAloneNextTime() throws Exception {
+    void recordsUnacknowledgedWhenABatchExpiredGoThroughAnUnbatchedProducer() throws Exception {
         var clock = new TestClock();
         var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
         var before = record(1, keyOnPartition(0, "a"));
@@ -407,31 +411,30 @@ class KafkaOutboxSenderTest {
         assertThat(first.get(5, SECONDS)).allSatisfy(o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
         clock.advance(Duration.ofSeconds(1)); // the partition cools for 1 s
 
-        var second = sendAsync(sender, List.of(before, poison, other, record(4, keyOnPartition(0, "c"))));
-        var producer = awaitSent(1, 1);
-        assertStillSent(producer, 1); // the next one waits for this ack
-        producer.completeNext();
-        awaitSent(1, 2);
-        assertStillSent(producer, 2);
-        producer.errorNext(new RecordTooLargeException("broker says too large"));
-        awaitSent(1, 3);
-        assertStillSent(producer, 3); // a record that is not remembered still waits behind one sent alone
-        producer.completeNext();
-        awaitSent(1, 4).completeNext();
-
+        var second = sendAsync(sender, List.of(before, poison, other));
+        var unbatchedProducer = awaitSent(1, 3); // all handed over at once
+        assertThat(unbatched).containsExactly(unbatchedProducer);
+        unbatchedProducer.completeNext();
+        unbatchedProducer.errorNext(new RecordTooLargeException("broker says too large"));
         assertThat(second.get(5, SECONDS)).satisfiesExactly(
                 o -> assertThat(o).isEqualTo(Outcome.delivered()),
                 o -> assertThat(o).isInstanceOfSatisfying(Outcome.Permanent.class,
                         p -> assertThat(p.error()).isInstanceOf(RecordTooLargeException.class)),
-                o -> assertThat(o).isEqualTo(Outcome.delivered()),
-                o -> assertThat(o).isEqualTo(Outcome.delivered()));
-        assertThat(producer.closed()).as("nothing was in flight with the refused record").isFalse();
+                o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
 
-        var third = sendAsync(sender, List.of(poison, other));
-        awaitSent(1, 6); // both handed over before an ack: refused and delivered records are forgotten
-        producer.completeNext();
-        producer.completeNext();
-        assertThat(third.get(5, SECONDS)).containsExactly(Outcome.delivered(), Outcome.delivered());
+        var third = sendAsync(sender, List.of(other)); // aborted, not settled: still remembered
+        var next = awaitSent(2, 1);
+        assertThat(unbatched).contains(next);
+        next.completeNext();
+        assertThat(third.get(5, SECONDS)).containsExactly(Outcome.delivered());
+        assertThat(next.closed()).as("nothing is remembered now").isTrue();
+
+        var fourth = sendAsync(sender, List.of(poison, other));
+        var batched = awaitSent(3, 2);
+        assertThat(unbatched).as("refused and delivered records are forgotten").doesNotContain(batched);
+        batched.completeNext();
+        batched.completeNext();
+        assertThat(fourth.get(5, SECONDS)).containsExactly(Outcome.delivered(), Outcome.delivered());
     }
 
     /**
@@ -458,11 +461,11 @@ class KafkaOutboxSenderTest {
     }
 
     /**
-     * A producer batch holds one partition: a record sent alone holds back only the later records of its partition,
-     * and when it fails (here it expires again) the call skips the rest of its partition and goes on with the others.
+     * A call through the unbatched pool hands every record over at once, as any call: a record of another partition
+     * is acknowledged on its own, while the remembered one expires again and closes the call as any failure does.
      */
     @Test
-    void aRecordSentAloneHoldsOnlyItsOwnPartition() throws Exception {
+    void aCallThroughTheUnbatchedPoolWaitsForNoPartition() throws Exception {
         var clock = new TestClock();
         var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
         var remembered = record(1, keyOnPartition(0, "a"));
@@ -471,25 +474,23 @@ class KafkaOutboxSenderTest {
         assertThat(first.get(5, SECONDS)).singleElement().isInstanceOf(Outcome.Retry.class);
         clock.advance(Duration.ofSeconds(1));
 
-        var second = sendAsync(sender, List.of(remembered, record(2, keyOnPartition(1, "b")),
+        var second = sendAsync(sender, List.of(record(2, keyOnPartition(1, "b")), remembered,
                 record(3, keyOnPartition(0, "c"))));
-        var producer = awaitSent(1, 2); // the other partition's record does not wait for the first one's ack
-        assertStillSent(producer, 2); // the later record of the first one's partition does
-        producer.errorNext(new TimeoutException("Expiring 1 record(s)"));
+        var producer = awaitSent(1, 3); // nothing waits for an ack
+        assertThat(unbatched).containsExactly(producer);
         producer.completeNext();
+        producer.errorNext(new TimeoutException("Expiring 1 record(s)"));
 
         assertThat(second.get(5, SECONDS)).satisfiesExactly(
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
                 o -> assertThat(o).isInstanceOfSatisfying(Outcome.Retry.class,
                         r -> assertThat(r.error()).isInstanceOf(TimeoutException.class)),
-                o -> assertThat(o).isEqualTo(Outcome.delivered()),
-                o -> assertThat(o).isEqualTo(Outcome.notAttempted()));
-        assertThat(producer.history()).hasSize(2);
-        assertThat(producer.closed()).as("nothing of its partition was in flight with it").isFalse();
+                o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
     }
 
     /** An expiry marks the records of its own partition: those of others the close aborted batch as before. */
     @Test
-    void onlyTheExpiredPartitionsRecordsAreSentAlone() throws Exception {
+    void onlyTheExpiredPartitionsRecordsAreRemembered() throws Exception {
         var clock = new TestClock();
         var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
         var aborted = record(2, keyOnPartition(1, "b"));
@@ -499,10 +500,11 @@ class KafkaOutboxSenderTest {
         clock.advance(Duration.ofSeconds(1));
 
         var second = sendAsync(sender, List.of(aborted, record(3, keyOnPartition(1, "c"))));
-        var producer = awaitSent(1, 2); // both handed over before an ack
+        var producer = awaitSent(1, 2);
         producer.completeNext();
         producer.completeNext();
         assertThat(second.get(5, SECONDS)).containsExactly(Outcome.delivered(), Outcome.delivered());
+        assertThat(unbatched).isEmpty();
     }
 
     /** A remembered record not handed again within 10 minutes (another instance sent it, say) is forgotten. */
@@ -516,41 +518,33 @@ class KafkaOutboxSenderTest {
         first.get(5, SECONDS);
         clock.advance(Duration.ofMinutes(10));
 
-        var second = sendAsync(sender, List.of(remembered, record(2, keyOnPartition(0, "b"))));
-        var producer = awaitSent(1, 2); // batched: forgotten
-        producer.completeNext();
-        producer.completeNext();
-        assertThat(second.get(5, SECONDS)).containsExactly(Outcome.delivered(), Outcome.delivered());
+        var second = sendAsync(sender, List.of(remembered));
+        awaitSent(1, 1).completeNext();
+        assertThat(second.get(5, SECONDS)).containsExactly(Outcome.delivered());
+        assertThat(unbatched).isEmpty();
     }
 
-    /** An interrupt while a record waits behind one sent alone: the waiting one was never handed over. */
+    /** The unbatched pool's producers get the same properties but {@code batch.size=0}. */
     @Test
-    void interruptWhileARecordWaitsBehindOneSentAlone() throws Exception {
-        var clock = new TestClock();
-        var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
-        var remembered = record(1, keyOnPartition(0, "a"));
+    void unbatchedProducersDifferOnlyInBatchSize() throws Exception {
+        var seen = new CopyOnWriteArrayList<Map<String, Object>>();
+        var sender = new KafkaOutboxSender(CONFIG, properties -> {
+            seen.add(properties);
+            var producer = new TestProducer(false, r -> null);
+            producers.add(producer);
+            return producer;
+        });
+        var remembered = record(1, keyOnPartition(0));
         var first = sendAsync(sender, List.of(remembered));
         awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
         first.get(5, SECONDS);
-        clock.advance(Duration.ofSeconds(1));
 
-        var result = new CompletableFuture<List<Outcome>>();
-        var flagKept = new AtomicBoolean();
-        var thread = new Thread(() -> {
-            var outcomes = sender.send(List.of(remembered, record(2, keyOnPartition(0, "b"))));
-            flagKept.set(Thread.currentThread().isInterrupted());
-            result.complete(outcomes);
-        });
-        thread.start();
-        var producer = awaitSent(1, 1);
-        assertStillSent(producer, 1);
-        thread.interrupt();
-
-        assertThat(result.get(5, SECONDS)).satisfiesExactly(
-                o -> assertThat(o).isInstanceOf(Outcome.Retry.class),
-                o -> assertThat(o).isEqualTo(Outcome.notAttempted()));
-        assertThat(flagKept).isTrue();
-        assertThat(producer.history()).hasSize(1);
+        // its partition cools for 1 s, so it is not attempted, but the call holds it
+        assertThat(sender.send(List.of(remembered))).singleElement().isInstanceOf(Outcome.NotAttempted.class);
+        var expected = new HashMap<>(seen.get(0));
+        expected.put("batch.size", "0");
+        assertThat(seen).hasSize(2);
+        assertThat(seen.get(1)).isEqualTo(expected);
     }
 
     /** A client-side refusal says nothing about the partition: its cooldown, here a probe's lease, stays. */
@@ -571,7 +565,7 @@ class KafkaOutboxSenderTest {
         assertThat(sender.send(List.of(record(3, onP)))).singleElement().isInstanceOf(Outcome.NotAttempted.class);
     }
 
-    /** Only an expired batch makes records go alone: those of a call that failed otherwise are batched as before. */
+    /** Only an expired batch makes records remembered: a call that failed otherwise leaves the next one batched. */
     @Test
     void recordsOfACallThatFailedOtherwiseAreBatchedAsBefore() throws Exception {
         var clock = new TestClock();
@@ -584,11 +578,12 @@ class KafkaOutboxSenderTest {
         clock.advance(Duration.ofSeconds(1)); // a's partition cools for 1 s
 
         var second = sendAsync(sender, List.of(failed, aborted, record(3, "c")));
-        var producer = awaitSent(1, 3); // all handed over before an ack
+        var producer = awaitSent(1, 3);
         producer.completeNext();
         producer.completeNext();
         producer.completeNext();
         assertThat(second.get(5, SECONDS)).containsOnly(Outcome.delivered());
+        assertThat(unbatched).isEmpty();
     }
 
     @Test
@@ -1322,9 +1317,14 @@ class KafkaOutboxSenderTest {
 
     private KafkaOutboxSender sender(Supplier<MockProducer<byte[], byte[]>> make, Duration deliveryTimeout,
             Clock clock) {
-        return new KafkaOutboxSender(() -> {
+        Supplier<MockProducer<byte[], byte[]>> made = () -> {
             var producer = make.get();
             producers.add(producer);
+            return producer;
+        };
+        return new KafkaOutboxSender(made::get, () -> {
+            var producer = made.get();
+            unbatched.add(producer);
             return producer;
         }, deliveryTimeout, clock);
     }
@@ -1340,13 +1340,6 @@ class KafkaOutboxSenderTest {
             Thread.sleep(5);
         }
         return producers.get(producer);
-    }
-
-    /** {@code producer} has handed over no more than {@code records} a moment later: the sender waits for an ack. */
-    private static void assertStillSent(MockProducer<byte[], byte[]> producer, int records)
-            throws InterruptedException {
-        Thread.sleep(100);
-        assertThat(producer.history()).hasSize(records);
     }
 
     private static String keyOnPartition(int partition) {
