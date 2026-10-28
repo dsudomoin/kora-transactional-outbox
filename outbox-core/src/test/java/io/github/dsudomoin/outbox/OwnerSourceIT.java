@@ -224,9 +224,12 @@ class OwnerSourceIT {
                 TestSql.execute(c, "select pg_advisory_lock(" + ns + ", " + TableNames.LOCK_MAINTENANCE + ")");
                 // the cast only on range names: the planner may evaluate it on rows of any join order
                 var from = "case when r.relname ~ '^outbox_x[0-9]+$' then substr(r.relname, 9)::bigint end";
+                // its bound, not from + xidsPerPartition: a swapped tail is attached with its rows as a wider range,
+                // writers may still be inside it; null for the tail
+                var to = "substring(pg_get_expr(r.relpartbound, r.oid) from 'TO \\(''(\\d+)''\\)')::bigint";
                 range = TestSql.queryString(c, "select (select n.nspname || '.' || r.relname from pg_inherits i"
                         + " join pg_class r on r.oid = i.inhrelid join pg_namespace n on n.oid = r.relnamespace"
-                        + " where i.inhparent = ?::regclass and " + from + " + " + config.partitions().xidsPerPartition()
+                        + " where i.inhparent = ?::regclass and r.relname ~ '^outbox_x[0-9]+$' and " + to
                         + " <= pg_current_xact_id()::text::bigint order by " + from + " limit 1)", names.base());
                 if (range == null) {
                     TestSql.execute(c, "select pg_advisory_unlock(" + ns + ", " + TableNames.LOCK_MAINTENANCE + ")");
