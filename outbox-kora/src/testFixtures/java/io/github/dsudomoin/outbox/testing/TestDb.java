@@ -21,7 +21,10 @@ import ru.tinkoff.kora.database.jdbc.JdbcHelper;
 import ru.tinkoff.kora.database.jdbc.JdbcDatabaseConfig;
 import ru.tinkoff.kora.telemetry.common.TelemetryConfig;
 
-/** One Postgres 16 container per test JVM, started on first use; Testcontainers removes it at exit. */
+/**
+ * One Postgres container per test JVM, {@link TestDataSources}' own, started on first use; Testcontainers removes it at
+ * exit.
+ */
 public final class TestDb {
 
     private static final AtomicInteger POOLS = new AtomicInteger();

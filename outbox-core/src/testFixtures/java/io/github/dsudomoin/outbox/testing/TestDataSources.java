@@ -4,14 +4,18 @@ import javax.sql.DataSource;
 import org.postgresql.ds.PGSimpleDataSource;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
-/** The tests' Postgres, started once per JVM, and plain {@link DataSource}s over it, without any framework. */
+/**
+ * The tests' Postgres, started once per JVM, and plain {@link DataSource}s over it, without any framework. 16 unless
+ * {@code -Doutbox.test.postgres} names another image.
+ */
 public final class TestDataSources {
 
     private TestDataSources() {}
 
     private static final class Pg {
-        static final PostgreSQLContainer INSTANCE = new PostgreSQLContainer("postgres:16-alpine")
-                .withCommand("postgres", "-c", "fsync=off", "-c", "max_connections=500");
+        static final PostgreSQLContainer INSTANCE =
+                new PostgreSQLContainer(System.getProperty("outbox.test.postgres", "postgres:16-alpine"))
+                        .withCommand("postgres", "-c", "fsync=off", "-c", "max_connections=500");
 
         static {
             INSTANCE.start();

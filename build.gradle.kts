@@ -30,7 +30,7 @@ configure(published.map { project(":$it") }) {
     }
 
     // -Pbenchmark runs only the tests tagged "benchmark" (never part of a normal build), always rerun, their stdout
-    // shown; -Dbench.* properties of the Gradle invocation reach the test JVM
+    // shown; -Dbench.* and -Doutbox.test.* properties of the Gradle invocation reach the test JVM
     val benchmark = project.hasProperty("benchmark")
     tasks.withType<Test>().configureEach {
         useJUnitPlatform {
@@ -42,7 +42,9 @@ configure(published.map { project(":$it") }) {
             testLogging.events("standard_out")
         }
         System.getProperties().forEach { (k, v) ->
-            if (k.toString().startsWith("bench.")) systemProperty(k.toString(), v)
+            if (k.toString().startsWith("bench.") || k.toString().startsWith("outbox.test.")) {
+                systemProperty(k.toString(), v)
+            }
         }
     }
 
