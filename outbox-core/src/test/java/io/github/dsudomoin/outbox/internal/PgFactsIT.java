@@ -19,8 +19,8 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 
 /**
- * The Postgres behaviour the partition tail's design rests on, pinned on 16 and 17 so a future major that changes it
- * fails here first: why the tail is never detached concurrently, why a hot tail is attached as a range by a scan and
+ * The Postgres behaviour the partition tail's design rests on, pinned on every supported major (14 to 18) so a future
+ * one that changes it fails here first: why the tail is never detached concurrently, why a hot tail is attached as a range by a scan and
  * never behind a check, why there is no default partition, and why the swap never queues for its lock. A table shaped
  * as the outbox: {@code partition by range (xid)}, ranges below H = 3000 and the tail {@code [H, MAXVALUE)}.
  */
@@ -39,7 +39,8 @@ class PgFactsIT {
      * partition and nothing can be attached there: the window cannot be closed early.
      */
     @ParameterizedTest
-    @ValueSource(strings = {"postgres:16-alpine", "postgres:17-alpine"})
+    @ValueSource(strings = {"postgres:14-alpine", "postgres:15-alpine", "postgres:16-alpine", "postgres:17-alpine",
+            "postgres:18-alpine"})
     void aPendingTailRefusesInsertsAndOverlappingAttaches(String image) throws Exception {
         try (var holder = connect(image); var c = connect(image)) {
             outbox(c, false);
@@ -77,7 +78,8 @@ class PgFactsIT {
      * skips the scan of a tail holding rows refuses the rows above its bound from the moment it is validated.
      */
     @ParameterizedTest
-    @ValueSource(strings = {"postgres:16-alpine", "postgres:17-alpine"})
+    @ValueSource(strings = {"postgres:14-alpine", "postgres:15-alpine", "postgres:16-alpine", "postgres:17-alpine",
+            "postgres:18-alpine"})
     void onlyAValidatedCheckSparesTheAttachItsScan(String image) throws Exception {
         try (var c = connect(image)) {
             for (var check : List.of("none", "not valid", "validated")) {
@@ -115,7 +117,8 @@ class PgFactsIT {
 
     /** With a default partition, no partition of the parent can be detached concurrently, the default's included. */
     @ParameterizedTest
-    @ValueSource(strings = {"postgres:16-alpine", "postgres:17-alpine"})
+    @ValueSource(strings = {"postgres:14-alpine", "postgres:15-alpine", "postgres:16-alpine", "postgres:17-alpine",
+            "postgres:18-alpine"})
     void aDefaultPartitionForbidsConcurrentDetaches(String image) throws Exception {
         try (var c = connect(image)) {
             outbox(c, true);
@@ -133,7 +136,8 @@ class PgFactsIT {
      * {@code lock_timeout} is shorter than the wait fails: the swap only ever takes the lock without waiting.
      */
     @ParameterizedTest
-    @ValueSource(strings = {"postgres:16-alpine", "postgres:17-alpine"})
+    @ValueSource(strings = {"postgres:14-alpine", "postgres:15-alpine", "postgres:16-alpine", "postgres:17-alpine",
+            "postgres:18-alpine"})
     void aQueuedExclusiveRequestFailsAWriterWithAShortLockTimeout(String image) throws Exception {
         try (var holder = connect(image); var swap = connect(image); var writer = connect(image)) {
             outbox(holder, false);
