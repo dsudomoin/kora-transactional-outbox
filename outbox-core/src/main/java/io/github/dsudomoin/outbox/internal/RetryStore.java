@@ -33,7 +33,8 @@ public final class RetryStore {
     static final int MAX_ERROR_LENGTH = 2000;
     static final String COLUMNS = "id, shard, message_id, topic, key, payload, headers, created_at";
     /** What {@link #record} reads. */
-    static final String RECORD_COLUMNS = "id, message_id, topic, key, payload, headers, created_at, attempts, requeues";
+    static final String RECORD_COLUMNS =
+            "id, message_id, topic, key, payload, headers, created_at, attempts, requeues, shard";
 
     private final String deadTable;
     private final String redriven;
@@ -61,8 +62,8 @@ public final class RetryStore {
         selectDue = "select " + RECORD_COLUMNS + " from " + retry
                 + " where shard = ? and next_attempt_at <= ? order by id limit ?";
         selectFollowers = "select h.id, f.id, f.message_id, f.topic, f.key, f.payload, f.headers, f.created_at,"
-                + " f.attempts, f.requeues from " + retry + " h cross join lateral (select * from " + retry + " f"
-                + " where f.shard = h.shard and f.topic = h.topic and f.key = h.key and f.id > h.id"
+                + " f.attempts, f.requeues, f.shard from " + retry + " h cross join lateral (select * from " + retry
+                + " f where f.shard = h.shard and f.topic = h.topic and f.key = h.key and f.id > h.id"
                 + " order by f.id limit ?) f where h.id = any(?) order by f.id";
         delete = "delete from " + retry + " where id = any(?)";
         promote = "update " + retry + " set next_attempt_at = ? where id = (select id from " + retry
@@ -255,7 +256,7 @@ public final class RetryStore {
         }
     }
 
-    /** Columns {@code first..first+8}: {@link #RECORD_COLUMNS}. */
+    /** Columns {@code first..first+9}: {@link #RECORD_COLUMNS}. */
     static OutboxRecord record(ResultSet rs, int first) throws SQLException {
         return new OutboxRecord(
                 rs.getLong(first),
@@ -266,7 +267,8 @@ public final class RetryStore {
                 HeaderCodec.decode(rs.getBytes(first + 5)),
                 rs.getObject(first + 6, OffsetDateTime.class).toInstant(),
                 rs.getInt(first + 7),
-                rs.getInt(first + 8));
+                rs.getInt(first + 8),
+                rs.getInt(first + 9));
     }
 
     static Array ids(Connection c, List<OutboxRecord> rows) throws SQLException {

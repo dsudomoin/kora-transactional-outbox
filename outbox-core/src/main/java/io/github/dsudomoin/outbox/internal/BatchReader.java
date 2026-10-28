@@ -63,7 +63,7 @@ public final class BatchReader {
     }
 
     private static String manySql(TableNames names, String blocked) {
-        return "select u.i, o.id, o.message_id, o.topic, o.key, o.payload, o.headers, o.created_at, " + blocked
+        return "select u.i, o.id, o.message_id, o.topic, o.key, o.payload, o.headers, o.created_at, o.shard, " + blocked
                 + " from unnest(?::int[], ?::text[]::xid8[],"
                 + " ?::text[]::xid8[], ?::text[]::xid8[], ?::text[]::xid8[], ?::text[], ?::text[]::pg_snapshot[],"
                 + " ?::int8[], ?::int[], ?::bool[]) with ordinality u(shard, pmax, tmax, lo, hi, xip, snap, last_id, lim,"
@@ -79,7 +79,7 @@ public final class BatchReader {
     }
 
     private static String sql(TableNames names, String blocked) {
-        return "select o.id, o.message_id, o.topic, o.key, o.payload, o.headers, o.created_at, " + blocked
+        return "select o.id, o.message_id, o.topic, o.key, o.payload, o.headers, o.created_at, o.shard, " + blocked
                 + " as blocked from ("
                 + " select * from " + names.base() + " where shard = ? and xid >= ?::xid8 and xid < ?::xid8"
                 + " union all"
@@ -211,7 +211,7 @@ public final class BatchReader {
             bindMany(ps, reads, totalLimit);
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    read.add(new Positioned(rs.getLong(1), new BatchRow(record(rs, 2), rs.getBoolean(9))));
+                    read.add(new Positioned(rs.getLong(1), new BatchRow(record(rs, 2), rs.getBoolean(10))));
                 }
             }
         }
@@ -244,14 +244,17 @@ public final class BatchReader {
             try (var rs = ps.executeQuery()) {
                 var rows = new ArrayList<BatchRow>();
                 while (rs.next()) {
-                    rows.add(new BatchRow(record(rs, 1), rs.getBoolean(8)));
+                    rows.add(new BatchRow(record(rs, 1), rs.getBoolean(9)));
                 }
                 return rows;
             }
         }
     }
 
-    /** The record whose id is in column {@code from}, followed by message id, topic, key, payload, headers, created. */
+    /**
+     * The record whose id is in column {@code from}, followed by message id, topic, key, payload, headers, created,
+     * shard.
+     */
     private static OutboxRecord record(ResultSet rs, int from) throws SQLException {
         return new OutboxRecord(
                 rs.getLong(from),
@@ -262,6 +265,7 @@ public final class BatchReader {
                 HeaderCodec.decode(rs.getBytes(from + 5)),
                 rs.getObject(from + 6, OffsetDateTime.class).toInstant(),
                 0,
-                0);
+                0,
+                rs.getInt(from + 7));
     }
 }

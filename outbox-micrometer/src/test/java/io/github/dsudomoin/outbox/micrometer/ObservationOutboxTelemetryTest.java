@@ -8,10 +8,12 @@ import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
+import io.micrometer.common.KeyValue;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.config.MeterFilter;
 import io.micrometer.core.instrument.observation.DefaultMeterObservationHandler;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import io.micrometer.observation.Observation;
 import io.micrometer.observation.ObservationHandler;
 import io.micrometer.observation.ObservationRegistry;
 import io.micrometer.tracing.Tracer;
@@ -37,6 +39,7 @@ import java.io.IOException;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -120,6 +123,31 @@ class ObservationOutboxTelemetryTest {
         assertThat(attribute(span, "outbox.message_id")).isEqualTo(stored.messageId().toString());
         assertThat(attribute(span, "outbox.attempt")).isEqualTo("1");
         assertThat(attribute(span, "outbox.delay_ms")).isEqualTo("1000");
+    }
+
+    @Test
+    void deliveryCarriesTheShard() {
+        var stopped = new CopyOnWriteArrayList<OutboxDeliveryContext>();
+        observations.observationConfig().observationHandler(new ObservationHandler<OutboxDeliveryContext>() {
+            @Override
+            public void onStop(OutboxDeliveryContext context) {
+                stopped.add(context);
+            }
+
+            @Override
+            public boolean supportsContext(Observation.Context context) {
+                return context instanceof OutboxDeliveryContext;
+            }
+        });
+        var known = record(List.of(), 3);
+        var unknown = record(List.of(), -1);
+        var delivery = telemetry().deliveryStarted(List.of(known, unknown), NOW);
+        delivery.handed(List.of(known, unknown));
+        delivery.finished(List.of(Outcome.delivered(), Outcome.delivered()));
+
+        assertThat(stopped).hasSize(2);
+        assertThat(stopped.get(0).getHighCardinalityKeyValues()).contains(KeyValue.of("outbox.shard", "3"));
+        assertThat(stopped.get(1).getHighCardinalityKeyValue("outbox.shard")).isNull();
     }
 
     @Test
@@ -226,6 +254,11 @@ class ObservationOutboxTelemetryTest {
 
     private static OutboxRecord record(List<OutboxHeader> headers) {
         return new OutboxRecord(1, UUID.randomUUID(), "orders", null, null, headers, NOW.minusSeconds(1), 0, 0);
+    }
+
+    private static OutboxRecord record(List<OutboxHeader> headers, int shard) {
+        return new OutboxRecord(1, UUID.randomUUID(), "orders", null, null, headers, NOW.minusSeconds(1), 0, 0,
+                shard);
     }
 
     private static OutboxHeader header(String name, String value) {

@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.dsudomoin.outbox.internal.Hashing;
 import io.github.dsudomoin.outbox.internal.UuidV7;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
@@ -12,6 +13,7 @@ import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -49,6 +51,34 @@ class FrameworkFreeIT {
         await(Duration.ofSeconds(1), () -> handler.delivered().size() == 3);
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId)
                 .containsExactlyInAnyOrder(one, two.get(0), two.get(1));
+    }
+
+    @Test
+    void recordsCarryTheirShard() throws Exception {
+        var handler = new RecordingHandler()
+                .failNext(r -> Arrays.equals(r.key(), bytes("k3")), () -> new IOException("down"));
+        // the first failure diverts its key: the record comes back from the retry table
+        var config = new TestOutboxConfig().relayEnabled(false).shards(4).headFailuresBeforeDivert(1);
+        var runtime = start(OutboxRuntime.builder(config, transactions, handler).build());
+
+        transactions.inTx(c -> runtime.outbox().sendAll(List.of(
+                OutboxMessage.of("orders", "k1", bytes("a")), OutboxMessage.of("orders", "k2", bytes("b")),
+                OutboxMessage.of("orders", bytes("keyless")), OutboxMessage.of("orders", "k3", bytes("c")))));
+        runtime.relay().drain();
+        Thread.sleep(config.relay().retry().initialDelay().toMillis() * 2); // the retry is due
+        runtime.relay().drain();
+
+        assertThat(handler.delivered()).hasSize(4);
+        for (var r : handler.delivered()) {
+            if (r.key() == null) {
+                assertThat(r.shard()).as("keyless").isBetween(0, 3);
+            } else {
+                assertThat(r.shard()).as(new String(r.key(), UTF_8))
+                        .isEqualTo(Hashing.shard(Hashing.keyHash("orders", r.key()), 4));
+            }
+        }
+        assertThat(handler.delivered()).filteredOn(r -> r.attempts() == 1)
+                .extracting(r -> new String(r.key(), UTF_8)).containsExactly("k3");
     }
 
     @Test

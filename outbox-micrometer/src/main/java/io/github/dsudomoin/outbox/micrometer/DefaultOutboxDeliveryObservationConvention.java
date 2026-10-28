@@ -8,7 +8,8 @@ import java.time.Duration;
  * {@code outbox.deliver}, span {@code outbox deliver <topic>}. Low cardinality: {@code messaging.destination.name}
  * and, once known, {@code outbox.outcome} ({@code delivered}, {@code retry}, {@code permanent}, {@code not_attempted},
  * {@code requeued}, or {@code failed} when the handler call ended without outcomes). High cardinality:
- * {@code outbox.message_id}, {@code outbox.attempt} (this attempt, from 1) and {@code outbox.delay_ms}.
+ * {@code outbox.message_id}, {@code outbox.attempt} (this attempt, from 1), {@code outbox.delay_ms} and, when the
+ * record's shard is known, {@code outbox.shard}.
  */
 public class DefaultOutboxDeliveryObservationConvention implements OutboxDeliveryObservationConvention {
 
@@ -39,10 +40,11 @@ public class DefaultOutboxDeliveryObservationConvention implements OutboxDeliver
     public KeyValues getHighCardinalityKeyValues(OutboxDeliveryContext context) {
         var r = context.record();
         var delay = Duration.between(r.createdAt(), context.now());
-        return KeyValues.of(
+        var values = KeyValues.of(
                 "outbox.message_id", r.messageId().toString(),
                 "outbox.attempt", Long.toString(r.attempts() + 1L),
                 "outbox.delay_ms", Long.toString(delay.isNegative() ? 0 : delay.toMillis()));
+        return r.shard() < 0 ? values : values.and("outbox.shard", Integer.toString(r.shard()));
     }
 
     private static String name(Outcome outcome) {
