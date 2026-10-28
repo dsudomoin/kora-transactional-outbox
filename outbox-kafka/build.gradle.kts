@@ -13,6 +13,9 @@ dependencies {
 
     testImplementation(testFixtures(project(":outbox-core")))
     testImplementation("jakarta.annotation:jakarta.annotation-api:2.1.1")
+    testImplementation(project(":outbox-micrometer"))
+    testImplementation("io.micrometer:micrometer-tracing-bridge-otel:1.2.12")
+    testImplementation("io.opentelemetry:opentelemetry-sdk-testing:1.31.0")
 }
 
 // test fixtures are for this repository's tests only, not part of the published artifact

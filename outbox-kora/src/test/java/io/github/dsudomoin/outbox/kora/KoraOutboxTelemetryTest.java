@@ -15,6 +15,7 @@ import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.TestTracing;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
@@ -88,6 +89,34 @@ class KoraOutboxTelemetryTest {
         assertThat(traceparent(handed.get(0))).as("the handed record carries the delivery span")
                 .isEqualTo("00-" + TRACE_ID + "-" + span.getSpanId() + "-01");
         assertThat(traceparent(record)).as("the stored record keeps its own").isEqualTo(TRACEPARENT);
+    }
+
+    @Test
+    void eachRecordOfACallKeepsItsOwnTrace() {
+        var spans = InMemorySpanExporter.create();
+        var tracer = SdkTracerProvider.builder().addSpanProcessor(SimpleSpanProcessor.create(spans)).build()
+                .get("test");
+        var telemetry = new KoraOutboxTelemetry(new OutboxMetrics(null), tracer);
+        var writers = List.of(tracer.spanBuilder("writer 1").startSpan(), tracer.spanBuilder("writer 2").startSpan());
+        writers.forEach(Span::end);
+        var records = writers.stream().map(w -> record(List.of(header("traceparent",
+                "00-" + w.getSpanContext().getTraceId() + "-" + w.getSpanContext().getSpanId() + "-01")))).toList();
+
+        var delivery = telemetry.deliveryStarted(records, NOW);
+        delivery.handed(records);
+        delivery.finished(List.of(Outcome.delivered(), Outcome.delivered()));
+
+        for (int i = 0; i < records.size(); i++) {
+            var id = records.get(i).messageId().toString();
+            var writer = writers.get(i).getSpanContext();
+            assertThat(spans.getFinishedSpanItems())
+                    .filteredOn(s -> id.equals(s.getAttributes().get(AttributeKey.stringKey("outbox.message_id"))))
+                    .singleElement()
+                    .satisfies(span -> {
+                        assertThat(span.getTraceId()).isEqualTo(writer.getTraceId());
+                        assertThat(span.getParentSpanId()).isEqualTo(writer.getSpanId());
+                    });
+        }
     }
 
     @Test
