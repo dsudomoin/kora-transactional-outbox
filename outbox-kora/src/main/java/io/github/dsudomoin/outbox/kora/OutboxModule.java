@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.kora;
 
+import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.Outbox;
 import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.OutboxConfig;
@@ -73,17 +74,22 @@ public interface OutboxModule extends OutboxCommonModule {
         return runtime.admin();
     }
 
+    /** Internal type, unstable: for the adapters of this repository. */
+    @InternalApi
     @Root
     default LifecycleWrapper<OutboxSchema> outboxSchema(OutboxRuntime runtime) {
         return new LifecycleWrapper<>(runtime.schema(), s -> {}, s -> {});
     }
 
+    /** Internal type, unstable: for the adapters of this repository. */
+    @InternalApi
     @Root
     default Maintenance outboxMaintenance(OutboxRuntime runtime) {
         return runtime.maintenance();
     }
 
-    /** The relay runs it and closes it. */
+    /** Internal type, unstable: for the adapters of this repository. The relay runs it and closes it. */
+    @InternalApi
     @Root
     default DeadLetterPass outboxDeadLetterPass(OutboxRuntime runtime) {
         return runtime.deadLetterPass();

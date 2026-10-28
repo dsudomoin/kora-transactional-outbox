@@ -1,0 +1,43 @@
+// Signature format: 4.0
+package io.github.dsudomoin.outbox.kafka {
+
+  public final class KafkaDeadLetterHandler implements io.github.dsudomoin.outbox.OutboxDeadLetterHandler {
+    ctor public KafkaDeadLetterHandler(io.github.dsudomoin.outbox.kafka.KafkaOutboxSender!, String?);
+    method public java.util.List<io.github.dsudomoin.outbox.DeadLetterDecision!>! handle(java.util.List<io.github.dsudomoin.outbox.DeadLetter!>!);
+    field public static final String DEAD_ATTEMPTS = "outbox-dead-attempts";
+    field public static final String DEAD_ERROR = "outbox-dead-error";
+    field public static final String DEAD_FAILED_AT = "outbox-dead-failed-at";
+    field public static final String DEAD_TOPIC = "outbox-dead-topic";
+  }
+
+  public interface KafkaOutboxConfig {
+    method public default String? deadLetterTopic();
+    method public java.util.Properties! driverProperties();
+  }
+
+  public final class KafkaOutboxHandler implements io.github.dsudomoin.outbox.OutboxHandler {
+    method public void handle(io.github.dsudomoin.outbox.OutboxRecord!);
+  }
+
+  public final class KafkaOutboxHeaders {
+    method public static java.util.UUID? messageId(org.apache.kafka.clients.consumer.ConsumerRecord<? extends java.lang.Object!,? extends java.lang.Object!>!);
+    method public static java.util.UUID? messageId(org.apache.kafka.common.header.Headers!);
+    field public static final String MESSAGE_ID = "outbox-message-id";
+  }
+
+  public final class KafkaOutboxPublisher<K, V> {
+    ctor public KafkaOutboxPublisher(io.github.dsudomoin.outbox.Outbox!, String!, org.apache.kafka.common.serialization.Serializer<K!>!, org.apache.kafka.common.serialization.Serializer<V!>!);
+    method public java.util.UUID! send(K?, V?);
+    method public java.util.UUID! send(K?, V?, org.apache.kafka.common.header.Headers!);
+  }
+
+  public final class KafkaOutboxSender implements java.lang.AutoCloseable {
+    ctor public KafkaOutboxSender(io.github.dsudomoin.outbox.kafka.KafkaOutboxConfig!);
+    ctor public KafkaOutboxSender(io.github.dsudomoin.outbox.kafka.KafkaOutboxConfig!, java.util.function.Function<java.util.Map<java.lang.String!,java.lang.Object!>!,org.apache.kafka.clients.producer.Producer<byte[]!,byte[]!>!>!);
+    method public void close();
+    method public io.github.dsudomoin.outbox.kafka.KafkaOutboxHandler! handler();
+    method public java.util.List<io.github.dsudomoin.outbox.Outcome!>! send(java.util.List<io.github.dsudomoin.outbox.OutboxRecord!>!);
+  }
+
+}
+

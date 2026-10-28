@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.admin.kora;
 
+import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.admin.kora.model.ModelError;
 import jakarta.annotation.Nullable;
 import java.util.Objects;
@@ -34,7 +35,10 @@ import ru.tinkoff.kora.json.common.JsonWriter;
  * "<path>" denied: <status>} when denied or when the authorizer fails. The path (its {@code {table}} is caller text,
  * logged before any authorization) and the identity (perhaps a token's subject) are quoted, with their quotes,
  * backslashes and control characters escaped, so no caller can forge a line or a part of one.
+ *
+ * <p>Internal type, unstable: for the adapters of this repository.
  */
+@InternalApi
 public final class OutboxAdminInterceptor implements HttpServerInterceptor {
 
     private static final Logger log = LoggerFactory.getLogger(OutboxAdminInterceptor.class);

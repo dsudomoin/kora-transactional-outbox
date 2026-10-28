@@ -149,9 +149,10 @@ public final class OutboxRelay implements AutoCloseable {
     private volatile boolean stopping;
 
     /**
-     * {@code deadLetters}: the pass this relay runs, and closes on {@link #close()}; its hook, or none, decides the
-     * fate of the dead letters.
+     * Internal types, unstable: for the adapters of this repository. {@code deadLetters}: the pass this relay runs, and
+     * closes on {@link #close()}; its hook, or none, decides the fate of the dead letters.
      */
+    @InternalApi
     public OutboxRelay(OutboxTransactions db, OutboxConfig config, OutboxSchema schema, OutboxHandler handler,
             OutboxTelemetry telemetry, Maintenance maintenance, DeadLetterPass deadLetters) {
         OutboxSchema.validate(config);

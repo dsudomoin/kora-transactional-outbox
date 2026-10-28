@@ -17,6 +17,7 @@ import static org.apache.kafka.clients.producer.ProducerConfig.REQUEST_TIMEOUT_M
 import static org.apache.kafka.clients.producer.ProducerConfig.TRANSACTIONAL_ID_CONFIG;
 import static org.apache.kafka.clients.producer.ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG;
 
+import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.BatchClassifier;
@@ -233,8 +234,10 @@ public final class KafkaOutboxSender implements AutoCloseable {
     /**
      * Logs a WARN when a call's own budget exceeds {@code limit}, the value of {@code setting} that bounds a caller's
      * calls; {@code effect} says what then becomes of slow ones. Such calls are not lost: the caller interrupts them
-     * and the sender returns their real outcomes at once, but slow sends then end as retries.
+     * and the sender returns their real outcomes at once, but slow sends then end as retries. Internal, unstable: for
+     * the adapters of this repository.
      */
+    @InternalApi
     public void warnIfLongerThan(String setting, Duration limit, String effect) {
         if (longestCall.compareTo(limit) > 0) {
             log.warn("A Kafka outbox call can take up to {} (delivery.timeout.ms + 5 s + max.block.ms), longer than "

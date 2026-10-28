@@ -1,0 +1,402 @@
+// Signature format: 4.0
+package io.github.dsudomoin.outbox {
+
+  @java.lang.FunctionalInterface public interface ConnectionSource {
+    method public java.sql.Connection! newConnection() throws java.sql.SQLException;
+  }
+
+  public final class DeadLetter extends java.lang.Record {
+    ctor public DeadLetter(long, java.util.UUID!, String!, byte[]?, byte[]?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!, java.time.Instant!, int, java.time.Instant!, String?, io.github.dsudomoin.outbox.DeadLetter.Status!, int, int, java.time.Instant?);
+  }
+
+  public enum DeadLetter.Status {
+    enum_constant public static final io.github.dsudomoin.outbox.DeadLetter.Status KEPT;
+    enum_constant public static final io.github.dsudomoin.outbox.DeadLetter.Status PENDING;
+    enum_constant public static final io.github.dsudomoin.outbox.DeadLetter.Status SCHEDULED;
+  }
+
+  public interface DeadLetterDecision {
+    method public static io.github.dsudomoin.outbox.DeadLetterDecision! discard();
+    method public static io.github.dsudomoin.outbox.DeadLetterDecision! keep();
+    method public static io.github.dsudomoin.outbox.DeadLetterDecision! redrive();
+    method public static io.github.dsudomoin.outbox.DeadLetterDecision! redriveAt(java.time.Instant!);
+  }
+
+  public static final class DeadLetterDecision.Discard extends java.lang.Record implements io.github.dsudomoin.outbox.DeadLetterDecision {
+    ctor public DeadLetterDecision.Discard();
+  }
+
+  public static final class DeadLetterDecision.Keep extends java.lang.Record implements io.github.dsudomoin.outbox.DeadLetterDecision {
+    ctor public DeadLetterDecision.Keep();
+  }
+
+  public static final class DeadLetterDecision.Redrive extends java.lang.Record implements io.github.dsudomoin.outbox.DeadLetterDecision {
+    ctor public DeadLetterDecision.Redrive();
+  }
+
+  public static final class DeadLetterDecision.RedriveAt extends java.lang.Record implements io.github.dsudomoin.outbox.DeadLetterDecision {
+    ctor public DeadLetterDecision.RedriveAt(java.time.Instant!);
+  }
+
+  public final class DeadLetterFilter extends java.lang.Record {
+    ctor public DeadLetterFilter();
+    method public static io.github.dsudomoin.outbox.DeadLetterFilter! any();
+    method public boolean isEmpty();
+  }
+
+  public final class DeadLetterPage extends java.lang.Record {
+    ctor public DeadLetterPage(java.util.List<io.github.dsudomoin.outbox.DeadLetter!>!, Long?);
+  }
+
+  public interface Inbox {
+    method public io.github.dsudomoin.outbox.Inbox! scope(String!);
+    method public boolean tryAccept(java.sql.Connection!, java.util.UUID!);
+    method public boolean tryAccept(java.util.UUID!);
+    method public java.util.Set<java.util.UUID!>! tryAcceptAll(java.sql.Connection!, java.util.Collection<java.util.UUID!>!);
+    method public java.util.Set<java.util.UUID!>! tryAcceptAll(java.util.Collection<java.util.UUID!>!);
+  }
+
+  public final class InboxRuntime implements java.lang.AutoCloseable {
+    method public static io.github.dsudomoin.outbox.InboxRuntime.Builder! builder(io.github.dsudomoin.outbox.OutboxConfig!, io.github.dsudomoin.outbox.OutboxTransactions!);
+    method public void close();
+    method public io.github.dsudomoin.outbox.Inbox! inbox();
+    method public void start();
+  }
+
+  public static final class InboxRuntime.Builder {
+    method public io.github.dsudomoin.outbox.InboxRuntime! build();
+    method public io.github.dsudomoin.outbox.InboxRuntime.Builder! ownerConnections(io.github.dsudomoin.outbox.ConnectionSource!);
+    method public io.github.dsudomoin.outbox.InboxRuntime.Builder! telemetry(io.github.dsudomoin.outbox.OutboxTelemetry!);
+  }
+
+  @java.lang.annotation.Documented @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.CLASS) @java.lang.annotation.Target({java.lang.annotation.ElementType.TYPE, java.lang.annotation.ElementType.METHOD, java.lang.annotation.ElementType.CONSTRUCTOR, java.lang.annotation.ElementType.FIELD}) public @interface InternalApi {
+  }
+
+  public final class JdbcTransactions implements io.github.dsudomoin.outbox.OutboxTransactions {
+    ctor public JdbcTransactions(javax.sql.DataSource!);
+    method public void afterCommit(Runnable!);
+    method public java.sql.Connection? currentConnection();
+    method public <T> T! inTx(io.github.dsudomoin.outbox.JdbcTransactions.SqlCall<T!>!);
+    method public java.sql.Connection! newConnection() throws java.sql.SQLException;
+    method public String! transactionHint();
+  }
+
+  @java.lang.FunctionalInterface public static interface JdbcTransactions.SqlCall<T> {
+    method public T! call(java.sql.Connection!) throws java.sql.SQLException;
+  }
+
+  public interface Outbox {
+    method public java.util.UUID! send(io.github.dsudomoin.outbox.OutboxMessage!);
+    method public java.util.UUID! send(java.sql.Connection!, io.github.dsudomoin.outbox.OutboxMessage!);
+    method public java.util.List<java.util.UUID!>! sendAll(java.util.List<io.github.dsudomoin.outbox.OutboxMessage!>!);
+  }
+
+  public interface OutboxAdmin {
+    method public long countDeadLetters(io.github.dsudomoin.outbox.DeadLetterFilter!);
+    method public long discardDeadLetters(io.github.dsudomoin.outbox.DeadLetterFilter!);
+    method public long discardDeadLetters(java.util.Collection<java.lang.Long!>!);
+    method public io.github.dsudomoin.outbox.DeadLetterPage! findDeadLetters(io.github.dsudomoin.outbox.DeadLetterFilter!, Long?, int);
+    method public long recoverXidRegression();
+    method public long redriveDeadLetters(io.github.dsudomoin.outbox.DeadLetterFilter!);
+    method public long redriveDeadLetters(java.util.Collection<java.lang.Long!>!);
+    method public long restoreOrphan(String!, long);
+    method public io.github.dsudomoin.outbox.OutboxStatus! status();
+  }
+
+  public interface OutboxConfig {
+    method public default io.github.dsudomoin.outbox.OutboxConfig.DeadLettersConfig! deadLetters();
+    method public default io.github.dsudomoin.outbox.OutboxConfig.InboxConfig! inbox();
+    method public default io.github.dsudomoin.outbox.OutboxConfig.PartitionsConfig! partitions();
+    method public default io.github.dsudomoin.outbox.OutboxConfig.RecoveryConfig! recovery();
+    method public default io.github.dsudomoin.outbox.OutboxConfig.RelayConfig! relay();
+    method public default io.github.dsudomoin.outbox.OutboxConfig.SchemaConfig! schema();
+    method public default Integer? shards();
+    method public default String! table();
+    field public static final int DEFAULT_SHARDS = 256; // 0x100
+  }
+
+  public static interface OutboxConfig.DeadLettersConfig {
+    method public default int batchSize();
+    method public default java.time.Duration! redriveHistory();
+    method public default java.time.Duration! retention();
+    method public default java.time.Duration! timeout();
+  }
+
+  public static interface OutboxConfig.InboxConfig {
+    method public default boolean attachOrphans();
+    method public default java.time.Duration! partitionInterval();
+    method public default java.time.Duration! premake();
+    method public default java.time.Duration! retention();
+    method public default String! table();
+  }
+
+  public static interface OutboxConfig.PartitionsConfig {
+    method public default java.time.Duration! maintenanceInterval();
+    method public default long maxTailScan();
+    method public default int premake();
+    method public default boolean restoreOrphans();
+    method public default java.time.Duration! swapLockTimeout();
+    method public default io.github.dsudomoin.outbox.OutboxConfig.TailConversionConfig! tailConversion();
+    method public default long xidsPerPartition();
+  }
+
+  public static interface OutboxConfig.RecoveryConfig {
+    method public default java.time.Duration! clockMargin();
+    method public default long maxRows();
+    method public default java.time.Duration! timeout();
+    method public default String! xidRegression();
+  }
+
+  public static interface OutboxConfig.RelayConfig {
+    method public default int batchSize();
+    method public default java.time.Duration! batchTimeout();
+    method public default java.time.Duration! cursorAnchorInterval();
+    method public default boolean enabled();
+    method public default int headFailuresBeforeDivert();
+    method public default java.time.Duration! idlePollInterval();
+    method public default int maxTicksPerBatch();
+    method public default java.time.Duration! minTickInterval();
+    method public default io.github.dsudomoin.outbox.OutboxConfig.RequeueConfig! requeue();
+    method public default io.github.dsudomoin.outbox.OutboxConfig.RetryConfig! retry();
+    method public default java.time.Duration! shutdownTimeout();
+    method public default int workers();
+  }
+
+  public static interface OutboxConfig.RequeueConfig {
+    method public default java.time.Duration! delay();
+    method public default int maxRequeues();
+  }
+
+  public static interface OutboxConfig.RetryConfig {
+    method public default java.time.Duration! initialDelay();
+    method public default int maxAttempts();
+    method public default java.time.Duration! maxDelay();
+  }
+
+  public static interface OutboxConfig.SchemaConfig {
+    method public default boolean bootstrap();
+  }
+
+  public static interface OutboxConfig.TailConversionConfig {
+    method public default java.time.Duration! maxStall();
+    method public default String! window();
+    method public default String! zone();
+  }
+
+  public interface OutboxDeadLetterHandler {
+    method public default boolean active();
+    method public java.util.List<io.github.dsudomoin.outbox.DeadLetterDecision!>! handle(java.util.List<io.github.dsudomoin.outbox.DeadLetter!>!) throws java.lang.Exception;
+    field public static final io.github.dsudomoin.outbox.OutboxDeadLetterHandler! NONE;
+  }
+
+  public enum OutboxGauge {
+    method public String! metricName();
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge DEAD_PENDING;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge DEAD_PENDING_OLDEST;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge DEAD_SIZE;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge INBOX_MAINTENANCE_TRANSACTION_POOLING;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge INBOX_PARTITIONS_ORPHANED;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge MAINTENANCE_SINCE_SUCCESS;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge MAINTENANCE_TRANSACTION_POOLING;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARKED_SIZE;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARTITIONS_ORPHANED;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARTITIONS_OVERFLOW;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARTITIONS_PREMADE;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARTITIONS_XIDS_LEFT;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge RETRY_SIZE;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge SHARD_LAG;
+  }
+
+  public interface OutboxHandler {
+    method public static io.github.dsudomoin.outbox.OutboxHandler! byTopic(java.util.Map<java.lang.String!,io.github.dsudomoin.outbox.OutboxHandler!>!, io.github.dsudomoin.outbox.OutboxHandler!);
+    method public void handle(io.github.dsudomoin.outbox.OutboxRecord!) throws java.lang.Exception;
+    method public default java.util.List<io.github.dsudomoin.outbox.Outcome!>! handleBatch(java.util.List<io.github.dsudomoin.outbox.OutboxRecord!>!);
+    method public static <T> T! inRecordScope(io.github.dsudomoin.outbox.OutboxRecord!, java.util.concurrent.Callable<T!>!) throws java.lang.Exception;
+    method public static boolean windDownRequested();
+  }
+
+  public final class OutboxHeader extends java.lang.Record {
+    ctor public OutboxHeader(String!, byte[]?);
+  }
+
+  public final class OutboxMessage extends java.lang.Record {
+    ctor public OutboxMessage(String!, byte[]?, byte[]?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
+    method public static io.github.dsudomoin.outbox.OutboxMessage! of(String!, byte[]?);
+    method public static io.github.dsudomoin.outbox.OutboxMessage! of(String!, byte[]?, byte[]?);
+    method public static io.github.dsudomoin.outbox.OutboxMessage! of(String!, String?, byte[]?);
+    method public io.github.dsudomoin.outbox.OutboxMessage! withHeader(String!, byte[]?);
+  }
+
+  public class OutboxPermanentException extends java.lang.RuntimeException {
+    ctor public OutboxPermanentException(String!);
+    ctor public OutboxPermanentException(String!, Throwable!);
+  }
+
+  public final class OutboxRecord extends java.lang.Record {
+    ctor public OutboxRecord(long, java.util.UUID!, String!, byte[]?, byte[]?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!, java.time.Instant!, int, int);
+    ctor public OutboxRecord(long, java.util.UUID!, String!, byte[]?, byte[]?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!, java.time.Instant!, int, int, int);
+    method public io.github.dsudomoin.outbox.OutboxRecord! withHeaders(java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
+  }
+
+  public final class OutboxRelay implements java.lang.AutoCloseable {
+    method public void close();
+    method public int drain();
+    method public boolean running();
+    method public void start();
+    method public void wake();
+  }
+
+  public final class OutboxRuntime implements java.lang.AutoCloseable {
+    method public io.github.dsudomoin.outbox.OutboxAdmin! admin();
+    method public static io.github.dsudomoin.outbox.OutboxRuntime.Builder! builder(io.github.dsudomoin.outbox.OutboxConfig!, io.github.dsudomoin.outbox.OutboxTransactions!, io.github.dsudomoin.outbox.OutboxHandler!);
+    method public void close();
+    method public io.github.dsudomoin.outbox.Outbox! outbox();
+    method public io.github.dsudomoin.outbox.OutboxRelay! relay();
+    method public void start();
+  }
+
+  public static final class OutboxRuntime.Builder {
+    method public io.github.dsudomoin.outbox.OutboxRuntime! build();
+    method public io.github.dsudomoin.outbox.OutboxRuntime.Builder! deadLetterHandler(io.github.dsudomoin.outbox.OutboxDeadLetterHandler!);
+    method public io.github.dsudomoin.outbox.OutboxRuntime.Builder! ownerConnections(io.github.dsudomoin.outbox.ConnectionSource!);
+    method public io.github.dsudomoin.outbox.OutboxRuntime.Builder! telemetry(io.github.dsudomoin.outbox.OutboxTelemetry!);
+  }
+
+  public class OutboxSerializationException extends java.lang.RuntimeException {
+    ctor public OutboxSerializationException(String!, Object!, Throwable!);
+  }
+
+  @java.lang.FunctionalInterface public interface OutboxSerializer<T> {
+    method public byte[]! serialize(String!, T!) throws java.lang.Exception;
+  }
+
+  public final class OutboxSql {
+    method public static String! inbox(io.github.dsudomoin.outbox.OutboxConfig!, String?);
+    method public static String! outbox(io.github.dsudomoin.outbox.OutboxConfig!, String?);
+    field public static final int SCHEMA_VERSION = 1; // 0x1
+  }
+
+  public final class OutboxSqlException extends java.lang.RuntimeException {
+    ctor public OutboxSqlException(java.sql.SQLException!);
+  }
+
+  public final class OutboxStatus extends java.lang.Record {
+    ctor public OutboxStatus(boolean, double, long, long, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.DeadLetterCount!>!, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.Orphan!>!, boolean, int, Long?, Double?, int, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.Instance!>!);
+  }
+
+  public static final class OutboxStatus.DeadLetterCount extends java.lang.Record {
+    ctor public OutboxStatus.DeadLetterCount();
+  }
+
+  public static final class OutboxStatus.Instance extends java.lang.Record {
+    ctor public OutboxStatus.Instance();
+  }
+
+  public static final class OutboxStatus.Orphan extends java.lang.Record {
+    ctor public OutboxStatus.Orphan();
+  }
+
+  public enum OutboxStatus.OrphanKind {
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxStatus.OrphanKind DETACHED_BY_LIBRARY;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxStatus.OrphanKind FOREIGN;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxStatus.OrphanKind SET_ASIDE;
+  }
+
+  public interface OutboxTelemetry {
+    method public default void deadLetterDecision(String!);
+    method public default void deadLetterHookFailed();
+    method public default void deadLettered(String!);
+    method public default void delivered(String!, java.time.Duration!);
+    method public default io.github.dsudomoin.outbox.OutboxTelemetry.Delivery! deliveryStarted(java.util.List<io.github.dsudomoin.outbox.OutboxRecord!>!, java.time.Instant!);
+    method public default io.github.dsudomoin.outbox.OutboxTelemetry.Enqueue! enqueueStarted();
+    method public default void enqueued(String!);
+    method public default void gauge(io.github.dsudomoin.outbox.OutboxGauge!, java.util.function.DoubleSupplier!);
+    method public default void inboxOutsideWindow();
+    method public default void relayFailed(Throwable!);
+    method public default void releaseThread();
+    method public default void requeued(String!);
+    method public default void retried(String!);
+    method public default void shardPaused();
+    method public default void stepFinished(java.time.Duration!);
+    method public default io.github.dsudomoin.outbox.OutboxTelemetry.RelayStep! stepStarted(java.util.List<java.lang.Integer!>!);
+    field public static final io.github.dsudomoin.outbox.OutboxTelemetry! NONE;
+  }
+
+  public static interface OutboxTelemetry.Delivery {
+    method public default void failed(Throwable!);
+    method public default void finished(java.util.List<io.github.dsudomoin.outbox.Outcome!>!);
+    method public default java.util.List<io.github.dsudomoin.outbox.OutboxRecord!>! handed(java.util.List<io.github.dsudomoin.outbox.OutboxRecord!>!);
+    method public default <T> T! inRecordScope(io.github.dsudomoin.outbox.OutboxRecord!, java.util.concurrent.Callable<T!>!) throws java.lang.Exception;
+    field public static final io.github.dsudomoin.outbox.OutboxTelemetry.Delivery! NONE;
+  }
+
+  public static interface OutboxTelemetry.Enqueue {
+    method public default void failed(Throwable!);
+    method public default void finished();
+    method public default java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>! headers(java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
+    field public static final io.github.dsudomoin.outbox.OutboxTelemetry.Enqueue! NONE;
+  }
+
+  public static interface OutboxTelemetry.RelayStep {
+    method public default void failed(Throwable!);
+    method public default void finished();
+    field public static final io.github.dsudomoin.outbox.OutboxTelemetry.RelayStep! NONE;
+  }
+
+  public interface OutboxTransactions extends io.github.dsudomoin.outbox.ConnectionSource {
+    method public void afterCommit(Runnable!) throws java.sql.SQLException;
+    method public java.sql.Connection? currentConnection();
+    method public String! transactionHint();
+    method public default RuntimeException! translate(java.sql.SQLException!);
+  }
+
+  public interface Outcome {
+    method public static io.github.dsudomoin.outbox.Outcome! delivered();
+    method public static io.github.dsudomoin.outbox.Outcome! notAttempted();
+    method public static io.github.dsudomoin.outbox.Outcome! notAttempted(java.time.Instant!);
+    method public static io.github.dsudomoin.outbox.Outcome! permanent(Throwable!);
+    method public static io.github.dsudomoin.outbox.Outcome! requeue();
+    method public static io.github.dsudomoin.outbox.Outcome! requeue(java.time.Instant!);
+    method public static io.github.dsudomoin.outbox.Outcome! retry(Throwable!);
+    method public static io.github.dsudomoin.outbox.Outcome! retry(Throwable!, java.time.Instant!);
+  }
+
+  public enum Outcome.Delivered implements io.github.dsudomoin.outbox.Outcome {
+    enum_constant public static final io.github.dsudomoin.outbox.Outcome.Delivered INSTANCE;
+  }
+
+  public static final class Outcome.NotAttempted extends java.lang.Record implements io.github.dsudomoin.outbox.Outcome {
+    ctor public Outcome.NotAttempted();
+  }
+
+  public static final class Outcome.Permanent extends java.lang.Record implements io.github.dsudomoin.outbox.Outcome {
+    ctor public Outcome.Permanent(Throwable!);
+  }
+
+  public static final class Outcome.Requeue extends java.lang.Record implements io.github.dsudomoin.outbox.Outcome {
+    ctor public Outcome.Requeue();
+  }
+
+  public static final class Outcome.Retry extends java.lang.Record implements io.github.dsudomoin.outbox.Outcome {
+    ctor public Outcome.Retry(Throwable!, java.time.Instant?);
+  }
+
+  public final class TypedOutbox<T> {
+    ctor public TypedOutbox(io.github.dsudomoin.outbox.Outbox!, io.github.dsudomoin.outbox.OutboxSerializer<T!>!);
+    method public java.util.UUID! send(String!, byte[]?, T?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
+    method public java.util.UUID! send(String!, String?, T?);
+    method public java.util.UUID! send(String!, String?, T?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
+  }
+
+}
+
+package io.github.dsudomoin.outbox.protobuf {
+
+  public final class ProtobufOutbox {
+    ctor public ProtobufOutbox(io.github.dsudomoin.outbox.Outbox!);
+    method public java.util.UUID! send(String!, String?, com.google.protobuf.MessageLite?);
+    method public java.util.UUID! send(String!, String?, com.google.protobuf.MessageLite?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
+  }
+
+}
+

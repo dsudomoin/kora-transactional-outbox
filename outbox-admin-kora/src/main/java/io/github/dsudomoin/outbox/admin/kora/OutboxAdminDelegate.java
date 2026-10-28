@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.admin.kora;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import io.github.dsudomoin.outbox.DeadLetterFilter;
+import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.OutboxStatus;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiDelegate;
@@ -61,7 +62,10 @@ import java.util.function.Supplier;
  * {@link IllegalStateException} 409, both with its message; anything else propagates, and the interceptor answers it
  * with a 500 {@code Error}. Enums are mapped by exhaustive {@code switch}, so a constant added on either side fails the
  * build instead of a request.
+ *
+ * <p>Internal type, unstable: for the adapters of this repository.
  */
+@InternalApi
 public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
 
     private static final int DEFAULT_LIMIT = 100;

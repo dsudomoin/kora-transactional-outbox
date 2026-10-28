@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox.admin.kora;
 
+import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiControllerModule;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiDelegate;
@@ -27,11 +28,15 @@ import ru.tinkoff.kora.json.common.JsonWriter;
  */
 public interface OutboxAdminHttpModule extends OutboxAdminApiControllerModule {
 
+    /** Internal type, unstable: for the adapters of this repository. */
+    @InternalApi
     default OutboxAdminInterceptor outboxAdminInterceptor(OutboxAdminAuthorizer authorizer,
             BlockingRequestExecutor executor, JsonWriter<ModelError> errorWriter) {
         return new OutboxAdminInterceptor(authorizer, executor, errorWriter);
     }
 
+    /** Internal type, unstable: for the adapters of this repository. */
+    @InternalApi
     default OutboxAdminApiDelegate outboxAdminDelegate(OutboxAdmin admin) {
         return new OutboxAdminDelegate(admin);
     }
@@ -40,29 +45,45 @@ public interface OutboxAdminHttpModule extends OutboxAdminApiControllerModule {
     // @Component classes, which an app's graph never finds in a library jar: without these it falls back to
     // Enum::name for the query parameter and generates its own JSON codecs, with a warning, in every app build.
 
+    /** Internal type, unstable: for the adapters of this repository. */
+    @InternalApi
     default StringParameterReader<DeadLetterStatus> outboxAdminDeadLetterStatusParameterReader() {
         return new DeadLetterStatus.StringParameterReader();
     }
 
+    /** Internal type, unstable: for the adapters of this repository. */
+    @InternalApi
     default JsonReader<DeadLetterStatus> outboxAdminDeadLetterStatusJsonReader(JsonReader<String> strings) {
         return new DeadLetterStatus.JsonReader(strings);
     }
 
+    /** Internal type, unstable: for the adapters of this repository. */
+    @InternalApi
     default JsonWriter<DeadLetterStatus> outboxAdminDeadLetterStatusJsonWriter(JsonWriter<String> strings) {
         return new DeadLetterStatus.JsonWriter(strings);
     }
 
+    /** Internal type, unstable: for the adapters of this repository. */
+    @InternalApi
     default JsonWriter<OrphanKind> outboxAdminOrphanKindJsonWriter(JsonWriter<String> strings) {
         return new OrphanKind.JsonWriter(strings);
     }
 
-    /** Refuses a field the contract does not name, which the generated reader would skip. */
+    /**
+     * Internal type, unstable: for the adapters of this repository. Refuses a field the contract does not name, which
+     * the generated reader would skip.
+     */
+    @InternalApi
     default JsonReader<Selection> outboxAdminSelectionJsonReader(JsonReader<List<Long>> ids,
             JsonReader<Filter> filter) {
         return RequestReaders.selection(ids, filter);
     }
 
-    /** Refuses a field the contract does not name, which the generated reader would skip. */
+    /**
+     * Internal type, unstable: for the adapters of this repository. Refuses a field the contract does not name, which
+     * the generated reader would skip.
+     */
+    @InternalApi
     default JsonReader<Filter> outboxAdminFilterJsonReader(JsonReader<OffsetDateTime> times,
             JsonReader<DeadLetterStatus> statuses) {
         return RequestReaders.filter(times, statuses);

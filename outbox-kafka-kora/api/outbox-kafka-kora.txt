@@ -1,0 +1,15 @@
+// Signature format: 4.0
+package io.github.dsudomoin.outbox.kafka.kora {
+
+  public interface KafkaOutboxModule {
+    method @ru.tinkoff.kora.common.DefaultComponent public default io.github.dsudomoin.outbox.kafka.KafkaDeadLetterHandler! kafkaDeadLetterHandler(io.github.dsudomoin.outbox.kafka.KafkaOutboxConfig!, io.github.dsudomoin.outbox.kafka.KafkaOutboxSender!, io.github.dsudomoin.outbox.OutboxConfig?);
+    method public default io.github.dsudomoin.outbox.kafka.KafkaOutboxConfig! kafkaOutboxConfig(ru.tinkoff.kora.config.common.Config!, ru.tinkoff.kora.config.common.extractor.ConfigValueExtractor<io.github.dsudomoin.outbox.kafka.kora.KoraKafkaOutboxConfig!>!);
+    method @ru.tinkoff.kora.common.DefaultComponent public default io.github.dsudomoin.outbox.kafka.KafkaOutboxHandler! kafkaOutboxHandler(io.github.dsudomoin.outbox.kafka.KafkaOutboxSender!);
+    method public default ru.tinkoff.kora.application.graph.LifecycleWrapper<io.github.dsudomoin.outbox.kafka.KafkaOutboxSender!>! kafkaOutboxSender(io.github.dsudomoin.outbox.kafka.KafkaOutboxConfig!, io.github.dsudomoin.outbox.OutboxConfig?);
+  }
+
+  @ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor public interface KoraKafkaOutboxConfig extends io.github.dsudomoin.outbox.kafka.KafkaOutboxConfig {
+  }
+
+}
+

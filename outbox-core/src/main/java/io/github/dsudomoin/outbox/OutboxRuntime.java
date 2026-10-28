@@ -66,16 +66,19 @@ public final class OutboxRuntime implements AutoCloseable {
     }
 
     /** Internal type, unstable: for the adapters of this repository. */
+    @InternalApi
     public OutboxSchema schema() {
         return parts().schema;
     }
 
     /** Internal type, unstable: for the adapters of this repository. */
+    @InternalApi
     public Maintenance maintenance() {
         return parts().maintenance;
     }
 
     /** Internal type, unstable: for the adapters of this repository. */
+    @InternalApi
     public DeadLetterPass deadLetterPass() {
         return parts().deadLetters;
     }

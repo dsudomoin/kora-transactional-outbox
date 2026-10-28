@@ -1,3 +1,9 @@
+import me.tylerbwong.gradle.metalava.extension.MetalavaExtension
+
+plugins {
+    id("me.tylerbwong.gradle.metalava") version "0.4.0-alpha03" apply false
+}
+
 val koraVersion: String by project
 
 val published = listOf(
@@ -7,9 +13,11 @@ val published = listOf(
 configure(published.map { project(":$it") }) {
     apply(plugin = "java-library")
     apply(plugin = "maven-publish")
+    apply(plugin = "me.tylerbwong.gradle.metalava")
 
     repositories {
         mavenCentral()
+        google { content { includeGroupByRegex("com\\.android\\.tools.*") } } // Metalava only
     }
 
     configure<JavaPluginExtension> {
@@ -67,6 +75,41 @@ configure(published.map { project(":$it") }) {
             if (forced != null) useVersion(forced)
         }
     }
+
+    configure<MetalavaExtension> {
+        filename = "api/${project.name}.txt"
+        hiddenPackages.addAll(
+            "io.github.dsudomoin.outbox.internal",
+            "io.github.dsudomoin.outbox.admin.kora.api",
+            "io.github.dsudomoin.outbox.admin.kora.model",
+        )
+        hiddenAnnotations.add("io.github.dsudomoin.outbox.InternalApi")
+        // the plugin finds no JDK classes on Java 9+ by itself
+        val jdk = the<JavaToolchainService>().launcherFor(the<JavaPluginExtension>().toolchain)
+        arguments.addAll(jdk.map { listOf("--jdk-home", it.metadata.installationPath.asFile.path) })
+    }
+
+    // Metalava's compatibility check passes additions; the checked-in signature must match the public API exactly
+    val signature = layout.projectDirectory.file("api/${project.name}.txt")
+    val current = layout.buildDirectory.file("metalava/current.txt") // written by metalavaCheckCompatibility
+    val apiCheck by tasks.registering {
+        description = "Fails when the public API differs from ${signature.asFile.name} (metalavaGenerateSignature)"
+        dependsOn("metalavaCheckCompatibility")
+        doLast {
+            val expected = signature.asFile.readLines()
+            val actual = current.get().asFile.readLines()
+            if (actual != expected) { // shows the lines between the first and the last difference
+                val head = expected.zip(actual).takeWhile { (e, a) -> e == a }.size
+                val tail = expected.drop(head).asReversed().zip(actual.drop(head).asReversed())
+                    .takeWhile { (e, a) -> e == a }.size
+                val diff = expected.subList(head, expected.size - tail).map { "- $it" } +
+                    actual.subList(head, actual.size - tail).map { "+ $it" }
+                throw GradleException("${signature.asFile} differs from the public API at line ${head + 1}:\n" +
+                    diff.joinToString("\n"))
+            }
+        }
+    }
+    tasks.named("check") { dependsOn(apiCheck) }
 
     configure<PublishingExtension> {
         publications.create<MavenPublication>("maven") {

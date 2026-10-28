@@ -1,0 +1,68 @@
+// Signature format: 4.0
+package io.github.dsudomoin.outbox.micrometer {
+
+  public class DefaultOutboxDeliveryObservationConvention implements io.github.dsudomoin.outbox.micrometer.OutboxDeliveryObservationConvention {
+    ctor public DefaultOutboxDeliveryObservationConvention();
+    method public String! getContextualName(io.github.dsudomoin.outbox.micrometer.OutboxDeliveryContext!);
+    method public io.micrometer.common.KeyValues! getHighCardinalityKeyValues(io.github.dsudomoin.outbox.micrometer.OutboxDeliveryContext!);
+    method public io.micrometer.common.KeyValues! getLowCardinalityKeyValues(io.github.dsudomoin.outbox.micrometer.OutboxDeliveryContext!);
+    field public static final io.github.dsudomoin.outbox.micrometer.DefaultOutboxDeliveryObservationConvention! INSTANCE;
+  }
+
+  public class DefaultOutboxEnqueueObservationConvention implements io.github.dsudomoin.outbox.micrometer.OutboxEnqueueObservationConvention {
+    ctor public DefaultOutboxEnqueueObservationConvention();
+    method public String! getContextualName(io.github.dsudomoin.outbox.micrometer.OutboxEnqueueContext!);
+    field public static final io.github.dsudomoin.outbox.micrometer.DefaultOutboxEnqueueObservationConvention! INSTANCE;
+  }
+
+  public class DefaultOutboxStepObservationConvention implements io.github.dsudomoin.outbox.micrometer.OutboxStepObservationConvention {
+    ctor public DefaultOutboxStepObservationConvention();
+    method public String! getContextualName(io.github.dsudomoin.outbox.micrometer.OutboxStepContext!);
+    method public io.micrometer.common.KeyValues! getHighCardinalityKeyValues(io.github.dsudomoin.outbox.micrometer.OutboxStepContext!);
+    field public static final io.github.dsudomoin.outbox.micrometer.DefaultOutboxStepObservationConvention! INSTANCE;
+  }
+
+  public final class ObservationOutboxTelemetry implements io.github.dsudomoin.outbox.OutboxTelemetry {
+    method public static io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry.Builder! builder(io.micrometer.observation.ObservationRegistry!, io.github.dsudomoin.outbox.micrometer.OutboxMetrics!);
+  }
+
+  public static final class ObservationOutboxTelemetry.Builder {
+    method public io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry! build();
+    method public io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry.Builder! deliveryConvention(io.github.dsudomoin.outbox.micrometer.OutboxDeliveryObservationConvention!);
+    method public io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry.Builder! enqueueConvention(io.github.dsudomoin.outbox.micrometer.OutboxEnqueueObservationConvention!);
+    method public io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry.Builder! stepConvention(io.github.dsudomoin.outbox.micrometer.OutboxStepObservationConvention!);
+    method public io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry.Builder! tracing(io.micrometer.tracing.Tracer!, io.micrometer.tracing.propagation.Propagator!);
+  }
+
+  public final class OutboxDeliveryContext extends io.micrometer.observation.transport.ReceiverContext<io.github.dsudomoin.outbox.OutboxRecord!> {
+    method public boolean failed();
+    method public java.time.Instant! now();
+    method public io.github.dsudomoin.outbox.Outcome? outcome();
+    method public io.github.dsudomoin.outbox.OutboxRecord! record();
+  }
+
+  public interface OutboxDeliveryObservationConvention extends io.micrometer.observation.ObservationConvention<io.github.dsudomoin.outbox.micrometer.OutboxDeliveryContext!> {
+    method public default boolean supportsContext(io.micrometer.observation.Observation.Context!);
+  }
+
+  public final class OutboxEnqueueContext extends io.micrometer.observation.transport.SenderContext<java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!> {
+  }
+
+  public interface OutboxEnqueueObservationConvention extends io.micrometer.observation.ObservationConvention<io.github.dsudomoin.outbox.micrometer.OutboxEnqueueContext!> {
+    method public default boolean supportsContext(io.micrometer.observation.Observation.Context!);
+  }
+
+  public final class OutboxMetrics implements io.github.dsudomoin.outbox.OutboxTelemetry {
+    ctor public OutboxMetrics(io.micrometer.core.instrument.MeterRegistry?);
+  }
+
+  public final class OutboxStepContext extends io.micrometer.observation.Observation.Context {
+    method public java.util.List<java.lang.Integer!>! shards();
+  }
+
+  public interface OutboxStepObservationConvention extends io.micrometer.observation.ObservationConvention<io.github.dsudomoin.outbox.micrometer.OutboxStepContext!> {
+    method public default boolean supportsContext(io.micrometer.observation.Observation.Context!);
+  }
+
+}
+

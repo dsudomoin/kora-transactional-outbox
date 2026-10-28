@@ -1,0 +1,26 @@
+// Signature format: 4.0
+package io.github.dsudomoin.outbox.admin.kora {
+
+  public interface OutboxAdminAuthorizer {
+    method public static io.github.dsudomoin.outbox.admin.kora.OutboxAdminAuthorizer.Decision! allow(String!);
+    method public io.github.dsudomoin.outbox.admin.kora.OutboxAdminAuthorizer.Decision! authorize(ru.tinkoff.kora.http.server.common.HttpServerRequest!) throws java.lang.Exception;
+    method public static io.github.dsudomoin.outbox.admin.kora.OutboxAdminAuthorizer.Decision! forbidden(String!);
+    method public static io.github.dsudomoin.outbox.admin.kora.OutboxAdminAuthorizer.Decision! unauthorized(String!);
+  }
+
+  public static final class OutboxAdminAuthorizer.Allow extends java.lang.Record implements io.github.dsudomoin.outbox.admin.kora.OutboxAdminAuthorizer.Decision {
+    ctor public OutboxAdminAuthorizer.Allow(String!);
+  }
+
+  public static interface OutboxAdminAuthorizer.Decision {
+  }
+
+  public static final class OutboxAdminAuthorizer.Deny extends java.lang.Record implements io.github.dsudomoin.outbox.admin.kora.OutboxAdminAuthorizer.Decision {
+    ctor public OutboxAdminAuthorizer.Deny(int, String!);
+  }
+
+  public interface OutboxAdminHttpModule {
+  }
+
+}
+
