@@ -52,7 +52,8 @@ public final class XidPartitions {
     private static final Duration TRY_MARGIN = Duration.ofMillis(10);
     /**
      * The hold's bound by day, past its tries: the attaches and a scan within maxTailScan. Longer, the server cuts the
-     * swap's statement (57014) and it rolls back; the next run tries again.
+     * swap's statement (57014) and it rolls back; the next run tries again. Writers' bound by day: this plus
+     * {@link #TRY_MARGIN} and the commit's local WAL flush.
      */
     static final Duration DAY_HOLD = Duration.ofMillis(250);
     /**
@@ -180,6 +181,9 @@ public final class XidPartitions {
     /** Due extensions in a row whose swap did not get its lock or was deferred; 0 after a swap. */
     private volatile int missedSwaps;
     private volatile boolean overflow;
+    /** For tests: runs under the quiesce right before the swap's statements. */
+    @Nullable
+    Runnable beforeSwap;
     /** For tests: runs in {@link #heal} right after its size gate, before anything is locked. */
     @Nullable
     Runnable afterGate;
@@ -316,12 +320,9 @@ public final class XidPartitions {
                     return;
                 }
             } catch (SQLException e) {
-                if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState()) && !QUERY_CANCELED.equals(e.getSQLState())) {
-                    throw e;
-                }
                 var failed = e instanceof WritersHeldTheLock w ? writersHeldTheLock(c, w) : e;
                 if (due) {
-                    missed(s, firstLine(failed.getMessage()));
+                    missed(s, "SQLState " + failed.getSQLState() + ": " + firstLine(failed.getMessage()));
                 }
                 throw failed;
             }
@@ -376,7 +377,8 @@ public final class XidPartitions {
      * moment it was added, and a swap that then failed could leave it there. So Postgres scans the tail under the
      * swap's ACCESS EXCLUSIVE on the parent, and writers wait for the scan: while {@code pg_relation_size(tail)} is at
      * most {@code maxTailScan}, or, larger, inside {@code tailConversion.window}, the scan's statement then cut at
-     * {@code tailConversion.maxStall} (one try a run; a cut one rolls back, with a WARN at most once a minute).
+     * {@code tailConversion.maxStall}: a cut one rolls back with a WARN, and this instance tries no other until the
+     * window ends ({@link #windowEnded}).
      * Otherwise the tail stays hot, writes going on into it, with an ERROR at most once an hour. U is {@code bound},
      * two ranges above the current xid's lower bound: room for the run until its swap. Standalone empty ranges a failed
      * swap pre-created below U are dropped first: {@code [H, U)} covers them, and the first would take its name. The
@@ -466,6 +468,7 @@ public final class XidPartitions {
         var cut = cutUntil;
         if (cut != null && !now.isBefore(cut)) {
             cutUntil = null;
+            largeLogged.set(System.nanoTime()); // the hourly over-cap ERROR starts over: one ERROR this run
             log.error("outbox partition tail {} conversion window {} ({}) ended without a conversion: its scan of {} MB"
                     + " did not fit outbox.partitions.tailConversion.maxStall {} ms. The tail stays hot, writes going"
                     + " on into it, and the next window tries again. To fit, raise maxStall, keeping it below the"
@@ -544,8 +547,14 @@ public final class XidPartitions {
     /** Creates the ranges from {@code from} until {@code target} standalone, each skipped when it exists; their top. */
     private long precreate(Connection c, long from, long target) throws SQLException {
         for (; from < target; from += size) {
-            PartitionDdl.create(c, names.base(), names.partitionPrefix() + from, PartitionDdl.CREATE_LOCK_TIMEOUT,
-                    true); // with the indexes: the swap's attach then builds none
+            var range = names.partitionPrefix() + from;
+            // one made before the parent's columns changed would fail every attach: made again while empty
+            if (PartitionDdl.attachment(c, names.base(), range) == Attachment.STANDALONE
+                    && !PartitionDdl.sameColumns(c, names.base(), range) && !PartitionDdl.hasRows(c, range)) {
+                PartitionDdl.drop(c, range, PartitionDdl.CREATE_LOCK_TIMEOUT);
+            }
+            // with the indexes: the swap's attach then builds none
+            PartitionDdl.create(c, names.base(), range, PartitionDdl.CREATE_LOCK_TIMEOUT, true);
         }
         return from;
     }
@@ -627,6 +636,9 @@ public final class XidPartitions {
             throws SQLException {
         String base = names.base();
         long first = bound == null ? lower : bound;
+        if (beforeSwap != null) {
+            beforeSwap.run();
+        }
         var given = readCommitted(c);
         long start = System.nanoTime();
         String result;
@@ -686,7 +698,12 @@ public final class XidPartitions {
     private String holdSql(boolean queued, long lower, @Nullable Long bound, long first, long top, long maxBytes) {
         String base = names.base();
         String tail = names.tail();
-        var sql = new StringBuilder("do $$ declare locked timestamptz; begin ");
+        // first, a local commit: Postgres stops the statement's timeout before the commit, and a wait for a synchronous
+        // standby ignores cancels, so it would hold the lock unbounded. Safe: a writer's acknowledged commit waits for
+        // an LSN past the swap's commit record, so it is replicated after it; a swap lost in a failover leaves the
+        // previous catalog, consistent and attached as before
+        var sql = new StringBuilder("do $$ declare locked timestamptz; begin perform set_config('synchronous_commit',"
+                + " 'local', true); ");
         if (queued) {
             sql.append("lock table only ").append(base).append(" in access exclusive mode; ");
         } else {

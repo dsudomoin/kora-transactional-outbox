@@ -1171,6 +1171,13 @@ class XidPartitionsIT {
 
             assertThat(queryLong(c, "select min(indexrelid::bigint) from pg_index where indrelid = to_regclass('"
                     + range + "')")).as("the same index, attached").isEqualTo(index);
+            assertThat(queryLong(c, "select count(*) from pg_index where indrelid = to_regclass('" + range + "')"))
+                    .as("as many indexes as the parent").isEqualTo(queryLong(c, "select count(*) from pg_index"
+                            + " where indrelid = to_regclass('" + names.base() + "')"));
+            assertThat(queryLong(c, "select count(*) from pg_index i where i.indrelid = to_regclass('" + range
+                    + "') and not exists (select 1 from pg_inherits h join pg_index p on p.indexrelid = h.inhparent"
+                    + " where h.inhrelid = i.indexrelid and p.indrelid = to_regclass('" + names.base() + "'))"))
+                    .as("each index under the parent's").isZero();
             assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(config.premake());
             var attached = java.util.regex.Pattern.compile("attached (\\d+) ranges").matcher(log).results()
                     .map(m -> Integer.parseInt(m.group(1))).toList();
@@ -1244,6 +1251,8 @@ class XidPartitionsIT {
             }
 
             assertThat(log.split("ended without a conversion", -1)).as("one ERROR").hasSize(2);
+            assertThat(log).as("the run that says the window ended says nothing more")
+                    .doesNotContain("over outbox.partitions.maxTailScan");
             assertThat(log).contains("ERROR").contains(" MB").contains("maxStall 1 ms").contains("raise");
             partitions.clock = at(23, 30);
             ensurePremadeAsMaintenance(partitions, c);
@@ -1307,6 +1316,130 @@ class XidPartitionsIT {
     private static void burn(Connection c, int xids) throws SQLException {
         for (int i = 0; i < xids; i++) {
             queryLong(c, "select pg_current_xact_id()::text::bigint");
+        }
+    }
+
+    /**
+     * The swap commits locally: Postgres stops the statement's timeout before the commit, and a wait for a
+     * synchronous standby ignores cancels, so a standby that never answers would hold the parent's lock for ever.
+     * Here the server waits for a standby that does not exist; the swap still ends and a writer still passes.
+     */
+    @Test
+    void theSwapsCommitDoesNotWaitForASynchronousStandby() throws Exception {
+        try (var pg = new PostgreSQLContainer("postgres:16-alpine")) {
+            pg.start();
+            var own = TestDb.newDatabase(pg.getJdbcUrl(), pg.getUsername(), pg.getPassword(), 4);
+            var pool = java.util.concurrent.Executors.newSingleThreadExecutor();
+            try (var c = DriverManager.getConnection(pg.getJdbcUrl(), pg.getUsername(), pg.getPassword());
+                    var admin = DriverManager.getConnection(pg.getJdbcUrl(), pg.getUsername(), pg.getPassword());
+                    var w = DriverManager.getConnection(pg.getJdbcUrl(), pg.getUsername(), pg.getPassword())) {
+                var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
+                var schema = new OutboxSchema(own, config);
+                schema.init();
+                var names = schema.names();
+                var partitions = new XidPartitions(names, config.partitions());
+                burn(c, 2500);
+                if (currentXid(c) % 1000 > 600) {
+                    burn(c, 500);
+                }
+                long lower = tail(c, names);
+                execute(w, "set synchronous_commit = local"); // the writer's own commits: not what this is about
+                partitions.beforeSwap = () -> {
+                    try {
+                        execute(admin, "alter system set synchronous_standby_names = 'ghost'");
+                        execute(admin, "select pg_reload_conf()");
+                        Thread.sleep(300);
+                    } catch (Exception e) {
+                        throw new IllegalStateException(e);
+                    }
+                };
+                try {
+                    var run = pool.submit(() -> {
+                        partitions.ensurePremade(c);
+                        return null;
+                    });
+                    try {
+                        run.get(10, TimeUnit.SECONDS);
+                    } catch (java.util.concurrent.TimeoutException e) {
+                        throw new AssertionError("the swap still waits for the standby after 10 s", e);
+                    }
+                    long start = System.nanoTime();
+                    send(w, names, 1);
+                    assertThat(Duration.ofNanos(System.nanoTime() - start)).as("a writer after the swap")
+                            .isLessThan(Duration.ofSeconds(1));
+                    assertThat(tail(c, names)).as("swapped").isGreaterThan(lower);
+                } finally {
+                    execute(admin, "alter system reset synchronous_standby_names");
+                    execute(admin, "select pg_reload_conf()");
+                }
+            } finally {
+                pool.shutdownNow();
+                own.release();
+            }
+        }
+    }
+
+    /**
+     * Ranges made ahead of a deferred swap are made again when the parent gained a column since, so the next swap
+     * attaches them: nothing is lost and the new column is there on every range.
+     */
+    @Test
+    void aColumnAddedToTheParentReachesTheRangesMadeAhead() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions(), Duration.ofSeconds(1));
+
+        try (var holder = TestDb.connect(); var c = TestDb.connect()) {
+            TestDb.burnXids(2500);
+            long offset = currentXid(c) % 1000;
+            if (offset > 600) {
+                TestDb.burnXids((int) (1000 - offset) + 10);
+            }
+            holder.setAutoCommit(false); // old: the run makes the ranges ahead, then defers
+            queryLong(holder, "select count(*) from " + names.base());
+            Thread.sleep(1100);
+            ensurePremadeAsMaintenance(partitions, c);
+            holder.commit();
+            assertThat(PartitionDdl.standalone(c, names.base(), "_x[0-9]+")).as("made ahead").isNotEmpty();
+            send(c, names, 5);
+            execute(c, "alter table " + names.base() + " add column added_later int"); // a newer library version
+
+            partitions.ensurePremade(c);
+
+            send(c, names, 5);
+            assertThat(queryLong(c, "select count(*) from " + names.base())).isEqualTo(10);
+            assertThat(PartitionDdl.listRanges(c, names.base())).allSatisfy(b -> assertThat(queryLong(c,
+                    "select count(*) from pg_attribute where attrelid = '" + b.name() + "'::regclass"
+                            + " and attname = 'added_later' and not attisdropped")).as(b.name()).isOne());
+            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(config.premake());
+            assertTailAboveLastRange(c, names);
+        }
+    }
+
+    /** Any failure of a due swap counts towards the hourly ERROR, which names its SQLState and message. */
+    @Test
+    void everySwapFailureCountsTowardsTheError() throws Exception {
+        var config = new TestOutboxConfig().xidsPerPartition(1000).premake(4);
+        var names = bootstrap(config);
+        var partitions = new XidPartitions(names, config.partitions());
+
+        try (var c = TestDb.connect()) {
+            while (partitions.premadeAhead(c) >= config.premake() / 2) { // ranges running out: the ERROR is due
+                TestDb.burnXids(200);
+            }
+            if (currentXid(c) % 1000 > 600) {
+                TestDb.burnXids(500);
+            }
+            partitions.inHold = "raise exception 'boom';";
+
+            String log;
+            try (var err = new CapturedStderr()) {
+                ensurePremadeAsMaintenance(partitions, c);
+                log = err.text();
+            }
+
+            assertThat(log).contains("ERROR").contains("outbox partition tail swap of " + names.base())
+                    .contains("has not run on 1 due runs in a row").contains("SQLState P0001").contains("boom");
         }
     }
 

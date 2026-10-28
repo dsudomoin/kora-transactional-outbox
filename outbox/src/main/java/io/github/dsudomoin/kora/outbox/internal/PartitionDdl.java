@@ -99,6 +99,22 @@ public final class PartitionDdl {
         drop(c, partition, lockTimeout);
     }
 
+    /** Whether {@code table} has {@code parent}'s columns: the same names and types in the same order. */
+    static boolean sameColumns(Connection c, String parent, String table) throws SQLException {
+        try (var ps = c.prepareStatement("select (select array_agg(attname::text || ' ' || atttypid::regtype::text"
+                + " order by attnum) from pg_attribute where attrelid = to_regclass(?) and attnum > 0 and not"
+                + " attisdropped) is not distinct from (select array_agg(attname::text || ' ' || atttypid::regtype::text"
+                + " order by attnum) from pg_attribute where attrelid = to_regclass(?) and attnum > 0 and not"
+                + " attisdropped)")) {
+            ps.setString(1, parent);
+            ps.setString(2, table);
+            try (var rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getBoolean(1);
+            }
+        }
+    }
+
     /** Partitions of {@code parent} in no particular order, including ones whose detach is still pending. */
     public static List<Bound> listRanges(Connection c, String parent) throws SQLException {
         var bounds = new ArrayList<Bound>();

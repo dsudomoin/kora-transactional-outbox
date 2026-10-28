@@ -206,7 +206,7 @@ public interface OutboxConfig {
         /**
          * The scan's {@code statement_timeout} in the window, so about the longest writers wait for its hold: keep it
          * below their own {@code lock_timeout} and {@code statement_timeout}. A scan that does not fit rolls back,
-         * nothing left behind, and the next run tries again. Default 1 s.
+         * nothing left behind, and this instance tries again in the next window. Default 1 s.
          */
         default Duration maxStall() {
             return Duration.ofSeconds(1);
