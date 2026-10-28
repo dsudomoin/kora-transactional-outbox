@@ -95,7 +95,8 @@ class ObservationEndToEndIT {
         assertThat(delivery.getParentSpanId()).isEqualTo(enqueue.getSpanId());
         assertThat(delivery.getTraceId()).isEqualTo(parent.context().traceId());
         assertThat(inScope).containsExactly(delivery.getSpanId());
-        assertThat(handed).containsExactly("00-" + delivery.getTraceId() + "-" + delivery.getSpanId() + "-01");
+        assertThat(handed).containsExactly("00-" + delivery.getTraceId() + "-" + delivery.getSpanId() + "-"
+                + delivery.getSpanContext().getTraceFlags().asHex()); // newer OpenTelemetry adds the random flag
     }
 
     private SpanData finished(String name) {

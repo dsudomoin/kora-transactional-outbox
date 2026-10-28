@@ -90,7 +90,9 @@ class ObservationOutboxTelemetryTest {
         var span = finished("outbox enqueue");
         assertThat(span.getKind()).isEqualTo(SpanKind.PRODUCER);
         assertThat(span.getParentSpanId()).isEqualTo(parent.context().spanId());
-        assertThat(traceparent(headers)).isEqualTo("00-" + span.getTraceId() + "-" + span.getSpanId() + "-01");
+        // its own flags: newer OpenTelemetry sets the random trace id flag besides the sampled one
+        assertThat(traceparent(headers)).isEqualTo("00-" + span.getTraceId() + "-" + span.getSpanId() + "-"
+                + span.getSpanContext().getTraceFlags().asHex());
     }
 
     @Test
