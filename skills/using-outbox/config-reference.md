@@ -108,6 +108,14 @@ The dead-letter hook and the dead table (writing-outbox-handlers, `dead-letter-h
 |---|---|---|
 | `bootstrap` | `true` | `true`: every instance creates the missing base tables at startup and upgrades older ones. `false`: the application's migrations own them: render the SQL once with `OutboxSql.outbox(config, role)` (and `OutboxSql.inbox` for the inbox) into a Flyway or Liquibase migration; startup then creates nothing and checks every table, column, index, partition key and the roles' rights, failing with every problem and the schema version that adds a missing object. Partitions stay the library's in both modes, so its role owns the partitioned tables. A newer schema's extra columns, indexes and tables are accepted (rolling deploys). |
 
+**DML-only application role.** With `bootstrap = false` the runtime DDL can run as the tables' owner while the app's
+own role has DML only: `OutboxRuntime.builder(...).ownerConnections(ownerDataSource::getConnection)` (and the same on
+`InboxRuntime`), or, with Kora, a second `JdbcDatabase` tagged `@Tag(OutboxOwner.class)`. Through the owner go startup,
+maintenance (partitions, orphans, xid-regression recovery), `OutboxAdmin.status()`, `restoreOrphan` and
+`recoverXidRegression`; through the app's role `send`, `tryAccept`, relay steps, the dead-letter pass, the other admin
+calls. An owner source with `bootstrap = true` fails at build; one reaching another database fails startup before
+any DDL. Render the grants with `OutboxSql.outbox(config, "app_role")`; the role also needs `USAGE` on the schema.
+
 ## Shard count and the emergency reshard
 
 - Rough sizing: 256 suits typical services. Go lower only for tiny installs. More than 256 is rarely needed; 1024
