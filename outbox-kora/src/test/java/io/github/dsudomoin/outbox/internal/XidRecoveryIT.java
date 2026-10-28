@@ -874,7 +874,8 @@ class XidRecoveryIT {
 
     /**
      * As after a dump/restore: a tick whose snapshot xmax lies 10⁹ xids past the counter, made a minute ago. Returns
-     * its id.
+     * its id. Made under the tick lock, as every tick is: a running relay's tick in flight would otherwise take its
+     * snapshot before this insert and its id after it, so its next tick would compare with that one, not this one.
      */
     private long forgeRegression() throws SQLException {
         return forgeRegression("now() - interval '1 minute'");
@@ -884,8 +885,12 @@ class XidRecoveryIT {
     private long forgeRegression(String createdAt) throws SQLException {
         try (var c = TestDb.connect()) {
             long xmax = currentXid() + 1_000_000_000L;
-            return queryLong(c, "insert into " + names.tick() + " (snapshot, created_at) values ('" + xmax + ":" + xmax
-                    + ":'::pg_snapshot, " + createdAt + ") returning id");
+            c.setAutoCommit(false);
+            new Ticks(names, config.shards()).lockForTest(c);
+            long id = queryLong(c, "insert into " + names.tick() + " (snapshot, created_at) values ('" + xmax + ":"
+                    + xmax + ":'::pg_snapshot, " + createdAt + ") returning id");
+            c.commit();
+            return id;
         }
     }
 
