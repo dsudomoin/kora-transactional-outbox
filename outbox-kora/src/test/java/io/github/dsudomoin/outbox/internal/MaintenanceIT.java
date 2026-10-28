@@ -970,8 +970,9 @@ class MaintenanceIT {
                 .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
                 .orElseThrow();
         try (var c = TestDb.connect()) {
-            execute(c, "insert into " + orphan.name() + " (id, shard, xid, message_id, topic) values (1000000, 0,"
-                    + " '" + orphan.from() + "', gen_random_uuid(), 't')");
+            // overriding: from Postgres 17 a partition has the outbox's identity column
+            execute(c, "insert into " + orphan.name() + " (id, shard, xid, message_id, topic) overriding system value"
+                    + " values (1000000, 0, '" + orphan.from() + "', gen_random_uuid(), 't')");
             while (currentXid() < Long.parseLong(orphan.to())) { // writers have moved on to the next range
                 TestDb.burnXids(200);
             }
@@ -1008,8 +1009,8 @@ class MaintenanceIT {
                 .orElseThrow();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(null), Duration.ofMillis(300));
         try (var reader = TestDb.connect(); var operator = TestDb.connect()) {
-            execute(operator, "insert into " + range.name() + " (id, shard, xid, message_id, topic) values (1000000,"
-                    + " 0, '" + range.from() + "', gen_random_uuid(), 't')");
+            execute(operator, "insert into " + range.name() + " (id, shard, xid, message_id, topic)"
+                    + " overriding system value values (1000000, 0, '" + range.from() + "', gen_random_uuid(), 't')");
             while (currentXid() < Long.parseLong(range.to())) {
                 TestDb.burnXids(200);
             }
@@ -1048,8 +1049,8 @@ class MaintenanceIT {
                 .min(Comparator.comparingLong(b -> Long.parseLong(b.from())))
                 .orElseThrow();
         try (var c = TestDb.connect()) {
-            execute(c, "insert into " + range.name() + " (id, shard, xid, message_id, topic) values (1000000, 0,"
-                    + " '" + range.from() + "', gen_random_uuid(), 't')");
+            execute(c, "insert into " + range.name() + " (id, shard, xid, message_id, topic) overriding system value"
+                    + " values (1000000, 0, '" + range.from() + "', gen_random_uuid(), 't')");
             while (currentXid() < Long.parseLong(range.to())) {
                 TestDb.burnXids(200);
             }

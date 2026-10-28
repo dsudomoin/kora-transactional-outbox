@@ -667,8 +667,10 @@ class OutboxAdminIT {
     /** A row of a standalone range with that xid; returns its message id. */
     private UUID orphanRow(String table, long id, long xid, String payload) throws SQLException {
         var messageId = UUID.randomUUID();
+        // overriding: from Postgres 17 a partition has the outbox's identity column
         try (var c = TestDb.connect(); var ps = c.prepareStatement("insert into " + table
-                + " (id, shard, xid, message_id, topic, key, payload) values (?, 0, ?::text::xid8, ?, 't', ?, ?)")) {
+                + " (id, shard, xid, message_id, topic, key, payload) overriding system value"
+                + " values (?, 0, ?::text::xid8, ?, 't', ?, ?)")) {
             ps.setLong(1, id);
             ps.setString(2, Long.toString(xid));
             ps.setObject(3, messageId);

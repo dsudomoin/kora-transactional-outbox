@@ -409,8 +409,9 @@ class XidRecoveryIT {
                 .orElseThrow();
         var orphanId = UUID.randomUUID();
         try (var c = TestDb.connect()) { // a range with a row, detached by someone else
-            execute(c, "insert into " + range.name() + " (id, shard, xid, message_id, topic) values (1000000, 0, '"
-                    + range.from() + "', '" + orphanId + "', 't')");
+            // overriding: from Postgres 17 a partition has the outbox's identity column
+            execute(c, "insert into " + range.name() + " (id, shard, xid, message_id, topic) overriding system value"
+                    + " values (1000000, 0, '" + range.from() + "', '" + orphanId + "', 't')");
             while (currentXid() < Long.parseLong(range.to())) { // writers have moved on to the next range
                 TestDb.burnXids(200);
             }
