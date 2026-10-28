@@ -101,11 +101,9 @@ public final class PartitionDdl {
 
     /** Whether {@code table} has {@code parent}'s columns: the same names and types in the same order. */
     static boolean sameColumns(Connection c, String parent, String table) throws SQLException {
-        try (var ps = c.prepareStatement("select (select array_agg(attname::text || ' ' || atttypid::regtype::text"
-                + " order by attnum) from pg_attribute where attrelid = to_regclass(?) and attnum > 0 and not"
-                + " attisdropped) is not distinct from (select array_agg(attname::text || ' ' || atttypid::regtype::text"
-                + " order by attnum) from pg_attribute where attrelid = to_regclass(?) and attnum > 0 and not"
-                + " attisdropped)")) {
+        String columns = "(select array_agg(attname::text || ' ' || atttypid::regtype::text order by attnum)"
+                + " from pg_attribute where attrelid = to_regclass(?) and attnum > 0 and not attisdropped)";
+        try (var ps = c.prepareStatement("select " + columns + " is not distinct from " + columns)) {
             ps.setString(1, parent);
             ps.setString(2, table);
             try (var rs = ps.executeQuery()) {
@@ -357,7 +355,7 @@ public final class PartitionDdl {
         execute(c, lockTimeout, statementTimeout, sql, null);
     }
 
-    /** {@link #execute(Connection, Duration, Duration, String)}, its statement's warnings, if any, to {@code warnings}. */
+    /** {@link #execute(Connection, Duration, Duration, String)}, its warnings to {@code warnings} if given. */
     static void execute(Connection c, Duration lockTimeout, Duration statementTimeout, String sql,
             @Nullable java.util.function.Consumer<java.sql.SQLWarning> warnings) throws SQLException {
         withTimeouts(c, lockTimeout, statementTimeout, () -> {
