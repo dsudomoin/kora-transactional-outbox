@@ -133,11 +133,26 @@ class FrameworkFreeIT {
         var handler = new RecordingHandler();
         var config = new TestOutboxConfig().xidsPerPartition(1000).premake(2)
                 .maintenanceInterval(Duration.ofMillis(200)).cursorAnchorInterval(Duration.ofMillis(200));
+        // A run that sees the xid cross a range boundary between its extension and its gauges logs the premade ERROR,
+        // so no boundary is crossed while a run goes, wherever the xid starts: the runtime starts at the first xid of
+        // a range (its start takes a few dozen xids while its first run goes), and the burn below goes in steps
+        try (var c = transactions.newConnection(); var st = c.createStatement();
+                var rs = st.executeQuery("select pg_current_xact_id()::text::bigint % 1000")) {
+            rs.next();
+            burnXids(999 - rs.getInt(1));
+        }
         try (var err = new CapturedStderr()) {
             var runtime = start(OutboxRuntime.builder(config, transactions, handler).build());
             await(Duration.ofSeconds(10), () -> runtime.admin().status().maintenanceSinceSuccessSeconds() != null);
 
-            burnXids(3000); // past the premade ranges: maintenance extends them, swapping the tail if rows overflowed
+            // 3000 xids, past the premade ranges: maintenance extends them, swapping the tail if rows overflowed.
+            // Half a range at a time, each right after a run, so done before the next run starts (200 ms after it)
+            long since = System.nanoTime();
+            for (int burnt = 0; burnt < 3000; burnt += 500) {
+                awaitMaintenanceRun(runtime, since);
+                burnXids(500);
+                since = System.nanoTime();
+            }
             var id = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", bytes("p"))));
 
             await(Duration.ofSeconds(30), () -> {
@@ -157,6 +172,15 @@ class FrameworkFreeIT {
             inbox.start();
         }
         return runtime;
+    }
+
+    /** Waits for a maintenance run to complete after {@code since} ({@link System#nanoTime()}). */
+    private static void awaitMaintenanceRun(OutboxRuntime runtime, long since) throws InterruptedException {
+        await(Duration.ofSeconds(10), () -> {
+            long before = System.nanoTime(); // the status reads the age after this: a success it shows is no older
+            var age = runtime.admin().status().maintenanceSinceSuccessSeconds();
+            return age != null && age < (before - since) / 1e9;
+        });
     }
 
     private void burnXids(int n) throws Exception {
