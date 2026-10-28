@@ -64,7 +64,7 @@ package io.github.dsudomoin.outbox.kora {
   }
 
   public interface OutboxJsonModule {
-    method public default <T> io.github.dsudomoin.outbox.OutboxSerializer<T!>! jsonOutboxSerializer(ru.tinkoff.kora.json.common.JsonWriter<T!>!);
+    method public default <T> io.github.dsudomoin.outbox.OutboxSerializer<T>! jsonOutboxSerializer(ru.tinkoff.kora.json.common.JsonWriter<T>!);
   }
 
   public interface OutboxModule extends io.github.dsudomoin.outbox.kora.OutboxCommonModule {
@@ -72,7 +72,7 @@ package io.github.dsudomoin.outbox.kora {
     method public default io.github.dsudomoin.outbox.OutboxAdmin! outboxAdmin(io.github.dsudomoin.outbox.OutboxRuntime!);
     method @ru.tinkoff.kora.common.annotation.Root public default ru.tinkoff.kora.application.graph.LifecycleWrapper<io.github.dsudomoin.outbox.OutboxRelay!>! outboxRelay(io.github.dsudomoin.outbox.OutboxRuntime!);
     method @ru.tinkoff.kora.common.annotation.Root public default ru.tinkoff.kora.application.graph.LifecycleWrapper<io.github.dsudomoin.outbox.OutboxRuntime!>! outboxRuntime(io.github.dsudomoin.outbox.OutboxConfig!, io.github.dsudomoin.outbox.OutboxTransactions!, io.github.dsudomoin.outbox.OutboxHandler!, io.github.dsudomoin.outbox.OutboxDeadLetterHandler?, io.github.dsudomoin.outbox.OutboxTelemetry!, @ru.tinkoff.kora.common.Tag(OutboxOwner.class) ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory?);
-    method public default <T> io.github.dsudomoin.outbox.TypedOutbox<T!>! typedOutbox(io.github.dsudomoin.outbox.Outbox!, io.github.dsudomoin.outbox.OutboxSerializer<T!>!);
+    method public default <T> io.github.dsudomoin.outbox.TypedOutbox<T>! typedOutbox(io.github.dsudomoin.outbox.Outbox!, io.github.dsudomoin.outbox.OutboxSerializer<T>!);
   }
 
   public final class OutboxOwner {
@@ -86,7 +86,7 @@ package io.github.dsudomoin.outbox.kora {
     method public static java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>! currentHeaders();
     method public static io.opentelemetry.context.Context! extract(java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
     method public static java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>! replaceTraceHeaders(java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!, io.opentelemetry.context.Context!);
-    method public static <T> T! withKoraContext(io.opentelemetry.context.Context!, java.util.concurrent.Callable<T!>!) throws java.lang.Exception;
+    method public static <T> T withKoraContext(io.opentelemetry.context.Context!, java.util.concurrent.Callable<T>!) throws java.lang.Exception;
     field public static final String TRACEPARENT = "traceparent";
     field public static final String TRACESTATE = "tracestate";
   }

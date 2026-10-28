@@ -1,9 +1,3 @@
-import me.tylerbwong.gradle.metalava.extension.MetalavaExtension
-
-plugins {
-    id("me.tylerbwong.gradle.metalava") version "0.4.0-alpha03" apply false
-}
-
 val koraVersion: String by project
 
 val published = listOf(
@@ -13,11 +7,10 @@ val published = listOf(
 configure(published.map { project(":$it") }) {
     apply(plugin = "java-library")
     apply(plugin = "maven-publish")
-    apply(plugin = "me.tylerbwong.gradle.metalava")
 
     repositories {
         mavenCentral()
-        google { content { includeGroupByRegex("com\\.android\\.tools.*") } } // Metalava only
+        google { content { includeGroupByRegex("com\\.android\\.tools.*|androidx\\..*") } } // Metalava only
     }
 
     configure<JavaPluginExtension> {
@@ -76,25 +69,51 @@ configure(published.map { project(":$it") }) {
         }
     }
 
-    configure<MetalavaExtension> {
-        filename = "api/${project.name}.txt"
-        hiddenPackages.addAll(
-            "io.github.dsudomoin.outbox.internal",
-            "io.github.dsudomoin.outbox.admin.kora.api",
-            "io.github.dsudomoin.outbox.admin.kora.model",
-        )
-        hiddenAnnotations.add("io.github.dsudomoin.outbox.InternalApi")
-        // the plugin finds no JDK classes on Java 9+ by itself
-        val jdk = the<JavaToolchainService>().launcherFor(the<JavaPluginExtension>().toolchain)
-        arguments.addAll(jdk.map { listOf("--jdk-home", it.metadata.installationPath.asFile.path) })
+    // The public API as Metalava's signature of the main sources, without the internal and generated packages and
+    // @InternalApi members: apiDump writes api/<module>.txt, apiCheck fails when the sources no longer match it
+    val metalava = configurations.create("metalava") { isCanBeConsumed = false }
+    dependencies { "metalava"("com.android.tools.metalava:metalava:1.0.0-alpha16") }
+    val toolchains = the<JavaToolchainService>()
+    val jdk = toolchains.launcherFor(the<JavaPluginExtension>().toolchain) // the JDK the API is compiled against
+    val main = the<SourceSetContainer>()["main"]
+    val sources = main.java.sourceDirectories // with the generated ones, so their tasks run first
+    val compileClasspath = main.compileClasspath
+    val excluded = listOf("internal", "admin.kora.api", "admin.kora.model").map { "io.github.dsudomoin.outbox.$it" }
+    fun signatureTask(name: String, out: Provider<RegularFile>) = tasks.register<JavaExec>(name) {
+        classpath = metalava
+        mainClass = "com.android.tools.metalava.Driver"
+        javaLauncher = toolchains.launcherFor { languageVersion = JavaLanguageVersion.of(21) } // Metalava needs 21
+        inputs.files(sources).withPathSensitivity(PathSensitivity.RELATIVE)
+        inputs.files(compileClasspath).withNormalizer(CompileClasspathNormalizer::class)
+        outputs.file(out)
+        argumentProviders.add {
+            listOf(
+                "main", "--format=4.0", "--api", out.get().asFile.path, "--java-source", "17",
+                "--jdk-home", jdk.get().metadata.installationPath.asFile.path,
+                "--source-path", sources.filter { it.exists() }.asPath,
+                "--classpath", compileClasspath.filter { it.exists() }.asPath,
+                "--stub-packages", (listOf("*") + excluded.map { "-$it.*" }).joinToString(":"),
+                "--hide-annotation", "io.github.dsudomoin.outbox.InternalApi",
+                "--hide", "AddedSealed", // Metalava does not model sealed types yet; they are listed as plain ones
+            )
+        }
+        doLast { // Metalava lists a public member that names an excluded type instead of refusing it
+            val leaks = out.get().asFile.readLines().filter { line -> excluded.any { "$it." in line } }
+            if (leaks.isNotEmpty()) {
+                throw GradleException("The public API names excluded types; mark these members @InternalApi:\n" +
+                    leaks.joinToString("\n"))
+            }
+        }
     }
-
-    // Metalava's compatibility check passes additions; the checked-in signature must match the public API exactly
     val signature = layout.projectDirectory.file("api/${project.name}.txt")
-    val current = layout.buildDirectory.file("metalava/current.txt") // written by metalavaCheckCompatibility
-    val apiCheck by tasks.registering {
-        description = "Fails when the public API differs from ${signature.asFile.name} (metalavaGenerateSignature)"
-        dependsOn("metalavaCheckCompatibility")
+    val apiDump = signatureTask("apiDump", provider { signature })
+    apiDump { description = "Writes the public API to ${signature.asFile.name}" }
+    val current = layout.buildDirectory.file("api/${project.name}.txt")
+    val apiCheck = signatureTask("apiCheck", current)
+    apiCheck {
+        description = "Fails when the public API differs from ${signature.asFile.name} (apiDump updates it)"
+        inputs.file(signature)
+        mustRunAfter(apiDump)
         doLast {
             val expected = signature.asFile.readLines()
             val actual = current.get().asFile.readLines()
@@ -104,8 +123,8 @@ configure(published.map { project(":$it") }) {
                     .takeWhile { (e, a) -> e == a }.size
                 val diff = expected.subList(head, expected.size - tail).map { "- $it" } +
                     actual.subList(head, actual.size - tail).map { "+ $it" }
-                throw GradleException("${signature.asFile} differs from the public API at line ${head + 1}:\n" +
-                    diff.joinToString("\n"))
+                throw GradleException("${signature.asFile} differs from the public API at line ${head + 1}" +
+                    " (./gradlew apiDump updates it):\n" + diff.joinToString("\n"))
             }
         }
     }

@@ -8,15 +8,18 @@ package io.github.dsudomoin.outbox.admin.kora {
     method public static io.github.dsudomoin.outbox.admin.kora.OutboxAdminAuthorizer.Decision! unauthorized(String!);
   }
 
-  public static final class OutboxAdminAuthorizer.Allow extends java.lang.Record implements io.github.dsudomoin.outbox.admin.kora.OutboxAdminAuthorizer.Decision {
+  public static final class OutboxAdminAuthorizer.Allow implements io.github.dsudomoin.outbox.admin.kora.OutboxAdminAuthorizer.Decision {
     ctor public OutboxAdminAuthorizer.Allow(String!);
+    method public String! identity();
   }
 
   public static interface OutboxAdminAuthorizer.Decision {
   }
 
-  public static final class OutboxAdminAuthorizer.Deny extends java.lang.Record implements io.github.dsudomoin.outbox.admin.kora.OutboxAdminAuthorizer.Decision {
+  public static final class OutboxAdminAuthorizer.Deny implements io.github.dsudomoin.outbox.admin.kora.OutboxAdminAuthorizer.Decision {
     ctor public OutboxAdminAuthorizer.Deny(int, String!);
+    method public String! message();
+    method public int status();
   }
 
   public interface OutboxAdminHttpModule {

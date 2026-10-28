@@ -42,9 +42,6 @@ sourceSets.test {
     java.srcDir(openApiGenerateTestApp.map { it.outputDir }) // compileTestJava depends on the generation
 }
 
-// the API signature reads the generated sources too: their types appear in the hand-written classes
-tasks.matching { it.name.startsWith("metalava") }.configureEach { dependsOn(tasks.openApiGenerate) }
-
 tasks.sourcesJar {
     exclude(".openapi-generator*", ".openapi-generator/**") // the generator's bookkeeping, not sources
 }
