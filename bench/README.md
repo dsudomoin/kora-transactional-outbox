@@ -82,6 +82,7 @@ Postgres нужны `max_locks_per_transaction=256` и `max_connections=300` (co
 | `SERVICE_NAME` | `tracing.attributes."service.name"` | `outbox-bench` |
 | `BENCH_HANDLER` | `bench.handler`: `kafka` или `noop` (считает и выбрасывает: чистая пропускная способность outbox) | `kafka` |
 | `BENCH_TRACE_RATIO` | `bench.traceRatio`, доля сэмплирования корневых span; она же сэмплирует трассы, начатые HTTP-запросом, например `POST /orders` | 1.0 |
+| `BENCH_TELEMETRY` | `bench.telemetry`: `kora` (`KoraOutboxTelemetry` модуля), `observation` (`ObservationOutboxTelemetry`: наблюдения Micrometer Observation с таймерами `DefaultMeterObservationHandler` и span-ами через мост micrometer-tracing к трассировщику OpenTelemetry из Kora, с тем же сэмплером; доставки несэмплированных трасс не наблюдаются, как по умолчанию в библиотеке) или `observation-all` (то же с `observeUnsampled(true)`: наблюдается каждая доставка) | `kora` |
 | `OUTBOX_SHARDS` | `outbox.shards` | значение библиотеки по умолчанию: 256 для новой таблицы, существующая сохраняет своё число |
 | `OUTBOX_RELAY_WORKERS` | `outbox.relay.workers` | 8 |
 | `OUTBOX_RELAY_BATCH_SIZE` | `outbox.relay.batchSize` | 2000 |
@@ -101,9 +102,10 @@ Postgres нужны `max_locks_per_transaction=256` и `max_connections=300` (co
 
 `bench/scenarios/run-all.sh` прогоняет все нагрузочные сценарии на compose-стенде и переписывает `bench/RESULTS.md`
 (около 105 минут); каждый `bench/scenarios/<name>.sh` можно запустить и отдельно, тогда он дописывает свой раздел.
-Сценарии сами запускают и останавливают приложение, поэтому сначала остановите работающий инстанс. Каждый прогон
-отмечает свой интервал времени аннотацией Grafana с тегом `scenario`, использует новую таблицу outbox и пустой топик
-`orders`, а после прогона удаляет таблицу. Логи приложения пишутся в `bench/build/scenarios/`.
+Сценарии сами запускают и останавливают приложение, поэтому сначала остановите работающий инстанс. Приложение они
+запускают с `BENCH_TRACE_RATIO=0.01`, если переменная не задана в окружении. Каждый прогон отмечает свой интервал
+времени аннотацией Grafana с тегом `scenario`, использует новую таблицу outbox и пустой топик `orders`, а после прогона
+удаляет таблицу. Логи приложения пишутся в `bench/build/scenarios/`.
 
 Сценарии с одиночными сообщениями запускают потребителя с 12 потоками (по одному на партицию). После остановки
 писателей сценарий ждёт, пока потребитель всё выберет (лаг группы 0, нет строк в retry-таблице, счётчики стабильны), и

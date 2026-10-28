@@ -28,6 +28,8 @@ dependencies {
     implementation("ru.tinkoff.kora:micrometer-module")
     implementation("ru.tinkoff.kora:opentelemetry-tracing")
     implementation("ru.tinkoff.kora:opentelemetry-tracing-exporter-grpc")
+    // bench.telemetry = observation: micrometer-tracing over Kora's OpenTelemetry (the bridge line of micrometer 1.12)
+    implementation("io.micrometer:micrometer-tracing-bridge-otel:1.2.12")
     implementation("ru.tinkoff.kora:kafka")
     implementation("ru.tinkoff.kora:json-module")
     implementation("org.postgresql:postgresql:42.7.14")

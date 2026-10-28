@@ -89,13 +89,14 @@ calc() { python3 -c "nan = NaN = float('nan'); print($1)"; } # calc EXPR: arithm
 # on I CMD...: runs CMD with BENCH and METRICS pointing at instance I (load, load_stop, metric, totals...).
 on() { local BENCH=http://localhost:$((8079 + $1)) METRICS=http://localhost:$((8084 + $1))/metrics; shift; "$@"; }
 
-# inst_start I LOGNAME [ENV=VALUE...]: instance I with BENCH_TRACE_RATIO=0.01 plus the given env; waits for readiness.
+# inst_start I LOGNAME [ENV=VALUE...]: instance I with BENCH_TRACE_RATIO (0.01 unless set) plus the given env; waits
+# for readiness.
 # Refuses to start while anything else answers on its port, so readiness can only come from the JVM started here.
 inst_start() {
   local i=$1 name=$2 ready=localhost:$((8084 + $1))/system/readiness pid; shift 2
   if curl -sf "$ready" > /dev/null; then log "something already answers on ${ready%%/*}; stop it first"; exit 1; fi
-  env BENCH_TRACE_RATIO=0.01 HTTP_PORT=$((8079 + i)) METRICS_PORT=$((8084 + i)) INSTANCE_NAME="bench-$i" "$@" "$APP" \
-    >> "$LOGS/$name.log" 2>&1 & # env and bin/bench exec: $! is the JVM
+  env BENCH_TRACE_RATIO="${BENCH_TRACE_RATIO:-0.01}" HTTP_PORT=$((8079 + i)) METRICS_PORT=$((8084 + i)) \
+    INSTANCE_NAME="bench-$i" "$@" "$APP" >> "$LOGS/$name.log" 2>&1 & # env and bin/bench exec: $! is the JVM
   pid=$!
   APP_PIDS[i]=$pid
   echo "$pid" > "$LOGS/app-$i.pid"
