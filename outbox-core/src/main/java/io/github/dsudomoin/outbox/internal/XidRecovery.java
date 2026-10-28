@@ -401,10 +401,10 @@ public final class XidRecovery {
         st.execute("lock table " + table + " in access exclusive mode");
         timeLeft(st, deadline);
         String lowest;
-        try (var rs = st.executeQuery("select min(xid)::text from (select xid from " + table + " limit "
-                + (digits == null ? "all" : "1") + ") t")) {
-            rs.next();
-            lowest = rs.getString(1);
+        // not min(xid): Postgres 14 has no min(xid8)
+        try (var rs = st.executeQuery("select xid::text from (select xid from " + table + " limit "
+                + (digits == null ? "all" : "1") + ") t order by xid limit 1")) {
+            lowest = rs.next() ? rs.getString(1) : null;
         }
         if (lowest == null) {
             st.execute("drop table " + table);
