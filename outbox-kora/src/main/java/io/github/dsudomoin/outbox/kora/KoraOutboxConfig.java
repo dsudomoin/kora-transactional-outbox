@@ -35,6 +35,11 @@ public interface KoraOutboxConfig extends OutboxConfig {
         return new KoraRecoveryConfig() {};
     }
 
+    @Override
+    default KoraSchemaConfig schema() {
+        return new KoraSchemaConfig() {};
+    }
+
     @ConfigValueExtractor
     interface KoraRelayConfig extends RelayConfig {
 
@@ -75,4 +80,7 @@ public interface KoraOutboxConfig extends OutboxConfig {
 
     @ConfigValueExtractor
     interface KoraRecoveryConfig extends RecoveryConfig {}
+
+    @ConfigValueExtractor
+    interface KoraSchemaConfig extends SchemaConfig {}
 }

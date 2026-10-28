@@ -43,6 +43,10 @@ public interface OutboxConfig {
         return new RecoveryConfig() {};
     }
 
+    default SchemaConfig schema() {
+        return new SchemaConfig() {};
+    }
+
     interface RelayConfig {
 
         default boolean enabled() {
@@ -298,6 +302,18 @@ public interface OutboxConfig {
          */
         default Duration timeout() {
             return Duration.ofMinutes(10);
+        }
+    }
+
+    interface SchemaConfig {
+
+        /**
+         * True (default): every instance creates and upgrades the base tables at startup. False: the application's
+         * migrations own them ({@link OutboxSql}), and startup only checks them and the roles' rights, failing with
+         * every problem named; partitions are the library's in both modes.
+         */
+        default boolean bootstrap() {
+            return true;
         }
     }
 }

@@ -41,8 +41,9 @@ import org.slf4j.LoggerFactory;
  * {@code pg_advisory_lock(internalNs, LOCK_INBOX_MAINTENANCE)} with a 5 s {@code lock_timeout} and a 65 s
  * {@code statement_timeout}, {@code internalNs} from the table the name resolves to ({@link TableNames#resolve}), and
  * fails when an existing table has no {@code consumer} column (made by an earlier version, with dedup across
- * consumers). It then runs {@link #runMaintenance()} every {@code outbox.partitions.maintenanceInterval} on the daemon
- * thread {@code outbox-inbox-maintenance} until {@link #close()}.
+ * consumers); with {@code outbox.schema.bootstrap = false} it creates no table and checks it ({@link SchemaCheck}).
+ * It then runs {@link #runMaintenance()} every {@code outbox.partitions.maintenanceInterval} on the daemon thread
+ * {@code outbox-inbox-maintenance} until {@link #close()}.
  */
 public final class PgInbox implements Inbox, AutoCloseable {
 
@@ -260,9 +261,13 @@ public final class PgInbox implements Inbox, AutoCloseable {
         try {
             advisory(c, "pg_advisory_lock", ns); // waits for another instance's bootstrap or maintenance run
             try {
-                execute(c, "create table if not exists " + names.base() + " (message_id uuid not null,"
-                        + " consumer text not null default '', received_at timestamptz not null default now(),"
-                        + " primary key (message_id, consumer)) partition by range (message_id)");
+                if (config.schema().bootstrap()) {
+                    execute(c, "create table if not exists " + names.base() + " (message_id uuid not null,"
+                            + " consumer text not null default '', received_at timestamptz not null default now(),"
+                            + " primary key (message_id, consumer)) partition by range (message_id)");
+                } else { // the application's migrations own it
+                    SchemaCheck.run(c, c, SchemaObjects.inbox(names), names.base(), "OutboxSql.inbox");
+                }
                 partitions.ensurePremade(c, System.currentTimeMillis());
             } finally {
                 advisory(c, "pg_advisory_unlock", ns);

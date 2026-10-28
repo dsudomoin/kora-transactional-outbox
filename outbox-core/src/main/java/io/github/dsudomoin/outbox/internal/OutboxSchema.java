@@ -45,7 +45,10 @@ import org.slf4j.LoggerFactory;
  * tick table keeps {@code shards}, the shard sets {@code dirty} replaces, for the previous release, which writes and
  * reads it beside or after this one; this version leaves it null (every shard). Ticks without {@code dirty} (null)
  * count as holding rows of every shard; dead letters older than {@code status} are kept and the hook sees new ones only: one ALTER adds the hook's
- * columns, and their check is not validated, so it scans no row of the dead table under that ALTER's lock.
+ * columns, and their check is not validated, so it scans no row of the dead table under that ALTER's lock. With
+ * {@code outbox.schema.bootstrap = false} it creates and alters no base object: {@link SchemaCheck} checks them first,
+ * failing startup with every problem, and the rest (partitions, the first tick, cursors, the maintenance and instance
+ * rows, the checks above) runs as with it.
  */
 public final class OutboxSchema implements AutoCloseable {
 
@@ -273,6 +276,11 @@ public final class OutboxSchema implements AutoCloseable {
         public RecoveryConfig recovery() {
             return config.recovery();
         }
+
+        @Override
+        public SchemaConfig schema() {
+            return config.schema();
+        }
     }
 
     public void start() throws SQLException {
@@ -318,6 +326,54 @@ public final class OutboxSchema implements AutoCloseable {
     }
 
     private void bootstrap(Connection c, TableNames n) throws SQLException {
+        try (var st = c.createStatement()) {
+            if (config.schema().bootstrap()) {
+                createBaseObjects(c, n);
+            } else { // the application's migrations own them: only checked, and nothing created when one is missing
+                SchemaCheck.run(c, c, SchemaObjects.outbox(n), spelled.base(), "OutboxSql.outbox");
+            }
+            // when a maintenance run last completed every step, on any instance; until the first one, bootstrap time
+            st.execute("insert into " + n.maintenance() + " (succeeded_at) values (now()) on conflict (id) do nothing");
+
+            checkSequenceCache(c, n);
+            int present = (int) queryLong(st, Cursors.shardCount(n));
+            int shards;
+            if (config.shards() == null) {
+                shards = present == 0 ? OutboxConfig.DEFAULT_SHARDS : present;
+                if (present != 0) {
+                    log.info("outbox.shards is not set: {} holds cursors for {} shards, which this instance uses",
+                            n.cursor(), present);
+                }
+            } else {
+                shards = config.shards();
+                if (present != 0 && present != shards) {
+                    reshard(c, n, present, shards);
+                }
+            }
+            var r = new Resolved(config, shards, guard);
+            checkXidCounter(c, n, r);
+
+            ensurePartitions(c, n);
+
+            st.execute("insert into " + n.tick() + " (snapshot, max_id) select pg_current_snapshot(), "
+                    + Ticks.maxIdQuery(c, n) + " where not exists (select 1 from " + n.tick() + ")");
+            // not after a recovery, which makes them
+            try (var ps = c.prepareStatement(insertCursors(n) + " where not exists (select 1 from " + n.cursor()
+                    + ")")) {
+                ps.setInt(1, shards);
+                ps.executeUpdate();
+            }
+            // still under the schema lock: from here on, another instance's reshard sees this one
+            try (var ps = c.prepareStatement(Heartbeat.upsert(n))) {
+                Heartbeat.bind(ps, 0, instanceId, shards, false, config.partitions().maintenanceInterval());
+                ps.executeUpdate();
+            }
+            resolved = r;
+        }
+    }
+
+    /** Creates the missing base objects ({@link SchemaObjects}) and upgrades the ones earlier versions made. */
+    private void createBaseObjects(Connection c, TableNames n) throws SQLException {
         try (var st = c.createStatement()) {
             st.execute("create table if not exists " + n.base() + """
                      (
@@ -472,13 +528,12 @@ public final class OutboxSchema implements AutoCloseable {
                       recovery_failed text
                     )""");
             addColumn(c, n.halt(), "recovery_failed", "text"); // the previous release's table
-            // when a maintenance run last completed every step, on any instance; until the first one, bootstrap time
+            // when a maintenance run last completed every step, on any instance
             st.execute("create table if not exists " + n.maintenance() + """
                      (
                       id           int primary key default 1 check (id = 1),
                       succeeded_at timestamptz not null
                     )""");
-            st.execute("insert into " + n.maintenance() + " (succeeded_at) values (now()) on conflict (id) do nothing");
             // XidPartitions: the ranges it detaches as relayed, by unqualified name, until they are dropped
             st.execute("create table if not exists " + n.dropping() + """
                      (
@@ -496,41 +551,6 @@ public final class OutboxSchema implements AutoCloseable {
                       expires_at  timestamptz
                     )""");
             addColumn(c, n.instance(), "expires_at", "timestamptz"); // made by an earlier build of this version
-
-            checkSequenceCache(c, n);
-            int present = (int) queryLong(st, Cursors.shardCount(n));
-            int shards;
-            if (config.shards() == null) {
-                shards = present == 0 ? OutboxConfig.DEFAULT_SHARDS : present;
-                if (present != 0) {
-                    log.info("outbox.shards is not set: {} holds cursors for {} shards, which this instance uses",
-                            n.cursor(), present);
-                }
-            } else {
-                shards = config.shards();
-                if (present != 0 && present != shards) {
-                    reshard(c, n, present, shards);
-                }
-            }
-            var r = new Resolved(config, shards, guard);
-            checkXidCounter(c, n, r);
-
-            ensurePartitions(c, n);
-
-            st.execute("insert into " + n.tick() + " (snapshot, max_id) select pg_current_snapshot(), "
-                    + Ticks.maxIdQuery(c, n) + " where not exists (select 1 from " + n.tick() + ")");
-            // not after a recovery, which makes them
-            try (var ps = c.prepareStatement(insertCursors(n) + " where not exists (select 1 from " + n.cursor()
-                    + ")")) {
-                ps.setInt(1, shards);
-                ps.executeUpdate();
-            }
-            // still under the schema lock: from here on, another instance's reshard sees this one
-            try (var ps = c.prepareStatement(Heartbeat.upsert(n))) {
-                Heartbeat.bind(ps, 0, instanceId, shards, false, config.partitions().maintenanceInterval());
-                ps.executeUpdate();
-            }
-            resolved = r;
         }
     }
 

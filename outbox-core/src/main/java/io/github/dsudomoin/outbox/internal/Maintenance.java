@@ -62,10 +62,11 @@ import org.slf4j.LoggerFactory;
  * {@code outbox.deadLetters.retention} (by {@code failed_at}; none when it is 0, pending or scheduled ones never) and
  * of redrive counts older than {@code outbox.deadLetters.redriveHistory}, the start of the dead table's
  * {@code <dead>_due} build when it is missing or invalid ({@link DeadIndexBuilder}: on its own thread, off the
- * maintenance lock; never a failed step), gauges; when none failed, the run is recorded
- * as the last success. One long-lived instance per outbox table: it registers the gauges {@code outbox.shard.lag},
- * {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.dead.pending} (letters waiting for the hook),
- * {@code outbox.dead.pending.oldest} (seconds since the oldest of them failed, 0 when none),
+ * maintenance lock; never a failed step; none with {@code outbox.schema.bootstrap = false}), gauges; when none
+ * failed, the run is recorded as the last success. One long-lived instance per outbox table: it registers the gauges
+ * {@code outbox.shard.lag}, {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.dead.pending}
+ * (letters waiting for the hook), {@code outbox.dead.pending.oldest} (seconds since the oldest of them failed, 0 when
+ * none),
  * {@code outbox.parked.size}, {@code outbox.partitions.premade},
  * {@code outbox.partitions.overflow}, {@code outbox.partitions.xids_left} (xids before inserts fail while the tail is
  * not attached, with an ERROR each run; NaN while it is), {@code outbox.maintenance.transaction_pooling} and
@@ -128,6 +129,8 @@ public final class Maintenance {
     private volatile Integer mismatch;
     private volatile boolean stepFailed; // in the current run, under LOCK_MAINTENANCE
     final DeadIndexBuilder deadIndex; // for tests
+    /** Off with {@code outbox.schema.bootstrap = false}: the migrations made the index. */
+    private final boolean buildsDeadIndex;
 
     private volatile double lag = Double.NaN;
     private volatile double retrySize = Double.NaN;
@@ -173,6 +176,7 @@ public final class Maintenance {
         this.staleAfter = config.partitions().maintenanceInterval().multipliedBy(STALE_INTERVALS);
         this.cursorShards = Cursors.shardCount(names);
         this.deadIndex = new DeadIndexBuilder(db, names, config.partitions().maintenanceInterval(), detachLockTimeout);
+        this.buildsDeadIndex = config.schema().bootstrap();
         this.deadRetention = config.deadLetters().retention();
         this.redriveHistory = config.deadLetters().redriveHistory();
         // ponytail: one statement per run, a scan of the dead table; chunk it if a first retention ever meets millions
@@ -583,10 +587,12 @@ public final class Maintenance {
             step("dead-letter retention", () -> deleteOlder(c, deleteOldKept, deadRetention));
         }
         step("redrive history cleanup", () -> deleteOlder(c, deleteOldRedrives, redriveHistory));
-        step("dead-letter index", () -> {
-            deadIndex.startIfDue(c);
-            return null;
-        });
+        if (buildsDeadIndex) {
+            step("dead-letter index", () -> {
+                deadIndex.startIfDue(c);
+                return null;
+            });
+        }
         step("gauges", () -> {
             refreshGauges(c, read);
             return null;

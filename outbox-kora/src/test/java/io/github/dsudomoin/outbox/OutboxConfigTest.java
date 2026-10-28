@@ -13,6 +13,7 @@ import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraRecoveryConfig_Conf
 import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraRelayConfig_ConfigValueExtractor;
 import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraRequeueConfig_ConfigValueExtractor;
 import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraRetryConfig_ConfigValueExtractor;
+import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraSchemaConfig_ConfigValueExtractor;
 import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraTailConversionConfig_ConfigValueExtractor;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
@@ -31,7 +32,8 @@ class OutboxConfigTest {
                     new $KoraOutboxConfig_KoraTailConversionConfig_ConfigValueExtractor(DURATION), DURATION),
             new $KoraOutboxConfig_KoraInboxConfig_ConfigValueExtractor(DURATION),
             new $KoraOutboxConfig_KoraDeadLettersConfig_ConfigValueExtractor(DURATION),
-            new $KoraOutboxConfig_KoraRecoveryConfig_ConfigValueExtractor(DURATION));
+            new $KoraOutboxConfig_KoraRecoveryConfig_ConfigValueExtractor(DURATION),
+            new $KoraOutboxConfig_KoraSchemaConfig_ConfigValueExtractor());
 
     private static OutboxConfig parse(String hocon) {
         var config = HoconConfigFactory.fromHocon(
@@ -90,6 +92,12 @@ class OutboxConfigTest {
         assertThat(config.recovery().maxRows()).isEqualTo(5000);
         assertThat(config.recovery().clockMargin()).isEqualTo(Duration.ofHours(1));
         assertThat(config.recovery().timeout()).isEqualTo(Duration.ofMinutes(30));
+    }
+
+    @Test
+    void schemaBootstrapIsReadAndOnByDefault() {
+        assertThat(parse("outbox {}").schema().bootstrap()).isTrue();
+        assertThat(parse("outbox.schema.bootstrap = false").schema().bootstrap()).isFalse();
     }
 
     @Test

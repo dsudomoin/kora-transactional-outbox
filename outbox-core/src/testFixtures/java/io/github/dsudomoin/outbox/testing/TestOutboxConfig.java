@@ -54,6 +54,7 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private long maxRows = 1_000_000L;
     private Duration clockMargin = Duration.ofMinutes(10);
     private Duration recoveryTimeout = Duration.ofMinutes(10);
+    private boolean schemaBootstrap = true;
 
     // OutboxConfig
 
@@ -145,6 +146,21 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
 
     @Override
     public RecoveryConfig recovery() {
+        return this;
+    }
+
+    @Override
+    public SchemaConfig schema() {
+        return new SchemaConfig() {
+            @Override
+            public boolean bootstrap() {
+                return schemaBootstrap;
+            }
+        };
+    }
+
+    public TestOutboxConfig schemaBootstrap(boolean schemaBootstrap) {
+        this.schemaBootstrap = schemaBootstrap;
         return this;
     }
 
