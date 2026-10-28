@@ -171,9 +171,26 @@ class KafkaTelemetryIT {
         var sent = ids.stream().filter(id -> !id.equals(dead)).toList();
         var received = TestKafka.consumeUntil(topic, TIMEOUT, r -> byMessageId(r).keySet().containsAll(sent));
         assertThat(byMessageId(received)).doesNotContainKey(dead);
+    }
 
-        await(Duration.ofSeconds(30), () -> runtime.maintenance().runOnce());
-        assertThat(meters.get("outbox.shard.lag").gauge().value()).isNotNaN().isGreaterThanOrEqualTo(0.0);
+    /**
+     * {@code outbox.shard.lag} as maintenance publishes it: above 0 while a shard holds a record it has not delivered,
+     * back to 0 once it delivered it.
+     */
+    @Test
+    void lagGaugeMovesWithTheBacklog() throws Exception {
+        var topic = TestKafka.createTopic(1);
+        var handler = new Handler();
+        var down = new AtomicBoolean(true);
+        handler.fail = r -> down.get() ? Outcome.retry(new IOException("down")) : null;
+        // never diverted to the retry table: the record holds its shard back until it is delivered
+        var runtime = start(config().headFailuresBeforeDivert(1_000), handler);
+        transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of(topic, "k", bytes("late"))));
+
+        await(TIMEOUT, () -> runtime.maintenance().runOnce() && lag() > 0);
+        down.set(false);
+        await(TIMEOUT, () -> counter("outbox.messages.delivered", "topic", topic) == 1);
+        await(TIMEOUT, () -> runtime.maintenance().runOnce() && lag() == 0);
     }
 
     /**
@@ -192,7 +209,8 @@ class KafkaTelemetryIT {
         var shard = Integer.toString(Hashing.shard(Hashing.keyHash(topic, bytes("k")), config.shards()));
         assertThat(spans(STEP)).singleElement().satisfies(step -> {
             assertThat(step.getAttributes().get(SHARDS).split(",")).contains(shard);
-            assertThat(step.getStatus().getStatusCode()).isEqualTo(StatusCode.UNSET);
+            // micrometer-tracing 1.7 sets OK on a span that ends without error, earlier versions leave it UNSET
+            assertThat(step.getStatus().getStatusCode()).isIn(StatusCode.UNSET, StatusCode.OK);
         });
         assertThat(meters.get("outbox.relay.step").tag("error", "none").timer().count()).isEqualTo(1);
         assertThat(counter("outbox.relay.failures")).isZero();
@@ -376,6 +394,10 @@ class KafkaTelemetryIT {
     }
 
     /** The count of the counter, 0 while it is not registered. */
+    private double lag() {
+        return meters.get("outbox.shard.lag").gauge().value();
+    }
+
     private double counter(String name, String... tags) {
         var counter = meters.find(name).tags(tags).counter();
         return counter == null ? 0 : counter.count();
