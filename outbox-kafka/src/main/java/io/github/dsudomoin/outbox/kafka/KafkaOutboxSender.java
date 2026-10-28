@@ -260,6 +260,9 @@ public final class KafkaOutboxSender implements AutoCloseable {
             if (!call.closed) {
                 giveBack(pooled);
             }
+            if (unbatched && expired.isEmpty()) { // none is needed now, after a closed call too
+                drain(unbatchedPool);
+            }
         }
     }
 
@@ -287,8 +290,6 @@ public final class KafkaOutboxSender implements AutoCloseable {
         pooled.home.offerFirst(pooled);
         if (released && pooled.home.remove(pooled)) { // close() has drained the pool already
             closeQuietly(pooled.producer, RELEASE_TIMEOUT);
-        } else if (pooled.home == unbatchedPool && expired.isEmpty()) { // none is needed now
-            drain(unbatchedPool);
         }
     }
 

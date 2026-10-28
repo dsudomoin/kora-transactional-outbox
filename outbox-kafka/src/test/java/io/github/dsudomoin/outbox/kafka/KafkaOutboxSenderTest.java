@@ -629,6 +629,41 @@ class KafkaOutboxSenderTest {
         assertThat(again.get(5, SECONDS)).containsExactly(Outcome.delivered());
     }
 
+    /**
+     * A call closed by a failure can settle the last remembered record: the idle producers of the unbatched pool are
+     * closed then, not left open until the next incident.
+     */
+    @Test
+    void idleUnbatchedProducersCloseWhenAClosedCallSettlesTheLastRememberedRecord() throws Exception {
+        var clock = new TestClock();
+        var sender = sender(() -> new TestProducer(false, r -> null), DELIVERY_TIMEOUT, clock);
+        var x = record(1, keyOnPartition(0, "a"));
+        var y = record(2, keyOnPartition(1, "b"));
+        var first = sendAsync(sender, List.of(x));
+        awaitSent(0, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
+        first.get(5, SECONDS);
+        var second = sendAsync(sender, List.of(y));
+        awaitSent(1, 1).errorNext(new TimeoutException("Expiring 1 record(s)"));
+        second.get(5, SECONDS);
+        clock.advance(Duration.ofSeconds(1)); // both partitions' cooldowns end
+
+        var callA = sendAsync(sender, List.of(x));
+        var idle = awaitSent(2, 1);
+        var callB = sendAsync(sender, List.of(y, record(3, keyOnPartition(2, "c"))));
+        var closing = awaitSent(3, 2); // the other unbatched producer is busy with callA
+        assertThat(unbatched).containsExactlyInAnyOrder(idle, closing);
+        idle.completeNext();
+        assertThat(callA.get(5, SECONDS)).containsExactly(Outcome.delivered());
+        assertThat(idle.closed()).as("y is still remembered").isFalse();
+
+        closing.completeNext();
+        closing.errorNext(new NotEnoughReplicasException("not enough"));
+        assertThat(callB.get(5, SECONDS)).satisfiesExactly(
+                o -> assertThat(o).isEqualTo(Outcome.delivered()),
+                o -> assertThat(o).isInstanceOf(Outcome.Retry.class));
+        assertThat(idle.closed()).as("nothing is remembered now").isTrue();
+    }
+
     @Test
     void invalidRecordIsPermanent() throws Exception {
         var sender = sender(DELIVERY_TIMEOUT);
