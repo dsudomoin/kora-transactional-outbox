@@ -52,6 +52,7 @@ class ObservationOutboxTelemetryTest {
     private static final String TRACE_ID = "0af7651916cd43dd8448eb211c80319c";
     private static final String SPAN_ID = "b7ad6b7169203331";
     private static final String TRACEPARENT = "00-" + TRACE_ID + "-" + SPAN_ID + "-01";
+    private static final String UNSAMPLED = "00-" + TRACE_ID + "-" + SPAN_ID + "-00";
     private static final Instant NOW = Instant.parse("2026-10-27T12:00:00Z");
 
     private final InMemorySpanExporter spans = InMemorySpanExporter.create();
@@ -206,6 +207,81 @@ class ObservationOutboxTelemetryTest {
         }
 
         assertThat(traceparent(handed.get(0).headers())).isEqualTo(TRACEPARENT);
+    }
+
+    @Test
+    void anUnsampledRecordIsObservedWhenAsked() {
+        var stored = record(List.of(header("traceparent", UNSAMPLED)));
+        var telemetry = ObservationOutboxTelemetry.builder(observations, new OutboxMetrics(meters))
+                .tracing(tracer, propagator)
+                .observeUnsampled(true)
+                .build();
+        var delivery = telemetry.deliveryStarted(List.of(stored), NOW);
+        delivery.handed(List.of(stored));
+        delivery.finished(List.of(Outcome.delivered()));
+
+        assertThat(meters.get("outbox.deliver").timer().count()).isEqualTo(1);
+        assertThat(finished("outbox deliver orders").getParentSpanId()).isEqualTo(SPAN_ID);
+    }
+
+    @Test
+    void anUnsampledRecordIsNotObservedByDefaultAndKeepsItsHeaders() throws Exception {
+        var headers = List.of(header("a", "1"), header("traceparent", UNSAMPLED), header("baggage", "tenant=acme"));
+        var stored = record(headers);
+        var delivery = telemetry().deliveryStarted(List.of(stored), NOW);
+        var handed = delivery.handed(List.of(stored));
+        var inside = delivery.inRecordScope(handed.get(0), () -> tracer.currentSpan());
+        delivery.finished(List.of(Outcome.delivered()));
+
+        assertThat(handed.get(0)).isSameAs(stored);
+        assertThat(handed.get(0).headers()).isSameAs(headers);
+        assertThat(inside).as("no scope of its own").isNull();
+        assertThat(meters.find("outbox.deliver").timer()).isNull();
+        assertThat(spans.getFinishedSpanItems()).isEmpty();
+    }
+
+    @Test
+    void sampledMissingAndMalformedTraceparentsAreObserved() {
+        var records = List.of(
+                record(List.of(header("traceparent", TRACEPARENT))),
+                record(List.of(header("b3", TRACE_ID + "-" + SPAN_ID + "-0"))),
+                record(List.of(header("traceparent", "00-" + TRACE_ID + "-" + SPAN_ID + "-0"))),
+                record(List.of(header("traceparent", "00-" + TRACE_ID.toUpperCase() + "-" + SPAN_ID + "-00"))),
+                record(List.of(header("traceparent", "00-" + "0".repeat(32) + "-" + SPAN_ID + "-00"))),
+                record(List.of(header("traceparent", "00-" + TRACE_ID + "-" + "0".repeat(16) + "-00"))),
+                record(List.of(header("traceparent", "ff-" + TRACE_ID + "-" + SPAN_ID + "-00"))),
+                record(List.of(header("traceparent", UNSAMPLED + "-extra"))),
+                record(List.of(header("traceparent", UNSAMPLED), header("traceparent", TRACEPARENT))));
+        var delivery = telemetry().deliveryStarted(records, NOW);
+        delivery.handed(records);
+        delivery.finished(records.stream().map(r -> Outcome.delivered()).toList());
+
+        assertThat(meters.get("outbox.deliver").timer().count()).isEqualTo(records.size());
+    }
+
+    @Test
+    void aMixedCallKeepsOrderAndTheOutcomesOfObservedRecords() {
+        var a = record(List.of(header("traceparent", UNSAMPLED)));
+        var b = record(List.of(header("traceparent", TRACEPARENT)));
+        var c = record(List.of(header("traceparent", UNSAMPLED)));
+        var d = record(List.of());
+        var delivery = telemetry().deliveryStarted(List.of(a, b, c, d), NOW);
+        var handed = delivery.handed(List.of(a, b, c, d));
+        delivery.finished(List.of(Outcome.delivered(), Outcome.retry(new IOException("x")),
+                Outcome.permanent(new IOException("y")), Outcome.requeue()));
+
+        assertThat(handed).hasSize(4);
+        assertThat(handed.get(0)).isSameAs(a);
+        assertThat(handed.get(1).messageId()).isEqualTo(b.messageId());
+        assertThat(handed.get(2)).isSameAs(c);
+        assertThat(handed.get(3).messageId()).isEqualTo(d.messageId());
+        assertThat(traceparent(handed.get(1).headers())).isNotEqualTo(TRACEPARENT);
+        assertThat(meters.get("outbox.deliver").tag("outbox.outcome", "retry").timer().count()).isEqualTo(1);
+        assertThat(meters.get("outbox.deliver").tag("outbox.outcome", "requeued").timer().count()).isEqualTo(1);
+        assertThat(meters.find("outbox.deliver").tag("outbox.outcome", "delivered").timer()).isNull();
+        assertThat(meters.find("outbox.deliver").tag("outbox.outcome", "permanent").timer()).isNull();
+        assertThat(spans.getFinishedSpanItems()).extracting(s -> attribute(s, "outbox.message_id"))
+                .containsExactlyInAnyOrder(b.messageId().toString(), d.messageId().toString());
     }
 
     @Test

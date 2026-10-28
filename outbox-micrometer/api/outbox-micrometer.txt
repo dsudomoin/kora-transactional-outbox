@@ -30,6 +30,7 @@ package io.github.dsudomoin.outbox.micrometer {
     method public io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry! build();
     method public io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry.Builder! deliveryConvention(io.github.dsudomoin.outbox.micrometer.OutboxDeliveryObservationConvention!);
     method public io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry.Builder! enqueueConvention(io.github.dsudomoin.outbox.micrometer.OutboxEnqueueObservationConvention!);
+    method public io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry.Builder! observeUnsampled(boolean);
     method public io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry.Builder! stepConvention(io.github.dsudomoin.outbox.micrometer.OutboxStepObservationConvention!);
     method public io.github.dsudomoin.outbox.micrometer.ObservationOutboxTelemetry.Builder! tracing(io.micrometer.tracing.Tracer!, io.micrometer.tracing.propagation.Propagator!);
   }
