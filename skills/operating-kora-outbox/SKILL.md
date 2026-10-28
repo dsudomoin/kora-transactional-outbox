@@ -9,17 +9,17 @@ description: Use when monitoring, alerting on, sizing or troubleshooting kora-tr
 
 Procedures: the library README (https://github.com/dsudomoin/kora-transactional-outbox#readme). Act through the admin
 API: `OutboxAdmin` in code or `kora-outbox-admin` over HTTP ([admin-api.md](admin-api.md)). **Never improvise SQL
-against the library's tables**; run only SQL the README prints, on a staging copy first.
+against the library's tables**; run only the README's SQL, on a staging copy first.
 
-## Wake someone: delivery stopped or soon stops
+## Wake someone: delivery stops
 
 | Signal | Meaning | README section |
 |---|---|---|
-| `outbox.shard.lag` growing | Target down, slow handler, too few workers; with ERROR «outbox shards [...] start from ticks [...] that no longer exist»: stranded shards | «Обработка сбоев», «Застрявшие шарды» |
+| `outbox.shard.lag` growing | Target down, slow handler, too few workers; ERROR «outbox shards [...] start from ticks [...] that no longer exist»: stranded shards | «Обработка сбоев», «Застрявшие шарды» |
 | `outbox.maintenance.since_success` > 5 × `maintenanceInterval` | No maintenance anywhere; `transaction_pooling` = 1: a pooler | «Обслуживание работает там же, где relay» |
 | `outbox.partitions.xids_left` not NaN | Tail detached: inserts fail at 0 | «Партиции» |
-| `outbox.dead.pending.oldest` > X (X > `relay.retry.maxDelay`) and `outbox.dead.hook.failures` growing | Hook failing: letters wait, no alerts sent | «Dead letters» |
-| ERROR «outbox xid regression detected» | «recovered»: done; «relay halted»: reason at line end, maybe `POST /recovery/xid-regression` | «Восстановление после регрессии xid (xid regression recovery)» |
+| `outbox.dead.pending.oldest` > X (X > `relay.retry.maxDelay`) and `outbox.dead.hook.failures` growing | Hook failing: letters wait | «Dead letters» |
+| ERROR «outbox xid regression detected» | «recovered»: done; «relay halted»: its reason, maybe `POST /recovery/xid-regression` | «Восстановление после регрессии xid» |
 | ERROR «... holds cursors for N shards, but this instance runs with outbox.shards = M ...» or «... refuses this write ...» | Old-count instance after a reshard: restart with the new count or unset | «Решардинг» |
 
 ## Morning: nothing lost, waits for a human
@@ -28,8 +28,8 @@ against the library's tables**; run only SQL the README prints, on a staging cop
 |---|---|
 | `outbox.dead.size` grows, `outbox.dead.pending` does not | «Dead letters» |
 | `outbox.partitions.orphaned` or `outbox.inbox.partitions.orphaned` > 0 | «Осиротевшие партиции» |
-| `outbox.partitions.overflow` = 1 past one extension cycle, `outbox.partitions.premade` < 2 | «Переполнение хвоста (tail overflow)» |
-| ERROR «... tail swap of ... has not run» | «Партиции» |
+| `outbox.partitions.overflow` = 1 past an extension, `premade` < 2 | «Переполнение хвоста (tail overflow)» |
+| ERROR «... has not run», «... over outbox.partitions.maxTailScan» | «Партиции» |
 | `outbox.parked.size` not back to its level | «Алерты» |
 
 Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dashboards/outbox.json`.
@@ -55,5 +55,6 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
   `partitionInterval`.
 - **Rollback to 5fc60dd** («Обновление с предыдущего релиза»): set its `outbox.shards` to the cursors' count (256 if
   this release created it); then list the window's `kept` dead letters.
-- «Репликация, failover и PITR»: async failover can deliver events whose data is gone; PITR redelivers.
+- «Репликация, failover и PITR»: async failover may deliver events whose data is gone; PITR redelivers.
 - `relay.retry.maxAttempts = 0` (default): a key stuck on a broken target shows as lag only.
+- Writers' timeouts: ≥ 300 ms by day, ≥ `tailConversion.maxStall` + 300 ms at night.
