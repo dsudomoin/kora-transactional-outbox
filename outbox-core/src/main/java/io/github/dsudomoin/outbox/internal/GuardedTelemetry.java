@@ -261,6 +261,11 @@ public final class GuardedTelemetry implements OutboxTelemetry {
                 warn("Delivery.inRecordScope", e);
                 return tracked.state == TrackedCall.RETURNED ? tracked.result : call.call();
             }
+            if (tracked.state == TrackedCall.THREW) { // a scope that swallowed the handler's failure: not a delivery
+                warn("Delivery.inRecordScope", new IllegalStateException("the record scope swallowed its call's "
+                        + tracked.error));
+                throw rethrow(tracked.error);
+            }
             if (tracked.state == TrackedCall.NOT_RUN) { // a scope that skipped its call: run it, as without telemetry
                 warn("Delivery.inRecordScope", new IllegalStateException("the record scope did not run its call"));
                 return call.call();

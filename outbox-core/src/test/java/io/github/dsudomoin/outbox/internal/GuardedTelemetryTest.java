@@ -104,6 +104,33 @@ class GuardedTelemetryTest {
     }
 
     @Test
+    void scopeThatSwallowsTheCallsFailureStillFails() {
+        var swallowing = new OutboxTelemetry() {
+            @Override
+            public Delivery deliveryStarted(List<OutboxRecord> records, Instant now) {
+                return new Delivery() {
+                    @Override
+                    public <T> T inRecordScope(OutboxRecord record, Callable<T> call) {
+                        try {
+                            return call.call();
+                        } catch (Exception e) {
+                            return null; // a bug: the handler's failure would read as a delivery
+                        }
+                    }
+                };
+            }
+        };
+        var delivery = GuardedTelemetry.of(swallowing).deliveryStarted(RECORDS, Instant.EPOCH);
+        var failure = new IOException("handler");
+        try (var err = new CapturedStderr()) {
+            assertThatThrownBy(() -> delivery.inRecordScope(RECORD, () -> {
+                throw failure;
+            })).isSameAs(failure);
+            assertThat(err.text()).contains("WARN").contains("Delivery.inRecordScope");
+        }
+    }
+
+    @Test
     void callRunsOnceWhenScopeThrowsAfterIt() throws Exception {
         var calls = new AtomicInteger();
         var delivery = GuardedTelemetry.of(new ScopeThrowing(true)).deliveryStarted(RECORDS, Instant.EPOCH);
