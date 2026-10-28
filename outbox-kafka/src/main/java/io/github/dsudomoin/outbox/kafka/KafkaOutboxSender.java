@@ -107,8 +107,8 @@ import org.slf4j.LoggerFactory;
  * until {@code batchTimeout}. The sender honours the interrupt at once: it stops handing records over, closes the
  * producer if records are in flight, and returns acked records as {@code Delivered}, unacked ones as {@code Retry} and
  * the rest as {@code NotAttempted}. Running past the soft cut is therefore safe, but turns slow sends into retries.
- * {@code KafkaOutboxModule} logs a WARN at startup when {@code delivery.timeout.ms} + 5 s + {@code max.block.ms}
- * exceeds {@code batchTimeout} itself.
+ * Keep {@code batchTimeout} at least {@code delivery.timeout.ms} + 5 s + {@code max.block.ms}; the Kora adapter's
+ * {@code KafkaOutboxModule} logs a WARN at startup when it is shorter.
  */
 public final class KafkaOutboxSender implements AutoCloseable {
 

@@ -11,13 +11,16 @@ import java.util.UUID;
  */
 public interface Outbox {
 
-    /** Must run inside {@code JdbcConnectionFactory.inTx(...)}; wakes the relay after commit. */
+    /**
+     * Must run inside the application's transaction (see {@link OutboxTransactions}), e.g.
+     * {@code JdbcTransactions.inTx(...)}; wakes the relay after commit.
+     */
     UUID send(OutboxMessage message);
 
     /**
-     * For code that holds the connection itself; it must be in a transaction (autocommit off). Only Kora's current
-     * {@code inTx} connection wakes the relay after commit; with any other connection delivery waits for the relay's
-     * idle poll.
+     * For code that holds the connection itself; it must be in a transaction (autocommit off). Only the connection of
+     * the caller's transaction ({@link OutboxTransactions#currentConnection()}) wakes the relay after commit; with any
+     * other connection delivery waits for the relay's idle poll.
      */
     UUID send(Connection connection, OutboxMessage message);
 

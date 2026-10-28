@@ -3,7 +3,10 @@ package io.github.dsudomoin.outbox.micrometer;
 import io.micrometer.observation.Observation;
 import java.util.List;
 
-/** The observation of one relay step, current on the relay thread while the step runs. */
+/**
+ * The observation of one relay step, current on the thread that steps (a relay worker, or the caller of
+ * {@code OutboxRelay.drain()}) while the step runs.
+ */
 public final class OutboxStepContext extends Observation.Context {
 
     private final List<Integer> shards;

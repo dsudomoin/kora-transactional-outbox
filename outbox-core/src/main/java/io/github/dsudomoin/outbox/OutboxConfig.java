@@ -3,7 +3,11 @@ package io.github.dsudomoin.outbox;
 import jakarta.annotation.Nullable;
 import java.time.Duration;
 
-/** The outbox's settings; every one has a default. With Kora, HOCON path {@code outbox}, keys named as here. */
+/**
+ * The outbox's settings; every one has a default: implement it and override what you change
+ * ({@code new OutboxConfig() {}} is all defaults). The Kora adapter reads it from HOCON path {@code outbox}, keys named
+ * as here.
+ */
 public interface OutboxConfig {
 
     default String table() {

@@ -22,8 +22,8 @@ public interface OutboxHandler {
     /**
      * Delivers one record. Throw {@link OutboxPermanentException} for a record that can never succeed; anything else
      * thrown, an {@link Error} included, means "retry later". The default {@link #handleBatch} runs it in the
-     * record's scope ({@link #inRecordScope}): with the Kora adapter, a Kora context carrying the record's trace, so
-     * Kora clients called from here continue it.
+     * record's scope ({@link #inRecordScope}), so clients called from here continue the record's trace when the
+     * telemetry binds one (the Kora adapter, the Micrometer Observation telemetry with tracing).
      */
     void handle(OutboxRecord record) throws Exception;
 
@@ -91,11 +91,12 @@ public interface OutboxHandler {
 
     /**
      * Runs {@code call} in the scope of {@code record}, one of the records the relay handed to the {@link #handleBatch}
-     * call running on this thread: whatever the application's telemetry binds to a record (with the Kora adapter, a
-     * Kora context carrying the record's trace). The default {@code handleBatch} wraps each {@link #handle} in it; an
-     * override that delivers records itself calls it the same way. Outside a relay call (a handler called directly,
-     * or on another thread) it runs {@code call} in the record's scope a framework adapter provides (the Kora
-     * adapter's: the record's trace), else alone.
+     * call running on this thread: whatever the application's telemetry binds to a record
+     * ({@link OutboxTelemetry.Delivery#inRecordScope}; with the Micrometer Observation telemetry, the record's delivery
+     * observation as the current one; with the Kora adapter, a Kora context carrying the record's trace). The default
+     * {@code handleBatch} wraps each {@link #handle} in it; an override that delivers records itself calls it the same
+     * way. Outside a relay call (a handler called directly, or on another thread) it runs {@code call} in the record's
+     * scope a framework adapter provides (the Kora adapter's: the record's trace), else alone.
      */
     static <T> T inRecordScope(OutboxRecord record, Callable<T> call) throws Exception {
         return RecordScope.run(record, call);
@@ -104,7 +105,7 @@ public interface OutboxHandler {
     /**
      * True once the relay asked the {@link #handleBatch} call running on this thread to wind down (its soft deadline
      * at 80 % of {@code batchTimeout}, or the hard timeout), and whenever the thread is interrupted. Check this before
-     * starting each record, not just the interrupt flag: a client may clear the flag (a blocking Kora HTTP client on
+     * starting each record, not just the interrupt flag: a client may clear the flag (Kora's blocking HTTP client on
      * the JDK transport wraps the {@link InterruptedException} without restoring it).
      */
     static boolean windDownRequested() {

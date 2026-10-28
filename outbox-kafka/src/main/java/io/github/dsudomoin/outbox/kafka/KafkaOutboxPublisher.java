@@ -14,11 +14,11 @@ import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.serialization.Serializer;
 
 /**
- * Typed {@link Outbox#send(OutboxMessage)} to one Kafka topic with Kafka serializers (Kora's {@code @Json} ones
- * included). The ordering key is the serialized Kafka key, the bytes Kafka partitions by; a {@code null} key is
- * unordered and a {@code null} value a tombstone. A serializer returning {@code null} for a non-null key or value
- * throws {@link OutboxSerializationException}. Like {@link Outbox#send(OutboxMessage)} it must run inside
- * {@code inTx}.
+ * Typed {@link Outbox#send(OutboxMessage)} to one Kafka topic with any Kafka {@link Serializer}s (the Kora adapter's
+ * {@code @Json} ones included). The ordering key is the serialized Kafka key, the bytes Kafka partitions by; a
+ * {@code null} key is unordered and a {@code null} value a tombstone. A serializer returning {@code null} for a
+ * non-null key or value throws {@link OutboxSerializationException}. Like {@link Outbox#send(OutboxMessage)} it must
+ * run inside the application's transaction (see {@link io.github.dsudomoin.outbox.OutboxTransactions}).
  */
 public final class KafkaOutboxPublisher<K, V> {
 

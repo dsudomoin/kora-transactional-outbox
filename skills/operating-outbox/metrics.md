@@ -6,10 +6,11 @@ Micrometer meters, registered only when the Kora graph has a `MeterRegistry` (fo
 name (`outbox_shard_lag`, `outbox_dead_size`).
 
 Without Kora the same meters come from `OutboxMetrics` (`outbox-micrometer`) passed to
-`OutboxRuntime.builder(...).telemetry(...)`. `ObservationOutboxTelemetry` adds two Micrometer observations on top:
-`outbox.enqueue` per send call and `outbox.deliver` per record (span kind CONSUMER, parented by the stored trace; tags
-`messaging.destination.name`, `outbox.outcome`). Rename them with an `Outbox*ObservationConvention`, rename meters with
-a `MeterFilter`.
+`OutboxRuntime.builder(...).telemetry(...)`. `ObservationOutboxTelemetry` adds three Micrometer observations on top:
+`outbox.enqueue` per send call, `outbox.relay.step` per relay step (span `outbox relay step`, a trace root;
+high-cardinality `outbox.shards`) and `outbox.deliver` per record (span kind CONSUMER, parented by the stored trace;
+tags `messaging.destination.name`, `outbox.outcome`; high-cardinality `outbox.shard`). Rename them with an
+`Outbox*ObservationConvention`, rename meters with a `MeterFilter`; README «Наблюдаемость» → «Контракт по этапам».
 
 | Meter | Type | Tags | Meaning |
 |---|---|---|---|
@@ -20,6 +21,7 @@ a `MeterFilter`.
 | `outbox.delivery.delay` | timer, percentile histogram | `topic` | Row insert to delivered outcome; buckets 1 ms to 6 h (about 110 bucket series per topic). |
 | `outbox.batch.duration` | timer, percentile histogram | | One shard step that wrote a cursor row. |
 | `outbox.shard.paused` | counter | | Shard pauses: target down, failing head, no free handler thread. |
+| `outbox.relay.failures` | counter | | Relay failures it logs at WARN: a pass failing outside a step (tick, cursor read, connection, a lost one included) and a rolled-back single-shard step. Not a multi-shard step redone shard by shard, not maintenance, heartbeat, the dead-letter pass or failures while stopping. |
 | `outbox.shard.lag` | gauge, seconds | | How far the slowest shard's tick is behind the latest tick. |
 | `outbox.retry.size`, `outbox.parked.size`, `outbox.dead.size` | gauges | | Rows in `<table>_retry`, `<table>_parked` (requeued records waiting) and `<table>_dead` (every status). |
 | `outbox.dead.pending` | gauge | | Dead letters waiting for the hook's decision (`pending`); 0 without an active hook. |

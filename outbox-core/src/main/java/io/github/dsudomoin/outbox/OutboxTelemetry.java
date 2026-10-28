@@ -9,8 +9,9 @@ import java.util.function.DoubleSupplier;
 /**
  * Metrics and traces of the outbox, implemented by the application's adapter: every method is a no-op by default,
  * and new events come as new default methods. Hooks run on the outbox's own threads, the enqueue ones on the
- * writer's; an exception a hook throws is logged at WARN (at most once per 10 s per hook) and ignored, so a broken
- * implementation never fails a send or a relay step.
+ * writer's; "the relay thread" below is the thread that steps: a relay worker, or the caller of
+ * {@link OutboxRelay#drain()}. An exception a hook throws is logged at WARN (at most once per 10 s per hook) and
+ * ignored, so a broken implementation never fails a send or a relay step.
  */
 public interface OutboxTelemetry {
 
@@ -42,8 +43,8 @@ public interface OutboxTelemetry {
     default void requeued(String topic) {}
 
     /**
-     * A relay step began on the relay thread holding the locks of {@code shards}; its database work and handler calls
-     * run on this thread (the handler itself on a handler thread) until {@link RelayStep#finished()} or
+     * A relay step began on the thread that steps, holding the locks of {@code shards}; its database work and handler
+     * calls run on this thread (the handler itself on a handler thread) until {@link RelayStep#finished()} or
      * {@link RelayStep#failed}.
      */
     default RelayStep stepStarted(List<Integer> shards) {
@@ -102,7 +103,7 @@ public interface OutboxTelemetry {
 
         RelayStep NONE = new RelayStep() {};
 
-        /** The step's work is done; its transaction commits next. */
+        /** The step's work is done; its transaction commits next, so a commit that fails still ends the step here. */
         default void finished() {}
 
         /** The step failed with {@code error}, which rolls its transaction back. */

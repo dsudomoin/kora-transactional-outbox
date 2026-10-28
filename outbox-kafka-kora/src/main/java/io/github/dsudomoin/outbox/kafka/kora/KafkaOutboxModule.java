@@ -72,7 +72,10 @@ public interface KafkaOutboxModule {
 
     /**
      * Publishes dead letters with {@code outbox.kafka.deadLetterTopic} set, is inactive without; {@code outbox} as for
-     * {@link #kafkaOutboxSender}.
+     * {@link #kafkaOutboxSender}. Declared as {@link KafkaDeadLetterHandler}, not {@code OutboxDeadLetterHandler}, so
+     * that an app's hook component replaces it: Kora 1.2.23 takes a default declared as exactly
+     * {@code OutboxDeadLetterHandler} over an app component of a subtype ({@code @Component class Hook implements
+     * OutboxDeadLetterHandler}).
      */
     @DefaultComponent
     default KafkaDeadLetterHandler kafkaDeadLetterHandler(KafkaOutboxConfig config, KafkaOutboxSender sender,

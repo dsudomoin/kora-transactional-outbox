@@ -3,7 +3,10 @@ package io.github.dsudomoin.outbox.kafka;
 import jakarta.annotation.Nullable;
 import java.util.Properties;
 
-/** The Kafka handler's settings. With Kora, HOCON path {@code outbox.kafka}, keys named as here. */
+/**
+ * The Kafka handler's settings, for {@link KafkaOutboxSender}. The Kora adapter reads them from HOCON path
+ * {@code outbox.kafka}, keys named as here.
+ */
 public interface KafkaOutboxConfig {
 
     /** Kafka producer properties; see {@link KafkaOutboxSender} for the ones it forces or defaults. */

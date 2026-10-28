@@ -6,8 +6,8 @@ import java.util.Collection;
 /**
  * The morning tool, for any code of the service (an endpoint, a job, a test): the outbox's status, dead letters, kept
  * orphans and the xid-regression recovery. Every call manages its own transactions, so it fails with
- * {@link IllegalStateException} inside the caller's {@code inTx}; any instance gives the same answers, as all act on
- * the shared database.
+ * {@link IllegalStateException} inside the application's transaction; any instance gives the same answers, as all act
+ * on the shared database.
  *
  * <p>Bulk calls act on the letters dead when they began, none that die meanwhile (a redriven letter dying again
  * included), in chunks of 1 000 letters in id order, one transaction each, so a large redrive never holds more than

@@ -25,8 +25,9 @@ import java.util.UUID;
 public interface Inbox {
 
     /**
-     * Must run inside {@code JdbcConnectionFactory.inTx(...)}. True the first time this scope sees the id (process the
-     * message), false for a duplicate (skip it). A rolled-back transaction records nothing.
+     * Must run inside the application's transaction (see {@link OutboxTransactions}), e.g.
+     * {@code JdbcTransactions.inTx(...)}. True the first time this scope sees the id (process the message), false for
+     * a duplicate (skip it). A rolled-back transaction records nothing.
      */
     boolean tryAccept(UUID messageId);
 

@@ -23,14 +23,15 @@ import java.util.function.DoubleSupplier;
 /**
  * The outbox on Micrometer Observation: an {@code outbox.enqueue} observation per {@code send}/{@code sendAll} call,
  * whose trace context the call's messages store; an {@code outbox.relay.step} observation per relay step, current on
- * the relay thread while the step runs; and an {@code outbox.deliver} observation per delivered record, parented by
- * that stored context, whose own context the record handed to the handler carries. The other events and the gauges
- * are {@link OutboxMetrics}' meters. Names and key values come from the conventions; meter names and tags can be
- * changed with a {@code MeterFilter}.
+ * the thread that steps (a relay worker, or the caller of {@code OutboxRelay.drain()}) while the step runs; and an
+ * {@code outbox.deliver} observation per delivered record, parented by that stored context, whose own context the
+ * record handed to the handler carries. The other events and the gauges are {@link OutboxMetrics}' meters. Names and
+ * key values come from the conventions; meter names and tags can be changed with a {@code MeterFilter}.
  *
  * <p>The enqueue observation is a sender one and the delivery observation a receiver one, so the application's
- * propagating tracing handlers inject and extract the context; the delivery span is therefore of kind CONSUMER.
- * {@link Builder#tracing} lets the handed records carry the delivery span; without it they keep their headers.
+ * propagating tracing handlers inject and extract the context; the delivery span is therefore of kind CONSUMER. A
+ * record stored without trace context (written without this telemetry) gets the step's span, current then, as its
+ * parent. {@link Builder#tracing} lets the handed records carry the delivery span; without it they keep their headers.
  */
 public final class ObservationOutboxTelemetry implements OutboxTelemetry {
 
@@ -79,7 +80,7 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
         return new ObservedDelivery(records, started, contexts);
     }
 
-    /** Opens the step observation's scope on the relay thread; the step closes it there before it stops. */
+    /** Opens the step observation's scope on the thread that steps; the step closes it there before it stops. */
     @Override
     public RelayStep stepStarted(List<Integer> shards) {
         var context = new OutboxStepContext(shards);
