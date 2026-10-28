@@ -377,7 +377,11 @@ class OutboxSchemaIT {
         config.xidsPerPartition(1000).premake(4);
         new OutboxSchema(db, config).start();
         var n = TableNames.of(config.table());
-        TestDb.burnXids(2500); // half of premake used: the next bootstrap wants to extend
+        // to the middle of a range: the DDL below must not move the xid on to the next one
+        try (var c = TestDb.connect()) {
+            long current = currentXid(c);
+            TestDb.burnXids((int) (Math.floorDiv(current, 1000) * 1000 + 2500 - current));
+        } // half of premake used: the next bootstrap wants to extend
 
         try (var holder = TestDb.connect(); var c = TestDb.connect()) {
             holder.setAutoCommit(false);
