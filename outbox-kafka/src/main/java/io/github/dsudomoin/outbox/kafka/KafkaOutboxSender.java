@@ -85,12 +85,13 @@ import org.slf4j.LoggerFactory;
  *
  * <p>The records of a call still unacknowledged when a producer batch of their partition expires
  * ({@link TimeoutException} from Kafka's I/O thread), and those whose partition Kafka chose, are remembered by message
- * id: at most 10 000, each until a call delivers it or has it refused, or for 10 minutes. A call that holds any of them
- * borrows its producer from a second pool, made with {@code batch.size=0} and otherwise the same properties: Kafka
- * then sizes each producer batch to its first record, so no other record joins it (with compression one may, until a
- * refusal splits the batch into single records). Thus a record the broker refuses becomes {@code Permanent} even when
- * it shared a producer batch before: Kafka splits a batch the broker refuses as too large, and kafka-clients before
- * 4.2 splits it by {@code batch.size}, which rebuilds a batch that fits {@code batch.size} as it was, until
+ * id, as are those still in flight when an interrupt or the call's deadline ends it first, so this works whatever the
+ * timeouts: at most 10 000, each until a call delivers it or has it refused, or for 10 minutes. A call that holds any
+ * of them borrows its producer from a second pool, made with {@code batch.size=0} and otherwise the same properties:
+ * Kafka then sizes each producer batch to its first record, so no other record joins it (with compression one may,
+ * until a refusal splits the batch into single records). Thus a record the broker refuses becomes {@code Permanent}
+ * even when it shared a producer batch before: Kafka splits a batch the broker refuses as too large, and kafka-clients
+ * before 4.2 splits it by {@code batch.size}, which rebuilds a batch that fits {@code batch.size} as it was, until
  * {@code delivery.timeout.ms} expires all its records; in a batch of its own, the refused record fails with
  * {@link RecordTooLargeException}. Such a call sends a partition at most {@code max.in.flight.requests.per.connection}
  * records per round trip; its producers are closed once nothing is remembered. With nothing remembered, a call looks
@@ -105,10 +106,11 @@ import org.slf4j.LoggerFactory;
  * send or metadata wait still blocking then can add up to {@code max.block.ms} (30 s in all by default). The relay
  * interrupts a handler call at 80 % of its {@code batchTimeout} (24 s of 30 s by default) and waits for the outcomes
  * until {@code batchTimeout}. The sender honours the interrupt at once: it stops handing records over, closes the
- * producer if records are in flight, and returns acked records as {@code Delivered}, unacked ones as {@code Retry} and
- * the rest as {@code NotAttempted}. Running past the soft cut is therefore safe, but turns slow sends into retries.
- * Keep {@code batchTimeout} at least {@code delivery.timeout.ms} + 5 s + {@code max.block.ms}; the Kora adapter's
- * {@code KafkaOutboxModule} logs a WARN at startup when it is shorter.
+ * producer if records are in flight, and returns acked records as {@code Delivered}, unacked ones as {@code Retry}
+ * (remembered, as above) and the rest as {@code NotAttempted}. Running past the soft cut is therefore safe, but turns
+ * slow sends into retries, sent unbatched once. Keep {@code batchTimeout} at least {@code delivery.timeout.ms} + 5 s +
+ * {@code max.block.ms} so that they end as Kafka's outcomes instead; the Kora adapter's {@code KafkaOutboxModule} logs
+ * a WARN at startup when it is shorter.
  */
 public final class KafkaOutboxSender implements AutoCloseable {
 
@@ -248,7 +250,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
         try {
             var partitions = sendAll(call, records, deadline, pooled);
             if (!call.await(deadline)) {
-                call.close(Thread.currentThread().isInterrupted() ? "interrupted" : "not acknowledged within " + wait);
+                call.cut(Thread.currentThread().isInterrupted() ? "interrupted" : "not acknowledged within " + wait);
             }
             return new Sent(outcomes(call, records, partitions), call.closedByRefusal());
         } catch (RuntimeException | Error e) {
@@ -610,7 +612,7 @@ public final class KafkaOutboxSender implements AutoCloseable {
         final Outcome[] outcomes;
         final boolean[] ownFailure;
         final RecordMetadata[] metadata;
-        final boolean[] stalled; // not acknowledged when a batch of its partition expired
+        final boolean[] stalled; // not acknowledged when a batch of its partition expired, or when the call was cut
         int pending;
         int started; // records 0 until started were handed to the loop body, in order
         volatile boolean closed; // written under this
@@ -725,9 +727,25 @@ public final class KafkaOutboxSender implements AutoCloseable {
 
         /** Idempotent. Callers must not hold this monitor: closing from the caller joins the I/O thread. */
         void close(String reason) {
+            close(reason, false);
+        }
+
+        /**
+         * {@link #close} on an interrupt or past the deadline: unless a failure closed the call first, the records
+         * still in flight are marked like an expired batch's, so a batch Kafka keeps rebuilding is not sent again
+         * whole.
+         */
+        void cut(String reason) {
+            close(reason, true);
+        }
+
+        private void close(String reason, boolean stallInFlight) {
             boolean closeProducer;
             synchronized (this) {
                 closeProducer = markClosed(reason);
+                for (int j = 0; closeProducer && stallInFlight && j < started; j++) {
+                    stalled[j] |= outcomes[j] == null;
+                }
             }
             if (closeProducer) {
                 closeQuietly(producer, Duration.ZERO);

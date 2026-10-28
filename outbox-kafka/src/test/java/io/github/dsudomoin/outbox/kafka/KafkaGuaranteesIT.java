@@ -236,6 +236,40 @@ class KafkaGuaranteesIT {
         assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThanOrEqualTo(within);
     }
 
+    /**
+     * As {@link #aPoisonSmallerThanTheProducerBatchStillGoesToTheDeadLetterTopic}, but the relay cuts the call (at 80 %
+     * of a 10 s {@code batchTimeout}) before Kafka expires the batch ({@code delivery.timeout.ms} 20 s): the records the
+     * cut leaves unacknowledged are remembered as an expiry's are, so the next call sends the poison alone. Halving the
+     * read alone would take about six cuts.
+     */
+    @Test
+    void aPoisonSmallerThanTheProducerBatchGoesToTheDeadLetterTopicWhenTheRelayCutsItsCall() throws Exception {
+        var within = Duration.ofSeconds(30);
+        var topic = TestKafka.createTopic("t-" + UUID.randomUUID(), 1, Map.of("max.message.bytes", "1024"));
+        var dlq = TestKafka.createTopic(topic + ".dlq", 1, Map.of());
+        var sender = sender(Map.of(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "1000",
+                ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, "20000"));
+        var config = config().shards(1).batchTimeout(Duration.ofSeconds(10));
+        var runtime = start(OutboxRuntime.builder(config, transactions, new Handler(sender))
+                .deadLetterHandler(new KafkaDeadLetterHandler(sender, "{topic}.dlq")));
+        long started = System.nanoTime();
+
+        var ids = sendAll(runtime, List.of(
+                OutboxMessage.of(topic, "k", bytes("before")),
+                OutboxMessage.of(topic, "k", new byte[10 * 1024]),
+                OutboxMessage.of(topic, "k", bytes("after")),
+                OutboxMessage.of(topic, "other", bytes("other"))));
+        var poison = ids.get(1);
+        committed.get("k").remove(poison); // its place is the dead-letter topic
+
+        var dead = TestKafka.consumeUntil(dlq, within, r -> !r.isEmpty());
+        assertThat(dead).extracting(KafkaOutboxHeaders::messageId).containsOnly(poison);
+        var main = consumeCommitted(topic, r -> true);
+        assertThat(main).extracting(KafkaOutboxHeaders::messageId).doesNotContain(poison);
+        await(Duration.ofSeconds(10), () -> runtime.admin().countDeadLetters(DeadLetterFilter.any()) == 0);
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThanOrEqualTo(within);
+    }
+
     @Test
     void aStoppedRuntimeLeavesItsBacklogToTheNext() throws Exception {
         var topic = TestKafka.createTopic(3);
@@ -343,7 +377,12 @@ class KafkaGuaranteesIT {
     }
 
     private KafkaOutboxSender sender() {
+        return sender(Map.of());
+    }
+
+    private KafkaOutboxSender sender(Map<String, String> driverProperties) {
         var properties = new Properties();
+        properties.putAll(driverProperties);
         properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, TestKafka.bootstrapServers());
         var sender = new KafkaOutboxSender(() -> properties);
         closing.add(sender);

@@ -586,6 +586,49 @@ class KafkaOutboxSenderTest {
         assertThat(unbatched).isEmpty();
     }
 
+    /**
+     * The relay cuts a call before Kafka expires its batch: the records then in flight are remembered as an expiry's
+     * are, while an acknowledged record and those never handed over are not.
+     */
+    @Test
+    void recordsInFlightWhenTheRelayCutsTheCallAreRemembered() throws Exception {
+        var blockOnce = new AtomicBoolean(true);
+        var sender = sender(() -> new TestProducer(false, r -> null) {
+            @Override
+            public Future<RecordMetadata> send(ProducerRecord<byte[], byte[]> record, Callback callback) {
+                if (new String(record.key(), UTF_8).equals("c") && blockOnce.getAndSet(false)) {
+                    try { // like KafkaProducer waiting for buffer space
+                        Thread.sleep(10_000);
+                    } catch (InterruptedException e) {
+                        throw new InterruptException(e);
+                    }
+                }
+                return super.send(record, callback);
+            }
+        }, DELIVERY_TIMEOUT);
+        var acked = record(1, "a");
+        var inFlight = record(2, "b");
+        var notSent = record(3, "c");
+        var cut = new Thread(() -> sender.send(List.of(acked, inFlight, notSent)));
+        cut.start();
+        awaitSent(0, 2).completeNext();
+        cut.interrupt();
+        cut.join(SECONDS.toMillis(5));
+
+        var next = sendAsync(sender, List.of(acked, notSent));
+        var batched = awaitSent(1, 2);
+        assertThat(unbatched).doesNotContain(batched);
+        batched.completeNext();
+        batched.completeNext();
+        assertThat(next.get(5, SECONDS)).containsOnly(Outcome.delivered());
+
+        var again = sendAsync(sender, List.of(inFlight));
+        var unbatchedProducer = awaitSent(2, 1);
+        assertThat(unbatched).containsExactly(unbatchedProducer);
+        unbatchedProducer.completeNext();
+        assertThat(again.get(5, SECONDS)).containsExactly(Outcome.delivered());
+    }
+
     @Test
     void invalidRecordIsPermanent() throws Exception {
         var sender = sender(DELIVERY_TIMEOUT);
