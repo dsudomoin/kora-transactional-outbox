@@ -22,10 +22,11 @@ import java.util.function.DoubleSupplier;
 
 /**
  * The outbox on Micrometer Observation: an {@code outbox.enqueue} observation per {@code send}/{@code sendAll} call,
- * whose trace context the call's messages store, and an {@code outbox.deliver} observation per delivered record,
- * parented by that stored context, whose own context the record handed to the handler carries. The other events and
- * the gauges are {@link OutboxMetrics}' meters. Names and key values come from the conventions; meter names and tags
- * can be changed with a {@code MeterFilter}.
+ * whose trace context the call's messages store; an {@code outbox.relay.step} observation per relay step, current on
+ * the relay thread while the step runs; and an {@code outbox.deliver} observation per delivered record, parented by
+ * that stored context, whose own context the record handed to the handler carries. The other events and the gauges
+ * are {@link OutboxMetrics}' meters. Names and key values come from the conventions; meter names and tags can be
+ * changed with a {@code MeterFilter}.
  *
  * <p>The enqueue observation is a sender one and the delivery observation a receiver one, so the application's
  * propagating tracing handlers inject and extract the context; the delivery span is therefore of kind CONSUMER.
@@ -41,6 +42,8 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
     private final OutboxEnqueueObservationConvention enqueueConvention;
     @Nullable
     private final OutboxDeliveryObservationConvention deliveryConvention;
+    @Nullable
+    private final OutboxStepObservationConvention stepConvention;
 
     private ObservationOutboxTelemetry(Builder builder) {
         this.observations = builder.observations;
@@ -48,6 +51,7 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
         this.injector = builder.injector;
         this.enqueueConvention = builder.enqueueConvention;
         this.deliveryConvention = builder.deliveryConvention;
+        this.stepConvention = builder.stepConvention;
     }
 
     public static Builder builder(ObservationRegistry observations, OutboxMetrics metrics) {
@@ -73,6 +77,15 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
                     DefaultOutboxDeliveryObservationConvention.INSTANCE, () -> context, observations).start();
         }
         return new ObservedDelivery(records, started, contexts);
+    }
+
+    /** Opens the step observation's scope on the relay thread; the step closes it there before it stops. */
+    @Override
+    public RelayStep stepStarted(List<Integer> shards) {
+        var context = new OutboxStepContext(shards);
+        var observation = Observation.createNotStarted(stepConvention, DefaultOutboxStepObservationConvention.INSTANCE,
+                () -> context, observations).start();
+        return new ObservedStep(observation, observation.openScope());
     }
 
     @Override
@@ -103,6 +116,11 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
     @Override
     public void stepFinished(Duration duration) {
         metrics.stepFinished(duration);
+    }
+
+    @Override
+    public void relayFailed(Throwable error) {
+        metrics.relayFailed(error);
     }
 
     @Override
@@ -158,6 +176,25 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
         @Override
         public void failed(Throwable error) {
             observation.error(error);
+            observation.stop();
+        }
+    }
+
+    /** The scope is closed even when recording the error fails: no step stays current on the relay thread. */
+    private record ObservedStep(Observation observation, Observation.Scope scope) implements RelayStep {
+        @Override
+        public void finished() {
+            scope.close();
+            observation.stop();
+        }
+
+        @Override
+        public void failed(Throwable error) {
+            try {
+                observation.error(error);
+            } finally {
+                scope.close();
+            }
             observation.stop();
         }
     }
@@ -238,6 +275,8 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
         private OutboxEnqueueObservationConvention enqueueConvention;
         @Nullable
         private OutboxDeliveryObservationConvention deliveryConvention;
+        @Nullable
+        private OutboxStepObservationConvention stepConvention;
 
         private Builder(ObservationRegistry observations, OutboxMetrics metrics) {
             this.observations = Objects.requireNonNull(observations, "observations");
@@ -262,6 +301,11 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
 
         public Builder deliveryConvention(OutboxDeliveryObservationConvention convention) {
             this.deliveryConvention = Objects.requireNonNull(convention, "convention");
+            return this;
+        }
+
+        public Builder stepConvention(OutboxStepObservationConvention convention) {
+            this.stepConvention = Objects.requireNonNull(convention, "convention");
             return this;
         }
 

@@ -279,7 +279,6 @@ public final class ShardProcessor implements AutoCloseable {
             }
         }
         var locked = tryLock(inTx, lockable.stream().map(shards::get).toList());
-        var steps = new ArrayList<Step>(lockable.size());
         var lockedShards = new ArrayList<Integer>(lockable.size());
         for (int k = 0; k < lockable.size(); k++) {
             if (locked[k]) {
@@ -288,6 +287,26 @@ public final class ShardProcessor implements AutoCloseable {
                 results[lockable.get(k)] = new ShardResult(ShardStatus.NOT_LOCKED, 0, false);
             }
         }
+        var step = lockedShards.isEmpty() ? OutboxTelemetry.RelayStep.NONE : telemetry.stepStarted(lockedShards);
+        List<ShardResult> stepped;
+        try {
+            stepped = stepLocked(inTx, shards, lockable, lockedShards, results, latestTickId, now, started);
+        } catch (Throwable t) {
+            step.failed(t);
+            throw t;
+        }
+        step.finished();
+        return stepped;
+    }
+
+    /**
+     * {@link #tryProcess(Connection, List, long, Instant)} past its locks: {@code lockable} are the positions in
+     * {@code shards} it tried to lock, {@code lockedShards} the shards it holds, {@code results} has the rest.
+     */
+    private List<ShardResult> stepLocked(Connection inTx, List<Integer> shards, List<Integer> lockable,
+            List<Integer> lockedShards, ShardResult[] results, long latestTickId, Instant now, long started)
+            throws SQLException, InterruptedException {
+        var steps = new ArrayList<Step>(lockable.size());
         // a statement after the locks: sees the previous holders' commits
         var currents = cursors.latest(inTx, lockedShards);
         for (var i : lockable) {

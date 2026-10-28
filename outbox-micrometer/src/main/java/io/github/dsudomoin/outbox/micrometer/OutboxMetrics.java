@@ -72,6 +72,13 @@ public final class OutboxMetrics implements OutboxTelemetry {
     }
 
     @Override
+    public void relayFailed(Throwable error) {
+        if (registry != null) {
+            registry.counter("outbox.relay.failures").increment();
+        }
+    }
+
+    @Override
     public void shardPaused() {
         if (registry != null) {
             registry.counter("outbox.shard.paused").increment();

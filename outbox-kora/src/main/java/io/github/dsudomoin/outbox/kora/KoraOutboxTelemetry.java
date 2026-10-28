@@ -93,6 +93,11 @@ public final class KoraOutboxTelemetry implements OutboxTelemetry {
     }
 
     @Override
+    public void relayFailed(Throwable error) {
+        metrics.relayFailed(error);
+    }
+
+    @Override
     public void shardPaused() {
         metrics.shardPaused();
     }

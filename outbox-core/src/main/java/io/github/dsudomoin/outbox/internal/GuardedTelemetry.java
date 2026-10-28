@@ -109,11 +109,32 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     }
 
     @Override
+    public RelayStep stepStarted(List<Integer> shards) {
+        RelayStep step;
+        try {
+            step = delegate.stepStarted(shards);
+        } catch (RuntimeException | LinkageError e) {
+            warn("stepStarted", e);
+            return RelayStep.NONE;
+        }
+        return step == RelayStep.NONE ? step : new GuardedRelayStep(step);
+    }
+
+    @Override
     public void stepFinished(Duration duration) {
         try {
             delegate.stepFinished(duration);
         } catch (RuntimeException | LinkageError e) {
             warn("stepFinished", e);
+        }
+    }
+
+    @Override
+    public void relayFailed(Throwable error) {
+        try {
+            delegate.relayFailed(error);
+        } catch (RuntimeException | LinkageError e) {
+            warn("relayFailed", e);
         }
     }
 
@@ -215,6 +236,33 @@ public final class GuardedTelemetry implements OutboxTelemetry {
                 delegate.failed(error);
             } catch (RuntimeException | LinkageError e) {
                 warn("Enqueue.failed", e);
+            }
+        }
+    }
+
+    private final class GuardedRelayStep implements RelayStep {
+
+        private final RelayStep delegate;
+
+        GuardedRelayStep(RelayStep delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void finished() {
+            try {
+                delegate.finished();
+            } catch (RuntimeException | LinkageError e) {
+                warn("RelayStep.finished", e);
+            }
+        }
+
+        @Override
+        public void failed(Throwable error) {
+            try {
+                delegate.failed(error);
+            } catch (RuntimeException | LinkageError e) {
+                warn("RelayStep.failed", e);
             }
         }
     }

@@ -36,6 +36,7 @@ import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
 import io.opentelemetry.sdk.trace.samplers.Sampler;
 import java.io.IOException;
+import java.sql.SQLException;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -207,6 +208,49 @@ class ObservationOutboxTelemetryTest {
     }
 
     @Test
+    void stepObservationIsCurrentUntilItEnds() {
+        var stopped = stoppedSteps();
+        var step = telemetry().stepStarted(List.of(1, 3));
+
+        var current = observations.getCurrentObservation();
+        assertThat(current).isNotNull();
+        assertThat(current.getContext()).isInstanceOfSatisfying(OutboxStepContext.class,
+                c -> assertThat(c.shards()).containsExactly(1, 3));
+        step.finished();
+
+        assertThat(observations.getCurrentObservation()).isNull();
+        assertThat(stopped).hasSize(1);
+        var context = stopped.get(0);
+        assertThat(context.getName()).isEqualTo("outbox.relay.step");
+        assertThat(context.getContextualName()).isEqualTo("outbox relay step");
+        assertThat(context.getLowCardinalityKeyValues()).isEmpty();
+        assertThat(context.getHighCardinalityKeyValues()).containsExactly(KeyValue.of("outbox.shards", "1,3"));
+        assertThat(context.getError()).isNull();
+        assertThat(finished("outbox relay step").getStatus().getStatusCode()).isNotEqualTo(StatusCode.ERROR);
+    }
+
+    @Test
+    void failedStepRecordsTheErrorAndLeavesNoScope() {
+        var stopped = stoppedSteps();
+        var error = new SQLException("x");
+
+        telemetry().stepStarted(List.of(2)).failed(error);
+
+        assertThat(observations.getCurrentObservation()).isNull();
+        assertThat(tracer.currentSpan()).isNull();
+        assertThat(stopped).hasSize(1);
+        assertThat(stopped.get(0).getError()).isSameAs(error);
+        assertThat(finished("outbox relay step").getStatus().getStatusCode()).isEqualTo(StatusCode.ERROR);
+    }
+
+    @Test
+    void relayFailuresReachTheCounter() {
+        telemetry().relayFailed(new SQLException("x"));
+
+        assertThat(meters.counter("outbox.relay.failures").count()).isEqualTo(1);
+    }
+
+    @Test
     void customConventionRenames() {
         var telemetry = ObservationOutboxTelemetry.builder(observations, new OutboxMetrics(meters))
                 .tracing(tracer, propagator)
@@ -242,6 +286,23 @@ class ObservationOutboxTelemetryTest {
         return ObservationOutboxTelemetry.builder(observations, new OutboxMetrics(meters))
                 .tracing(tracer, propagator)
                 .build();
+    }
+
+    /** The step contexts as they stop. */
+    private List<OutboxStepContext> stoppedSteps() {
+        var stopped = new CopyOnWriteArrayList<OutboxStepContext>();
+        observations.observationConfig().observationHandler(new ObservationHandler<OutboxStepContext>() {
+            @Override
+            public void onStop(OutboxStepContext context) {
+                stopped.add(context);
+            }
+
+            @Override
+            public boolean supportsContext(Observation.Context context) {
+                return context instanceof OutboxStepContext;
+            }
+        });
+        return stopped;
     }
 
     private SpanData finished(String name) {

@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxRecord;
+import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.TestTracing;
@@ -18,6 +19,7 @@ import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -86,6 +88,23 @@ class KoraOutboxTelemetryTest {
         assertThat(traceparent(handed.get(0))).as("the handed record carries the delivery span")
                 .isEqualTo("00-" + TRACE_ID + "-" + span.getSpanId() + "-01");
         assertThat(traceparent(record)).as("the stored record keeps its own").isEqualTo(TRACEPARENT);
+    }
+
+    @Test
+    void relayFailuresReachTheCounterAndStepsMakeNoSpan() {
+        var registry = new SimpleMeterRegistry();
+        var spans = InMemorySpanExporter.create();
+        var tracer = SdkTracerProvider.builder().addSpanProcessor(SimpleSpanProcessor.create(spans)).build()
+                .get("test");
+        var telemetry = new KoraOutboxTelemetry(new OutboxMetrics(registry), tracer);
+
+        telemetry.relayFailed(new SQLException("x"));
+        var step = telemetry.stepStarted(List.of(1, 3));
+        step.finished();
+
+        assertThat(registry.get("outbox.relay.failures").counter().count()).isEqualTo(1);
+        assertThat(step).isSameAs(OutboxTelemetry.RelayStep.NONE);
+        assertThat(spans.getFinishedSpanItems()).isEmpty();
     }
 
     @Test

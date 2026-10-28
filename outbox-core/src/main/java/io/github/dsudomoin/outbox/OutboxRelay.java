@@ -76,6 +76,7 @@ public final class OutboxRelay implements AutoCloseable {
     private final Ticks ticks;
     private final Cursors cursors;
     private final ShardProcessor processor;
+    private final OutboxTelemetry telemetry;
     private final DeadLetterPass deadLetters;
     private final Heartbeat heartbeat;
     private final long idleNanos;
@@ -162,6 +163,7 @@ public final class OutboxRelay implements AutoCloseable {
         this.cursors = new Cursors(schema.names(), config.shards());
         this.deadLetters = deadLetters;
         this.processor = new ShardProcessor(schema.names(), config, handler, telemetry, deadLetters.active());
+        this.telemetry = telemetry;
         // the pass runs only where the relay does
         this.heartbeat = new Heartbeat(db, schema, config, relay.enabled() && deadLetters.active());
         this.idleNanos = relay.idlePollInterval().toNanos();
@@ -717,6 +719,7 @@ public final class OutboxRelay implements AutoCloseable {
                     }
                     Thread.interrupted(); // not stopping: a stray interrupt is one more failure
                     warn("outbox relay worker failed, retrying in " + relay.idlePollInterval(), t);
+                    telemetry.relayFailed(t);
                     // wake-ups do not cut it short
                     park(System.nanoTime() + idleNanos, false, seen, seenTicks, seenRequeued);
                     continue;
@@ -860,6 +863,7 @@ public final class OutboxRelay implements AutoCloseable {
                 if (group.size() == 1) {
                     isolated.set(group.get(0), 1);
                     warn("outbox shard " + group.get(0) + " step failed, retried in a later pass", e);
+                    telemetry.relayFailed(e);
                     return false;
                 }
                 log.debug("outbox step of shards {} failed; stepping each alone", group, e);

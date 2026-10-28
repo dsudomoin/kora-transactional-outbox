@@ -41,8 +41,23 @@ public interface OutboxTelemetry {
     /** A record set aside with {@link Outcome#requeue()} and parked. */
     default void requeued(String topic) {}
 
+    /**
+     * A relay step began on the relay thread holding the locks of {@code shards}; its database work and handler calls
+     * run on this thread (the handler itself on a handler thread) until {@link RelayStep#finished()} or
+     * {@link RelayStep#failed}.
+     */
+    default RelayStep stepStarted(List<Integer> shards) {
+        return RelayStep.NONE;
+    }
+
     /** A relay step of one or more shards ended. */
     default void stepFinished(Duration duration) {}
+
+    /**
+     * A relay pass, or a step of a single shard, failed and is retried later; the relay logs it at WARN. Never while
+     * stopping.
+     */
+    default void relayFailed(Throwable error) {}
 
     /** A shard was paused after a failed call. */
     default void shardPaused() {}
@@ -79,6 +94,18 @@ public interface OutboxTelemetry {
         default void finished() {}
 
         /** The call failed with {@code error}, which reaches the caller. */
+        default void failed(Throwable error) {}
+    }
+
+    /** One relay step, ended once on the thread that started it. */
+    interface RelayStep {
+
+        RelayStep NONE = new RelayStep() {};
+
+        /** The step's work is done; its transaction commits next. */
+        default void finished() {}
+
+        /** The step failed with {@code error}, which rolls its transaction back. */
         default void failed(Throwable error) {}
     }
 

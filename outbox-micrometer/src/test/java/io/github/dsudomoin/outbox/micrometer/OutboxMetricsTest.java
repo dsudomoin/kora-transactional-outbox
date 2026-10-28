@@ -10,6 +10,7 @@ import io.micrometer.core.instrument.cumulative.CumulativeTimer;
 import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
 import io.micrometer.core.instrument.distribution.pause.PauseDetector;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
@@ -34,6 +35,7 @@ class OutboxMetricsTest {
             noop.inboxOutsideWindow();
             noop.deadLetterDecision("keep");
             noop.deadLetterHookFailed();
+            noop.relayFailed(new SQLException("x"));
             noop.gauge(OutboxGauge.RETRY_SIZE, () -> 1);
         }).doesNotThrowAnyException();
     }
@@ -118,6 +120,14 @@ class OutboxMetricsTest {
 
         assertThat(registry.get("outbox.messages.requeued").tag("topic", "orders").counter().count()).isEqualTo(2);
         assertThat(registry.get("outbox.messages.requeued").tag("topic", "payments").counter().count()).isEqualTo(1);
+    }
+
+    @Test
+    void relayFailuresCount() {
+        metrics.relayFailed(new SQLException("x"));
+        metrics.relayFailed(new SQLException("y"));
+
+        assertThat(registry.counter("outbox.relay.failures").count()).isEqualTo(2.0);
     }
 
     /** SimpleMeterRegistry never materializes percentile-histogram buckets; Prometheus does, like this one. */

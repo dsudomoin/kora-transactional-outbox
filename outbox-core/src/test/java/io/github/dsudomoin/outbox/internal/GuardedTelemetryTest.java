@@ -86,6 +86,18 @@ class GuardedTelemetryTest {
     }
 
     @Test
+    void throwingRelayHooksAreIgnored() {
+        assertThat(GuardedTelemetry.of(new ThrowingStart()).stepStarted(List.of(1)))
+                .isSameAs(OutboxTelemetry.RelayStep.NONE);
+
+        var t = GuardedTelemetry.of(new Throwing());
+        var step = t.stepStarted(List.of(1));
+        assertThatCode(step::finished).doesNotThrowAnyException();
+        assertThatCode(() -> step.failed(new IOException("x"))).doesNotThrowAnyException();
+        assertThatCode(() -> t.relayFailed(new IOException("x"))).doesNotThrowAnyException();
+    }
+
+    @Test
     void callExceptionsPassThrough() throws Exception {
         var plain = new OutboxTelemetry() {
             @Override
@@ -169,7 +181,10 @@ class GuardedTelemetryTest {
         assertThat(GuardedTelemetry.of(guarded)).isSameAs(guarded);
     }
 
-    /** Every hook throws; its enqueue and delivery throw from every method, their scopes before running the call. */
+    /**
+     * Every hook throws; its enqueue, delivery and relay step throw from every method, their scopes before running the
+     * call.
+     */
     private static class Throwing implements OutboxTelemetry {
 
         private static RuntimeException bug() {
@@ -219,6 +234,26 @@ class GuardedTelemetryTest {
                     throw bug();
                 }
             };
+        }
+
+        @Override
+        public RelayStep stepStarted(List<Integer> shards) {
+            return new RelayStep() {
+                @Override
+                public void finished() {
+                    throw bug();
+                }
+
+                @Override
+                public void failed(Throwable error) {
+                    throw bug();
+                }
+            };
+        }
+
+        @Override
+        public void relayFailed(Throwable error) {
+            throw bug();
         }
 
         @Override
@@ -290,6 +325,11 @@ class GuardedTelemetryTest {
 
         @Override
         public Delivery deliveryStarted(List<OutboxRecord> records, Instant now) {
+            throw new IllegalStateException("telemetry bug");
+        }
+
+        @Override
+        public RelayStep stepStarted(List<Integer> shards) {
             throw new IllegalStateException("telemetry bug");
         }
     }
