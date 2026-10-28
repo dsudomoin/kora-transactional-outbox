@@ -102,6 +102,12 @@ The dead-letter hook and the dead table (writing-outbox-handlers, `dead-letter-h
 | `retention` | `0` | 0..3650 days. Maintenance deletes `kept` letters older than this by `failed_at`; `0` keeps them forever. `pending` and `scheduled` letters are never deleted. |
 | `redriveHistory` | `30d` | > 0, ≤ 3650 days. How long `<table>_redriven` remembers a message's redrive count, which a letter that dies again carries in `redrives`. |
 
+## `outbox.schema`
+
+| Key | Default | Rule and meaning |
+|---|---|---|
+| `bootstrap` | `true` | `true`: every instance creates the missing base tables at startup and upgrades older ones. `false`: the application's migrations own them: render the SQL once with `OutboxSql.outbox(config, role)` (and `OutboxSql.inbox` for the inbox) into a Flyway or Liquibase migration; startup then creates nothing and checks every table, column, index, partition key and the roles' rights, failing with every problem and the schema version that adds a missing object. Partitions stay the library's in both modes, so its role owns the partitioned tables. A newer schema's extra columns, indexes and tables are accepted (rolling deploys). |
+
 ## Shard count and the emergency reshard
 
 - Rough sizing: 256 suits typical services. Go lower only for tiny installs. More than 256 is rarely needed; 1024
