@@ -28,8 +28,10 @@ import io.micrometer.tracing.propagation.Propagator;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
+import io.opentelemetry.api.baggage.propagation.W3CBaggagePropagator;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.propagation.ContextPropagators;
+import io.opentelemetry.context.propagation.TextMapPropagator;
 import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.data.SpanData;
@@ -163,6 +165,47 @@ class ObservationOutboxTelemetryTest {
                 .isEqualTo("00-" + span.getTraceId() + "-" + span.getSpanId() + "-01");
         assertThat(handed.get(0).headers()).extracting(OutboxHeader::name).containsOnlyOnce("a");
         assertThat(traceparent(stored.headers())).as("the stored record keeps its own").isEqualTo(TRACEPARENT);
+    }
+
+    @Test
+    void storedBaggageSurvivesHanding() {
+        var withBaggage = new OtelPropagator(ContextPropagators.create(TextMapPropagator.composite(
+                W3CTraceContextPropagator.getInstance(), W3CBaggagePropagator.getInstance())), otel);
+        var registry = ObservationRegistry.create();
+        registry.observationConfig().observationHandler(new ObservationHandler.FirstMatchingCompositeObservationHandler(
+                new PropagatingReceiverTracingObservationHandler<>(tracer, withBaggage),
+                new DefaultTracingObservationHandler(tracer)));
+        var telemetry = ObservationOutboxTelemetry.builder(registry, new OutboxMetrics(meters))
+                .tracing(tracer, withBaggage).build();
+        var stored = record(List.of(header("traceparent", TRACEPARENT), header("baggage", "tenant=acme")));
+        var delivery = telemetry.deliveryStarted(List.of(stored), NOW);
+        var handed = delivery.handed(List.of(stored));
+        delivery.finished(List.of(Outcome.delivered()));
+
+        var span = finished("outbox deliver orders");
+        assertThat(traceparent(handed.get(0).headers()))
+                .isEqualTo("00-" + span.getTraceId() + "-" + span.getSpanId() + "-01");
+        assertThat(handed.get(0).headers()).filteredOn(h -> h.name().equals("baggage"))
+                .extracting(h -> new String(h.value(), UTF_8)).containsExactly("tenant=acme");
+    }
+
+    @Test
+    void deliveryWithoutItsOwnSpanKeepsTheStoredTraceInsideAStep() {
+        observations.observationConfig().observationPredicate((name, context) -> !name.equals("outbox.deliver"));
+        var telemetry = telemetry();
+        var stored = record(List.of(header("traceparent", TRACEPARENT)));
+        var step = telemetry.stepStarted(List.of(1));
+        List<OutboxRecord> handed;
+        try {
+            assertThat(tracer.currentSpan()).as("the step span is current").isNotNull();
+            var delivery = telemetry.deliveryStarted(List.of(stored), NOW);
+            handed = delivery.handed(List.of(stored));
+            delivery.finished(List.of(Outcome.delivered()));
+        } finally {
+            step.finished();
+        }
+
+        assertThat(traceparent(handed.get(0).headers())).isEqualTo(TRACEPARENT);
     }
 
     @Test

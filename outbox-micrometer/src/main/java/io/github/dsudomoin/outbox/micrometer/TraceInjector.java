@@ -27,11 +27,16 @@ final class TraceInjector {
         this.fields = Set.copyOf(propagator.fields());
     }
 
-    /** {@code record} with its trace headers replaced by those of {@code observation}'s span; as is without a span. */
+    /**
+     * {@code record} with its trace headers replaced by those of {@code observation}'s span. As is when the observation
+     * makes no span of its own (an {@code ObservationPredicate} rejected it, no tracing handler, a noop registry): its
+     * scope then leaves the span current before it, such as the relay step's, which is not the record's trace.
+     */
     OutboxRecord inject(Observation observation, OutboxRecord record) {
+        var outer = tracer.currentSpan();
         try (var scope = observation.openScope()) {
             var span = tracer.currentSpan();
-            if (span == null) {
+            if (span == null || outer != null && outer.context().spanId().equals(span.context().spanId())) {
                 return record;
             }
             var headers = new ArrayList<OutboxHeader>(record.headers().size() + fields.size());
