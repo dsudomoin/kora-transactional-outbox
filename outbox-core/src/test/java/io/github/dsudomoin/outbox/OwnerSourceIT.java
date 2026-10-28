@@ -22,6 +22,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.postgresql.ds.PGPoolingDataSource;
 import org.postgresql.ds.PGSimpleDataSource;
 
 /**
@@ -105,7 +106,7 @@ class OwnerSourceIT {
                 .inboxPartitionInterval(Duration.ofMinutes(1)).inboxPremake(Duration.ofMinutes(5))
                 .inboxRetention(Duration.ofMinutes(10))
                 .retry(Duration.ofMillis(50), Duration.ofMillis(200), 0).relayEnabled(true);
-        var transactions = new JdbcTransactions(as(app));
+        var transactions = new JdbcTransactions(pooled(app));
         ConnectionSource ownerSource = as(owner)::getConnection;
         var handler = new KeyedHandler();
         OutboxDeadLetterHandler hook = letters -> letters.stream()
@@ -162,7 +163,8 @@ class OwnerSourceIT {
                 var since = outbox.admin().status().maintenanceSinceSuccessSeconds();
                 return since != null && since < 2 * interval.toMillis() / 1000.0;
             });
-            assertThat(err.text()).doesNotContain("permission denied").doesNotContain("42501");
+            // the SQLState, not the bare code: that turns up inside message ids
+            assertThat(err.text()).doesNotContain("permission denied").doesNotContain("SQLState 42501");
         }
         assertThat(handler.outcomes).as("retried, requeued and dead-lettered keys")
                 .contains("retry", "requeue", "dead");
@@ -266,6 +268,22 @@ class OwnerSourceIT {
     private <T extends AutoCloseable> T runtime(T runtime) {
         runtimes.add(runtime);
         return runtime;
+    }
+
+    /**
+     * A pool as {@code role}: the writers and the relay at full speed on a new connection per transaction take every
+     * local port within seconds (each closed one waits in TIME_WAIT).
+     */
+    @SuppressWarnings("deprecation") // the driver's own pool is enough for a test
+    private PGPoolingDataSource pooled(String role) {
+        var pool = new PGPoolingDataSource();
+        pool.setDataSourceName(role); // close() requires one; the role is unique to the test
+        pool.setUrl(TestDataSources.jdbcUrl());
+        pool.setUser(role);
+        pool.setPassword("pw");
+        pool.setMaxConnections(32);
+        runtimes.add(pool::close); // closed last: the runtimes, registered later, close first
+        return pool;
     }
 
     private static PGSimpleDataSource as(String role) {
