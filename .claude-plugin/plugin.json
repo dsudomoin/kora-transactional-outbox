@@ -1,12 +1,12 @@
 {
   "name": "outbox",
-  "description": "Skills for kora-transactional-outbox in Kora 1.x services: sending events, writing handlers, inbox deduplication, testing and operations",
+  "description": "Skills for dsudomoin/outbox in Kora 1.x services: sending events, writing handlers, inbox deduplication, testing and operations",
   "author": {
     "name": "d.sudomoin",
     "url": "https://github.com/dsudomoin"
   },
-  "homepage": "https://github.com/dsudomoin/kora-transactional-outbox",
-  "repository": "https://github.com/dsudomoin/kora-transactional-outbox",
+  "homepage": "https://github.com/dsudomoin/outbox",
+  "repository": "https://github.com/dsudomoin/outbox",
   "license": "MIT",
   "keywords": ["kora", "outbox", "transactional-outbox", "inbox", "kafka", "postgres"]
 }

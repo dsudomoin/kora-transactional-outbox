@@ -1,6 +1,6 @@
 ---
 name: writing-outbox-handlers
-description: Use when writing or reviewing an OutboxHandler or an OutboxDeadLetterHandler (dead-letter hook) for kora-transactional-outbox (delivering outbox records to an HTTP API, another database or several targets, OutboxHandler.byTopic next to kafka.handler(), a wrapper around the Kafka handler), or when choosing outbox.relay.batchSize, batchTimeout or retry.maxAttempts for a slow target, or delivering concurrently inside handleBatch, or setting a record aside with Outcome.requeue so the rest of its key goes on (a running process of the same account blocks it). Also «свой обработчик outbox», «доставка из аутбокса в HTTP», «dead letters», «Retry-After», «отложить событие», «requeue», «хук dead letters», «DLQ», outbox.kafka.deadLetterTopic.
+description: Use when writing or reviewing an OutboxHandler or an OutboxDeadLetterHandler (dead-letter hook) for dsudomoin/outbox (delivering outbox records to an HTTP API, another database or several targets, OutboxHandler.byTopic next to kafka.handler(), a wrapper around the Kafka handler), or when choosing outbox.relay.batchSize, batchTimeout or retry.maxAttempts for a slow target, or delivering concurrently inside handleBatch, or setting a record aside with Outcome.requeue so the rest of its key goes on (a running process of the same account blocks it). Also «свой обработчик outbox», «доставка из аутбокса в HTTP», «dead letters», «Retry-After», «отложить событие», «requeue», «хук dead letters», «DLQ», outbox.kafka.deadLetterTopic.
 ---
 
 # Writing outbox handlers

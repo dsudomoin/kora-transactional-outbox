@@ -1,6 +1,6 @@
 ---
 name: testing-outbox
-description: Use when writing or fixing tests of a Kora 1.x service that uses kora-transactional-outbox or its inbox, such as a @KoraAppTest with Testcontainers Postgres or Kafka that must prove an event was delivered, OutboxRelay.drain(), or existing tests that log Kafka connection errors, hang or slow down after the outbox was added. Also «тест outbox», «интеграционный тест аутбокса», «проверить доставку события».
+description: Use when writing or fixing tests of a Kora 1.x service that uses dsudomoin/outbox or its inbox, such as a @KoraAppTest with Testcontainers Postgres or Kafka that must prove an event was delivered, OutboxRelay.drain(), or existing tests that log Kafka connection errors, hang or slow down after the outbox was added. Also «тест outbox», «интеграционный тест аутбокса», «проверить доставку события».
 ---
 
 # Testing a service that uses outbox

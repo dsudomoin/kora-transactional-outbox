@@ -1,13 +1,13 @@
 ---
 name: operating-outbox
-description: Use when monitoring, alerting on, sizing or troubleshooting kora-transactional-outbox in a running Kora service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, dead letters and the dead-letter hook, the admin API (OutboxAdmin, outbox-admin-kora, /kora-outbox/admin/v1), redrive or discard, tail overflow, orphaned partitions, stranded shards, «outbox relay halted» or «xid regression detected», outbox.shards and the emergency reshard, «refuses this write», rolling deploys, upgrades and rollback to the previous release, pg_dump/restore or failover. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox», «админка outbox».
+description: Use when monitoring, alerting on, sizing or troubleshooting dsudomoin/outbox in a running Kora service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, dead letters and the dead-letter hook, the admin API (OutboxAdmin, outbox-admin-kora, /kora-outbox/admin/v1), redrive or discard, tail overflow, orphaned partitions, stranded shards, «outbox relay halted» or «xid regression detected», outbox.shards and the emergency reshard, «refuses this write», rolling deploys, upgrades and rollback to the previous release, pg_dump/restore or failover. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox», «админка outbox».
 ---
 
 # Operating outbox
 
 ## Overview
 
-Procedures: the library README (https://github.com/dsudomoin/kora-transactional-outbox#readme). Act through the admin
+Procedures: the library README (https://github.com/dsudomoin/outbox#readme). Act through the admin
 API: `OutboxAdmin` in code or `outbox-admin-kora` over HTTP ([admin-api.md](admin-api.md)). **Never improvise SQL
 against the library's tables**; run only the README's SQL, on a staging copy first.
 

@@ -1,6 +1,6 @@
 ---
 name: consuming-with-outbox-inbox
-description: Use when a Kora 1.x Kafka consumer reads messages published through kora-transactional-outbox and must apply each one once, or when touching Inbox, tryAccept / tryAcceptAll, inbox.scope, KafkaOutboxHeaders.messageId, the outbox-message-id header, outbox.inbox.* settings, duplicates after redelivery or a replay. Also «inbox», «дедупликация», «идемпотентный консьюмер», «повторы сообщений из Kafka».
+description: Use when a Kora 1.x Kafka consumer reads messages published through dsudomoin/outbox and must apply each one once, or when touching Inbox, tryAccept / tryAcceptAll, inbox.scope, KafkaOutboxHeaders.messageId, the outbox-message-id header, outbox.inbox.* settings, duplicates after redelivery or a replay. Also «inbox», «дедупликация», «идемпотентный консьюмер», «повторы сообщений из Kafka».
 ---
 
 # Consuming with the outbox inbox

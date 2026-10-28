@@ -59,7 +59,7 @@ configure(published.map { project(":$it") }) {
                 } else {
                     "Transactional outbox for PostgreSQL"
                 }
-                url = "https://github.com/dsudomoin/kora-transactional-outbox"
+                url = "https://github.com/dsudomoin/outbox"
                 licenses {
                     license {
                         name = "MIT License"
@@ -67,8 +67,8 @@ configure(published.map { project(":$it") }) {
                     }
                 }
                 scm {
-                    url = "https://github.com/dsudomoin/kora-transactional-outbox"
-                    connection = "scm:git:https://github.com/dsudomoin/kora-transactional-outbox.git"
+                    url = "https://github.com/dsudomoin/outbox"
+                    connection = "scm:git:https://github.com/dsudomoin/outbox.git"
                 }
             }
         }

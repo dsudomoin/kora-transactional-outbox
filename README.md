@@ -2627,8 +2627,8 @@ retry и dead пусты. Прогон на более ранней версии
 **Claude Code.** Репозиторий — маркетплейс с одним плагином `outbox`:
 
 ```
-/plugin marketplace add dsudomoin/kora-transactional-outbox
-/plugin install outbox@kora-transactional-outbox
+/plugin marketplace add dsudomoin/outbox
+/plugin install outbox@outbox
 ```
 
 **Другие агенты.** Скопируйте каталоги из `skills/` в каталог скиллов агента. Codex и Cursor читают
@@ -2637,9 +2637,9 @@ retry и dead пусты. Прогон на более ранней версии
 и `.claude/skills/`.
 
 ```bash
-git clone https://github.com/dsudomoin/kora-transactional-outbox
+git clone https://github.com/dsudomoin/outbox
 mkdir -p ~/.agents/skills
-cp -R kora-transactional-outbox/skills/* ~/.agents/skills/
+cp -R outbox/skills/* ~/.agents/skills/
 ```
 
 ## Лицензия
