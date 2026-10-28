@@ -48,6 +48,26 @@ configure(published.map { project(":$it") }) {
         }
     }
 
+    // -Poutbox.test.kafkaClients, .micrometer, .micrometerTracing and .opentelemetry run the tests on that version:
+    // forced on the test runtime classpath only, so the code still compiles against the declared versions
+    val kafkaClients = findProperty("outbox.test.kafkaClients") as String?
+    val micrometer = findProperty("outbox.test.micrometer") as String?
+    val micrometerTracing = findProperty("outbox.test.micrometerTracing") as String?
+    val opentelemetry = findProperty("outbox.test.opentelemetry") as String?
+    configurations.named("testRuntimeClasspath") {
+        resolutionStrategy.eachDependency {
+            val forced = when {
+                requested.group == "org.apache.kafka" && requested.name == "kafka-clients" -> kafkaClients
+                requested.group == "io.micrometer" && requested.name.startsWith("micrometer-tracing") -> micrometerTracing
+                requested.group == "io.micrometer" && requested.name.startsWith("micrometer-") -> micrometer
+                // the -alpha artifacts are versioned apart from the stable ones
+                requested.group == "io.opentelemetry" && requested.version?.endsWith("-alpha") != true -> opentelemetry
+                else -> null
+            }
+            if (forced != null) useVersion(forced)
+        }
+    }
+
     configure<PublishingExtension> {
         publications.create<MavenPublication>("maven") {
             artifactId = project.name
