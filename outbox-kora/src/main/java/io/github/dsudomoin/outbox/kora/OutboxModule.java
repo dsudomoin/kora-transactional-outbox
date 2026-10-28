@@ -54,10 +54,14 @@ public interface OutboxModule extends OutboxCommonModule {
         return new LifecycleWrapper<>(builder.build(), OutboxRuntime::start, OutboxRuntime::close);
     }
 
-    /** A root, as it was before the runtime; so are the schema, maintenance and dead-letter pass it depended on. */
+    /**
+     * A root, as it was before the runtime; so are the schema, maintenance and dead-letter pass it depended on. The
+     * runtime starts and stops them: Kora would close a node nothing depends on as soon as the app starts stopping,
+     * while the components that send are still at work.
+     */
     @Root
-    default OutboxRelay outboxRelay(OutboxRuntime runtime) {
-        return runtime.relay();
+    default LifecycleWrapper<OutboxRelay> outboxRelay(OutboxRuntime runtime) {
+        return new LifecycleWrapper<>(runtime.relay(), r -> {}, r -> {});
     }
 
     default Outbox outbox(OutboxRuntime runtime) {
@@ -70,8 +74,8 @@ public interface OutboxModule extends OutboxCommonModule {
     }
 
     @Root
-    default OutboxSchema outboxSchema(OutboxRuntime runtime) {
-        return runtime.schema();
+    default LifecycleWrapper<OutboxSchema> outboxSchema(OutboxRuntime runtime) {
+        return new LifecycleWrapper<>(runtime.schema(), s -> {}, s -> {});
     }
 
     @Root
