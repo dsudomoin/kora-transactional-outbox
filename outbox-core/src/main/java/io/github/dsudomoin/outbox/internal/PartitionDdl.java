@@ -113,7 +113,10 @@ public final class PartitionDdl {
         }
     }
 
-    /** Partitions of {@code parent} in no particular order, including ones whose detach is still pending. */
+    /**
+     * Partitions of {@code parent} in no particular order, including ones whose detach is still pending, but not one
+     * another session dropped after this query's snapshot.
+     */
     public static List<Bound> listRanges(Connection c, String parent) throws SQLException {
         var bounds = new ArrayList<Bound>();
         try (var ps = c.prepareStatement("select c.oid::regclass::text, pg_get_expr(c.relpartbound, c.oid)"
@@ -121,6 +124,9 @@ public final class PartitionDdl {
             ps.setString(1, parent);
             try (var rs = ps.executeQuery()) {
                 while (rs.next()) {
+                    if (rs.getString(2) == null) { // dropped meanwhile: pg_get_expr reads the current catalog
+                        continue;
+                    }
                     var m = BOUNDS.matcher(rs.getString(2));
                     if (!m.matches()) {
                         throw new IllegalStateException("not a range partition: " + rs.getString(1));
