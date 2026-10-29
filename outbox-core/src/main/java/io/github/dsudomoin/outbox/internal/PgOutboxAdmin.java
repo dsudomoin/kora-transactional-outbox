@@ -108,6 +108,10 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     public OutboxStatus status() {
         requireOwnTransactions();
         try (var conn = ddl.newConnection()) { // the tail check reads the tail itself
+            // in a transaction of its own: its lock on the tail lasts until the commit, and a swap's hold waits 10 ms at
+            // most for it, so the reads after it would make a swap running meanwhile miss
+            boolean tailOverflow = read(conn, c -> PartitionDdl.attachment(c, names.base(), names.tail())
+                    != Attachment.MISSING && PartitionDdl.hasRows(c, names.tail()));
             return read(conn, c -> new OutboxStatus(
                     queryBoolean(c, "select exists (select 1 from " + names.halt() + ")"),
                     maintenance.lagSeconds(c),
@@ -117,8 +121,7 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                     partitions.orphans(c).stream().map(o -> new OutboxStatus.Orphan(o.table(), o.setAside()
                             ? OrphanKind.SET_ASIDE : o.ours() ? OrphanKind.DETACHED_BY_LIBRARY : OrphanKind.FOREIGN))
                             .toList(),
-                    PartitionDdl.attachment(c, names.base(), names.tail()) != Attachment.MISSING
-                            && PartitionDdl.hasRows(c, names.tail()),
+                    tailOverflow,
                     partitions.premadeAhead(c),
                     partitions.xidsLeft(c),
                     maintenance.secondsSinceSuccess(c),
