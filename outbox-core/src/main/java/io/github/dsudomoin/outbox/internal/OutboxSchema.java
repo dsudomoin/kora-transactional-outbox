@@ -59,6 +59,7 @@ public final class OutboxSchema implements AutoCloseable {
     /** {@code LOCK_TIMEOUT} each: a minute for other instances' bootstraps, which take milliseconds each. */
     private static final int SCHEMA_LOCK_ATTEMPTS = 12;
     private static final String LOCK_NOT_AVAILABLE = "55P03";
+    private static final String QUERY_CANCELED = "57014";
     private static final String DUPLICATE_TABLE = "42P07";
     /** Bound of {@code deadLetters.retention} and {@code redriveHistory}: 10 years, an age maintenance compares. */
     private static final Duration MAX_DEAD_LETTER_AGE = Duration.ofDays(3650);
@@ -806,8 +807,9 @@ public final class OutboxSchema implements AutoCloseable {
      * (an interrupted range drop's, which would fail the next one with 55000, or an operator's tail detach), then the
      * same extension maintenance runs: the tail swap, the one ACCESS EXCLUSIVE on the parent, taken without waiting
      * (and {@code outbox.partitions.swapLockTimeout}), after waiting up to {@code LOCK_TIMEOUT} for relay steps in
-     * flight. A lock failure there (running transactions in a rolling deploy) is logged and left to
-     * maintenance while inserts at the current xid still find a partition. A hot tail is left to maintenance too:
+     * flight. A lock failure there (running transactions in a rolling deploy), or a swap the server cut at its
+     * {@code statement_timeout} (a slow disk), rolls back whole and is logged and left to maintenance while inserts at
+     * the current xid still find a partition. A hot tail is left to maintenance too:
      * turning it into a range scans it, which would hold the schema lock and every other instance's startup.
      * Partition DDL is serialised by {@code LOCK_MAINTENANCE}, taken here after {@code LOCK_SCHEMA};
      * {@link Maintenance} takes it with {@code pg_try_advisory_lock} and never takes {@code LOCK_SCHEMA}, so the two
@@ -826,11 +828,12 @@ public final class OutboxSchema implements AutoCloseable {
                 advisory(c, "pg_advisory_unlock", n, TableNames.LOCK_MAINTENANCE);
             }
         } catch (SQLException e) {
-            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState()) || !partitions.acceptsInserts(c)) {
+            var state = e.getSQLState();
+            if (!(LOCK_NOT_AVAILABLE.equals(state) || QUERY_CANCELED.equals(state)) || !partitions.acceptsInserts(c)) {
                 throw e;
             }
-            log.warn("outbox partition extension of {} hit a lock timeout at startup; maintenance retries it: {}",
-                    n.base(), e.getMessage());
+            log.warn("outbox partition extension of {} gave up at startup (SQLState {}); maintenance retries it: {}",
+                    n.base(), state, e.getMessage());
         }
     }
 

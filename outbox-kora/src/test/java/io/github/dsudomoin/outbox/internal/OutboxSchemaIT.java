@@ -401,6 +401,47 @@ class OutboxSchemaIT {
         }
     }
 
+    /**
+     * A swap the server cuts at its statement_timeout (here a DDL hook sleeping past it on the outbox's ATTACH) rolls
+     * back whole, as a lock it could not take does: the start goes on, inserts find a partition, maintenance retries.
+     */
+    @Test
+    void bootstrapToleratesASwapCutByItsStatementTimeout() throws Exception {
+        config.xidsPerPartition(1000).premake(4);
+        new OutboxSchema(db, config).start();
+        var n = TableNames.of(config.table());
+        try (var c = TestDb.connect()) {
+            long current = currentXid(c);
+            TestDb.burnXids((int) (Math.floorDiv(current, 1000) * 1000 + 2500 - current));
+        } // half of premake used: the next bootstrap wants to extend
+
+        var hook = "slow_" + config.table();
+        try (var c = TestDb.connect()) {
+            execute(c, "create function " + hook + "() returns event_trigger language plpgsql as $$ begin"
+                    + " if exists (select 1 from pg_event_trigger_ddl_commands() where object_identity = 'public."
+                    + n.base() + "') then perform pg_sleep(0.3); end if; end $$");
+            execute(c, "create event trigger " + hook + " on ddl_command_end when tag in ('ALTER TABLE')"
+                    + " execute function " + hook + "()");
+            try (var log = new CapturedStderr()) {
+                new OutboxSchema(db, config).start();
+
+                assertThat(log.text()).contains("outbox partition extension of " + n.base())
+                        .contains("SQLState 57014");
+            } finally {
+                execute(c, "drop event trigger " + hook + "; drop function " + hook + "()");
+            }
+
+            assertThat(queryString(c, "insert into " + n.base()
+                            + "(shard, message_id, topic) values (0, gen_random_uuid(), 't')"
+                            + " returning tableoid::regclass::text"))
+                    .startsWith(n.partitionPrefix())
+                    .isNotEqualTo(n.tail());
+            var partitions = new XidPartitions(n, config.partitions());
+            partitions.ensurePremade(c); // maintenance finishes the extension
+            assertThat(partitions.premadeAhead(c)).isGreaterThanOrEqualTo(4);
+        }
+    }
+
     @Test
     void rejectsBadConfigBeforeAnyDdl() throws Exception {
         List<Map.Entry<String, Consumer<TestOutboxConfig>>> cases = List.of(
