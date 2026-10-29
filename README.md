@@ -181,11 +181,12 @@ flowchart LR
 
 Версии зависимостей в тестах подменяются свойствами проекта Gradle (`-P`). Они действуют только на test runtime
 classpath, поэтому код по-прежнему компилируется с объявленными версиями. Через `-D` эти свойства не работают:
-системное свойство (`-D`) здесь одно — образ Postgres.
+системных свойств (`-D`) здесь два — образ Postgres и CPU контейнеров.
 
 | Свойство | Что подменяет в тестах |
 |---|---|
 | `-Doutbox.test.postgres=<образ>` | образ Postgres, по умолчанию `postgres:16-alpine` |
+| `-Doutbox.test.containerCpus=<число>` | CPU контейнеров Postgres и Kafka, по умолчанию без ограничения |
 | `-Poutbox.test.kafkaClients=<версия>` | `org.apache.kafka:kafka-clients` |
 | `-Poutbox.test.micrometer=<версия>` | `io.micrometer:micrometer-*`, кроме `micrometer-tracing*` |
 | `-Poutbox.test.micrometerTracing=<версия>` | `io.micrometer:micrometer-tracing*` |
@@ -203,6 +204,12 @@ classpath, поэтому код по-прежнему компилируетс�
 
 micrometer-tracing 1.7.2 тянет OpenTelemetry 1.62.0, а `opentelemetry-sdk-testing` в тестах объявлен 1.31.0,
 старее; `-Poutbox.test.opentelemetry=1.62.0` выравнивает все артефакты OpenTelemetry на одну версию.
+
+**CI.** Классы `outbox-kora` идут в нескольких JVM, по одной на 3 ядра, но не больше 6, и у каждой свой Postgres. На
+раннере с 4 ядрами и меньше JVM одна; `--max-workers` тоже ограничивает их число. Когда задана переменная окружения
+`CI`, тесты с тегом `timing` не запускаются: они проверяют скорость (например, задержку соседей медленного шарда),
+которую раннер неизвестной мощности может не дать. `-Poutbox.test.timing` возвращает их. Слабый раннер локально:
+`./gradlew test --max-workers=1 -Doutbox.test.containerCpus=1`.
 
 ### Роль в базе и привилегии
 

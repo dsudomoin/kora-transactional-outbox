@@ -16,7 +16,10 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.testcontainers.kafka.KafkaContainer;
 
-/** One Kafka broker per test JVM, started on first use; Testcontainers removes it at exit. */
+/**
+ * One Kafka broker per test JVM, started on first use; Testcontainers removes it at exit.
+ * {@code -Doutbox.test.containerCpus=1} gives it one CPU, as a small CI runner would.
+ */
 public final class TestKafka {
 
     private TestKafka() {}
@@ -24,7 +27,13 @@ public final class TestKafka {
     private static final class Broker {
         // production brokers do not create topics on first use either
         static final KafkaContainer INSTANCE = new KafkaContainer("apache/kafka:3.9.1")
-                .withEnv("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "false");
+                .withEnv("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "false")
+                .withCreateContainerCmdModifier(cmd -> {
+                    var cpus = System.getProperty("outbox.test.containerCpus");
+                    if (cpus != null) {
+                        cmd.getHostConfig().withNanoCPUs((long) (Double.parseDouble(cpus) * 1e9));
+                    }
+                });
 
         static {
             INSTANCE.start();

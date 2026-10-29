@@ -60,6 +60,7 @@ import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.database.common.telemetry.DataBaseTelemetry;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
@@ -1339,6 +1340,7 @@ class OutboxRelayIT {
     }
 
     @Test
+    @Tag("timing") // a delay bound: a starved CI runner misses it
     void aSlowShardDoesNotHoldItsNeighboursBackAcrossRounds() throws Exception {
         // 8 shards, one worker: a group of up to 8. Shard 0's call of 3 slow records winds down at the soft deadline
         // (800 ms) after its last one, so its batch ends while the shards after it in the call are not attempted

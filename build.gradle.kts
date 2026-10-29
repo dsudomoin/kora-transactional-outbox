@@ -31,13 +31,21 @@ configure(published.map { project(":$it") }) {
     }
 
     // -Pbenchmark runs only the tests tagged "benchmark" (never part of a normal build), always rerun, their stdout
-    // shown; -Dbench.* and -Doutbox.test.* properties of the Gradle invocation reach the test JVM
+    // shown; -Dbench.* and -Doutbox.test.* properties of the Gradle invocation reach the test JVM. On CI (the CI
+    // environment variable set) the tests tagged "timing", whose property is a speed a runner of unknown power may not
+    // reach, are left out unless -Poutbox.test.timing asks for them
     val benchmark = project.hasProperty("benchmark")
+    val timing = System.getenv("CI") == null || project.hasProperty("outbox.test.timing")
     tasks.withType<Test>().configureEach {
         useJUnitPlatform {
             if (benchmark) includeTags("benchmark") else excludeTags("benchmark")
+            if (!timing) excludeTags("timing")
         }
-        maxParallelForks = 1
+        // outbox-kora holds most of the suite: its classes go round-robin to several JVMs, each with its own Postgres and
+        // load tests that want cores of their own, so one JVM per 3 cores, at most 6. A small CI runner keeps one, as
+        // before; --max-workers caps them too. Benchmarks keep the machine to themselves.
+        maxParallelForks = if (benchmark || project.name != "outbox-kora") 1
+            else (Runtime.getRuntime().availableProcessors() / 3).coerceIn(1, 6)
         if (benchmark) {
             outputs.upToDateWhen { false }
             testLogging.events("standard_out")
