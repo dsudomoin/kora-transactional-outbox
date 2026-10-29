@@ -6,17 +6,21 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * The startup check of base objects the application's migrations own ({@code outbox.schema.bootstrap = false}): every
  * table, column (type, nullability, default, identity), index, primary key and partition key of
  * {@link SchemaObjects} as this version needs it; DML rights on every table (and {@code SELECT} on the outbox's id
  * sequence) for the role of {@code app}; and for the role of {@code ddl}, which makes and drops the partitions,
- * membership of the partitioned table's owner and {@code CREATE} on its schema. What it does not know, a newer
+ * membership of the partitioned table's owner and {@code CREATE} on its schema. With an owner source, a WARN when the
+ * application role may create where the owner's sessions resolve functions. What it does not know, a newer
  * schema's columns, indexes and tables, it ignores. Fails with one {@link IllegalStateException} naming every problem.
  */
 final class SchemaCheck {
 
+    private static final Logger log = LoggerFactory.getLogger(SchemaCheck.class);
     private static final List<String> DML = List.of("SELECT", "INSERT", "UPDATE", "DELETE");
 
     private SchemaCheck() {}
@@ -83,6 +87,48 @@ final class SchemaCheck {
             throw new IllegalStateException("outbox owner connection source reaches another database than the"
                     + " application's: owner " + o + ", application " + a + "; point both at the database of " + table
                     + " (and, for an unqualified name, give both roles the same search_path)");
+        }
+    }
+
+    /**
+     * Warns when the role of {@code app}, without the rights of {@code owner}'s role, may create in a schema the
+     * sessions of {@code owner} search for functions and operators: an overload of a built-in for {@code varchar}, the
+     * type a bound string has, made there takes over this library's queries on {@code owner} and runs with the owner's
+     * rights (CVE-2018-1058), so the application role would not be DML-only. Names everything through
+     * {@code pg_catalog} itself.
+     */
+    static void warnIfAppCanCreateWhereOwnerResolves(Connection app, Connection owner, String table)
+            throws SQLException {
+        String role;
+        try (var st = app.createStatement(); var rs = st.executeQuery("select current_user")) {
+            rs.next();
+            role = rs.getString(1);
+        }
+        var schemas = new ArrayList<String>();
+        var revokes = new ArrayList<String>();
+        String ownerRole = null;
+        String appRole = null;
+        try (var ps = owner.prepareStatement("select pg_catalog.quote_ident(s), pg_catalog.quote_ident(current_user),"
+                + " pg_catalog.quote_ident(?::text) from pg_catalog.unnest(pg_catalog.current_schemas(false)) s"
+                + " where pg_catalog.has_schema_privilege(?::name, s::text, 'CREATE')"
+                + " and not pg_catalog.pg_has_role(?::name, current_user, 'MEMBER')")) {
+            ps.setString(1, role);
+            ps.setString(2, role);
+            ps.setString(3, role);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    schemas.add(rs.getString(1));
+                    ownerRole = rs.getString(2);
+                    appRole = rs.getString(3);
+                    revokes.add("REVOKE CREATE ON SCHEMA " + rs.getString(1) + " FROM PUBLIC, " + appRole);
+                }
+            }
+        }
+        if (!schemas.isEmpty()) {
+            log.warn("outbox {}: role {} can CREATE in schema {}, which the sessions of {} (the owner connection"
+                    + " source) search for functions and operators: what {} creates there can run with the rights of"
+                    + " {}. Revoke it (or from the role {} inherits it through): {}", table, appRole,
+                    String.join(", ", schemas), ownerRole, appRole, ownerRole, appRole, String.join("; ", revokes));
         }
     }
 

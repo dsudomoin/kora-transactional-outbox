@@ -60,7 +60,9 @@ for ops:
      (and `OutboxSql.inbox`) pasted into a Flyway or Liquibase migration, run with the app's `search_path` or a
      schema-qualified `outbox.table`; the app role DML-only plus `USAGE` on the schema; a second `JdbcDatabase` tagged
      `@Tag(OutboxOwner.class)` on the same database as the owner (owns the tables, `CREATE` on the schema, `DO`
-     allowed).
+     allowed). The app role must not have `CREATE` on any schema of the owner's `search_path` (PUBLIC has it on
+     `public` on PG 14 and on databases moved from it): what it creates there runs as the owner. Startup WARNs with
+     the `REVOKE`.
 
    Either way: `pg_read_all_stats` recommended for the role that runs maintenance; no role `statement_timeout` of
    seconds.

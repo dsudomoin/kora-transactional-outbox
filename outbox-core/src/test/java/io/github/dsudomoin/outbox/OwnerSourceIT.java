@@ -98,6 +98,36 @@ class OwnerSourceIT {
                 .hasMessageContaining("role " + app + " does not own " + names.base());
     }
 
+    /**
+     * What the application role can create in a schema the owner's sessions search for functions and operators (an
+     * overload of a built-in taking varchar, the type a bound string has) runs as the owner: the start names it.
+     */
+    @Test
+    void appRoleThatCanCreateWhereTheOwnerResolvesIsWarned() throws Exception {
+        migrate();
+        sql("alter role " + owner + " set search_path = " + schema);
+        try (var log = new CapturedStderr()) {
+            runtime(OutboxRuntime.builder(config, new JdbcTransactions(as(app)), record -> {})
+                    .ownerConnections(as(owner)::getConnection).build()).start();
+
+            assertThat(log.text()).doesNotContain("REVOKE CREATE");
+        }
+
+        sql("grant create on schema " + schema + " to " + app);
+        try (var log = new CapturedStderr()) {
+            runtime(OutboxRuntime.builder(config, new JdbcTransactions(as(app)), record -> {})
+                    .ownerConnections(as(owner)::getConnection).build()).start();
+            runtime(InboxRuntime.builder(config, new JdbcTransactions(as(app)))
+                    .ownerConnections(as(owner)::getConnection).build()).start();
+
+            var warning = "role " + app + " can CREATE in schema " + schema + ", which the sessions of " + owner;
+            assertThat(log.text().lines().filter(l -> l.contains(warning)))
+                    .as("one WARN for the outbox, one for the inbox").hasSize(2)
+                    .allSatisfy(l -> assertThat(l).contains("WARN")
+                            .contains("REVOKE CREATE ON SCHEMA " + schema + " FROM PUBLIC, " + app));
+        }
+    }
+
     @Test
     void dmlOnlyLifecycleUnderLoad() throws Exception {
         migrate();

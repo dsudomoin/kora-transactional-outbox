@@ -301,6 +301,7 @@ public final class OutboxSchema implements AutoCloseable {
             if (ddl != db) { // before any DDL
                 try (var app = db.newConnection()) {
                     SchemaCheck.requireSameDatabase(app, c, spelled.base());
+                    SchemaCheck.warnIfAppCanCreateWhereOwnerResolves(app, c, spelled.base());
                 }
             }
             boolean autoCommit = c.getAutoCommit();

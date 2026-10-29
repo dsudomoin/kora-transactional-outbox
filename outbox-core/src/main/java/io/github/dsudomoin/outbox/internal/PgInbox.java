@@ -191,6 +191,7 @@ public final class PgInbox implements Inbox, AutoCloseable {
             if (ddl != db) { // before any DDL
                 try (var app = db.newConnection()) {
                     SchemaCheck.requireSameDatabase(app, c, names.base());
+                    SchemaCheck.warnIfAppCanCreateWhereOwnerResolves(app, c, names.base());
                 }
             }
             c.setAutoCommit(true);
