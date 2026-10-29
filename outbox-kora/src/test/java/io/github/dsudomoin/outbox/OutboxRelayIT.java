@@ -1211,14 +1211,12 @@ class OutboxRelayIT {
         config.shards(4).workers(1); // one worker: all four candidates in one group
         bootstrap();
         var handler = new RecordingHandler();
+        var bootstrapped = lastSuccess();
         var first = start(handler);
         // shard 0's cursor past the checkpoint's tick, which then stays valid for the other shards (deleting the
-        // checkpoint's own tick would strand every shard); maintenance does not run again for an hour
-        await(Duration.ofSeconds(5), () -> {
-            try (var c = TestDb.connect()) {
-                return queryLong(c, "select count(*) from " + schema.names().maintenance()) > 0;
-            }
-        });
+        // checkpoint's own tick would strand every shard); once its start run is over, maintenance does not run again
+        // for an hour
+        await(Duration.ofSeconds(5), () -> !lastSuccess().equals(bootstrapped));
         long stuckAt = 0;
         for (int a = 1; stuckAt <= checkpointTick(); a++) {
             assertThat(a).as("rows sent to shard 0").isLessThanOrEqualTo(10);
@@ -1597,11 +1595,19 @@ class OutboxRelayIT {
         var relay = new OutboxRelay(db, config, schema, new RecordingHandler(), TestTelemetry.kora(), maintenance,
                 noHook(db));
         relays.add(relay);
+        var bootstrapped = lastSuccess();
         relay.start();
         awaitParked();
+        // its start run is over: one starting after the tick below would find the regression itself and recover it
+        await(Duration.ofSeconds(5), () -> !lastSuccess().equals(bootstrapped));
         assertThat(maintenance.halted()).isFalse();
         try (var c = TestDb.connect()) {
+            // under the tick lock, as every tick is: a tick of the running relay in flight would otherwise take its
+            // snapshot before this insert and its id after it, so the workers' next ticks would compare with that one
+            var lock = "(" + schema.names().internalNamespace() + ", " + TableNames.LOCK_TICK + ")";
+            execute(c, "select pg_advisory_lock" + lock);
             insertTickAhead(c);
+            execute(c, "select pg_advisory_unlock" + lock);
         }
 
         send(outbox(relay::wake), msg("t", "k", "m"));
@@ -1791,25 +1797,30 @@ class OutboxRelayIT {
     }
 
     private void aTickWithoutAShardSetStepsEachShardOnce(int idleTicksBefore) throws Exception {
-        // no idle tick of the relay's own during the sweep: a cursor read racing a sibling's step of a shard (begun
-        // before the read, committed after it) finds the shard behind, and a newer idle tick by then makes its second
-        // step a fresh batch with a cursor row of its own, which a cold JVM (this test alone) hits often
+        // no tick of the relay's own during the sweep: a cursor read racing a sibling's step of a shard (begun before
+        // the read, committed after it) finds the shard behind, and a newer tick by then makes its second step a fresh
+        // batch with a cursor row of its own. The wake-up below is throttled by the tick just inserted, so its attempt
+        // follows minTickInterval later, inside a sweep slowed by a cold JVM or a loaded machine: the tick lock, held
+        // until the sweep is over, keeps it from inserting one
         config.shards(32).workers(4).minTickInterval(Duration.ofMillis(50)).idlePollInterval(Duration.ofSeconds(30));
         bootstrap();
         var relay = start(new RecordingHandler());
         awaitParked();
         long seq = maxCursorSeq();
-        try (var c = TestDb.connect()) {
+        try (var c = TestDb.connect(); var tickLock = TestDb.connect()) {
+            var lock = "(" + schema.names().internalNamespace() + ", " + TableNames.LOCK_TICK + ")";
+            execute(tickLock, "select pg_advisory_lock" + lock);
             execute(c, "insert into " + schema.names().tick() + " (snapshot, max_id, dirty) select"
                     + " pg_current_snapshot(), t.max_id, ''::varbit from (select max_id from " + schema.names().tick()
                     + " order by id desc limit 1) t, generate_series(1, " + idleTicksBefore + ")");
             // as a capped or failed probe leaves it: every shard may have rows
             execute(c, "insert into " + schema.names().tick() + " (snapshot, max_id) select pg_current_snapshot(),"
                     + " max_id from " + schema.names().tick() + " order by id desc limit 1");
-        }
-        relay.wake();
+            relay.wake();
 
-        await(Duration.ofSeconds(5), () -> maxCursorSeq() >= seq + config.shards());
+            await(Duration.ofSeconds(5), () -> maxCursorSeq() >= seq + config.shards());
+            execute(tickLock, "select pg_advisory_unlock" + lock);
+        }
         awaitParked();
         for (int i = 0; i < 5; i++) { // idle ticks go on: no shard is behind them, so no further step
             try (var c = TestDb.connect()) {
@@ -2382,6 +2393,14 @@ class OutboxRelayIT {
     private long maxCursorSeq() throws Exception {
         try (var c = TestDb.connect()) {
             return queryLong(c, "select max(seq) from " + schema.names().cursor());
+        }
+    }
+
+    /** {@code succeeded_at} of the maintenance marker, as sortable text. */
+    private String lastSuccess() throws Exception {
+        try (var c = TestDb.connect()) {
+            return queryString(c, "select to_char(succeeded_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') from "
+                    + schema.names().maintenance());
         }
     }
 

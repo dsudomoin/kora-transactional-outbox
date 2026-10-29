@@ -63,6 +63,7 @@ class SchemaValidationIT {
         var transactions = new JdbcTransactions(TestDataSources.newDataSource());
         var runtime = OutboxRuntime.builder(config, transactions, handler).build();
         runtimes.add(runtime);
+        long started = System.nanoTime();
         runtime.start();
 
         var id = transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("t", "k", "p".getBytes(UTF_8))));
@@ -71,6 +72,10 @@ class SchemaValidationIT {
             Thread.sleep(5);
         }
         assertThat(handler.delivered()).extracting(OutboxRecord::messageId).containsExactly(id);
+        // the start's own run is over: while it holds the maintenance lock, another run skips and returns false
+        while (!maintainedSince(runtime, started) && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
         assertThat(runtime.maintenance().runOnce()).isTrue();
         assertThat(runtime.admin().status().premade()).isGreaterThanOrEqualTo(config.partitions().premake());
     }
@@ -171,6 +176,13 @@ class SchemaValidationIT {
         var runtime = OutboxRuntime.builder(config, new JdbcTransactions(ds), new RecordingHandler()).build();
         runtimes.add(runtime);
         return runtime;
+    }
+
+    /** A maintenance run completed after {@code since} ({@link System#nanoTime()}). */
+    private static boolean maintainedSince(OutboxRuntime runtime, long since) {
+        long before = System.nanoTime(); // the status reads the age after this: a success it shows is no older
+        var age = runtime.admin().status().maintenanceSinceSuccessSeconds();
+        return age != null && age < (before - since) / 1e9;
     }
 
     private static PGSimpleDataSource as(String role) {
