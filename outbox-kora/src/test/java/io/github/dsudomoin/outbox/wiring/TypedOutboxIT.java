@@ -95,4 +95,14 @@ class TypedOutboxIT implements KoraAppTestConfigModifier {
         assertThat(proto.key()).isEqualTo("p".getBytes(UTF_8));
         assertThat(proto.headers()).contains(header);
     }
+
+    @Test
+    void eachDeserializerDecodesItsType() throws Exception {
+        var json = "{\"id\":7,\"userId\":\"u1\"}".getBytes(UTF_8);
+
+        assertThat(app.ordersDecoder().deserialize("orders", json)).as("JsonReader-derived deserializer")
+                .isEqualTo(new OrderCreated(7, "u1"));
+        assertThat(app.customDecoder().deserialize("custom", "hi".getBytes(UTF_8)))
+                .as("the app's deserializer, not the JSON template").isEqualTo(new Custom("custom:hi"));
+    }
 }

@@ -10,6 +10,7 @@ import io.github.dsudomoin.outbox.OutboxRelay;
 import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxSerializer;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
+import io.github.dsudomoin.outbox.OutboxTopicHandler;
 import io.github.dsudomoin.outbox.OutboxTransactions;
 import io.github.dsudomoin.outbox.TypedOutbox;
 import io.github.dsudomoin.outbox.internal.DeadLetterPass;
@@ -17,13 +18,16 @@ import io.github.dsudomoin.outbox.internal.Maintenance;
 import io.github.dsudomoin.outbox.internal.OutboxSchema;
 import io.opentelemetry.api.trace.Tracer;
 import jakarta.annotation.Nullable;
+import ru.tinkoff.kora.application.graph.All;
 import ru.tinkoff.kora.application.graph.LifecycleWrapper;
 import ru.tinkoff.kora.common.Tag;
 import ru.tinkoff.kora.common.annotation.Root;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
 
 /**
- * Wires the outbox into a Kora app; the app provides one {@link OutboxHandler} component.
+ * Wires the outbox into a Kora app. Records go to the app's {@link OutboxTopicHandler} components, each for the topics
+ * it claims, and every other topic to its one untagged {@link OutboxHandler} ({@code KafkaOutboxModule}'s or the app's
+ * own); either may be absent, not both.
  * <pre>{@code
  * @KoraApp
  * interface App extends HoconConfigModule, JdbcDatabaseModule, OutboxModule {}
@@ -31,6 +35,14 @@ import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
  * // sending and deduplicating on consumption as well
  * @KoraApp
  * interface App extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, InboxModule {}
+ * }</pre>
+ * A topic handler is a component of its own, no factory or tag needed; two of them claiming one topic fail the start:
+ * <pre>{@code
+ * @Component
+ * public final class AuditHandler implements OutboxTopicHandler {
+ *     public Set<String> topics() { return Set.of("audit"); }
+ *     public void handle(OutboxRecord record) throws Exception { client.post(record.payload()); }
+ * }
  * }</pre>
  * Config at {@code outbox}. The outbox is a root: started with the app, tables first, then the relay; with
  * {@code outbox.relay.enabled = false} the relay only serves {@link OutboxRelay#drain()}. Tracing is on when the app
@@ -43,9 +55,10 @@ public interface OutboxModule extends OutboxCommonModule {
 
     @Root
     default LifecycleWrapper<OutboxRuntime> outboxRuntime(OutboxConfig config, OutboxTransactions db,
-            OutboxHandler handler, @Nullable OutboxDeadLetterHandler hook, OutboxTelemetry telemetry,
-            @Tag(OutboxOwner.class) @Nullable JdbcConnectionFactory owner) {
+            @Nullable OutboxHandler handler, All<OutboxTopicHandler> routes, @Nullable OutboxDeadLetterHandler hook,
+            OutboxTelemetry telemetry, @Tag(OutboxOwner.class) @Nullable JdbcConnectionFactory owner) {
         var builder = OutboxRuntime.builder(config, db, handler).telemetry(telemetry);
+        routes.forEach(builder::route);
         if (hook != null) {
             builder.deadLetterHandler(hook);
         }

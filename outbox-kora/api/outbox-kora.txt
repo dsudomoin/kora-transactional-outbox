@@ -64,6 +64,7 @@ package io.github.dsudomoin.outbox.kora {
   }
 
   public interface OutboxJsonModule {
+    method public default <T> io.github.dsudomoin.outbox.OutboxDeserializer<T>! jsonOutboxDeserializer(ru.tinkoff.kora.json.common.JsonReader<T>!);
     method public default <T> io.github.dsudomoin.outbox.OutboxSerializer<T>! jsonOutboxSerializer(ru.tinkoff.kora.json.common.JsonWriter<T>!);
   }
 
@@ -71,7 +72,7 @@ package io.github.dsudomoin.outbox.kora {
     method public default io.github.dsudomoin.outbox.Outbox! outbox(io.github.dsudomoin.outbox.OutboxRuntime!);
     method public default io.github.dsudomoin.outbox.OutboxAdmin! outboxAdmin(io.github.dsudomoin.outbox.OutboxRuntime!);
     method @ru.tinkoff.kora.common.annotation.Root public default ru.tinkoff.kora.application.graph.LifecycleWrapper<io.github.dsudomoin.outbox.OutboxRelay!>! outboxRelay(io.github.dsudomoin.outbox.OutboxRuntime!);
-    method @ru.tinkoff.kora.common.annotation.Root public default ru.tinkoff.kora.application.graph.LifecycleWrapper<io.github.dsudomoin.outbox.OutboxRuntime!>! outboxRuntime(io.github.dsudomoin.outbox.OutboxConfig!, io.github.dsudomoin.outbox.OutboxTransactions!, io.github.dsudomoin.outbox.OutboxHandler!, io.github.dsudomoin.outbox.OutboxDeadLetterHandler?, io.github.dsudomoin.outbox.OutboxTelemetry!, @ru.tinkoff.kora.common.Tag(OutboxOwner.class) ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory?);
+    method @ru.tinkoff.kora.common.annotation.Root public default ru.tinkoff.kora.application.graph.LifecycleWrapper<io.github.dsudomoin.outbox.OutboxRuntime!>! outboxRuntime(io.github.dsudomoin.outbox.OutboxConfig!, io.github.dsudomoin.outbox.OutboxTransactions!, io.github.dsudomoin.outbox.OutboxHandler?, ru.tinkoff.kora.application.graph.All<io.github.dsudomoin.outbox.OutboxTopicHandler!>!, io.github.dsudomoin.outbox.OutboxDeadLetterHandler?, io.github.dsudomoin.outbox.OutboxTelemetry!, @ru.tinkoff.kora.common.Tag(OutboxOwner.class) ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory?);
     method public default <T> io.github.dsudomoin.outbox.TypedOutbox<T>! typedOutbox(io.github.dsudomoin.outbox.Outbox!, io.github.dsudomoin.outbox.OutboxSerializer<T>!);
   }
 

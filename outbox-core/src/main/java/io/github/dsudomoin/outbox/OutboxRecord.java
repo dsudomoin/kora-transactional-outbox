@@ -1,5 +1,7 @@
 package io.github.dsudomoin.outbox;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import jakarta.annotation.Nullable;
 import java.time.Instant;
 import java.util.List;
@@ -31,6 +33,12 @@ public record OutboxRecord(
     public OutboxRecord(long id, UUID messageId, String topic, @Nullable byte[] key, @Nullable byte[] payload,
             List<OutboxHeader> headers, Instant createdAt, int attempts, int requeues) {
         this(id, messageId, topic, key, payload, headers, createdAt, attempts, requeues, -1);
+    }
+
+    /** The key as UTF-8, as {@link TypedOutbox} and {@link OutboxMessage} write a {@code String} key; null if none. */
+    @Nullable
+    public String keyAsString() {
+        return key == null ? null : new String(key, UTF_8);
     }
 
     public OutboxRecord withHeaders(List<OutboxHeader> headers) {

@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.kafka.kora;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.outbox.OutboxHandler;
+import io.github.dsudomoin.outbox.OutboxTopicHandler;
 import io.github.dsudomoin.outbox.kafka.KafkaDeadLetterHandler;
 import io.github.dsudomoin.outbox.kafka.KafkaOutboxConfig;
 import io.github.dsudomoin.outbox.kafka.KafkaOutboxHandler;
@@ -25,9 +26,18 @@ import ru.tinkoff.kora.config.common.extractor.ConfigValueExtractor;
  * <pre>{@code
  * outbox.kafka.driverProperties { "bootstrap.servers" = "localhost:9092" }
  * }</pre>
- * The relay takes the app's one untagged {@code OutboxHandler}. The app's own, if it has one, replaces the default,
- * whether it is a component of an {@code OutboxHandler} subtype ({@code @Component class Router implements
- * OutboxHandler}) or declared as exactly {@code OutboxHandler}, like a factory routing some topics elsewhere:
+ * The relay takes the app's one untagged {@code OutboxHandler} for every topic no {@link OutboxTopicHandler} component
+ * claims. To deliver some topics elsewhere, add one component per target, no factory and no tag:
+ * <pre>{@code
+ * @Component
+ * public final class BillingHandler implements OutboxTopicHandler {
+ *     public Set<String> topics() { return Set.of("billing"); }
+ *     public void handle(OutboxRecord record) throws Exception { billing.post(record.payload()); }
+ * }
+ * }</pre>
+ * The app's own {@code OutboxHandler}, if it has one, replaces the default, whether it is a component of an
+ * {@code OutboxHandler} subtype ({@code @Component class Router implements OutboxHandler}) or declared as exactly
+ * {@code OutboxHandler}, like a factory routing with {@link OutboxHandler#byTopic}:
  * <pre>{@code
  * default OutboxHandler outboxHandler(KafkaOutboxSender kafka, @Tag(Audit.class) AuditHandler audit) {
  *     return OutboxHandler.byTopic(Map.of("audit", audit), kafka.handler());

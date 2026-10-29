@@ -21,6 +21,10 @@ import io.github.dsudomoin.outbox.protobuf.ProtobufOutbox;
  *     events.send("orders", userId, OrderCreated.newBuilder().setId(id).setUserId(userId).build())
  * }
  * }</pre>
+ * Decoding has no generic factory (each message type has its own parser): a
+ * {@link io.github.dsudomoin.outbox.TypedOutboxTopicHandler TypedOutboxTopicHandler&lt;OrderCreated&gt;} takes
+ * {@code (topic, payload) -> OrderCreated.parseFrom(payload)} as its deserializer, or an app factory declaring
+ * {@code OutboxDeserializer<OrderCreated>} returns it.
  */
 public interface OutboxProtobufModule {
 

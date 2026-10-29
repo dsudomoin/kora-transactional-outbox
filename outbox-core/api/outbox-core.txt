@@ -212,6 +212,10 @@ package io.github.dsudomoin.outbox {
     field public static final io.github.dsudomoin.outbox.OutboxDeadLetterHandler! NONE;
   }
 
+  @java.lang.FunctionalInterface public interface OutboxDeserializer<T> {
+    method public T deserialize(String!, byte[]!) throws java.lang.Exception;
+  }
+
   public enum OutboxGauge {
     method public String! metricName();
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge DEAD_PENDING;
@@ -269,6 +273,7 @@ package io.github.dsudomoin.outbox {
     method public java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>! headers();
     method public long id();
     method public byte[]? key();
+    method public String? keyAsString();
     method public java.util.UUID! messageId();
     method public byte[]? payload();
     method public int requeues();
@@ -287,7 +292,7 @@ package io.github.dsudomoin.outbox {
 
   public final class OutboxRuntime implements java.lang.AutoCloseable {
     method public io.github.dsudomoin.outbox.OutboxAdmin! admin();
-    method public static io.github.dsudomoin.outbox.OutboxRuntime.Builder! builder(io.github.dsudomoin.outbox.OutboxConfig!, io.github.dsudomoin.outbox.OutboxTransactions!, io.github.dsudomoin.outbox.OutboxHandler!);
+    method public static io.github.dsudomoin.outbox.OutboxRuntime.Builder! builder(io.github.dsudomoin.outbox.OutboxConfig!, io.github.dsudomoin.outbox.OutboxTransactions!, io.github.dsudomoin.outbox.OutboxHandler?);
     method public void close();
     method public io.github.dsudomoin.outbox.Outbox! outbox();
     method public io.github.dsudomoin.outbox.OutboxRelay! relay();
@@ -298,6 +303,7 @@ package io.github.dsudomoin.outbox {
     method public io.github.dsudomoin.outbox.OutboxRuntime! build();
     method public io.github.dsudomoin.outbox.OutboxRuntime.Builder! deadLetterHandler(io.github.dsudomoin.outbox.OutboxDeadLetterHandler!);
     method public io.github.dsudomoin.outbox.OutboxRuntime.Builder! ownerConnections(io.github.dsudomoin.outbox.ConnectionSource!);
+    method public io.github.dsudomoin.outbox.OutboxRuntime.Builder! route(io.github.dsudomoin.outbox.OutboxTopicHandler!);
     method public io.github.dsudomoin.outbox.OutboxRuntime.Builder! telemetry(io.github.dsudomoin.outbox.OutboxTelemetry!);
   }
 
@@ -403,6 +409,12 @@ package io.github.dsudomoin.outbox {
     field public static final io.github.dsudomoin.outbox.OutboxTelemetry.RelayStep! NONE;
   }
 
+  public interface OutboxTopicHandler {
+    method public void handle(io.github.dsudomoin.outbox.OutboxRecord!) throws java.lang.Exception;
+    method public default java.util.List<io.github.dsudomoin.outbox.Outcome!>! handleBatch(java.util.List<io.github.dsudomoin.outbox.OutboxRecord!>!);
+    method public java.util.Set<java.lang.String!>! topics();
+  }
+
   public interface OutboxTransactions extends io.github.dsudomoin.outbox.ConnectionSource {
     method public void afterCommit(Runnable!) throws java.sql.SQLException;
     method public java.sql.Connection? currentConnection();
@@ -451,6 +463,15 @@ package io.github.dsudomoin.outbox {
     method public java.util.UUID! send(String!, byte[]?, T?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
     method public java.util.UUID! send(String!, String?, T?);
     method public java.util.UUID! send(String!, String?, T?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
+  }
+
+  public abstract class TypedOutboxTopicHandler<T> implements io.github.dsudomoin.outbox.OutboxTopicHandler {
+    ctor protected TypedOutboxTopicHandler(java.util.Set<java.lang.String!>!, io.github.dsudomoin.outbox.OutboxDeserializer<T>!);
+    method protected final T? decode(io.github.dsudomoin.outbox.OutboxRecord!) throws java.lang.Exception;
+    method public final void handle(io.github.dsudomoin.outbox.OutboxRecord!) throws java.lang.Exception;
+    method protected abstract void handle(T, io.github.dsudomoin.outbox.OutboxRecord!) throws java.lang.Exception;
+    method protected void handleTombstone(io.github.dsudomoin.outbox.OutboxRecord!) throws java.lang.Exception;
+    method public final java.util.Set<java.lang.String!>! topics();
   }
 
 }

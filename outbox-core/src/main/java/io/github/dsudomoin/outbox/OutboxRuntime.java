@@ -9,13 +9,16 @@ import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.internal.PgOutboxAdmin;
 import jakarta.annotation.Nullable;
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Objects;
 
 /**
- * The outbox assembled from public parts: config, the application's transactions, the handler and, optionally, a
- * dead-letter hook and telemetry. {@link #start()} creates or checks the tables, then starts the relay with its
- * maintenance and dead-letter pass; {@link #close()} stops the relay. The components exist from {@code start()} on,
- * built with the shard count the bootstrap resolved.
+ * The outbox assembled from public parts: config, the application's transactions, the handler and, optionally, topic
+ * routes in front of it, a dead-letter hook and telemetry. {@link #start()} creates or checks the tables, then starts
+ * the relay with its maintenance and dead-letter pass; {@link #close()} stops the relay. The components exist from
+ * {@code start()} on, built with the shard count the bootstrap resolved.
  * <pre>{@code
  * var transactions = new JdbcTransactions(dataSource);
  * var runtime = OutboxRuntime.builder(config, transactions, handler).build();
@@ -23,15 +26,26 @@ import java.util.Objects;
  * transactions.inTx(c -> runtime.outbox().send(OutboxMessage.of("orders", key, payload)));
  * runtime.close();
  * }</pre>
+ * Handlers that claim their own topics go in front of the handler, which delivers every other topic:
+ * <pre>{@code
+ * OutboxRuntime.builder(config, transactions, kafka.handler())
+ *         .route(new AuditHandler(client))
+ *         .route(new BillingHandler(billing))
+ *         .build();
+ * }</pre>
  */
 public final class OutboxRuntime implements AutoCloseable {
 
     static final String OWNER_NEEDS_MIGRATIONS = "outbox.schema.bootstrap must be false when an owner connection source"
             + " is set: objects it created would leave the application role without rights on them";
+    static final String NO_HANDLER = "the outbox has neither an OutboxHandler nor an OutboxTopicHandler route: nothing"
+            + " would deliver its records (in a Kora app the OutboxHandler comes from KafkaOutboxModule or the app's"
+            + " own component)";
 
     private final OutboxConfig config;
     private final OutboxTransactions transactions;
-    private final OutboxHandler handler;
+    /** The builder's handler, with its routes in front of it. Package-private for tests. */
+    final OutboxHandler handler;
     private final OutboxDeadLetterHandler deadLetterHandler;
     private final OutboxTelemetry telemetry;
     /** The transactions with the owner's new connections, or {@link #transactions} without an owner source. */
@@ -39,16 +53,18 @@ public final class OutboxRuntime implements AutoCloseable {
     @Nullable
     private volatile Parts parts;
 
-    private OutboxRuntime(Builder builder) {
+    private OutboxRuntime(Builder builder, OutboxHandler handler) {
         this.config = builder.config;
         this.transactions = builder.transactions;
-        this.handler = builder.handler;
+        this.handler = handler;
         this.deadLetterHandler = builder.deadLetterHandler;
         this.telemetry = GuardedTelemetry.of(builder.telemetry);
         this.ddl = OwnerTransactions.of(transactions, builder.owner);
     }
 
-    public static Builder builder(OutboxConfig config, OutboxTransactions transactions, OutboxHandler handler) {
+    /** {@code handler} delivers every topic no {@link Builder#route} claims; it may be null when there are routes. */
+    public static Builder builder(OutboxConfig config, OutboxTransactions transactions,
+            @Nullable OutboxHandler handler) {
         return new Builder(config, transactions, handler);
     }
 
@@ -141,16 +157,27 @@ public final class OutboxRuntime implements AutoCloseable {
 
         private final OutboxConfig config;
         private final OutboxTransactions transactions;
+        @Nullable
         private final OutboxHandler handler;
+        private final List<OutboxTopicHandler> routes = new ArrayList<>();
         private OutboxDeadLetterHandler deadLetterHandler = OutboxDeadLetterHandler.NONE;
         private OutboxTelemetry telemetry = OutboxTelemetry.NONE;
         @Nullable
         private ConnectionSource owner;
 
-        private Builder(OutboxConfig config, OutboxTransactions transactions, OutboxHandler handler) {
+        private Builder(OutboxConfig config, OutboxTransactions transactions, @Nullable OutboxHandler handler) {
             this.config = Objects.requireNonNull(config, "config");
             this.transactions = Objects.requireNonNull(transactions, "transactions");
-            this.handler = Objects.requireNonNull(handler, "handler");
+            this.handler = handler;
+        }
+
+        /**
+         * Sends the records of {@code route}'s topics to it instead of the handler, as {@link OutboxHandler#byTopic}
+         * does. {@link #build()} fails when two routes claim one topic, or a route claims none.
+         */
+        public Builder route(OutboxTopicHandler route) {
+            routes.add(Objects.requireNonNull(route, "route"));
+            return this;
         }
 
         /** Where dead letters go; without one, every dead letter is kept for the admin API. */
@@ -175,13 +202,62 @@ public final class OutboxRuntime implements AutoCloseable {
             return this;
         }
 
-        /** Validates the config; touches no database. */
+        /** Validates the config and the routes; touches no database. */
         public OutboxRuntime build() {
             OutboxSchema.validate(config);
             if (owner != null && config.schema().bootstrap()) {
                 throw new IllegalArgumentException(OWNER_NEEDS_MIGRATIONS);
             }
-            return new OutboxRuntime(this);
+            return new OutboxRuntime(this, routed());
+        }
+
+        private OutboxHandler routed() {
+            if (routes.isEmpty()) {
+                if (handler == null) {
+                    throw new IllegalArgumentException(NO_HANDLER);
+                }
+                return handler;
+            }
+            var claims = new HashMap<String, OutboxTopicHandler>();
+            var table = new HashMap<String, OutboxHandler>();
+            for (var route : routes) {
+                var topics = route.topics();
+                if (topics.isEmpty()) {
+                    throw new IllegalArgumentException(route.getClass().getName() + " claims no topics");
+                }
+                var adapted = adapt(route); // one per route: byTopic hands a route all its topics in one call
+                for (var topic : topics) {
+                    var other = claims.putIfAbsent(topic, route);
+                    if (other != null) {
+                        throw new IllegalArgumentException("outbox topic " + topic + " is claimed by both "
+                                + other.getClass().getName() + " and " + route.getClass().getName());
+                    }
+                    table.put(topic, adapted);
+                }
+            }
+            return OutboxHandler.byTopic(table, handler != null ? handler : record -> {
+                throw CannotHandle.failure(record, "no OutboxTopicHandler claims its topic and there is no"
+                        + " OutboxHandler behind the routes", null);
+            });
+        }
+
+        private static OutboxHandler adapt(OutboxTopicHandler route) {
+            return new OutboxHandler() {
+                @Override
+                public void handle(OutboxRecord record) throws Exception {
+                    route.handle(record);
+                }
+
+                @Override
+                public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                    return route.handleBatch(records);
+                }
+
+                @Override
+                public String toString() {
+                    return route.toString();
+                }
+            };
         }
     }
 }

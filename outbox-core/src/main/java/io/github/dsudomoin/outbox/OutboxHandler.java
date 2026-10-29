@@ -16,7 +16,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.LoggerFactory;
 
-/** Delivers relayed records to their target. The application graph holds exactly one. */
+/**
+ * Delivers relayed records to their target: every topic, or those no {@link OutboxTopicHandler} route claims. The
+ * application graph holds at most one.
+ */
 public interface OutboxHandler {
 
     /**
@@ -114,7 +117,9 @@ public interface OutboxHandler {
     }
 
     /**
-     * Routes records by topic to {@code routes}, unknown topics to {@code fallback}. Each route's
+     * Routes records by topic to {@code routes}, unknown topics to {@code fallback}; the runtime builds one from its
+     * {@link OutboxTopicHandler} routes ({@link OutboxRuntime.Builder#route}, Kora's components of that type). Each
+     * route's
      * {@link #handleBatch} gets its records in their original order; outcomes come back in the input positions. A
      * route whose {@code handleBatch} throws an exception, or returns an invalid list (null, wrong size, a null
      * element; logged at ERROR, at most once per 10 s), gets {@code Retry} for all its records; an {@link Error}

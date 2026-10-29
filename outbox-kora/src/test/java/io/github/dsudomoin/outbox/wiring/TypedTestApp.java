@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.wiring;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import io.github.dsudomoin.outbox.kora.OutboxModule;
+import io.github.dsudomoin.outbox.OutboxDeserializer;
 import io.github.dsudomoin.outbox.OutboxSerializer;
 import io.github.dsudomoin.outbox.TypedOutbox;
 import io.github.dsudomoin.outbox.kora.OutboxJsonModule;
@@ -16,9 +17,9 @@ import ru.tinkoff.kora.database.jdbc.JdbcDatabaseModule;
 import ru.tinkoff.kora.json.common.annotation.Json;
 
 /**
- * JSON template and an explicit serializer in one app: compiles only if Kora prefers the explicit
- * {@code OutboxSerializer<Custom>} over the template, although {@code Custom} is {@code @Json} too. It has no
- * dead-letter hook component.
+ * JSON templates and an explicit serializer and deserializer in one app: compiles only if Kora prefers the explicit
+ * {@code OutboxSerializer<Custom>} and {@code OutboxDeserializer<Custom>} over the templates, although {@code Custom}
+ * is {@code @Json} too. It has no dead-letter hook component.
  */
 @KoraApp
 public interface TypedTestApp extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, OutboxJsonModule,
@@ -35,15 +36,21 @@ public interface TypedTestApp extends HoconConfigModule, JdbcDatabaseModule, Out
         return (topic, value) -> (topic + ":" + value.text()).getBytes(UTF_8);
     }
 
+    default OutboxDeserializer<Custom> customDeserializer() {
+        return (topic, payload) -> new Custom(topic + ":" + new String(payload, UTF_8));
+    }
+
     default RecordingHandler outboxHandler() {
         return new RecordingHandler();
     }
 
     /** Application code: Kora leaves components that no root depends on out of the graph. */
-    record AppCode(TypedOutbox<OrderCreated> orders, TypedOutbox<Custom> custom, ProtobufOutbox protobuf) {}
+    record AppCode(TypedOutbox<OrderCreated> orders, TypedOutbox<Custom> custom, ProtobufOutbox protobuf,
+            OutboxDeserializer<OrderCreated> ordersDecoder, OutboxDeserializer<Custom> customDecoder) {}
 
     @Root
-    default AppCode appCode(TypedOutbox<OrderCreated> orders, TypedOutbox<Custom> custom, ProtobufOutbox protobuf) {
-        return new AppCode(orders, custom, protobuf);
+    default AppCode appCode(TypedOutbox<OrderCreated> orders, TypedOutbox<Custom> custom, ProtobufOutbox protobuf,
+            OutboxDeserializer<OrderCreated> ordersDecoder, OutboxDeserializer<Custom> customDecoder) {
+        return new AppCode(orders, custom, protobuf, ordersDecoder, customDecoder);
     }
 }
