@@ -11,6 +11,11 @@ import ru.tinkoff.kora.http.server.common.HttpServerRequest;
  * <p>Refuse with {@link Deny}, never by throwing: any exception {@link #authorize} throws, even an
  * {@code HttpServerResponseException} 401 or 403, answers 500 {@code "authorization failed"}, and the exception goes
  * to a WARN line, never to the caller.
+ *
+ * <p>Base the decision on a credential the client sends on purpose (a header such as an API key or a bearer token),
+ * not on one a browser adds by itself (a cookie, Basic or SSO credentials it remembers, a client certificate, the
+ * caller's address): a page on another site can make the operator's browser send those. The admin API refuses state
+ * changes a browser marks as cross-site before this runs, but a browser too old to mark them gets through.
  */
 public interface OutboxAdminAuthorizer {
 

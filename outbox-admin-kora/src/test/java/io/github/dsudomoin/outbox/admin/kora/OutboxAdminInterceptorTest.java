@@ -17,6 +17,9 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.AtomicReference;
 import org.assertj.core.api.InstanceOfAssertFactories;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import ru.tinkoff.kora.common.Context;
 import ru.tinkoff.kora.http.common.body.HttpBodyInput;
 import ru.tinkoff.kora.http.common.cookie.Cookie;
@@ -161,6 +164,49 @@ class OutboxAdminInterceptorTest {
         }
     }
 
+    /**
+     * A browser names the site that made it send a request; a POST another site sent, perhaps with the operator's
+     * cookie, SSO session or network address, is refused before the authorizer, which could not tell it apart.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"cross-site", "same-site"})
+    void aPostAnotherSiteSentIsRefusedBeforeTheAuthorizer(String site) {
+        var interceptor = new OutboxAdminInterceptor(request -> {
+            throw new AssertionError("the authorizer must not run");
+        }, deferred(new AtomicReference<>()), new $ModelError_JsonWriter());
+
+        try (var stderr = new CapturedStderr()) {
+            var response = interceptor.intercept(Context.current(), request("POST",
+                    "/kora-outbox/admin/v1/dead-letters/discard", HttpHeaders.of("sec-fetch-site", site)),
+                    (context, request) -> {
+                        throw new AssertionError("the route must not run");
+                    }).toCompletableFuture();
+
+            assertThat(response).as("answered without the authorizer").isDone();
+            var answered = response.join();
+            assertThat(answered.code()).isEqualTo(403);
+            assertThat(body(answered)).isEqualTo("{\"message\":\"cross-site request refused\"}");
+            assertThat(stderr.text())
+                    .contains("outbox admin POST \"/kora-outbox/admin/v1/dead-letters/discard\" denied: 403");
+        }
+    }
+
+    /** Clients other than browsers send no such header; a GET changes nothing, so a link from another site works. */
+    @ParameterizedTest
+    @CsvSource({"POST,", "POST,same-origin", "POST,none", "GET,cross-site"})
+    void aCallOfTheSameSiteOrNoBrowserReachesTheAuthorizer(String method, String site) {
+        var authorization = new AtomicReference<Runnable>();
+        var interceptor = new OutboxAdminInterceptor(request -> OutboxAdminAuthorizer.allow("ops"),
+                deferred(authorization), new $ModelError_JsonWriter());
+
+        var response = interceptor.intercept(Context.current(), request(method, "/kora-outbox/admin/v1/status",
+                site == null ? HttpHeaders.of() : HttpHeaders.of("sec-fetch-site", site)),
+                (context, request) -> CompletableFuture.completedFuture(HttpServerResponse.of(200)));
+        authorization.get().run();
+
+        assertThat(response.toCompletableFuture().join().code()).isEqualTo(200);
+    }
+
     private static String body(HttpServerResponse response) {
         var out = new ByteArrayOutputStream();
         try {
@@ -190,10 +236,14 @@ class OutboxAdminInterceptorTest {
     }
 
     private static HttpServerRequest request(String path) {
+        return request("GET", path, HttpHeaders.of());
+    }
+
+    private static HttpServerRequest request(String method, String path, HttpHeaders headers) {
         return new HttpServerRequest() {
             @Override
             public String method() {
-                return "GET";
+                return method;
             }
 
             @Override
@@ -208,7 +258,7 @@ class OutboxAdminInterceptorTest {
 
             @Override
             public HttpHeaders headers() {
-                return HttpHeaders.of();
+                return headers;
             }
 
             @Override

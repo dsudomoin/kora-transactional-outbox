@@ -28,7 +28,10 @@ import ru.tinkoff.kora.json.common.JsonWriter;
  * nothing of why. For an allowed call, a 4xx the server raises before the route runs (a malformed parameter or body)
  * is answered as an {@code Error} of its status too, as is any response exception of the server (a 503), and any
  * other failure as a 500 {@code Error} with the failure's message (its class name when it has none), for the
- * authenticated operator; a 5xx after one WARN with the exception.
+ * authenticated operator; a 5xx after one WARN with the exception. A call other than a {@code GET} or {@code HEAD}
+ * that a browser marks as sent by another site ({@code Sec-Fetch-Site} other than {@code same-origin} or {@code none})
+ * gets a 403 {@code Error} "cross-site request refused" without the authorizer: a page elsewhere cannot change state
+ * with what the operator's browser adds by itself.
  *
  * <p>Every call leaves one INFO audit line, written before its response completes:
  * {@code outbox admin <method> "<path>" by "<identity>": <status>} when allowed, {@code outbox admin <method>
@@ -57,6 +60,10 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
     @Override
     public CompletionStage<HttpServerResponse> intercept(Context context, HttpServerRequest request, InterceptChain chain) {
         var call = request.method() + " \"" + printable(request.path()) + "\"";
+        if (!request.method().equals("GET") && !request.method().equals("HEAD") && sentByAnotherSite(request)) {
+            log.info("outbox admin {} denied: 403", call);
+            return CompletableFuture.completedFuture(error(context, 403, null, "cross-site request refused"));
+        }
         return executor.execute(context, () -> authorizer.authorize(request))
                 .handle((decision, error) -> respond(context, request, chain, call, decision, error))
                 .thenCompose(Function.identity());
@@ -99,6 +106,16 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
         }
         log.warn("outbox admin {} failed, answered 500", caller, cause);
         return error(context, 500, null, Objects.requireNonNullElse(cause.getMessage(), cause.getClass().getName()));
+    }
+
+    /**
+     * Whether a browser says another site made it send {@code request} ({@code Sec-Fetch-Site}): such a request may
+     * carry what the browser adds by itself (a cookie, an SSO session, the operator's network address), which an
+     * authorizer cannot tell from the operator's own call. Clients other than browsers send no such header.
+     */
+    private static boolean sentByAnotherSite(HttpServerRequest request) {
+        var site = request.headers().getFirst("sec-fetch-site");
+        return site != null && !site.equals("same-origin") && !site.equals("none");
     }
 
     private HttpServerResponse error(Context context, int code, @Nullable MutableHttpHeaders headers,
