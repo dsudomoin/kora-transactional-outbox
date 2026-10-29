@@ -19,11 +19,11 @@ step's own transaction (same `message_id`, payload, headers, `created_at`); a ro
 ## The coordinator
 
 Only a `handleBatch` override can requeue: the default `handleBatch` (calling `handle` per record) never returns it.
-`OutboxHandler.byTopic` passes a route's `requeue` through like any outcome.
+Topic routing (`OutboxTopicHandler`, `OutboxHandler.byTopic`) passes a `requeue` through like any outcome.
 
 ```java
-/** Per-account job queue: one topic, key = account id. Not a @Component if byTopic wraps it. */
-public final class AccountJobsHandler implements OutboxHandler {
+/** Per-account job queue: topic "account-jobs", key = account id. A @Component in Kora. */
+public final class AccountJobsHandler implements OutboxTopicHandler {
 
     private static final int GIVE_UP_AFTER = 1000; // requeues, then dead letters
 
@@ -33,6 +33,11 @@ public final class AccountJobsHandler implements OutboxHandler {
     public AccountJobsHandler(AccountProcesses processes, AccountJobs jobs) {
         this.processes = processes;
         this.jobs = jobs;
+    }
+
+    @Override
+    public Set<String> topics() {
+        return Set.of("account-jobs");
     }
 
     @Override

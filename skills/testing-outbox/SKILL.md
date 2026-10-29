@@ -76,7 +76,8 @@ Testcontainers 2.x packages: `org.testcontainers.postgresql`, `org.testcontainer
 ## Other cases
 
 - **Custom handler without Kafka**: a test `@KoraApp` whose `OutboxHandler` factory returns a handler that records
-  what it got. The library's own test fixtures are not published; write the ten lines.
+  what it got; `OutboxTopicHandler` components still get their own topics. The library's own test fixtures are not
+  published; write the ten lines.
 - **Retry path**: `drain()` throws `IllegalStateException` after 2 × (`batchTimeout` + 5 s) without progress
   (a stub answering 500). Lower `batchTimeout` only with a non-Kafka handler; with Kafka it must stay ≥
   `delivery.timeout.ms + 5 s + max.block.ms`.

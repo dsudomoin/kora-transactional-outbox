@@ -14,7 +14,7 @@ contract in SKILL.md still holds: one outcome per record in input order, no null
 - **Throughput.** A call waits for its slowest request, so rows/s ≤ min(shards, instances × workers) × `batchSize` /
   (call time + step overhead), where call time ≈ ceil(route records / P) × p99. Size it with one instance down, with
   ≥ 2× headroom. The deadline still applies: ceil(route records / P) × p99 ≤ 0.8 × `batchTimeout` − per-record
-  timeout, and `byTopic` runs the other routes (often `kafka.handler()`) after this one in the same call.
+  timeout, and the other topic handlers and the `OutboxHandler` (often Kafka) run after this one in the same call.
 - **Down-target breaker.** While the target looks down, start at most 3 requests and send the rest only if one of them
   is answered; otherwise return `notAttempted()` for the rest (no attempt spent). Without it every record of every call
   hits a down target and spends an attempt. The default `handleBatch` stops after 3 failing pairs while nothing

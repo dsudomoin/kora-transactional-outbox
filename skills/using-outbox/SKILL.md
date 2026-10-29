@@ -74,7 +74,7 @@ for ops:
 5. **Bulk**: `sendAll` with thousands of distinct keys needs `max_locks_per_transaction × (max_connections +
    max_prepared_transactions)` ≥ concurrent bulk transactions × distinct keys each + other locks (SQLState 53200);
    state the numbers. It needs a restart; hot standbys need at least the primary's value.
-6. **Topics** the Kafka handler writes (other `byTopic` routes need none), and DLQ topics with
+6. **Topics** the Kafka handler writes (topics an `OutboxTopicHandler` claims need none), and DLQ topics with
    `outbox.kafka.deadLetterTopic`: created before writers deploy, broker
    auto-create off, ACLs (WRITE, DESCRIBE) for the service principal, final partition count (added partitions move
    keys), the producer's `batch.size` ≤ the topic's `max.message.bytes` (the default 16 384 is; else kafka-clients

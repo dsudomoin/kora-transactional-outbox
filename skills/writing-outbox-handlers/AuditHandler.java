@@ -1,6 +1,7 @@
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
+import io.github.dsudomoin.outbox.OutboxTopicHandler;
 import io.github.dsudomoin.outbox.Outcome;
 import java.io.IOException;
 import java.net.URI;
@@ -14,15 +15,17 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
- * POSTs outbox records to an audit API. Not a @Component: build it inside the app's one OutboxHandler factory,
- * e.g. OutboxHandler.byTopic(Map.of("audit", new AuditHandler(url)), kafka.handler()).
+ * POSTs the records of topic "audit" to an audit API; every other topic goes to the app's OutboxHandler (Kafka).
+ * In Kora make it a @Component (with a constructor taking its config); without Kora
+ * OutboxRuntime.builder(config, transactions, kafka.handler()).route(new AuditHandler(url)).
  *
  * handle() alone is enough for status mapping (the default handleBatch does the rest). handleBatch is overridden
  * here only to honour Retry-After; copy that part only if the target sends it.
  */
-public final class AuditHandler implements OutboxHandler {
+public final class AuditHandler implements OutboxTopicHandler {
 
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(5); // well below outbox.relay.batchTimeout
 
@@ -31,6 +34,11 @@ public final class AuditHandler implements OutboxHandler {
 
     public AuditHandler(URI baseUrl) {
         this.events = URI.create(baseUrl.toString().replaceAll("/+$", "") + "/events"); // keeps a base path
+    }
+
+    @Override
+    public Set<String> topics() {
+        return Set.of("audit");
     }
 
     @Override

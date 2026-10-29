@@ -1,6 +1,6 @@
 ---
 name: writing-outbox-handlers
-description: Use when writing or reviewing an OutboxHandler or an OutboxDeadLetterHandler (dead-letter hook) for dsudomoin/outbox (delivering outbox records to an HTTP API, another database or several targets, OutboxHandler.byTopic next to kafka.handler(), a wrapper around the Kafka handler), or when choosing outbox.relay.batchSize, batchTimeout or retry.maxAttempts for a slow target, or delivering concurrently inside handleBatch, or setting a record aside with Outcome.requeue so the rest of its key goes on (a running process of the same account blocks it). Also «свой обработчик outbox», «доставка из аутбокса в HTTP», «dead letters», «Retry-After», «отложить событие», «requeue», «хук dead letters», «DLQ», outbox.kafka.deadLetterTopic.
+description: Use when writing or reviewing an OutboxTopicHandler, TypedOutboxTopicHandler (with OutboxDeserializer), OutboxHandler or an OutboxDeadLetterHandler (dead-letter hook) for dsudomoin/outbox (delivering outbox records of some topics to an HTTP API, another database or several targets next to Kafka, decoding payloads to typed values, OutboxHandler.byTopic next to kafka.handler(), a wrapper around the Kafka handler), or when choosing outbox.relay.batchSize, batchTimeout or retry.maxAttempts for a slow target, or delivering concurrently inside handleBatch, or setting a record aside with Outcome.requeue so the rest of its key goes on (a running process of the same account blocks it). Also «свой обработчик outbox», «доставка из аутбокса в HTTP», «dead letters», «Retry-After», «отложить событие», «requeue», «хук dead letters», «DLQ», outbox.kafka.deadLetterTopic.
 ---
 
 # Writing outbox handlers
@@ -59,8 +59,23 @@ bound redrive loops with `letter.redrives()`; `active()` false (as `NONE`) keeps
 
 ## Wiring
 
-- One untagged handler: a factory returning exactly `OutboxHandler`, e.g.
-  `OutboxHandler.byTopic(Map.of("audit", new AuditHandler(url)), kafka.handler())`, injecting `KafkaOutboxSender`,
-  never `KafkaOutboxHandler` (Kora 1.2.23 then fails: «More than one component matches dependency type:
-  OutboxHandler (no tags)»).
+- A target for some topics is an `OutboxTopicHandler`: `topics()` (read once at build) plus `handle`, and
+  `handleBatch` as above. In Kora it is a plain `@Component`: `OutboxModule` collects every untagged one, no
+  factory, no `Map`, no tag. Without Kora: `OutboxRuntime.builder(config, tx, kafka.handler()).route(new
+  AuditHandler(url))`. Every other topic goes to the graph's one `OutboxHandler` (Kafka by default). Two handlers
+  claiming one topic, or one claiming none, fail the start naming the classes. Different topics are different
+  (topic, key) pairs: no order between them.
+- Do not make a per-topic target an `OutboxHandler` `@Component`: it replaces the Kafka handler, and next to another
+  one Kora 1.2.23 fails with «More than one component matches dependency type: OutboxHandler (no tags)».
+- Typed values: extend `TypedOutboxTopicHandler<T>`, constructor `(OutboxDeserializer<T> deserializer, ...)` calling
+  `super(Set.of("audit"), deserializer)`, override `handle(T value, OutboxRecord record)`. `value` is never null:
+  a null payload (tombstone) goes to `handleTombstone(record)`; override it if the topic carries them. Kotlin
+  declares `value: T` non-null. A `handleBatch` override decodes with `decode(record)` (null for a tombstone).
+- Deserializers: with `OutboxJsonModule`, every `@Json` class gets one from its `JsonReader`; an app's own
+  `OutboxDeserializer<T>` component wins for its `T`. Protobuf has no generic factory: declare
+  `OutboxDeserializer<Msg>` as `(topic, payload) -> Msg.parseFrom(payload)`. A String key: `record.keyAsString()`
+  (UTF-8, null if keyless).
+- Assembling by hand still works: a factory returning exactly `OutboxHandler`, e.g.
+  `OutboxHandler.byTopic(Map.of("audit", toAudit), kafka.handler())` with `toAudit` an `OutboxHandler`, injecting
+  `KafkaOutboxSender`, never `KafkaOutboxHandler`; keep it the only untagged `OutboxHandler` (same Kora error).
 - A wrapper around `kafka.handler()` delegates `handleBatch` too (else one acks=all round trip per record).

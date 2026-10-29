@@ -116,8 +116,9 @@ flowchart TD
   распределённые SQL-базы, где одну таблицу пишут несколько узлов, не поддерживаются, а split-brain двух primary ломает
   и бизнес-данные, и outbox. Данные, разнесённые по независимым кластерам Postgres (шардирование по базам), — это
   независимый outbox в каждой базе; порядок ключа сохраняется, если все его данные пишутся в одну базу.
-- **Несколько независимых relay для одной таблицы.** У одной таблицы outbox один набор курсоров и один обработчик на
-  граф приложения. Маршрутизируйте по топику внутри обработчика ([`byTopic`](#свой-обработчик)).
+- **Несколько независимых relay для одной таблицы.** У одной таблицы outbox один набор курсоров и одна доставка на
+  граф приложения. Разводите топики по целям обработчиками своих топиков (`OutboxTopicHandler`) или `byTopic`
+  ([Свой обработчик](#свой-обработчик)).
 
 Куда попадает сообщение: шард зависит только от пары (topic, key) и для ключа не меняется, физическая партиция outbox —
 только от xid транзакции-писателя (то есть от времени записи), а партицию Kafka по ключу выбирает партиционер Kafka.
@@ -453,8 +454,9 @@ interface App : HoconConfigModule, JdbcDatabaseModule, JsonModule,
     OutboxModule, OutboxJsonModule, KafkaOutboxModule, InboxModule
 ```
 
-- `OutboxModule` требует ровно один `OutboxHandler` в графе. `KafkaOutboxModule` даёт обработчик по умолчанию; ваш
-  собственный `OutboxHandler` его заменяет ([Свой обработчик](#свой-обработчик)).
+- `OutboxModule` берёт из графа все компоненты `OutboxTopicHandler`, каждый для своих топиков, и один `OutboxHandler`
+  для остальных. `KafkaOutboxModule` даёт `OutboxHandler` по умолчанию; ваш собственный его заменяет
+  ([Свой обработчик](#свой-обработчик)). Без обоих граф не стартует.
 - `InboxModule` без `OutboxModule` даёт сервису, который только потребляет, `Inbox` без обработчика и relay.
 - Метрики включаются, когда в графе есть Micrometer `MeterRegistry` (`MetricsModule` из Kora). Трассировка включается,
   когда в нём есть OpenTelemetry `Tracer` (`OpentelemetryTracingModule` из Kora).
@@ -626,6 +628,8 @@ class Orders(private val db: JdbcConnectionFactory, private val events: TypedOut
   `TypedOutbox` бросает `OutboxSerializationException`, а не отправляет случайный tombstone, который удалил бы ключ в
   compacted-топике. Сериализатор, бросивший исключение, приводит к тому же исключению. В обоих случаях ничего не
   записывается, и что делать дальше, решает ваша транзакция.
+- Обратная сторона — `TypedOutboxTopicHandler<T>` с `OutboxDeserializer<T>`, который `OutboxJsonModule` выводит из
+  `JsonReader` ([Типизированный обработчик](#свой-обработчик)).
 
 #### Protobuf: `ProtobufOutbox`
 
@@ -675,20 +679,35 @@ db.inTx(() -> {
 
 ### Свой обработчик
 
-Обработчик доставляет записи куда-то ещё: в HTTP API, в другую базу, в несколько целей. Реализуйте `OutboxHandler`:
+Обработчик доставляет записи куда-то ещё: в HTTP API, в другую базу, в несколько целей. Обработчик своих топиков
+реализует `OutboxTopicHandler`: relay отдаёт ему записи этих топиков, а все остальные — `OutboxHandler` графа (по
+умолчанию Kafka). `OutboxHandler` реализуют, когда один обработчик берёт все топики вместо Kafka.
 
 ```java
-public interface OutboxHandler {
-    void handle(OutboxRecord record) throws Exception;          // одна запись
+public interface OutboxTopicHandler {
+    Set<String> topics();                                          // свои топики, читаются один раз при сборке
+    void handle(OutboxRecord record) throws Exception;             // одна запись
     default List<Outcome> handleBatch(List<OutboxRecord> records); // по одному Outcome на запись, в том же порядке
+}
+
+public interface OutboxHandler {
+    void handle(OutboxRecord record) throws Exception;
+    default List<Outcome> handleBatch(List<OutboxRecord> records);
     static boolean windDownRequested();
     static OutboxHandler byTopic(Map<String, OutboxHandler> routes, OutboxHandler fallback);
 }
 ```
 
+`handle` и `handleBatch` у них ведут себя одинаково, и всё ниже относится к обоим. В Kora хватает `@Component`:
+`OutboxModule` сам собирает все компоненты `OutboxTopicHandler`, без фабрики и тегов. `OutboxTopicHandler` намеренно
+не наследует `OutboxHandler`: иначе каждый такой компонент был бы ещё одним `OutboxHandler` без тега, и Kora 1.x не
+собрала бы граф.
+
 `OutboxRecord` несёт `id`, `messageId`, `topic`, `key`, `payload`, `headers`, `createdAt`, `attempts` (число
 предыдущих неудачных попыток), `requeues` (сколько раз запись уже откладывали через `Outcome.requeue()`) и `shard`
 (шард, из которого relay её прочитал; `-1`, если неизвестен: запись собрана вручную или восстановлена из dead letter).
+`keyAsString()` возвращает ключ в UTF-8, как его пишут `TypedOutbox` и `OutboxMessage.of(topic, String key, …)`, и
+`null` для записи без ключа.
 
 **`handle`: простая форма.** Доставьте одну запись и верните управление. Для записи, которая никогда не сможет пройти,
 бросьте `OutboxPermanentException`: она переносится в dead-таблицу, а её ключ продолжает со следующего сообщения.
@@ -714,12 +733,17 @@ public interface AuditClient {
 }
 
 @Component
-public final class AuditHandler implements OutboxHandler {
+public final class AuditHandler implements OutboxTopicHandler {
 
     private final AuditClient client;
 
     public AuditHandler(AuditClient client) {
         this.client = client;
+    }
+
+    @Override
+    public Set<String> topics() {
+        return Set.of("audit"); // остальные топики идут в Kafka
     }
 
     @Override
@@ -742,6 +766,48 @@ httpClient.audit {
   requestTimeout = 5s # таймаут чтения в Kora по умолчанию 2 мин: намного больше outbox.relay.batchTimeout
 }
 ```
+
+**Типизированный обработчик: `TypedOutboxTopicHandler<T>`.** Обратная сторона `TypedOutbox<T>`: payload декодирует
+`OutboxDeserializer<T>`, обработчик получает значение.
+
+```java
+@Json
+public record AuditEvent(String userId, String action) {}
+
+@Component
+public final class AuditEventsHandler extends TypedOutboxTopicHandler<AuditEvent> {
+
+    private final AuditLog log;
+
+    public AuditEventsHandler(OutboxDeserializer<AuditEvent> deserializer, AuditLog log) {
+        super(Set.of("audit-events"), deserializer);
+        this.log = log;
+    }
+
+    @Override
+    protected void handle(AuditEvent event, OutboxRecord record) {
+        log.append(record.messageId(), event.userId(), event.action());
+    }
+}
+```
+
+```kotlin
+@Component
+class AuditEventsHandler(deserializer: OutboxDeserializer<AuditEvent>, private val log: AuditLog) :
+    TypedOutboxTopicHandler<AuditEvent>(setOf("audit-events"), deserializer) {
+    override fun handle(value: AuditEvent, record: OutboxRecord) {
+        log.append(record.messageId(), value.userId, value.action)
+    }
+}
+```
+
+- С `OutboxJsonModule` десериализатор класса с `@Json` выводится из его `JsonReader`; ваш собственный компонент
+  `OutboxDeserializer<T>` важнее шаблона для своего `T`, как и сериализатор. Для protobuf общей фабрики нет (у каждого
+  типа свой парсер): объявите фабрику `OutboxDeserializer<OrderEvent>`, возвращающую
+  `(topic, payload) -> OrderEvent.parseFrom(payload)`. Без Kora десериализатор передаётся в конструктор.
+- `value` никогда не `null`. Запись с payload `null` (tombstone) идёт в `handleTombstone(record)`: переопределите его,
+  если топик их несёт. Поэтому и в Kotlin параметр объявляется ненулевым.
+- Переопределённый `handleBatch` получает значение через `decode(record)` (`null` для tombstone).
 
 **`handleBatch`: быстрая форма.** Переопределите его, чтобы доставлять много записей за один round trip, как это
 делает обработчик Kafka. Контракт:
@@ -790,11 +856,12 @@ httpClient.audit {
   записи, чей ключ уже дал сбой раньше в этом вызове, не откладывает её: она встаёт в retry-таблицу за сбойной
   записью. Вызов, после которого шард встаёт на паузу, ничего не откладывает: эти записи придут снова.
 - `handleBatch` по умолчанию никогда не возвращает `requeue`: обработчик, которому он нужен, переопределяет
-  `handleBatch`. `byTopic` передаёт `requeue` маршрута дальше, как любой outcome.
+  `handleBatch`. Маршрутизация по топикам (`OutboxTopicHandler`, `byTopic`) передаёт `requeue` дальше, как любой
+  outcome.
 
 ```java
 @Component
-public final class AccountJobsHandler implements OutboxHandler {
+public final class AccountJobsHandler implements OutboxTopicHandler {
 
     // столько раз отложена — дальше в dead letters; предел по времени вместо числа:
     // Duration.between(record.createdAt(), Instant.now()) больше порога → Outcome.permanent
@@ -809,12 +876,17 @@ public final class AccountJobsHandler implements OutboxHandler {
     }
 
     @Override
+    public Set<String> topics() {
+        return Set.of("account-jobs");
+    }
+
+    @Override
     public void handle(OutboxRecord record) throws Exception {
         jobs.start(record);
     }
 
     @Override
-    public List<Outcome> handleBatch(List<OutboxRecord> records) { // один топик, ключ = id счёта
+    public List<Outcome> handleBatch(List<OutboxRecord> records) { // ключ = id счёта
         var outcomes = new ArrayList<Outcome>(records.size());
         var failedKeys = new HashSet<ByteBuffer>();
         var heldTypes = new HashMap<ByteBuffer, Set<String>>(); // по ключу: типы задач, придержанные в этом вызове
@@ -869,35 +941,48 @@ FEE_RELEASE#2 обгонит отложенную FEE_RELEASE#1, если бло
   HTTP-клиент Kora на транспорте JDK оборачивает `InterruptedException`, не восстанавливая флаг).
 - От вызова, который всё ещё выполняется по истечении `batchTimeout`, relay отказывается, и все его записи
   повторяются, включая доставленные.
-- Поэтому держите таймауты на одну запись (таймауты HTTP-запросов, собственные таймауты каждого маршрута `byTopic`)
+- Поэтому держите таймауты на одну запись (таймауты HTTP-запросов, собственные таймауты каждого обработчика топиков)
   заметно ниже `batchTimeout`, а `batchSize ×` время на запись — тоже ниже него (если обработчик откладывает записи,
   вызов несёт до `2 × batchSize`).
 - Вызов, который игнорирует прерывания и переживает `batchTimeout`, удерживает свой поток. У каждого инстанса
   `max(4, 2 × workers)` потоков обработчика. Когда заняты все потоки инстанса, этот инстанс пропускает свои шарды с
   растущим backoff, пока эти вызовы не вернутся; другие инстансы забирают шарды через `relay.retry.initialDelay`.
 
-**Несколько целей: `byTopic`.** Один обработчик на граф; маршрутизируйте внутри него. С `KafkaOutboxModule` фабрика,
-объявленная ровно как `OutboxHandler`, заменяет обработчик Kafka по умолчанию:
+**Несколько целей.** Каждой цели — свой `OutboxTopicHandler`; топики, которые не забрал ни один, уходят в
+`OutboxHandler` графа (Kafka). В Kora это просто компоненты: ни фабрики, ни `Map`, ни тегов, и список параметров не
+растёт с каждым обработчиком:
 
 ```java
 @KoraApp
 public interface App extends HoconConfigModule, JdbcDatabaseModule, JdkHttpClientModule, OutboxModule,
-        KafkaOutboxModule {
+        KafkaOutboxModule {}
 
-    default OutboxHandler outboxHandler(KafkaOutboxSender kafka, AuditClient audit) {
-        return OutboxHandler.byTopic(Map.of("audit", new AuditHandler(audit)), kafka.handler());
-    }
-}
+@Component
+public final class AuditHandler implements OutboxTopicHandler { ... }   // topics(): "audit"
+
+@Component
+public final class BillingHandler implements OutboxTopicHandler { ... } // topics(): "billing", "invoices"
 ```
 
-- `byTopic` передаёт каждому маршруту его записи в исходном порядке и расставляет outcome обратно по местам. Маршрут,
-  который бросил исключение или вернул некорректный список, получает `Retry` только для своих записей; `Error` проваливает
-  весь вызов. Маршруты выполняются один за другим, поэтому маршрут, игнорирующий сворачивание, держит весь вызов до
-  `batchTimeout`.
-- Пусть это будет единственный компонент `OutboxHandler` без тега. Создавайте вложенные обработчики внутри фабрики, как
-  выше (тогда `AuditHandler` сам не должен быть `@Component`), или помечайте их тегом (`@Tag(Audit.class)`); иначе
-  Kora 1.x валит сборку с «More than one component matches dependency type: OutboxHandler». Внедряйте
-  `KafkaOutboxSender`, а не `KafkaOutboxHandler`.
+- Маршрутизирует `OutboxHandler.byTopic`: каждый обработчик получает свои записи в исходном порядке, одним вызовом на
+  все свои топики, и outcome встают обратно по местам. Обработчик, который бросил исключение или вернул некорректный
+  список, получает `Retry` только для своих записей; `Error` проваливает весь вызов. Обработчики выполняются один за
+  другим, поэтому тот, что игнорирует сворачивание, держит весь вызов до `batchTimeout`.
+- Два обработчика с общим топиком или обработчик без топиков валят старт и называют классы.
+- Записи разных топиков (и ключей) идут в разных шардах, поэтому порядка между ними нет, как и раньше.
+- Ручная сборка через `byTopic(routes, fallback)` работает по-прежнему: фабрика, объявленная ровно как `OutboxHandler`,
+  заменяет обработчик Kafka по умолчанию:
+
+  ```java
+  default OutboxHandler outboxHandler(KafkaOutboxSender kafka, AuditClient audit) {
+      OutboxHandler toAudit = record -> audit.post(record.messageId().toString(), record.payload());
+      return OutboxHandler.byTopic(Map.of("audit", toAudit), kafka.handler());
+  }
+  ```
+
+  Пусть это будет единственный компонент `OutboxHandler` без тега. Создавайте вложенные обработчики внутри фабрики,
+  как выше, или помечайте их тегом (`@Tag(Audit.class)`); иначе Kora 1.x валит сборку с «More than one component
+  matches dependency type: OutboxHandler». Внедряйте `KafkaOutboxSender`, а не `KafkaOutboxHandler`.
 - Класс с `@Component`, реализующий `OutboxHandler`, тоже заменяет обработчик по умолчанию.
 - Декоратор вокруг `kafka.handler()` (логирование, метрики) должен делегировать не только `handle`, но и
   `handleBatch`. Иначе `handleBatch` по умолчанию отправляет по одной записи за round trip и превращает `NotAttempted`
@@ -1104,8 +1189,18 @@ var runtime = OutboxRuntime.builder(config, new JdbcTransactions(appDataSource),
 
 ### Обработчик, Kafka и dead letters
 
-- Свой обработчик реализует `OutboxHandler` ([Свой обработчик](#свой-обработчик)). Несколько целей разводит
-  `OutboxHandler.byTopic(routes, fallback)`.
+- Обработчик своих топиков реализует `OutboxTopicHandler`, обработчик всех топиков — `OutboxHandler`
+  ([Свой обработчик](#свой-обработчик)). `route` ставит обработчики топиков перед обработчиком из `builder(...)`, а
+  тот получает остальные топики; два `route` с общим топиком валят `build()`. Обработчик из `builder(...)` может быть
+  `null`, если есть хотя бы один `route`:
+
+```java
+var runtime = OutboxRuntime.builder(config, transactions, sender.handler())
+        .route(new AuditHandler(auditClient))
+        .route(new AuditEventsHandler((topic, payload) -> json.readValue(payload, AuditEvent.class), auditLog))
+        .build();
+```
+
 - Kafka — `KafkaOutboxSender` из `outbox-kafka`; его `handler()` и есть обработчик:
 
 ```java
@@ -2825,7 +2920,8 @@ class OrdersTest implements KoraAppTestConfigModifier {
 - `partitions { xidsPerPartition = 1000000, premake = 4 }` ускоряет bootstrap новой таблицы (6 партиций вместо 66).
 - Чтобы проверять доставленное без Kafka, дайте тестовому графу собственный обработчик: тестовый `@KoraApp`, фабрика
   `OutboxHandler` которого возвращает обработчик, запоминающий записи, заменяет обработчик Kafka по умолчанию (с
-  `KafkaOutboxModule` действует правило из раздела [Свой обработчик](#свой-обработчик)).
+  `KafkaOutboxModule` действует правило из раздела [Свой обработчик](#свой-обработчик)). Компоненты
+  `OutboxTopicHandler` при этом по-прежнему получают свои топики.
 - С `relay.enabled = true` доставка асинхронная (вскоре после коммита); опрашивайте результат, а не ждите через sleep.
 - Массовым тестам с множеством различных ключей нужен увеличенный `max_locks_per_transaction` в тестовом контейнере
   (`withCommand("postgres", "-c", "max_locks_per_transaction=256")`).
@@ -2972,8 +3068,8 @@ retry и dead пусты. Прогон на более ранней версии
 
 ## Известные ограничения
 
-- Один relay (один набор курсоров, один обработчик) на таблицу outbox; раздавайте сообщения по разным целям через
-  `byTopic` или дальше по цепочке.
+- Один relay (один набор курсоров, одна доставка) на таблицу outbox; раздавайте сообщения по разным целям
+  обработчиками своих топиков (`OutboxTopicHandler`, `byTopic`) или дальше по цепочке.
 - Решардинг требует остановить все инстансы и дать relay доставить всё. Регрессия xid больше `outbox.recovery.maxRows`
   строк (или в режиме `halt`) ждёт вызова `recoverXidRegression`, а непустой диапазон, отсоединённый не библиотекой, и
   непустая таблица `<base>_o<цифры>`, отложенная восстановлением, — вызова `restoreOrphan`.
@@ -3019,8 +3115,10 @@ retry и dead пусты. Прогон на более ранней версии
 |---|---|---|
 | `OutboxTransactions`, `ConnectionSource` | `outbox-core` | Транзакции приложения, соединения outbox и роли-владельца ([Без Kora](#без-kora)) |
 | `OutboxHandler` | `outbox-core` | Доставка ([Свой обработчик](#свой-обработчик)) |
+| `OutboxTopicHandler`, `TypedOutboxTopicHandler` | `outbox-core` | Доставка своих топиков ([Свой обработчик](#свой-обработчик)) |
 | `OutboxDeadLetterHandler` | `outbox-core` | Решения о dead letters ([Dead letters](#dead-letters)) |
 | `OutboxSerializer` | `outbox-core` | Payload для `TypedOutbox` |
+| `OutboxDeserializer` | `outbox-core` | Значение из payload для `TypedOutboxTopicHandler` |
 | `OutboxTelemetry` с `Enqueue`, `RelayStep`, `Delivery` | `outbox-core` | Метрики и трассы ([Телеметрия как SPI](#телеметрия-как-spi)) |
 | `OutboxConfig` и вложенные `…Config` | `outbox-core` | Настройки ([Справочник по конфигурации](#справочник-по-конфигурации)) |
 | `KafkaOutboxConfig` | `outbox-kafka` | Настройки Kafka |
@@ -3061,7 +3159,7 @@ record (`case OutboxRecord(var id, ...)`) должны добавить новы
 | Скилл | Когда агент его загружает |
 |---|---|
 | `using-outbox` | Подключение, настройка и отправка; версии, роль в базе и схема в миграциях, соединения, топики Kafka перед деплоем |
-| `writing-outbox-handlers` | Свой `OutboxHandler`, `byTopic`, `batchSize` и `batchTimeout` под медленную цель, dead letters, `Outcome.requeue` |
+| `writing-outbox-handlers` | Свой `OutboxTopicHandler` или `OutboxHandler`, типизированный обработчик, `byTopic`, `batchSize` и `batchTimeout` под медленную цель, dead letters, `Outcome.requeue` |
 | `consuming-with-outbox-inbox` | Потребитель с `Inbox`: дедупликация, scope, записи без заголовка `outbox-message-id` |
 | `testing-outbox` | Интеграционные тесты с Testcontainers и `OutboxRelay.drain()`, тесты, не проверяющие доставку |
 | `operating-outbox` | Метрики, алерты, dead letters, процедуры восстановления, решардинг, деплои, медленная доставка в Kafka после слишком большой записи |

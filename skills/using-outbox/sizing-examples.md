@@ -220,8 +220,8 @@ kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic imports --partition
 **Assumptions:**
 
 - 3 instances.
-- An HTTP audit target with p99 300 ms (2 s in the worst variant) per record, routed with
-  `OutboxHandler.byTopic(Map.of("audit", auditHandler), kafka.handler())`.
+- An HTTP audit target with p99 300 ms (2 s in the worst variant) per record: an `OutboxTopicHandler` component
+  claiming `audit`; every other topic goes to Kafka.
 - Orders go to Kafka as in profile 2.
 
 ```hocon

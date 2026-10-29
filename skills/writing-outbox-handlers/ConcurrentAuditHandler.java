@@ -1,6 +1,7 @@
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
+import io.github.dsudomoin.outbox.OutboxTopicHandler;
 import io.github.dsudomoin.outbox.Outcome;
 import java.io.IOException;
 import java.net.URI;
@@ -14,6 +15,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -24,12 +26,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
- * POSTs audit records concurrently, at most IN_FLIGHT per handleBatch call; the rules it follows are in
- * concurrent-delivery.md. Not a @Component: build it inside the app's one OutboxHandler factory, e.g.
- * OutboxHandler.byTopic(Map.of("audit", new ConcurrentAuditHandler(url)), kafka.handler()). For Retry-After see
- * AuditHandler.java.
+ * POSTs the records of topic "audit" concurrently, at most IN_FLIGHT per handleBatch call; the rules it follows are in
+ * concurrent-delivery.md. Wired as AuditHandler.java is (a @Component in Kora, builder.route(...) without); for
+ * Retry-After see there.
  */
-public final class ConcurrentAuditHandler implements OutboxHandler {
+public final class ConcurrentAuditHandler implements OutboxTopicHandler {
 
     static final int IN_FLIGHT = 200;   // P per call: the target sees up to min(shards, instances × workers) × P
     static final int PROBES = 3;        // requests a call starts while the target looks down
@@ -42,6 +43,11 @@ public final class ConcurrentAuditHandler implements OutboxHandler {
 
     public ConcurrentAuditHandler(URI baseUrl) {
         this.events = URI.create(baseUrl.toString().replaceAll("/+$", "") + "/events");
+    }
+
+    @Override
+    public Set<String> topics() {
+        return Set.of("audit");
     }
 
     @Override
