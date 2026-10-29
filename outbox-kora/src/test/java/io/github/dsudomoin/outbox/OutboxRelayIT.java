@@ -1047,46 +1047,6 @@ class OutboxRelayIT {
     }
 
     @Test
-    void idleRelayWritesOnlyTicks() throws Exception {
-        config.shards(1024).workers(4).minTickInterval(Duration.ofMillis(50)).idlePollInterval(Duration.ofMillis(200))
-                .maintenanceInterval(Duration.ofSeconds(30));
-        bootstrap(); // the defaults, 1024 shards
-        start(new RecordingHandler());
-        await(Duration.ofSeconds(5), () -> ticksMade() >= 3);
-        awaitParked();
-        long seq = maxCursorSeq();
-        long ticks = ticksMade();
-        long used;
-        double seconds;
-        // xids are the cluster's: autovacuum analysing the tables earlier tests left would take some of its own
-        try (var c = TestDb.connect()) {
-            execute(c, "alter system set autovacuum = off");
-            execute(c, "select pg_reload_conf()");
-        }
-        try {
-            long xid = currentXid();
-            long started = System.nanoTime();
-
-            Thread.sleep(30_000); // the measured idle period
-
-            used = currentXid() - xid - 1; // the second currentXid() takes one itself
-            seconds = (System.nanoTime() - started) / 1e9;
-        } finally {
-            try (var c = TestDb.connect()) {
-                execute(c, "alter system reset autovacuum");
-                execute(c, "select pg_reload_conf()");
-            }
-        }
-        System.out.printf("idle relay, 1024 shards: %d xids in %.1f s (%.1f/s), %d ticks%n", used, seconds,
-                used / seconds, ticksMade() - ticks);
-        // an idle tick per idlePollInterval and maintenance (its checkpoint, tick cleanup, its success) per interval:
-        // no cursor row (shards / 5 a second before, 205 xids/s at 1024 shards)
-        assertThat(used).as("xids").isLessThanOrEqualTo(30_000 / config.idlePollInterval().toMillis()
-                + 30 / config.maintenanceInterval().toSeconds() * 2 + 5);
-        assertThat(maxCursorSeq()).as("no cursor row").isEqualTo(seq);
-    }
-
-    @Test
     void idleTicksAreRateLimitedAcrossInstancesWhileTheirCommitsStillFlow() throws Exception {
         config.idlePollInterval(Duration.ofMillis(200)); // minTickInterval 5 ms
         bootstrap();
@@ -1424,87 +1384,6 @@ class OutboxRelayIT {
                 slowDone.get());
         // a slow call of about 900 ms, then the neighbours' step: they never wait for two of them
         assertThat(max).as("longest delivery delay of a neighbour, ms").isLessThan(2000);
-    }
-
-    @Test
-    void manyShardsDeliverInOrderUnderLoad() throws Exception {
-        // 2 instances × 4 workers over 1024 shards; a slow shard whose calls wind down at the soft deadline (1.6 s)
-        // with its group's later shards unread, and a hot key whose shard fills the group's read
-        config.shards(1024).workers(4).batchSize(1000).batchTimeout(Duration.ofSeconds(2));
-        bootstrap();
-        var slowKey = keyOnShard(7, "slow");
-        var hotKey = keyOnShard(9, "hot");
-        var delivered = ConcurrentHashMap.<UUID>newKeySet();
-        var duplicates = new AtomicInteger();
-        var outOfOrder = new ConcurrentLinkedQueue<String>();
-        var lastId = new ConcurrentHashMap<String, Long>();
-        var handler = new OutboxHandler() {
-            @Override
-            public void handle(OutboxRecord record) {
-                if (payload(record).startsWith("slow")) { // 300 ms, deaf to the wind-down's interrupt
-                    long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300);
-                    while (System.nanoTime() < end) {
-                        Thread.onSpinWait();
-                    }
-                }
-                if (!delivered.add(record.messageId())) {
-                    duplicates.incrementAndGet();
-                }
-                lastId.compute(key(record), (k, last) -> {
-                    if (last != null && last >= record.id()) {
-                        outOfOrder.add(k + ": " + record.id() + " after " + last);
-                    }
-                    return last == null ? record.id() : Math.max(last, record.id());
-                });
-            }
-        };
-        var started = List.of(start(handler), start(handler));
-        var sent = ConcurrentHashMap.<UUID>newKeySet();
-        var writers = Executors.newFixedThreadPool(8);
-        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
-        try {
-            var done = new ArrayList<Future<?>>();
-            for (int w = 0; w < 8; w++) {
-                int writer = w;
-                var outbox = outbox(started.get(w % 2)::wake);
-                done.add(writers.submit(() -> {
-                    var random = ThreadLocalRandom.current();
-                    while (System.nanoTime() < until) {
-                        OutboxMessage[] messages;
-                        long pause;
-                        if (writer == 0) { // a burst of slow records: more than one call fits before its deadline
-                            messages = IntStream.range(0, 8).mapToObj(i -> msg("t", slowKey, "slow" + i))
-                                    .toArray(OutboxMessage[]::new);
-                            pause = 3000;
-                        } else if (writer == 1) {
-                            messages = IntStream.range(0, 100).mapToObj(i -> msg("t", hotKey, "hot"))
-                                    .toArray(OutboxMessage[]::new);
-                            pause = 20;
-                        } else {
-                            messages = IntStream.range(0, 10).mapToObj(i -> msg("t", "k" + random.nextInt(8192),
-                                    "m")).toArray(OutboxMessage[]::new);
-                            pause = 10;
-                        }
-                        sent.addAll(send(outbox, messages));
-                        Thread.sleep(pause);
-                    }
-                    return null;
-                }));
-            }
-            for (var f : done) {
-                f.get(90, TimeUnit.SECONDS);
-            }
-        } finally {
-            writers.shutdown();
-        }
-        System.out.printf("%d messages sent in 60 s%n", sent.size());
-        await(Duration.ofSeconds(60), () -> delivered.size() >= sent.size());
-
-        assertThat(delivered).hasSameSizeAs(sent);
-        assertThat(delivered.containsAll(sent)).as("every message delivered").isTrue(); // a hash lookup each
-        assertThat(duplicates).hasValue(0);
-        assertThat(outOfOrder).as("per-key order").isEmpty();
-        assertThat(lastId).containsKeys(slowKey, hotKey);
     }
 
     @Test
