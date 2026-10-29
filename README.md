@@ -3041,11 +3041,11 @@ record (`case OutboxRecord(var id, ...)`) должны добавить новы
 
 | Скилл | Когда агент его загружает |
 |---|---|
-| `using-outbox` | Подключение, настройка и отправка; роль в базе, соединения, топики Kafka перед деплоем |
+| `using-outbox` | Подключение, настройка и отправка; версии, роль в базе и схема в миграциях, соединения, топики Kafka перед деплоем |
 | `writing-outbox-handlers` | Свой `OutboxHandler`, `byTopic`, `batchSize` и `batchTimeout` под медленную цель, dead letters, `Outcome.requeue` |
 | `consuming-with-outbox-inbox` | Потребитель с `Inbox`: дедупликация, scope, записи без заголовка `outbox-message-id` |
 | `testing-outbox` | Интеграционные тесты с Testcontainers и `OutboxRelay.drain()`, тесты, не проверяющие доставку |
-| `operating-outbox` | Метрики, алерты, dead letters, процедуры восстановления, решардинг, деплои |
+| `operating-outbox` | Метрики, алерты, dead letters, процедуры восстановления, решардинг, деплои, медленная доставка в Kafka после слишком большой записи |
 
 **Claude Code.** Репозиторий — маркетплейс с одним плагином `outbox`:
 

@@ -1,6 +1,6 @@
 ---
 name: operating-outbox
-description: Use when monitoring, alerting on, sizing or troubleshooting dsudomoin/outbox in a running Kora service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, dead letters and the dead-letter hook, the admin API (OutboxAdmin, outbox-admin-kora, /kora-outbox/admin/v1), redrive or discard, tail overflow, orphaned partitions, stranded shards, «outbox relay halted» or «xid regression detected», outbox.shards and the emergency reshard, «refuses this write», rolling deploys, upgrades and rollback to the previous release, pg_dump/restore or failover. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox», «админка outbox».
+description: Use when monitoring, alerting on, sizing or troubleshooting dsudomoin/outbox in a running Kora service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, dead letters and the dead-letter hook, the admin API (OutboxAdmin, outbox-admin-kora, /kora-outbox/admin/v1), redrive or discard, tail overflow, orphaned partitions, stranded shards, «outbox relay halted» or «xid regression detected», outbox.shards and the emergency reshard, «refuses this write», rolling deploys, upgrades and rollback to the previous release, pg_dump/restore or failover, Kafka delivery slow after RecordTooLargeException or an expired batch. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox», «админка outbox».
 ---
 
 # Operating outbox
@@ -57,4 +57,9 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
   this release created it); then list the window's `kept` dead letters.
 - «Репликация, failover и PITR»: async failover may deliver events whose data is gone; PITR redelivers.
 - `relay.retry.maxAttempts = 0` (default): a key stuck on a broken target shows as lag only.
+- Kafka records slower for up to 10 min after a call expired or was cut, often with a `RecordTooLargeException` dead
+  letter («Требования к Kafka»): on kafka-clients ≤ 4.1 an oversized record shared a producer batch, and the sender
+  resends its batch-mates unbatched. Nothing is lost; fix the cause with `batch.size` ≤ the topic's
+  `max.message.bytes`, or kafka-clients 4.2+.
+- Upgrades: Postgres 14+ (13 fails at startup), Kora 1.2.23+ (using-outbox).
 - Writers' timeouts: ≥ 300 ms by day, ≥ `tailConversion.maxStall` + 300 ms at night.

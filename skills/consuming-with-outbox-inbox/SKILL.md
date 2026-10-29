@@ -63,6 +63,9 @@ replay to cover; change it and `partitionInterval` on all instances at once.
 
 ## Wiring and database
 
-Consume-only service: `InboxModule` alone, no `OutboxModule`, no handler. The library creates the inbox table: the
-DB role needs `CREATE` and ownership, a direct or session-mode connection (no transaction pooling), and the same
-`outbox.inbox.table` on every instance.
+Consume-only service: `InboxModule` alone, no `OutboxModule`, no handler. By default the library creates the inbox
+table: the DB role needs `CREATE` and ownership. With migrations (`outbox.schema.bootstrap = false`, the output of
+`OutboxSql.inbox(config, "<app role>")` in a Flyway or Liquibase migration) the app role is DML-only and a
+`JdbcDatabase` tagged `@Tag(OutboxOwner.class)` owns the table (using-outbox, `config-reference.md`). Either way:
+direct or session-mode connections (no transaction pooling), Postgres 14+, and the same `outbox.inbox.table` on every
+instance.

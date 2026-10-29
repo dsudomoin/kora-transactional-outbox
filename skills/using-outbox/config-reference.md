@@ -41,7 +41,7 @@ outbox {
 | Key | Default | Rule and meaning |
 |---|---|---|
 | `initialDelay` | `1s` | > 0. First backoff of a failed key and of a paused shard; doubles per failure. |
-| `maxDelay` | `5m` | ≥ `initialDelay`. Backoff ceiling. |
+| `maxDelay` | `5m` | ≥ `initialDelay`. Backoff ceiling. With Kafka keep it under 10 min: a record kept for an unbatched resend is forgotten after 10 min, and a later retry goes back into a shared batch (below, «Oversized records»). |
 | `maxAttempts` | `0` | ≥ 0. After this many failed attempts a record moves to `<table>_dead`. `0` = retry forever. `NotAttempted` does not count. Global, Kafka included: a dead-lettered record lets the later records of its key go on, so with ordered topics keep 0 and bound a slow route in its handler (`record.attempts()`, writing-outbox-handlers). |
 
 ## `outbox.relay.requeue`
@@ -151,5 +151,18 @@ not `{topic}` alone. Behaviour and duplicates: writing-outbox-handlers, `dead-le
 | Forced | `enable.idempotence=true`, `acks=all`, byte-array key and value serializers |
 | Rejected | `transactional.id`; `partitioner.class`; `partitioner.ignore.keys=true`; `acks` other than `all`/`-1`; `enable.idempotence=false`; `max.in.flight.requests.per.connection` > 5; `delivery.timeout.ms` < `linger.ms + request.timeout.ms`; anything Kafka's `ProducerConfig` rejects |
 | Defaults when unset | `delivery.timeout.ms=20000`, then (only if that was unset) `request.timeout.ms=15000`; `max.block.ms=5000`; `enable.metrics.push=false` |
+
+**Outcomes.** `RecordTooLargeException`, `InvalidRecordException` (a null key on a compacted topic among them) and
+`InvalidTopicException` are permanent (dead letters); everything else, authorization errors included, retries.
+
+**Oversized records.** The broker refuses a whole producer batch that holds a record over the topic's
+`max.message.bytes`. kafka-clients 4.2+ split it until that record is alone and refused: permanent. kafka-clients
+≤ 4.1 rebuild the same batch until `delivery.timeout.ms`, and every record in it times out. The sender handles both:
+records still unacked when their batch expired or the relay cut the call (80 % of `batchTimeout`) are remembered by
+message id (up to 10 000, each until a call delivers or refuses it, at most 10 min), and a call holding one goes
+through a second producer with `batch.size=0`, where the oversized record is refused alone and its key goes on. What
+remains on ≤ 4.1: the first call waits for the expiry or the cut, and calls with remembered records are slower
+(about 0.2 s per 1 000 records instead of 0.02 s on a local stand). Keep `batch.size` ≤ the topic's
+`max.message.bytes` and `relay.retry.maxDelay` < 10 min.
 
 Producer client metrics are not bound to Micrometer; they are visible through JMX only.

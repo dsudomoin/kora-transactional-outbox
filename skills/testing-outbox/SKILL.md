@@ -10,12 +10,17 @@ description: Use when writing or fixing tests of a Kora 1.x service that uses ds
 If the test does not assert delivery, its config contains `outbox.relay.enabled = false`. Otherwise each such test
 starts relay workers and Kafka producers against a broker that is not there. Keep
 `outbox.kafka.driverProperties."bootstrap.servers"` set (it is validated at startup; with the relay off nothing
-connects). Add `outbox.partitions { xidsPerPartition = 1000000, premake = 4 }`: bootstrap then creates 6 partitions
+connects). Add `outbox.partitions { xidsPerPartition = 1000000, premake = 4 }`: startup then creates 6 partitions
 instead of 66.
+
+With `outbox.schema.bootstrap = false` startup checks the base tables instead of creating them: run the service's
+own migrations against the container before the graph starts (do not switch bootstrap on in tests, it hides a broken
+migration). Partitions stay the library's, so the settings above still apply. An `@Tag(OutboxOwner.class)` database
+needs its own config section pointing at the same container.
 
 ## Delivery test: required parts
 
-1. Postgres 16+ Testcontainer (no H2). Bulk tests with many distinct keys:
+1. Postgres Testcontainer of the production major, 14 or newer (no H2). Bulk tests with many distinct keys:
    `.withCommand("postgres", "-c", "max_locks_per_transaction=256")`.
 2. Kafka Testcontainer with `KAFKA_AUTO_CREATE_TOPICS_ENABLE=false`, and the topic created with `Admin` **before**
    anything is sent. Auto-create hides a missing deploy step, and a failed send waits in `<table>_retry` for its
