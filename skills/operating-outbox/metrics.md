@@ -23,7 +23,7 @@ README «Наблюдаемость» → «Контракт по этапам»
 | `outbox.messages.failed` | counter | `topic`, `outcome` = `retry` / `dead` | Records diverted to (or failing again in) the retry table, and records moved to dead letters. |
 | `outbox.messages.requeued` | counter | `topic` | Records the handler set aside with `Outcome.requeue()`, every requeue counted. Not a failure; the requeue past `relay.requeue.maxRequeues` counts as `failed{outcome="dead"}` instead. |
 | `outbox.delivery.delay` | timer, percentile histogram | `topic` | Row insert to delivered outcome; buckets 1 ms to 6 h (about 110 bucket series per topic). |
-| `outbox.batch.duration` | timer, percentile histogram | | One shard step that wrote a cursor row. |
+| `outbox.batch.duration` | timer, percentile histogram | | One relay step that found work in at least one of its locked shards; one step may cover several shards. Steps without work are not timed. |
 | `outbox.shard.paused` | counter | | Shard pauses: target down, failing head, no free handler thread. |
 | `outbox.relay.failures` | counter | | Relay failures it logs at WARN: a pass failing outside a step (tick, cursor read, connection, a lost one included) and a rolled-back single-shard step. Not a multi-shard step redone shard by shard, not maintenance, heartbeat, the dead-letter pass or failures while stopping. |
 | `outbox.shard.lag` | gauge, seconds | | How far the slowest shard's tick is behind the latest tick. |

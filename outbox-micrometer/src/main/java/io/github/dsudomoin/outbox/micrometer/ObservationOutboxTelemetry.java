@@ -390,9 +390,12 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
          * clear. Only W3C counts: a record with a sampled, missing or malformed {@code traceparent}, or with another
          * format's headers only, is always observed. A record not observed is handed to the handler with its stored
          * headers, so downstream consumers keep its trace, but the handler's code for it runs without that trace
-         * context current. A meter handler's {@code outbox.deliver} timer then counts only the observed records; the
-         * {@link OutboxMetrics} meters count every record. Skipping cuts the per-record cost of Observation on the
-         * relay thread when most traces are not sampled.
+         * context current: on a relay handler thread nothing is current unless something carries context into that
+         * pool (an agent, say), and then it is the relay step's, which an instrumented client inside the handler would
+         * write instead. The library's Kafka sender sends the stored headers either way. A meter handler's
+         * {@code outbox.deliver} timer then counts only the observed records; the {@link OutboxMetrics} meters count
+         * every record. Skipping cuts the per-record cost of Observation on the relay thread when most traces are not
+         * sampled.
          */
         public Builder observeUnsampled(boolean observe) {
             this.observeUnsampled = observe;
