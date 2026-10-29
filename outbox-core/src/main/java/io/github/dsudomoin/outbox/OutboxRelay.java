@@ -191,7 +191,13 @@ public final class OutboxRelay implements AutoCloseable {
             log.info("outbox relay disabled (outbox.relay.enabled = false); messages are delivered only by drain()");
             return;
         }
-        maintenance.checkHalt(); // a halt recorded before this instance started holds before a worker takes a shard
+        try {
+            // a halt recorded before this instance started holds before a worker takes a shard
+            maintenance.checkHalt();
+        } catch (RuntimeException | Error e) {
+            heartbeat.stop(); // a failed start leaves no instance: its beats would write the row back for good
+            throw e;
+        }
         var threads = new Thread[relay.workers()];
         for (int i = 0; i < threads.length; i++) {
             threads[i] = new Thread(new Worker(), "outbox-relay-" + THREADS.incrementAndGet());
