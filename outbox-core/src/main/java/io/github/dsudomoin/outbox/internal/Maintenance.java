@@ -754,13 +754,13 @@ public final class Maintenance {
         }
         boolean alert = oldest > waitingAlertAfter.toNanos() / 1e9;
         if (due(alert ? waitingAlerted : waitingWarned)) {
-            var text = "outbox: {} records wait for an instance that can handle them; the oldest has waited {} (topic"
-                    + " {}, {}): a release half rolled out or rolled back?";
+            var text = "outbox: {} records of {} wait for an instance that can handle them; the oldest has waited {}"
+                    + " (topic {}, {}): a release half rolled out or rolled back?";
             var waited = Duration.ofSeconds(Math.round(oldest));
             if (alert) {
-                log.error(text, count, waited, topic, error);
+                log.error(text, count, names.base(), waited, topic, error);
             } else {
-                log.warn(text, count, waited, topic, error);
+                log.warn(text, count, names.base(), waited, topic, error);
             }
         }
     }
