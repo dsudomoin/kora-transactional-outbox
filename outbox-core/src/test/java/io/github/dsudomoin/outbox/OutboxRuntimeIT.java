@@ -165,6 +165,7 @@ class OutboxRuntimeIT {
                 all.add(typed.send("orders", "k", new V2("1"), OWN));
                 all.add(outbox.send(new OutboxMessage("audit", null, bytes("p"), OWN)));
                 all.add(outbox.send(c, OutboxMessage.of("audit", "k", bytes("p"))));
+                all.add(typed.send("kafka", "k", new V2("3"), OWN));
                 all.addAll(outbox.sendAll(List.of(typed.message("orders", "k", new V2("2"), OWN),
                         OutboxMessage.of("audit", "k", bytes("p")),
                         new OutboxMessage("kafka", null, bytes("p"), OWN))));
@@ -175,6 +176,7 @@ class OutboxRuntimeIT {
                     List.of(H, CONTRACT, TRACE, LOCAL),
                     List.of(H, TRACE, LOCAL),
                     List.of(TRACE, LOCAL),
+                    List.of(H, CONTRACT, TRACE),
                     List.of(H, CONTRACT, TRACE, LOCAL),
                     List.of(TRACE, LOCAL),
                     List.of(H, TRACE));
