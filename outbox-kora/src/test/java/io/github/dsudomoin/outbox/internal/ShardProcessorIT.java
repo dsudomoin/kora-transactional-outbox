@@ -11,10 +11,13 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.dsudomoin.outbox.BuiltHandler;
 import io.github.dsudomoin.outbox.OutboxHandler;
+import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
+import io.github.dsudomoin.outbox.OutboxRuntime;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.OutboxWaitException;
 import io.github.dsudomoin.outbox.Outcome;
@@ -624,6 +627,40 @@ class ShardProcessorIT {
         assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, due, null));
         assertThat(retryRows()).containsExactly("k1#1:0:" + due, "k1#2:0:-", "k2#1:0:" + due);
         assertThat(waiting()).containsExactly("k1#1:" + now, "k2#1:" + now);
+    }
+
+    @Test
+    void aLocalRecordWaitsForItsRouteAndNeverReachesTheFallback() throws Exception {
+        bootstrap();
+        var release = BuiltHandler.of(OutboxRuntime.builder(config, db, handler)); // one without billing's route
+        script = release::handleBatch;
+        send(msg("billing", "k", "k#1"), msg("billing", "k", "k#2"), msg("kafka", "j", "j#1"),
+                msg("billing", null, "u#1"), msg("kafka", null, "v#1"));
+        markLocal("k#1", "u#1"); // as a release with the route writes them
+        long t = tick();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
+
+        var due = now.plus(WAIT_DELAY);
+        assertThat(delivered()).containsExactly("j#1", "v#1");
+        assertThat(handler.batches()).as("the fallback's records in one call").hasSize(1);
+        assertThat(retryRows()).containsExactly("k#1:0:" + due, "k#2:0:-", "u#1:0:" + due);
+        assertThat(headErrors()).containsOnly("waiting (no_route): a record for a local handler of topic billing,"
+                + " which no route on this instance claims");
+        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, due, null));
+        assertThat(counter("outbox.messages.waiting", "topic", "billing", "kind", "no_route")).isEqualTo(2);
+
+        calls.clear();
+        now = due;
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("k#1", "u#1"));
+        assertThat(handler.batches()).as("no fallback call without a record for it").hasSize(1);
+        assertThat(retryRows()).containsExactly("k#1:0:" + now.plus(WAIT_DELAY), "k#2:0:-",
+                "u#1:0:" + now.plus(WAIT_DELAY));
+        assertThat(cursor().pausedUntil()).isNull();
+        assertThat(cursor().failures()).isZero();
+        assertThat(counter("outbox.messages.failed", "topic", "billing", "outcome", "retry")).isZero();
     }
 
     @Test
@@ -3918,6 +3955,18 @@ class ShardProcessorIT {
     /** One committed transaction; rows get ids in argument order. */
     private List<UUID> send(OutboxMessage... messages) throws SQLException {
         return db.inTx((SqlFunction0<List<UUID>>) () -> outbox.sendAll(List.of(messages)));
+    }
+
+    /** Gives the rows of {@code payloads} the local marker, the only header a writer with their route stores. */
+    private void markLocal(String... payloads) throws SQLException {
+        try (var c = TestDb.connect();
+                var st = c.prepareStatement("update " + names.base() + " set headers = ? where payload = ?")) {
+            st.setBytes(1, HeaderCodec.encode(List.of(new OutboxHeader(PgOutbox.LOCAL_HEADER, null))));
+            for (var payload : payloads) {
+                st.setBytes(2, payload.getBytes(UTF_8));
+                assertThat(st.executeUpdate()).as(payload).isEqualTo(1);
+            }
+        }
     }
 
     private static OutboxMessage msg(String topic, @Nullable String key, String payload) {

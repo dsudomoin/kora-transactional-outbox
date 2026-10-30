@@ -47,7 +47,10 @@ public final class OutboxRuntime implements AutoCloseable {
 
     private final OutboxConfig config;
     private final OutboxTransactions transactions;
-    /** The builder's handler, with its routes in front of it. Package-private for tests. */
+    /**
+     * The builder's handler, kept from local records ({@link LocalOnly}), with its routes in front of it.
+     * Package-private for tests.
+     */
     final OutboxHandler handler;
     /** The topics the routes claim, the only ones {@link #outbox()} takes; null with a handler behind them. */
     @Nullable
@@ -77,7 +80,9 @@ public final class OutboxRuntime implements AutoCloseable {
     }
 
     /**
-     * {@code handler} delivers every topic no {@link Builder#route} claims. It may be null when there are routes:
+     * {@code handler} delivers every topic no {@link Builder#route} claims, but never a record written for a route of
+     * its topic that this instance lacks (an older release, or a rollback): that waits
+     * ({@link Outcome.Waiting.Kind#NO_ROUTE}) for an instance with the route. It may be null when there are routes:
      * {@link #outbox()} then refuses a topic none claims with an {@link IllegalArgumentException}, before anything is
      * written, and a record of such a topic that another release wrote waits
      * ({@link Outcome.Waiting.Kind#NO_ROUTE}) for an instance with its route.
@@ -248,7 +253,7 @@ public final class OutboxRuntime implements AutoCloseable {
                 if (handler == null) {
                     throw new IllegalArgumentException(NO_HANDLER);
                 }
-                return handler;
+                return new LocalOnly(handler);
             }
             var table = new HashMap<String, OutboxHandler>();
             for (var route : routes) {
@@ -266,7 +271,7 @@ public final class OutboxRuntime implements AutoCloseable {
                     table.put(topic, adapted);
                 }
             }
-            return OutboxHandler.byTopic(table, handler != null ? handler : record -> {
+            return OutboxHandler.byTopic(table, handler != null ? new LocalOnly(handler) : record -> {
                 throw CannotHandle.waiting(Outcome.Waiting.Kind.NO_ROUTE,
                         "no handler for topic " + record.topic() + " on this instance");
             });

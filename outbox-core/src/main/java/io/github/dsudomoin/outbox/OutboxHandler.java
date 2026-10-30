@@ -11,10 +11,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Callable;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import org.slf4j.LoggerFactory;
 
 /**
  * Delivers relayed records to their target: every topic, or those no {@link OutboxTopicHandler} route claims. The
@@ -140,10 +136,7 @@ public interface OutboxHandler {
         var table = Map.copyOf(routes);
         Objects.requireNonNull(fallback, "fallback");
         return new OutboxHandler() {
-            private final long reportInterval = TimeUnit.SECONDS.toNanos(10);
-            /** When an invalid route answer was last logged ({@code nanoTime}), and how many went unlogged since. */
-            private final AtomicLong reported = new AtomicLong(System.nanoTime() - reportInterval);
-            private final AtomicInteger suppressed = new AtomicInteger();
+            private final RouteCalls calls = new RouteCalls("byTopic route");
 
             @Override
             public void handle(OutboxRecord record) throws Exception {
@@ -159,38 +152,12 @@ public interface OutboxHandler {
                 }
                 var outcomes = new Outcome[records.size()];
                 positions.forEach((route, indexes) -> {
-                    List<Outcome> routed;
-                    try {
-                        routed = route.handleBatch(indexes.stream().map(records::get).toList());
-                    } catch (OutboxWaitException e) { // the route cannot take any of them now
-                        Outcome waiting = new Outcome.Waiting(e.kind(), e.getMessage(), null);
-                        routed = indexes.stream().map(i -> waiting).toList();
-                    } catch (Exception e) { // one broken route must not block the others; Errors propagate
-                        routed = indexes.stream().map(i -> Outcome.retry(e)).toList();
-                    }
-                    if (routed == null || routed.size() != indexes.size()
-                            || routed.stream().anyMatch(Objects::isNull)) { // a handler bug: Retry, not the call
-                        var error = new IllegalStateException(route + " returned an invalid outcome list for "
-                                + indexes.size() + " records: " + routed);
-                        report(error);
-                        routed = indexes.stream().map(i -> Outcome.retry(error)).toList();
-                    }
+                    var routed = calls.handleBatch(route, indexes.stream().map(records::get).toList());
                     for (int i = 0; i < indexes.size(); i++) {
                         outcomes[indexes.get(i)] = routed.get(i);
                     }
                 });
                 return Arrays.asList(outcomes);
-            }
-
-            private void report(IllegalStateException error) {
-                long now = System.nanoTime();
-                long last = reported.get();
-                if (now - last < reportInterval || !reported.compareAndSet(last, now)) {
-                    suppressed.incrementAndGet();
-                    return;
-                }
-                LoggerFactory.getLogger(OutboxHandler.class).error("outbox byTopic route failed; its records are"
-                        + " retried ({} more since the previous report not logged)", suppressed.getAndSet(0), error);
             }
         };
     }

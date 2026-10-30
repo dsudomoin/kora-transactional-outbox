@@ -28,6 +28,7 @@ import ru.tinkoff.kora.opentelemetry.common.OpentelemetryContext;
 class OutboxTopicHandlerTest {
 
     private static final AtomicLong IDS = new AtomicLong();
+    private static final OutboxHeader LOCAL = new OutboxHeader("outbox-local", null);
     private static final OutboxDeserializer<Text2> TEXT2 = (topic, payload) -> new Text2(new String(payload, UTF_8));
 
     /** Never connects: building a runtime touches no database. */
@@ -101,10 +102,29 @@ class OutboxTopicHandlerTest {
     }
 
     @Test
-    void withoutRoutesTheHandlerIsUsedAsIs() {
+    void aLocalRecordReachesItsRouteButNeverTheHandler() {
         var fallback = new RecordingHandler();
+        var audit = new Recorder(Set.of("audit"));
+        var handler = build(OutboxRuntime.builder(new TestOutboxConfig(), transactions, fallback).route(audit));
+        var routed = record("audit", "k", List.of(LOCAL));
+        var unrouted = record("billing", "k", List.of(LOCAL));
+        var plain = record("billing", "j");
 
-        assertThat(build(OutboxRuntime.builder(new TestOutboxConfig(), transactions, fallback))).isSameAs(fallback);
+        assertThat(handler.handleBatch(List.of(routed, unrouted, plain)))
+                .containsExactly(Outcome.delivered(), noRoute("billing"), Outcome.delivered());
+        assertThat(audit.calls).as("the marker stays visible to the route").containsExactly(List.of(routed));
+        assertThat(fallback.delivered()).containsExactly(plain);
+    }
+
+    @Test
+    void withoutRoutesTheHandlerNeverTakesALocalRecord() {
+        var fallback = new RecordingHandler();
+        var handler = build(OutboxRuntime.builder(new TestOutboxConfig(), transactions, fallback));
+        var plain = record("billing", "j");
+
+        assertThat(handler.handleBatch(List.of(record("billing", "k", List.of(LOCAL)), plain)))
+                .containsExactly(noRoute("billing"), Outcome.delivered());
+        assertThat(fallback.delivered()).containsExactly(plain);
     }
 
     @Test
@@ -455,6 +475,11 @@ class OutboxTopicHandlerTest {
         return new OutboxRecord(IDS.incrementAndGet(), UUID.randomUUID(), topic,
                 key == null ? null : key.getBytes(UTF_8), payload == null ? null : payload.getBytes(UTF_8), headers,
                 Instant.now(), 0, 0);
+    }
+
+    private static Outcome noRoute(String topic) {
+        return new Outcome.Waiting(Outcome.Waiting.Kind.NO_ROUTE,
+                "a record for a local handler of topic " + topic + ", which no route on this instance claims", null);
     }
 
     private static OutboxHeader contract(String version) {
