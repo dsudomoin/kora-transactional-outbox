@@ -97,7 +97,11 @@ bound redrive loops with `letter.redrives()`; `active()` false (as `NONE`) keeps
   records of the key queue behind it, `attempts` stays, `maxAttempts` never applies, the shard does not pause. It is
   handed again alone after a quarter of its wait so far, within `outbox.relay.waiting.delay` (1 s) and `maxDelay`
   (5 min), until an instance that can handle it takes it. `kind`: `contract`, `no_route`, `handler` (yours).
-- Use it only for «another release handles this»; a failing target is `Retry`, a blocked entity is `requeue`.
+- Use it for «another release handles this»; a failing target is `Retry`, a blocked entity is `requeue`. A wait does
+  not pause the shard: while the target is down every key of the topic becomes a waiting head and every later record a
+  follower row in `<table>_retry` (an insert, a delete and vacuum per record); each waiting head is handed alone,
+  without batching, and no shard-level breaker protects the target. The API still allows a wait there when chosen
+  explicitly.
 - `@OutboxContract(n)` on an event class is its payload version (none = 1, not inherited). `TypedOutbox<T>` and
   `KafkaOutboxPublisher` stamp `T`'s version in the `outbox-contract` header (none for 1); `record.contractVersion()`
   reads it (1 without; an invalid value throws `OutboxWaitException`).
