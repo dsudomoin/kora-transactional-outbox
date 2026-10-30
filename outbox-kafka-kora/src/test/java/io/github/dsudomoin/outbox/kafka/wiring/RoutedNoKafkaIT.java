@@ -60,11 +60,12 @@ class RoutedNoKafkaIT implements KoraAppTestConfigModifier {
 
         await(() -> !audit.events.isEmpty());
         assertThat(audit.events).containsExactly(new AuditEvent("login"));
-        await(() -> retried(unclaimed) != null); // what a record no route claims gets today: a Retry
-        assertThat(retried(unclaimed)).contains("routed-unclaimed");
+        await(() -> lastError(unclaimed) != null); // no route claims it: it waits for an instance with one
+        assertThat(lastError(unclaimed))
+                .isEqualTo("waiting (no_route): no handler for topic routed-unclaimed on this instance");
     }
 
-    private String retried(UUID messageId) {
+    private String lastError(UUID messageId) {
         try (var c = TestDb.connect()) {
             return queryString(c, "select last_error from " + table + "_retry where message_id = ?::uuid",
                     messageId.toString());

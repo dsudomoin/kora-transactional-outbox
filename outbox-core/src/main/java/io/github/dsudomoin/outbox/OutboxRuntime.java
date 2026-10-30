@@ -62,7 +62,10 @@ public final class OutboxRuntime implements AutoCloseable {
         this.ddl = OwnerTransactions.of(transactions, builder.owner);
     }
 
-    /** {@code handler} delivers every topic no {@link Builder#route} claims; it may be null when there are routes. */
+    /**
+     * {@code handler} delivers every topic no {@link Builder#route} claims. It may be null when there are routes: a
+     * record of a topic none claims then waits ({@link Outcome.Waiting.Kind#NO_ROUTE}) for an instance with one.
+     */
     public static Builder builder(OutboxConfig config, OutboxTransactions transactions,
             @Nullable OutboxHandler handler) {
         return new Builder(config, transactions, handler);
@@ -236,8 +239,8 @@ public final class OutboxRuntime implements AutoCloseable {
                 }
             }
             return OutboxHandler.byTopic(table, handler != null ? handler : record -> {
-                throw CannotHandle.failure(record, "no OutboxTopicHandler claims its topic and there is no"
-                        + " OutboxHandler behind the routes", null);
+                throw CannotHandle.waiting(record, Outcome.Waiting.Kind.NO_ROUTE,
+                        "no handler for topic " + record.topic() + " on this instance");
             });
         }
 

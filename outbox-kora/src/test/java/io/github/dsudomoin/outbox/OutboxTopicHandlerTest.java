@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox;
 import static io.github.dsudomoin.outbox.testing.TestTracing.TRACEPARENT;
 import static io.github.dsudomoin.outbox.testing.TestTracing.TRACE_ID;
 import static io.github.dsudomoin.outbox.testing.TestTracing.header;
+import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -16,6 +17,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -26,6 +28,7 @@ import ru.tinkoff.kora.opentelemetry.common.OpentelemetryContext;
 class OutboxTopicHandlerTest {
 
     private static final AtomicLong IDS = new AtomicLong();
+    private static final OutboxDeserializer<Text2> TEXT2 = (topic, payload) -> new Text2(new String(payload, UTF_8));
 
     /** Never connects: building a runtime touches no database. */
     private final OutboxTransactions transactions = new JdbcTransactions(new PGSimpleDataSource());
@@ -105,15 +108,14 @@ class OutboxTopicHandlerTest {
     }
 
     @Test
-    void withoutHandlerAnUnclaimedTopicCannotBeHandled() {
+    void withoutHandlerAnUnclaimedTopicWaits() {
         var audit = new Recorder(Set.of("audit"));
         var handler = build(OutboxRuntime.builder(new TestOutboxConfig(), transactions, null).route(audit));
-        var billing = record("billing", "k");
 
-        var outcomes = handler.handleBatch(List.of(billing, record("audit", "k")));
+        var outcomes = handler.handleBatch(List.of(record("billing", "k"), record("audit", "k")));
 
-        assertCannotHandle(outcomes.get(0), billing, "no OutboxTopicHandler claims its topic");
-        assertThat(outcomes.get(1)).isEqualTo(Outcome.delivered());
+        assertThat(outcomes).containsExactly(new Outcome.Waiting(Outcome.Waiting.Kind.NO_ROUTE,
+                "no handler for topic billing on this instance", null), Outcome.delivered());
     }
 
     @Test
@@ -144,17 +146,17 @@ class OutboxTopicHandlerTest {
     }
 
     @Test
-    void tombstoneWithoutOverrideCannotBeHandled() {
+    void tombstoneWithoutOverrideIsPermanent() {
         var typed = new Texts();
         var tombstone = record("text", "k", (String) null);
 
-        assertCannotHandle(typed.handleBatch(List.of(tombstone)).get(0), tombstone,
+        assertPermanent(typed.handleBatch(List.of(tombstone)).get(0), tombstone,
                 Texts.class.getName() + " takes no tombstones");
         assertThat(typed.values).isEmpty();
     }
 
     @Test
-    void undecodablePayloadCannotBeHandledAndNamesItsCause() {
+    void undecodablePayloadIsPermanentAndNamesItsCause() {
         var broken = new IllegalArgumentException("not text");
         var typed = new Texts((topic, payload) -> {
             throw broken;
@@ -163,18 +165,68 @@ class OutboxTopicHandlerTest {
 
         var outcome = typed.handleBatch(List.of(record)).get(0);
 
-        assertCannotHandle(outcome, record, Texts.class.getName() + " cannot decode its payload");
-        assertThat(((Outcome.Retry) outcome).error()).hasCause(broken);
+        assertPermanent(outcome, record, Texts.class.getName() + " cannot decode its payload");
+        assertThat(((Outcome.Permanent) outcome).error()).hasCause(broken);
         assertThat(typed.values).isEmpty();
     }
 
     @Test
-    void deserializerReturningNullCannotBeHandled() {
+    void deserializerReturningNullIsPermanent() {
         var typed = new Texts((topic, payload) -> null);
         var record = record("text", "k", "a");
 
-        assertCannotHandle(typed.handleBatch(List.of(record)).get(0), record, "returned null");
+        assertPermanent(typed.handleBatch(List.of(record)).get(0), record, "returned null");
         assertThat(typed.values).isEmpty();
+    }
+
+    @Test
+    void typedHandlerReadsUpToTheContractVersionOfItsT() {
+        assertThat(new Texts().contractVersion()).as("String: no @OutboxContract").isEqualTo(1);
+        assertThat(new Texts2().contractVersion()).as("a direct subclass").isEqualTo(2);
+        assertThat(new $Texts2__AopProxy().contractVersion()).as("a proxy-like subclass").isEqualTo(2);
+        assertThat(new ViaKeyed().contractVersion()).as("through generic intermediate classes").isEqualTo(2);
+        assertThat(new Base<Text2>(TEXT2) {}.contractVersion()).as("an anonymous subclass").isEqualTo(2);
+        assertThat(new Unbound<>(TEXT2, Text2.class).contractVersion()).as("an explicit type").isEqualTo(2);
+    }
+
+    @Test
+    void unresolvableTFailsTheConstructorPointingToTheTypeOverload() {
+        assertThatThrownBy(() -> new Unbound<>(TEXT2)).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(Unbound.class.getName())
+                .hasMessageContaining("TypedOutboxTopicHandler(Set, OutboxDeserializer, Class) constructor");
+    }
+
+    @Test
+    void recordOfANewerContractWaitsUndecodedThroughHandleAndDecode() {
+        var decoded = new AtomicInteger();
+        var typed = new Texts((topic, payload) -> {
+            decoded.incrementAndGet();
+            return new String(payload, UTF_8);
+        });
+        var v2 = record("text", "k1", "a", List.of(contract("2")));
+        var v2Tombstone = record("text", "k2", null, List.of(contract("2")));
+        var unreadable = record("text", "k3", "a", List.of(contract("x")));
+        var newer = new Outcome.Waiting(Outcome.Waiting.Kind.CONTRACT,
+                "contract v2 of topic text, this instance reads up to v1", null);
+
+        assertThat(typed.handleBatch(List.of(v2, v2Tombstone, unreadable))).containsExactly(newer, newer,
+                new Outcome.Waiting(Outcome.Waiting.Kind.CONTRACT, "invalid outbox-contract header: x", null));
+        assertThatThrownBy(() -> typed.decode(v2)).isInstanceOfSatisfying(OutboxWaitException.class,
+                e -> assertThat(e.kind()).isEqualTo(Outcome.Waiting.Kind.CONTRACT)).hasMessage(newer.reason());
+        assertThat(decoded).as("the payload is never touched").hasValue(0);
+        assertThat(typed.values).isEmpty();
+    }
+
+    @Test
+    void handlerOfANewerContractReadsOlderRecordsBranchingOnTheirVersion() {
+        var typed = new Texts2();
+
+        var outcomes = typed.handleBatch(List.of(record("text", "k1", "a"),
+                record("text", "k1", "b", List.of(contract("2"))), record("text", "k2", "c", List.of(contract("3")))));
+
+        assertThat(outcomes).containsExactly(Outcome.delivered(), Outcome.delivered(), new Outcome.Waiting(
+                Outcome.Waiting.Kind.CONTRACT, "contract v3 of topic text, this instance reads up to v2", null));
+        assertThat(typed.values).containsExactly("v1 a", "v2 b");
     }
 
     @Test
@@ -237,10 +289,10 @@ class OutboxTopicHandlerTest {
         return builder.build().handler;
     }
 
-    /** What every case of a record this instance cannot handle gives today, whatever the case. */
-    private static void assertCannotHandle(Outcome outcome, OutboxRecord record, String reason) {
-        assertThat(outcome).isInstanceOfSatisfying(Outcome.Retry.class, r -> assertThat(r.error())
-                .isInstanceOf(IllegalStateException.class)
+    /** A record no instance reading its contract version can ever handle. */
+    private static void assertPermanent(Outcome outcome, OutboxRecord record, String reason) {
+        assertThat(outcome).isInstanceOfSatisfying(Outcome.Permanent.class, p -> assertThat(p.error())
+                .isInstanceOf(OutboxPermanentException.class)
                 .hasMessageStartingWith("cannot handle outbox record " + record.messageId() + " of topic "
                         + record.topic() + ": ")
                 .hasMessageContaining(reason));
@@ -262,6 +314,70 @@ class OutboxTopicHandlerTest {
         @Override
         protected void handle(String value, OutboxRecord record) {
             values.add(value);
+        }
+    }
+
+    /** Version 2 of a text event, which v1 records also decode to. */
+    @OutboxContract(2)
+    record Text2(String text) {}
+
+    /** Reads v1 and v2 records, recording each value with its record's version. */
+    private static class Texts2 extends TypedOutboxTopicHandler<Text2> {
+
+        final List<String> values = new CopyOnWriteArrayList<>();
+
+        Texts2() {
+            super(Set.of("text"), TEXT2);
+        }
+
+        @Override
+        protected void handle(Text2 value, OutboxRecord record) {
+            values.add("v" + record.contractVersion() + " " + value.text());
+        }
+    }
+
+    /** What Kora's AOP makes of a handler with aspects: a plain subclass. */
+    private static final class $Texts2__AopProxy extends Texts2 {}
+
+    /** Binds T only through its type variable. */
+    private abstract static class Base<E> extends TypedOutboxTopicHandler<E> {
+
+        Base(OutboxDeserializer<E> deserializer) {
+            super(Set.of("text"), deserializer);
+        }
+
+        Base(OutboxDeserializer<E> deserializer, Class<E> type) {
+            super(Set.of("text"), deserializer, type);
+        }
+
+        @Override
+        protected void handle(E value, OutboxRecord record) {}
+    }
+
+    /** T is its second type variable, passed on to {@link Base}'s first. */
+    private abstract static class Keyed<K, E> extends Base<E> {
+
+        Keyed(OutboxDeserializer<E> deserializer) {
+            super(deserializer);
+        }
+    }
+
+    private static final class ViaKeyed extends Keyed<Long, Text2> {
+
+        ViaKeyed() {
+            super(TEXT2);
+        }
+    }
+
+    /** Its hierarchy never names T: erased at runtime whatever the caller writes. */
+    private static final class Unbound<E> extends Base<E> {
+
+        Unbound(OutboxDeserializer<E> deserializer) {
+            super(deserializer);
+        }
+
+        Unbound(OutboxDeserializer<E> deserializer, Class<E> type) {
+            super(deserializer, type);
         }
     }
 
@@ -315,9 +431,18 @@ class OutboxTopicHandlerTest {
     }
 
     private static OutboxRecord record(String topic, @Nullable String key, @Nullable String payload) {
+        return record(topic, key, payload, List.of());
+    }
+
+    private static OutboxRecord record(String topic, @Nullable String key, @Nullable String payload,
+            List<OutboxHeader> headers) {
         return new OutboxRecord(IDS.incrementAndGet(), UUID.randomUUID(), topic,
-                key == null ? null : key.getBytes(UTF_8), payload == null ? null : payload.getBytes(UTF_8), List.of(),
+                key == null ? null : key.getBytes(UTF_8), payload == null ? null : payload.getBytes(UTF_8), headers,
                 Instant.now(), 0, 0);
+    }
+
+    private static OutboxHeader contract(String version) {
+        return new OutboxHeader("outbox-contract", version.getBytes(US_ASCII));
     }
 
     private static OutboxRecord record(String topic, @Nullable String key, List<OutboxHeader> headers) {

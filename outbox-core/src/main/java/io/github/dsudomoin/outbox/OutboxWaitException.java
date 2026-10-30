@@ -7,7 +7,7 @@ import java.util.Objects;
  * {@link OutboxHandler#handleBatch} turns it into {@link Outcome.Waiting} (see {@link Outcome#waitFor}), with the
  * message as the reason.
  */
-public class OutboxWaitException extends RuntimeException {
+public final class OutboxWaitException extends RuntimeException {
 
     private final Outcome.Waiting.Kind kind;
 

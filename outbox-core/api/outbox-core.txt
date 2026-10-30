@@ -437,7 +437,7 @@ package io.github.dsudomoin.outbox {
     method public default RuntimeException! translate(java.sql.SQLException!);
   }
 
-  public class OutboxWaitException extends java.lang.RuntimeException {
+  public final class OutboxWaitException extends java.lang.RuntimeException {
     ctor public OutboxWaitException(String!);
     method public io.github.dsudomoin.outbox.Outcome.Waiting.Kind! kind();
   }
@@ -506,6 +506,7 @@ package io.github.dsudomoin.outbox {
 
   public abstract class TypedOutboxTopicHandler<T> implements io.github.dsudomoin.outbox.OutboxTopicHandler {
     ctor protected TypedOutboxTopicHandler(java.util.Set<java.lang.String!>!, io.github.dsudomoin.outbox.OutboxDeserializer<T>!);
+    ctor protected TypedOutboxTopicHandler(java.util.Set<java.lang.String!>!, io.github.dsudomoin.outbox.OutboxDeserializer<T>!, Class<T>!);
     method protected final T? decode(io.github.dsudomoin.outbox.OutboxRecord!) throws java.lang.Exception;
     method public final void handle(io.github.dsudomoin.outbox.OutboxRecord!) throws java.lang.Exception;
     method protected abstract void handle(T, io.github.dsudomoin.outbox.OutboxRecord!) throws java.lang.Exception;
