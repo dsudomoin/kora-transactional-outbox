@@ -113,7 +113,7 @@ class ContractGuardTest {
             assertThatThrownBy(() -> g.require(NAMES, message("kafka-bound", "2"), "Created", telemetry))
                     .isInstanceOfSatisfying(OutboxIncompatibleContractException.class, e -> {
                         assertThat(e).hasMessage("outbox contract of topic kafka-bound: Created writes v2, but this"
-                                + " instance has not read the live relay instances' contracts for PT1M30S (its"
+                                + " instance has not read the live relay instances' contracts for 90 s (its"
                                 + " heartbeat fails?); refused until it reads them again");
                         assertThat(e.minSupported()).isZero();
                         assertThat(e.incompatibleInstances()).isEmpty();

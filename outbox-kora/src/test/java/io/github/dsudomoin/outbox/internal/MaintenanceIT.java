@@ -1547,8 +1547,8 @@ class MaintenanceIT {
         try (var err = new CapturedStderr()) {
             assertThat(maintenance.runOnce()).isTrue();
             assertThat(waitingLog(err)).contains("WARN").doesNotContain("ERROR")
-                    .contains("outbox: 2 records of " + names.base() + " wait for an instance that can handle them;"
-                            + " the oldest has waited PT10M")
+                    .contains("outbox: 2 keys of " + names.base() + " wait for an instance that can handle them;"
+                            + " the oldest has waited 600 s")
                     .contains("(topic orders, waiting (contract): v3 is above v2): a release half rolled out or"
                             + " rolled back?");
         }
@@ -1568,7 +1568,7 @@ class MaintenanceIT {
         try (var err = new CapturedStderr()) {
             assertThat(maintenance.runOnce()).isTrue();
             assertThat(waitingLog(err)).as("past alertAfter, not held back by the WARN a moment ago")
-                    .contains("ERROR").contains("2 records of " + names.base() + " wait").contains("has waited PT20M")
+                    .contains("ERROR").contains("2 keys of " + names.base() + " wait").contains("has waited 1200 s")
                     .contains("(topic orders, waiting (contract): v3 is above v2)");
         }
         assertThat(gauge(registry, "outbox.waiting.oldest")).isBetween(1200.0, 1260.0);

@@ -69,7 +69,7 @@ Logs: logger `io.github.dsudomoin.outbox`, repeated lines rate-limited. INFO for
 changing admin call; WARN for diverted keys, shard pauses, deferred partition extensions, tail swaps without their
 lock (55P03), a window tail conversion that did not fit `maxStall`, tail overflow, stale maintenance, dead-letter hook
 failures, letters the Kafka DLQ kept, failed heartbeats («outbox heartbeat of instance ... failed»), waiting records
-(«outbox: N records of ... wait for an instance that can handle them ...», once a minute) and sends the writer guard
+(«outbox: N keys of ... wait for an instance that can handle them ...», once a minute) and sends the writer guard
 refused («outbox ... refused a send», once a minute); ERROR for records waiting past `relay.waiting.alertAfter` (the
 same line), dead letters, handler errors, stranded shards, the shard-count mismatch after a reshard («... holds
 cursors for N shards, but this instance runs with outbox.shards = M ...»), the xid regression, `premade < 2`, a

@@ -121,8 +121,8 @@ final class ContractGuard {
         if (s == null || System.nanoTime() - s.readAt > staleAfter.toNanos()) {
             throw refused(names, telemetry, new OutboxIncompatibleContractException("outbox contract of topic " + topic
                     + ": " + type + " writes v" + version + ", but this instance has not read the live relay"
-                    + " instances' contracts for " + staleAfter + " (its heartbeat fails?); refused until it reads"
-                    + " them again", topic, type, version, 0, List.of()));
+                    + " instances' contracts for " + staleAfter.toSeconds() + " s (its heartbeat fails?); refused until"
+                    + " it reads them again", topic, type, version, 0, List.of()));
         }
         var lowest = s.lowest.get(topic);
         // no live relay instance reports it and no route here claims it: only an unknown report stands in the way

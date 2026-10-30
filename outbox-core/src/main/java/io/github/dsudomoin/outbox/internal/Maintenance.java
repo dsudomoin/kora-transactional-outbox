@@ -754,9 +754,10 @@ public final class Maintenance {
         }
         boolean alert = oldest > waitingAlertAfter.toNanos() / 1e9;
         if (due(alert ? waitingAlerted : waitingWarned)) {
-            var text = "outbox: {} records of {} wait for an instance that can handle them; the oldest has waited {}"
+            // a waiting head per key: the records of its key behind it wait too
+            var text = "outbox: {} keys of {} wait for an instance that can handle them; the oldest has waited {} s"
                     + " (topic {}, {}): a release half rolled out or rolled back?";
-            var waited = Duration.ofSeconds(Math.round(oldest));
+            long waited = Math.round(oldest);
             if (alert) {
                 log.error(text, count, names.base(), waited, topic, error);
             } else {
