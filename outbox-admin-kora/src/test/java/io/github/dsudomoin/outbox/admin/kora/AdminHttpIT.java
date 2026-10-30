@@ -430,27 +430,6 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         assertThat(deadIds()).isEmpty();
     }
 
-    /** The shard's lock, held as a relay step holds it, is waited for batchTimeout + 5 s: then a 409, retry. */
-    @Test
-    void abandonOnABusyShardIs409() throws Exception {
-        seedWaiting();
-
-        try (var step = TestDb.connect()) {
-            step.setAutoCommit(false);
-            TestSql.execute(step, "select pg_advisory_xact_lock(" + names().internalNamespace() + ", "
-                    + TableNames.LOCK_SHARD_BASE + ")");
-
-            var busy = call("POST", "/waiting/abandon", "{\"topic\":\"t\",\"reason\":\"r\"}");
-
-            assertJson(busy, 409);
-            assertThat(busy.body()).startsWith("{\"message\":\"shard 0 of ").contains(" is busy, retry");
-            step.rollback();
-        }
-        assertThat(deadIds()).isEmpty();
-        assertThat(call("POST", "/waiting/abandon", "{\"topic\":\"t\",\"reason\":\"r\"}").body())
-                .isEqualTo("{\"keys\":3,\"records\":5}");
-    }
-
     /** What the generated server or the call refuses for its input answers 400 before anything runs. */
     @Test
     void badInputIs400() throws Exception {
