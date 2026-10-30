@@ -98,6 +98,16 @@ public final class KoraOutboxTelemetry implements OutboxTelemetry {
     }
 
     @Override
+    public void routeRejected(String topic) {
+        metrics.routeRejected(topic);
+    }
+
+    @Override
+    public void routeUnchecked(String topic) {
+        metrics.routeUnchecked(topic);
+    }
+
+    @Override
     public void stepFinished(Duration duration) {
         metrics.stepFinished(duration);
     }

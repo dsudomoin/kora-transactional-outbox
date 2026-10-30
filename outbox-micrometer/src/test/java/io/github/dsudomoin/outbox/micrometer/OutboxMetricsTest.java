@@ -33,6 +33,8 @@ class OutboxMetricsTest {
             noop.requeued("orders");
             noop.waited("orders", Outcome.Waiting.Kind.HANDLER);
             noop.contractRejected("orders", "Created", 2);
+            noop.routeRejected("orders");
+            noop.routeUnchecked("orders");
             noop.stepFinished(Duration.ofMillis(5));
             noop.shardPaused();
             noop.inboxOutsideWindow();
@@ -150,6 +152,21 @@ class OutboxMetricsTest {
                 .isEqualTo(2);
         assertThat(registry.get("outbox.messages.contract_rejected")
                 .tags("topic", "orders", "type", "?", "version", "3").counter().count()).isEqualTo(1);
+    }
+
+    @Test
+    void routeRejectedAndRouteUncheckedCountPerTopic() {
+        metrics.routeRejected("orders");
+        metrics.routeRejected("orders");
+        metrics.routeRejected("audit");
+        metrics.routeUnchecked("orders");
+
+        assertThat(registry.get("outbox.messages.route_rejected").tags("topic", "orders").counter().count())
+                .isEqualTo(2);
+        assertThat(registry.get("outbox.messages.route_rejected").tags("topic", "audit").counter().count())
+                .isEqualTo(1);
+        assertThat(registry.get("outbox.messages.route_unchecked").tags("topic", "orders").counter().count())
+                .isEqualTo(1);
     }
 
     @Test

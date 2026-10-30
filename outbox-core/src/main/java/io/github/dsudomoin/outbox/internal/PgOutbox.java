@@ -21,9 +21,10 @@ import org.slf4j.LoggerFactory;
  * before the identity assigns the row id, so per (topic, key) id order is commit order. Unkeyed rows take no lock and
  * land on a random shard. {@code sendAll} inserts through {@link Resender}, every key locked in one statement first.
  * Without a handler behind the routes, a message of a topic no route claims is refused before anything is written;
- * so is a contract version some live relay instance cannot read ({@link ContractGuard}). A message of a topic a
- * route of this instance claims is written with the {@code outbox-local} header, which marks its record for a route,
- * after the telemetry's headers and in place of any such header given; any other message is written without one.
+ * so is one of a topic a route of this instance claims that some live relay instance does not route, and a contract
+ * version some live relay instance cannot read ({@link ContractGuard}). A message of a topic a route of this instance
+ * claims is written with the {@code outbox-local} header, which marks its record for a route, after the telemetry's
+ * headers and in place of any such header given; any other message is written without one.
  */
 public final class PgOutbox implements Outbox {
 
@@ -112,9 +113,12 @@ public final class PgOutbox implements Outbox {
         if (n == 0) {
             return List.of();
         }
-        for (var m : messages) {
+        var local = new boolean[n];
+        for (int i = 0; i < n; i++) {
+            var m = messages.get(i);
             requireClaimed(m.topic());
-            contracts.require(names, m, UNKNOWN_TYPE, telemetry);
+            local[i] = contracts.routes().contains(m.topic());
+            contracts.require(names, m, UNKNOWN_TYPE, local[i], telemetry);
         }
         var enqueue = telemetry.enqueueStarted();
         var ids = new UUID[n];
@@ -123,7 +127,7 @@ public final class PgOutbox implements Outbox {
             for (int i = 0; i < n; i++) {
                 var m = messages.get(i);
                 ids[i] = UuidV7.next();
-                var headers = marked(m.topic(), enqueue.headers(m.headers()));
+                var headers = marked(local[i], enqueue.headers(m.headers()));
                 rows.add(new Resender.Row(ids[i], m.topic(), m.key(), m.payload(), HeaderCodec.encode(headers)));
             }
             try {
@@ -147,7 +151,8 @@ public final class PgOutbox implements Outbox {
     private UUID insert(Connection c, OutboxMessage m, String type) {
         guard.require(names, shards);
         requireClaimed(m.topic());
-        contracts.require(names, m, type, telemetry);
+        boolean local = contracts.routes().contains(m.topic());
+        contracts.require(names, m, type, local, telemetry);
         var enqueue = telemetry.enqueueStarted();
         var id = UuidV7.next();
         boolean keyed = m.key() != null;
@@ -158,7 +163,7 @@ public final class PgOutbox implements Outbox {
             ps.setString(3, m.topic());
             ps.setBytes(4, m.key());
             ps.setBytes(5, m.payload());
-            ps.setBytes(6, HeaderCodec.encode(marked(m.topic(), enqueue.headers(m.headers()))));
+            ps.setBytes(6, HeaderCodec.encode(marked(local, enqueue.headers(m.headers()))));
             if (keyed) {
                 ps.setInt(7, keyNamespace);
                 ps.setInt(8, hash);
@@ -190,10 +195,10 @@ public final class PgOutbox implements Outbox {
 
     /**
      * {@code headers} without their {@code outbox-local} headers, plus the marker if a route of this instance claims
-     * {@code topic}; the very list when there is nothing to change, so an unmarked write copies nothing.
+     * the message's topic ({@code local}); the very list when there is nothing to change, so an unmarked write copies
+     * nothing.
      */
-    private List<OutboxHeader> marked(String topic, List<OutboxHeader> headers) {
-        boolean local = contracts.routes().contains(topic);
+    private static List<OutboxHeader> marked(boolean local, List<OutboxHeader> headers) {
         if (!local && !hasLocal(headers)) {
             return headers;
         }

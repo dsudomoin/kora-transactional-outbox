@@ -127,6 +127,24 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     }
 
     @Override
+    public void routeRejected(String topic) {
+        try {
+            delegate.routeRejected(topic);
+        } catch (RuntimeException | LinkageError e) {
+            warn("routeRejected", e);
+        }
+    }
+
+    @Override
+    public void routeUnchecked(String topic) {
+        try {
+            delegate.routeUnchecked(topic);
+        } catch (RuntimeException | LinkageError e) {
+            warn("routeUnchecked", e);
+        }
+    }
+
+    @Override
     public RelayStep stepStarted(List<Integer> shards) {
         RelayStep step;
         try {

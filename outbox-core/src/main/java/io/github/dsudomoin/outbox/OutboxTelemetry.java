@@ -56,6 +56,19 @@ public interface OutboxTelemetry {
     default void contractRejected(String topic, String type, int version) {}
 
     /**
+     * A send refused with {@link OutboxMissingRouteException}, on the writer's thread: a route of this instance claims
+     * {@code topic}, but some live relay instance does not route it.
+     */
+    default void routeRejected(String topic) {}
+
+    /**
+     * A send to {@code topic} allowed unchecked, on the writer's thread, once per message: this instance has not read
+     * the live relay instances' reports lately, so the route or the version check took the last read, which allowed
+     * it.
+     */
+    default void routeUnchecked(String topic) {}
+
+    /**
      * A relay step found work, on the thread that steps: called at the first locked shard with work, so only for the
      * steps {@link #stepFinished} measures; a step that locks nothing or finds nothing to do calls neither.
      * {@code shards} is a copy of the shards whose locks the step holds, those without work included. The step's

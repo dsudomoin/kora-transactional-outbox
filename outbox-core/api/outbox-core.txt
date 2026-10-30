@@ -288,6 +288,11 @@ package io.github.dsudomoin.outbox {
     method public io.github.dsudomoin.outbox.OutboxMessage! withHeader(String!, byte[]?);
   }
 
+  public final class OutboxMissingRouteException extends java.lang.RuntimeException {
+    method public java.util.List<java.lang.String!>! instances();
+    method public String! topic();
+  }
+
   public class OutboxPermanentException extends java.lang.RuntimeException {
     ctor public OutboxPermanentException(String!);
     ctor public OutboxPermanentException(String!, Throwable!);
@@ -417,6 +422,8 @@ package io.github.dsudomoin.outbox {
     method public default void releaseThread();
     method public default void requeued(String!);
     method public default void retried(String!);
+    method public default void routeRejected(String!);
+    method public default void routeUnchecked(String!);
     method public default void shardPaused();
     method public default void stepFinished(java.time.Duration!);
     method public default io.github.dsudomoin.outbox.OutboxTelemetry.RelayStep! stepStarted(java.util.List<java.lang.Integer!>!);

@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.internal;
 
 import io.github.dsudomoin.outbox.OutboxIncompatibleContractException;
 import io.github.dsudomoin.outbox.OutboxMessage;
+import io.github.dsudomoin.outbox.OutboxMissingRouteException;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
@@ -11,6 +12,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -24,20 +26,34 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * The writer guard, one per {@link OutboxSchema}: {@link PgOutbox} refuses a message whose {@code outbox-contract}
- * header gives a version v above 1 with {@link OutboxIncompatibleContractException}, before anything is written,
- * unless every live relay instance ({@code relay}, {@code expires_at} ahead: any of them can take any shard) reports
- * its topic at v or above in {@code contracts}; one that lacks the topic, or gives a version that is no positive int,
+ * The writer guard, one per {@link OutboxSchema}: {@link PgOutbox} checks a message against the live relay instances
+ * ({@code relay}, {@code expires_at} ahead: any of them can take any shard) before anything is written, first the
+ * route check, then the version check.
+ * <ul>
+ * <li>The route check covers a message of a topic a route of this instance claims ({@link #routes()}), whatever its
+ * version: its record is marked for a route, so every live relay instance must report the topic in {@code routes},
+ * else {@link OutboxMissingRouteException}. One whose {@code routes} is unknown (null) routes nothing.
+ * <li>The version check covers a message whose {@code outbox-contract} header gives a version v above 1: every live
+ * relay instance must report its topic at v or above in {@code contracts}, else
+ * {@link OutboxIncompatibleContractException}. One that lacks the topic, or gives a version that is no positive int,
  * reads none of it. A topic that no live relay instance reports and no typed route of this instance claims is not
  * checked, as its records are forwarded or handled raw (a Kafka-bound one), unless a live relay instance's report is
  * unknown ({@code contracts} null or not an object): such an instance is incompatible with every version above 1.
- * Without a live relay instance nothing is refused. The reports are as the bootstrap, then each beat of this
- * instance's {@link Heartbeat}, last read them: a read older than {@value OutboxSchema#LIVE_INTERVALS}
- * {@code maintenanceInterval}s refuses every such message, as nothing stands behind it. A refusal is counted
- * ({@link OutboxTelemetry#contractRejected}) and logged at WARN with every instance id, at most once a minute. A
- * header that gives no version (null, not a decimal int, not positive) is refused with
- * {@link IllegalArgumentException}: the relay would make the record wait for good. The guard also holds this
- * instance's routes, which its row reports, and each read takes the live relay instances' {@code routes} too.
+ * </ul>
+ * A message neither check covers, of version 1 and a topic no route here claims, is never checked.
+ * <p>
+ * The reports are as the bootstrap, then each beat of this instance's {@link Heartbeat}, last read them. On a fresh
+ * read, without a live relay instance nothing is refused. A read older than {@value OutboxSchema#LIVE_INTERVALS}
+ * {@code maintenanceInterval}s is stale, and the last read decides what a check covers: refused when there is no read,
+ * when it found no live relay instance, or when the check refuses on it, an unknown report included; else let through
+ * unchecked, counted once per message ({@link OutboxTelemetry#routeUnchecked}) and logged at WARN at most once a
+ * minute. A stale refusal names no instance.
+ * <p>
+ * A refusal is counted ({@link OutboxTelemetry#routeRejected}, {@link OutboxTelemetry#contractRejected}) and logged at
+ * WARN with every instance id, at most once a minute per check. A message of a topic no route here claims, so written
+ * unmarked, while a live relay instance routes it, is logged at WARN at most once a minute: its writer should register
+ * that route too. A header that gives no version (null, not a decimal int, not positive) is refused with
+ * {@link IllegalArgumentException}: the relay would make the record wait for good.
  */
 final class ContractGuard {
 
@@ -63,7 +79,11 @@ final class ContractGuard {
     private final Map<String, Integer> contracts;
     private final SortedSet<String> routes;
     private final Duration staleAfter;
-    private final AtomicLong warned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
+    /** When each WARN last logged ({@link System#nanoTime()}), each on its own limit. */
+    private final AtomicLong contractWarned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
+    private final AtomicLong routeWarned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
+    private final AtomicLong uncheckedWarned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
+    private final AtomicLong unmarkedWarned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
     @Nullable
     private volatile Snapshot snapshot;
 
@@ -140,10 +160,11 @@ final class ContractGuard {
     }
 
     /**
-     * Throws {@link OutboxIncompatibleContractException} when {@code message} must not be written, and
-     * {@link IllegalArgumentException} for a header that gives no version (see above).
+     * Throws {@link OutboxMissingRouteException} or {@link OutboxIncompatibleContractException} when {@code message}
+     * must not be written, and {@link IllegalArgumentException} for a header that gives no version (see above).
+     * {@code local}: a route of this instance claims its topic ({@link #routes()}).
      */
-    void require(TableNames names, OutboxMessage message, String type, OutboxTelemetry telemetry) {
+    void require(TableNames names, OutboxMessage message, String type, boolean local, OutboxTelemetry telemetry) {
         var topic = message.topic();
         int version = Contracts.version(message.headers());
         if (version == 0) {
@@ -151,21 +172,70 @@ final class ContractGuard {
                     + ": " + Contracts.value(message.headers()) + "; it must be a positive decimal int, or absent for"
                     + " version 1");
         }
-        if (version == 1) {
+        var s = snapshot;
+        if (local || version > 1) {
+            boolean stale = s == null || System.nanoTime() - s.readAt > staleAfter.toNanos();
+            if (local) {
+                requireRouted(names, s, stale, topic, telemetry);
+            }
+            if (version > 1) {
+                requireReadable(names, s, stale, topic, type, version, telemetry);
+            }
+            if (stale) {
+                unchecked(names, s, topic, telemetry);
+            }
+        }
+        if (!local && s != null && s.routedByAny.contains(topic) && due(unmarkedWarned)) {
+            log.warn("outbox {} wrote to topic {} unmarked, as no route here claims it, while a live relay instance"
+                    + " routes it: register that route here too, or a relay instance without it hands such records to"
+                    + " its fallback; this WARN repeats at most once a minute", names.base(), topic);
+        }
+    }
+
+    private void requireRouted(TableNames names, @Nullable Snapshot s, boolean stale, String topic,
+            OutboxTelemetry telemetry) {
+        if (s != null && (s.routedByAll.contains(topic) || !stale && s.routes.isEmpty())) {
             return;
         }
-        var s = snapshot;
-        if (s == null || System.nanoTime() - s.readAt > staleAfter.toNanos()) {
-            throw refused(names, telemetry, new OutboxIncompatibleContractException("outbox contract of topic " + topic
-                    + ": " + type + " writes v" + version + ", but this instance has not read the live relay"
-                    + " instances' contracts for " + staleAfter.toSeconds() + " s (its heartbeat fails?); refused until"
-                    + " it reads them again", topic, type, version, 0, List.of()));
+        OutboxMissingRouteException e;
+        if (stale) {
+            e = new OutboxMissingRouteException("outbox topic " + topic + " has a local route here, but this instance "
+                    + staleRefusal(s, s != null && s.routes.isEmpty(), "routes it"), topic, List.of());
+        } else {
+            var missing = new ArrayList<String>();
+            s.routes.forEach((id, topics) -> {
+                if (topics == null || !topics.contains(topic)) {
+                    missing.add(id);
+                }
+            });
+            e = new OutboxMissingRouteException("outbox topic " + topic + " has a local route here, but "
+                    + missing.size() + " of " + s.routes.size() + " live relay instances do not route it ("
+                    + named(missing) + "); deploy the release with this route everywhere before writing to it", topic,
+                    missing);
         }
-        var lowest = s.lowest.get(topic);
+        telemetry.routeRejected(topic);
+        if (due(routeWarned)) {
+            log.warn("outbox {} refused a send: {}; the instances: {}; refusals are counted in"
+                    + " outbox.messages.route_rejected, this WARN repeats at most once a minute", names.base(),
+                    e.getMessage(), e.instances());
+        }
+        throw e;
+    }
+
+    private void requireReadable(TableNames names, @Nullable Snapshot s, boolean stale, String topic, String type,
+            int version, OutboxTelemetry telemetry) {
+        var lowest = s == null ? null : s.lowest.get(topic);
         // no live relay instance reports it and no route here claims it: only an unknown report stands in the way
         boolean unguarded = lowest == null && !contracts.containsKey(topic);
-        if (unguarded && !s.unknown || s.reports.isEmpty() || lowest != null && lowest >= version) {
+        boolean readable = s != null && (unguarded && !s.unknown || lowest != null && lowest >= version);
+        if (stale ? readable && !s.reports.isEmpty() : readable || s.reports.isEmpty()) {
             return;
+        }
+        if (stale) {
+            throw refused(names, telemetry, new OutboxIncompatibleContractException("outbox contract of topic " + topic
+                    + ": " + type + " writes v" + version + ", but this instance "
+                    + staleRefusal(s, s != null && s.reports.isEmpty(), "reads v" + version), topic, type, version, 0,
+                    List.of()));
         }
         var below = new ArrayList<String>();
         int most = 0; // the highest version any of them reads, so the message holds for each one it names
@@ -176,26 +246,65 @@ final class ContractGuard {
                 most = Math.max(most, read);
             }
         }
-        var named = String.join(", ", below.subList(0, Math.min(NAMED, below.size())))
-                + (below.size() > NAMED ? ", +" + (below.size() - NAMED) + " more" : "");
         throw refused(names, telemetry, new OutboxIncompatibleContractException("outbox contract of topic " + topic
                 + ": " + type + " writes v" + version + ", but " + below.size() + " of " + s.reports.size()
-                + " live relay instances " + (most == 0 ? "do not read it" : "read at most v" + most) + " (" + named
-                + "); deploy the release that reads v" + version + " everywhere first", topic, type, version,
-                lowest == null ? 0 : lowest, below));
+                + " live relay instances " + (most == 0 ? "do not read it" : "read at most v" + most) + " ("
+                + named(below) + "); deploy the release that reads v" + version + " everywhere first", topic, type,
+                version, lowest == null ? 0 : lowest, below));
+    }
+
+    /**
+     * Why a stale read refuses, after "this instance": how long ago it read the reports, and, when it did, that the
+     * last read found no live relay instance ({@code none}) or not every one that {@code does} so.
+     */
+    private static String staleRefusal(@Nullable Snapshot s, boolean none, String does) {
+        if (s == null) {
+            return "has never read the live relay instances' reports (its heartbeat fails?); refused until a fresh"
+                    + " read allows it";
+        }
+        return "has not read the live relay instances' reports for " + age(s) + " s (its heartbeat fails?), and "
+                + (none ? "the last read found no live relay instance" : "in the last read not every one " + does)
+                + "; refused until a fresh read allows it";
+    }
+
+    /** A message let through on a stale read that allowed it. */
+    private void unchecked(TableNames names, Snapshot s, String topic, OutboxTelemetry telemetry) {
+        telemetry.routeUnchecked(topic);
+        if (due(uncheckedWarned)) {
+            log.warn("outbox {} let a send to topic {} through unchecked: this instance has not read the live relay"
+                    + " instances' reports for {} s (its heartbeat fails?), and the last read allowed it; such sends"
+                    + " are counted in outbox.messages.route_unchecked, this WARN repeats at most once a minute",
+                    names.base(), topic, age(s));
+        }
     }
 
     private OutboxIncompatibleContractException refused(TableNames names, OutboxTelemetry telemetry,
             OutboxIncompatibleContractException e) {
         telemetry.contractRejected(e.topic(), e.type(), e.version());
-        long now = System.nanoTime();
-        long last = warned.get();
-        if (now - last >= WARN_INTERVAL && warned.compareAndSet(last, now)) {
+        if (due(contractWarned)) {
             log.warn("outbox {} refused a send: {}; the instances: {}; refusals are counted in"
                     + " outbox.messages.contract_rejected, this WARN repeats at most once a minute", names.base(),
                     e.getMessage(), e.incompatibleInstances());
         }
         return e;
+    }
+
+    /** The first {@link #NAMED} of {@code ids}, then how many more. */
+    private static String named(List<String> ids) {
+        return String.join(", ", ids.subList(0, Math.min(NAMED, ids.size())))
+                + (ids.size() > NAMED ? ", +" + (ids.size() - NAMED) + " more" : "");
+    }
+
+    /** How long ago {@code s} was read, in whole seconds. */
+    private static long age(Snapshot s) {
+        return TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - s.readAt);
+    }
+
+    /** Whether the WARN that {@code warned} limits may log now, at most once a {@link #WARN_INTERVAL}. */
+    private static boolean due(AtomicLong warned) {
+        long now = System.nanoTime();
+        long last = warned.get();
+        return now - last >= WARN_INTERVAL && warned.compareAndSet(last, now);
     }
 
     /** One read of the live relay instances' reports; {@code readAt}: {@link System#nanoTime()} before it ran. */
@@ -210,12 +319,29 @@ final class ContractGuard {
         final boolean unknown;
         /** By instance id, sorted: the topics its routes claim; null when unknown. */
         final SortedMap<String, Set<String>> routes;
+        /** The topics every instance's routes claim: none when one's are unknown, or there is no instance. */
+        final Set<String> routedByAll;
+        /** The topics some instance's routes claim. */
+        final Set<String> routedByAny;
 
         Snapshot(long readAt, Map<String, Map<String, Integer>> reports, Map<String, Set<String>> routes) {
             this.readAt = readAt;
             this.reports = Collections.unmodifiableSortedMap(new TreeMap<>(reports));
             this.routes = Collections.unmodifiableSortedMap(new TreeMap<>(routes));
             this.unknown = this.reports.containsValue(null); // the copy's: Map.of refuses to look for null
+            Set<String> all = null;
+            var any = new HashSet<String>();
+            for (var topics : this.routes.values()) {
+                var claimed = topics == null ? Set.<String>of() : topics;
+                any.addAll(claimed);
+                if (all == null) {
+                    all = new HashSet<>(claimed);
+                } else {
+                    all.retainAll(claimed);
+                }
+            }
+            this.routedByAll = all == null ? Set.of() : Set.copyOf(all);
+            this.routedByAny = Set.copyOf(any);
             var lowest = new HashMap<String, Integer>();
             for (var report : reports.values()) {
                 if (report != null) {

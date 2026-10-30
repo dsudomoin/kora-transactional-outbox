@@ -78,6 +78,8 @@ class GuardedTelemetryTest {
             t.requeued("orders");
             t.waited("orders", Outcome.Waiting.Kind.CONTRACT);
             t.contractRejected("orders", "Created", 2);
+            t.routeRejected("orders");
+            t.routeUnchecked("orders");
             t.stepFinished(Duration.ofMillis(1));
             t.shardPaused();
             t.deadLetterDecision("keep");
@@ -116,6 +118,27 @@ class GuardedTelemetryTest {
         t.contractRejected("orders", "Created", 2);
 
         assertThat(rejected).containsExactly("orders Created 2");
+    }
+
+    @Test
+    void routeRejectedAndRouteUncheckedAreForwarded() {
+        var events = new ArrayList<String>();
+        var t = GuardedTelemetry.of(new OutboxTelemetry() {
+            @Override
+            public void routeRejected(String topic) {
+                events.add("rejected " + topic);
+            }
+
+            @Override
+            public void routeUnchecked(String topic) {
+                events.add("unchecked " + topic);
+            }
+        });
+
+        t.routeRejected("orders");
+        t.routeUnchecked("audit");
+
+        assertThat(events).containsExactly("rejected orders", "unchecked audit");
     }
 
     @Test
@@ -321,6 +344,16 @@ class GuardedTelemetryTest {
 
         @Override
         public void contractRejected(String topic, String type, int version) {
+            throw bug();
+        }
+
+        @Override
+        public void routeRejected(String topic) {
+            throw bug();
+        }
+
+        @Override
+        public void routeUnchecked(String topic) {
             throw bug();
         }
 

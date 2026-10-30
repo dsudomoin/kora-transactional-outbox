@@ -335,6 +335,15 @@ class ObservationOutboxTelemetryTest {
     }
 
     @Test
+    void aRejectedAndAnUncheckedRouteAreCounted() {
+        telemetry().routeRejected("orders");
+        telemetry().routeUnchecked("audit");
+
+        assertThat(meters.get("outbox.messages.route_rejected").tag("topic", "orders").counter().count()).isEqualTo(1);
+        assertThat(meters.get("outbox.messages.route_unchecked").tag("topic", "audit").counter().count()).isEqualTo(1);
+    }
+
+    @Test
     void aWaitingRecordIsLabelledWaitingWithoutAnErrorAndCounted() {
         var telemetry = telemetry();
         var delivery = telemetry.deliveryStarted(List.of(record(List.of())), NOW);

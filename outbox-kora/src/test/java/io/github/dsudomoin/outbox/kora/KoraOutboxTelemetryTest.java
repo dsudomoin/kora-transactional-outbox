@@ -103,6 +103,20 @@ class KoraOutboxTelemetryTest {
     }
 
     @Test
+    void aRejectedAndAnUncheckedRouteAreCounted() {
+        var registry = new SimpleMeterRegistry();
+        var telemetry = new KoraOutboxTelemetry(new OutboxMetrics(registry), null);
+
+        telemetry.routeRejected("orders");
+        telemetry.routeUnchecked("audit");
+
+        assertThat(registry.get("outbox.messages.route_rejected").tag("topic", "orders").counter().count())
+                .isEqualTo(1);
+        assertThat(registry.get("outbox.messages.route_unchecked").tag("topic", "audit").counter().count())
+                .isEqualTo(1);
+    }
+
+    @Test
     void aWaitingRecordEndsItsSpanAsWaitingWithoutAnErrorAndIsCounted() {
         var registry = new SimpleMeterRegistry();
         var spans = InMemorySpanExporter.create();

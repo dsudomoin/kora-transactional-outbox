@@ -110,7 +110,10 @@ class WriterGuardIT {
         }
     }
 
-    /** A crashed relay instance, of unknown report, blocks until its row expires, then the next beat lets go. */
+    /**
+     * A crashed relay instance, of unknown report, blocks until its row expires, then the next beat lets go. It routes
+     * the topic, so the version check is what blocks.
+     */
     @Test
     void anExpiredRowStopsBlocking() throws Exception {
         var config = new TestOutboxConfig().relayEnabled(false).maintenanceInterval(Duration.ofMillis(100));
@@ -118,8 +121,9 @@ class WriterGuardIT {
                 .route(new Reads<>(V2.class, "orders")).build()) {
             writer.start();
             transactions.inTx(c -> {
-                TestSql.execute(c, "insert into " + config.table() + "_instance (instance_id, shards, relay,"
-                        + " expires_at) values ('crashed/1/00000000', 4, true, now() + interval '1 second')");
+                TestSql.execute(c, "insert into " + config.table() + "_instance (instance_id, shards, relay, routes,"
+                        + " expires_at) values ('crashed/1/00000000', 4, true, '{orders}', now() + interval '1"
+                        + " second')");
                 return null;
             });
             var v2 = typed(writer, V2.class);
@@ -139,6 +143,101 @@ class WriterGuardIT {
             long live = transactions.inTx(c -> TestSql.queryLong(c, "select count(*) from " + config.table()
                     + "_instance where instance_id = 'crashed/1/00000000' and expires_at > now()"));
             assertThat(live).isZero();
+        }
+    }
+
+    /**
+     * A canary with a new route next to a live relay instance without it: raw, version-1 typed and bulk sends to the
+     * route's topic are refused and counted; a topic every relay instance routes goes in.
+     */
+    @Test
+    void aRouteALiveRelayLacksRefusesRawAndVersion1SendsAndCountsThem() {
+        var oldConfig = new TestOutboxConfig();
+        var rejected = new CopyOnWriteArrayList<String>();
+        try (var old = OutboxRuntime.builder(oldConfig, transactions, new RecordingHandler()).route(new Plain("audit"))
+                .build();
+                var canary = OutboxRuntime.builder(new TestOutboxConfig().table(oldConfig.table()), transactions,
+                        new RecordingHandler()).route(new Plain("audit")).route(new Reads<>(V1.class, "orders"))
+                        .telemetry(new OutboxTelemetry() {
+                            @Override
+                            public void routeRejected(String topic) {
+                                rejected.add(topic);
+                            }
+                        }).build()) {
+            old.start();
+            canary.start(); // its bootstrap reads both rows
+            var oldId = old.schema().instanceId();
+            var v1 = typed(canary, V1.class);
+
+            transactions.inTx(c -> {
+                assertThatThrownBy(() -> canary.outbox().send(raw("orders")))
+                        .isInstanceOfSatisfying(OutboxMissingRouteException.class, e -> {
+                            assertThat(e).hasMessage("outbox topic orders has a local route here, but 1 of 2 live"
+                                    + " relay instances do not route it (" + oldId + "); deploy the release with this"
+                                    + " route everywhere before writing to it");
+                            assertThat(e.topic()).isEqualTo("orders");
+                            assertThat(e.instances()).containsExactly(oldId);
+                        });
+                assertThatThrownBy(() -> v1.send("orders", "k", new V1("1")))
+                        .isInstanceOf(OutboxMissingRouteException.class);
+                assertThatThrownBy(() -> canary.outbox().sendAll(List.of(raw("audit"), v1.message("orders", "k",
+                        new V1("1"))))).as("none of it goes in").isInstanceOf(OutboxMissingRouteException.class);
+                canary.outbox().send(raw("audit"));
+                return null;
+            });
+
+            assertThat(rows(oldConfig)).isOne();
+            assertThat(rejected).containsExactly("orders", "orders", "orders");
+        }
+    }
+
+    /** Only relay instances take records, so a writer-only instance's routes count for nothing. */
+    @Test
+    void aWriterOnlyInstanceIsNotCountedForARoute() {
+        var relayConfig = new TestOutboxConfig();
+        var writerConfig = new TestOutboxConfig().table(relayConfig.table()).relayEnabled(false);
+        try (var relay = OutboxRuntime.builder(relayConfig, transactions, new RecordingHandler())
+                .route(new Plain("orders")).build();
+                var writer = OutboxRuntime.builder(writerConfig, transactions, new RecordingHandler())
+                        .route(new Plain("orders", "billing")).build()) {
+            relay.start();
+            writer.start();
+
+            transactions.inTx(c -> writer.outbox().send(raw("orders")));
+            assertThatThrownBy(() -> transactions.inTx(c -> writer.outbox().send(raw("billing"))))
+                    .isInstanceOfSatisfying(OutboxMissingRouteException.class, e -> {
+                        assertThat(e).hasMessageContaining("1 of 1 live relay instances do not route it");
+                        assertThat(e.instances()).containsExactly(relay.schema().instanceId());
+                    });
+            assertThat(rows(relayConfig)).isOne();
+        }
+    }
+
+    /** A crashed relay instance, of unknown routes, blocks a local send until its row expires. */
+    @Test
+    void anExpiredRowStopsBlockingALocalSend() throws Exception {
+        var config = new TestOutboxConfig().relayEnabled(false).maintenanceInterval(Duration.ofMillis(100));
+        try (var writer = OutboxRuntime.builder(config, transactions, new RecordingHandler())
+                .route(new Plain("orders")).build()) {
+            writer.start();
+            transactions.inTx(c -> {
+                TestSql.execute(c, "insert into " + config.table() + "_instance (instance_id, shards, relay,"
+                        + " contracts, expires_at) values ('crashed/1/00000000', 4, true, '{}', now() + interval '1"
+                        + " second')");
+                return null;
+            });
+
+            var refusal = new AtomicReference<OutboxMissingRouteException>();
+            var refused = await(() -> { // once a beat read the row; a late beat's stale refusal names none
+                refusal.set(sendRaw(writer));
+                return refusal.get() != null && !refusal.get().instances().isEmpty();
+            });
+            assertThat(refusal.get())
+                    .hasMessageContaining("1 of 1 live relay instances do not route it (crashed/1/00000000)");
+            var allowed = await(() -> sendRaw(writer) == null);
+
+            assertThat(Duration.ofNanos(allowed - refused)).as("blocked until the row expired")
+                    .isGreaterThan(Duration.ofMillis(300));
         }
     }
 
@@ -189,6 +288,17 @@ class WriterGuardIT {
         }
     }
 
+    /** The refusal of a raw send to {@code orders}, or null when it went in. */
+    @Nullable
+    private OutboxMissingRouteException sendRaw(OutboxRuntime runtime) {
+        try {
+            transactions.inTx(c -> runtime.outbox().send(raw("orders")));
+            return null;
+        } catch (OutboxMissingRouteException e) {
+            return e;
+        }
+    }
+
     /** When {@code condition} first held, by {@link System#nanoTime()}; fails after 10 s. */
     private static long await(Condition condition) throws InterruptedException {
         long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
@@ -217,6 +327,10 @@ class WriterGuardIT {
                 + config.table() + "_instance where instance_id = ?", id));
     }
 
+    private static OutboxMessage raw(String topic) {
+        return new OutboxMessage(topic, bytes("k"), bytes("1"), List.of());
+    }
+
     private static byte[] bytes(String s) {
         return s.getBytes(UTF_8);
     }
@@ -231,5 +345,16 @@ class WriterGuardIT {
 
         @Override
         protected void handle(T value, OutboxRecord record) {}
+    }
+
+    /** A plain route that takes its records and does nothing. */
+    private record Plain(Set<String> topics) implements OutboxTopicHandler {
+
+        Plain(String... topics) {
+            this(Set.of(topics));
+        }
+
+        @Override
+        public void handle(OutboxRecord record) {}
     }
 }

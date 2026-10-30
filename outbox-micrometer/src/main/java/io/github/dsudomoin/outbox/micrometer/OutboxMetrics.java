@@ -82,6 +82,22 @@ public final class OutboxMetrics implements OutboxTelemetry {
         }
     }
 
+    /** {@code outbox.messages.route_rejected{topic}}; a refused send, so the registry looks it up. */
+    @Override
+    public void routeRejected(String topic) {
+        if (registry != null) {
+            registry.counter("outbox.messages.route_rejected", "topic", topic).increment();
+        }
+    }
+
+    /** {@code outbox.messages.route_unchecked{topic}}; a send on a stale read, so the registry looks it up. */
+    @Override
+    public void routeUnchecked(String topic) {
+        if (registry != null) {
+            registry.counter("outbox.messages.route_unchecked", "topic", topic).increment();
+        }
+    }
+
     @Override
     public void stepFinished(Duration duration) {
         if (registry != null) {
