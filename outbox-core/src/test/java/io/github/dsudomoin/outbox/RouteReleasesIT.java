@@ -147,6 +147,7 @@ class RouteReleasesIT {
 
         assertThat(calls).first().isEqualTo(List.of("orders a1 waits", "kafka k1 delivered", "orders b1 waits",
                 "kafka k2 delivered", "orders a2 waits", "kafka k3 delivered", "audit x1 delivered"));
+        await(() -> calls.size() >= 2);
         assertThat(kafka.batches()).as("one call, and none without a record for it").extracting(List::size)
                 .containsExactly(3);
         assertThat(kafka.delivered()).extracting(r -> text(r.payload())).containsExactly("k1", "k2", "k3");
