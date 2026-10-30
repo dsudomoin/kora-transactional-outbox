@@ -802,6 +802,28 @@ class KafkaOutboxSenderTest {
         assertThat(record.headers()).isEqualTo(headers);
     }
 
+    /** {@code outbox-local} marks a record for a route of the relay: of any value, it never leaves for Kafka. */
+    @Test
+    void localMarkerNeverReachesKafka() throws Exception {
+        var sender = sender(DELIVERY_TIMEOUT);
+        var headers = List.of(new OutboxHeader("traceparent", "00-trace".getBytes(UTF_8)),
+                new OutboxHeader("outbox-local", "x".getBytes(UTF_8)), new OutboxHeader("x", null),
+                new OutboxHeader("outbox-local", null));
+        var record = new OutboxRecord(1, UUID.randomUUID(), TOPIC, "k".getBytes(UTF_8), "v".getBytes(UTF_8), headers,
+                Instant.now(), 0, 0);
+
+        var result = sendAsync(sender, List.of(record));
+        var producer = awaitSent(0, 1);
+        producer.completeNext();
+        assertThat(result.get(5, SECONDS)).containsExactly(Outcome.delivered());
+
+        var sent = producer.history().get(0);
+        assertThat(sent.headers().toArray()).extracting(Header::key)
+                .containsExactly("traceparent", "x", "outbox-message-id");
+        assertThat(sent.headers().lastHeader("traceparent").value()).isEqualTo("00-trace".getBytes(UTF_8));
+        assertThat(record.headers()).isEqualTo(headers);
+    }
+
     @Test
     void inFlightAboveFiveRejected() {
         assertThatThrownBy(() -> new KafkaOutboxSender(() -> props(

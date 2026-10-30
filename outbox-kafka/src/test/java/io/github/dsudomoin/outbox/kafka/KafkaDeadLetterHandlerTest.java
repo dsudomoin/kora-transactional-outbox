@@ -103,6 +103,23 @@ class KafkaDeadLetterHandlerTest {
                 Map.entry(KafkaOutboxHeaders.MESSAGE_ID, unkeyed.messageId().toString()));
     }
 
+    /** A dead letter of a route carries the marker; its dead-letter topic gets its other headers. */
+    @Test
+    void aLetterIsPublishedWithoutItsLocalMarker() throws Exception {
+        var handler = handler(TEMPLATE, r -> null);
+        var letter = letter(1, "k", "v", null, new OutboxHeader("h", bytes("a")),
+                new OutboxHeader("outbox-local", null));
+
+        assertThat(handler.handle(List.of(letter))).containsExactly(DeadLetterDecision.discard());
+        assertThat(headers(producers.get(0).history().get(0))).containsExactly(
+                Map.entry("h", "a"),
+                Map.entry(KafkaDeadLetterHandler.DEAD_TOPIC, TOPIC),
+                Map.entry(KafkaDeadLetterHandler.DEAD_ERROR, "<null>"),
+                Map.entry(KafkaDeadLetterHandler.DEAD_ATTEMPTS, "3"),
+                Map.entry(KafkaDeadLetterHandler.DEAD_FAILED_AT, "2026-10-27T10:15:30.123456Z"),
+                Map.entry(KafkaOutboxHeaders.MESSAGE_ID, letter.messageId().toString()));
+    }
+
     @Test
     void anUnacknowledgedLetterFailsTheCallNamingHowMany() {
         var handler = handler(TEMPLATE, r -> new String(r.value(), UTF_8).equals("down")

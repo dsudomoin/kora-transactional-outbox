@@ -28,9 +28,10 @@ import org.slf4j.LoggerFactory;
  * for {@code OutboxRuntime.Builder#deadLetterHandler} (the Kora adapter's {@code KafkaOutboxModule} provides it). With
  * a template set ({@link KafkaOutboxConfig#deadLetterTopic()}), it publishes each letter through the relay's
  * {@link KafkaOutboxSender} to the topic that template names, {@code {topic}} replaced by the letter's topic: the
- * letter's key, payload and headers, then {@link #DEAD_TOPIC}, {@link #DEAD_ERROR}, {@link #DEAD_ATTEMPTS},
- * {@link #DEAD_FAILED_AT} and the sender's {@link KafkaOutboxHeaders#MESSAGE_ID}. Letters Kafka acknowledged are
- * discarded. Kept for humans: a letter whose dead-letter topic is no valid topic name (longer than 249 characters) or
+ * letter's key, payload and headers (but {@code outbox-local}, which the sender drops), then {@link #DEAD_TOPIC},
+ * {@link #DEAD_ERROR}, {@link #DEAD_ATTEMPTS}, {@link #DEAD_FAILED_AT} and the sender's
+ * {@link KafkaOutboxHeaders#MESSAGE_ID}. Letters Kafka acknowledged are discarded.
+ * Kept for humans: a letter whose dead-letter topic is no valid topic name (longer than 249 characters) or
  * is the letter's own topic, and one Kafka refuses for good (too large). Kafka's refusals are remembered by message id
  * (the last 10 000, until a restart), so such a letter handed again, after a call that failed or was cut, is kept at
  * once with no send. A refusal by the broker, after the append, closes the producer and fails the letter's batch-mates

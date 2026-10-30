@@ -22,6 +22,7 @@ import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.BatchClassifier;
+import io.github.dsudomoin.outbox.internal.PgOutbox;
 import jakarta.annotation.Nullable;
 import java.time.Clock;
 import java.time.Duration;
@@ -111,6 +112,9 @@ import org.slf4j.LoggerFactory;
  * slow sends into retries, which go unbatched until a call settles them. Keep {@code batchTimeout} at least
  * {@code delivery.timeout.ms} + 5 s + {@code max.block.ms} so that they end as Kafka's outcomes instead; the Kora
  * adapter's {@code KafkaOutboxModule} logs a WARN at startup when it is shorter.
+ *
+ * <p>A record goes to Kafka with its headers but any named {@code outbox-local}, of whatever value: that name marks
+ * a record for a route of the relay, and reaches no Kafka topic, a dead-letter topic included.
  */
 public final class KafkaOutboxSender implements AutoCloseable {
 
@@ -517,7 +521,9 @@ public final class KafkaOutboxSender implements AutoCloseable {
     private static ProducerRecord<byte[], byte[]> producerRecord(OutboxRecord record, @Nullable Integer partition) {
         var headers = new ArrayList<Header>(record.headers().size() + 1);
         for (var h : record.headers()) {
-            headers.add(new RecordHeader(h.name(), h.value()));
+            if (!h.name().equals(PgOutbox.LOCAL_HEADER)) {
+                headers.add(new RecordHeader(h.name(), h.value()));
+            }
         }
         headers.add(new RecordHeader(KafkaOutboxHeaders.MESSAGE_ID, record.messageId().toString().getBytes(UTF_8)));
         return new ProducerRecord<>(record.topic(), partition, null, record.key(), record.payload(), headers);
