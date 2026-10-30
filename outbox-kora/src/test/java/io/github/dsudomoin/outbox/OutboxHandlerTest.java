@@ -164,6 +164,23 @@ class OutboxHandlerTest {
         assertThat(outcomes.subList(4, 6)).allMatch(o -> o instanceof Outcome.Retry);
         assertThat(outcomes.subList(6, 8)).containsExactly(waiting, Outcome.delivered());
         assertThat(attempted).doesNotContain(k1Again).hasSize(7);
+
+        // nor is a wait a delivery: 3 failing keys after it still stop the call before ok
+        var f3 = record("t", "f3");
+        OutboxHandler stops = r -> {
+            if (r == k1) {
+                throw new OutboxWaitException("not yet");
+            }
+            if (r != ok) {
+                throw new RuntimeException("down");
+            }
+        };
+
+        var stopped = stops.handleBatch(List.of(k1, f1, f2, f3, ok));
+
+        assertThat(stopped.get(0)).isEqualTo(waiting);
+        assertThat(stopped.subList(1, 4)).allMatch(o -> o instanceof Outcome.Retry);
+        assertThat(stopped.get(4)).isEqualTo(Outcome.notAttempted());
     }
 
     @Test

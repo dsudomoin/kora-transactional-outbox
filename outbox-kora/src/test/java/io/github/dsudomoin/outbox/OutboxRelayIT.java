@@ -664,6 +664,27 @@ class OutboxRelayIT {
     }
 
     @Test
+    void drainReturnsWhileWaitingHeadsRemain() throws Exception {
+        config.relayEnabled(false).waiting(Duration.ofMillis(500), Duration.ofSeconds(5), Duration.ofMinutes(15));
+        bootstrap();
+        var handler = new RecordingHandler()
+                .failAlways(r -> "w".equals(key(r)), () -> new OutboxWaitException("v2 not here"));
+        var relay = relay(handler);
+        send(outbox(relay::wake), msg("t", "w", "w#1"), msg("t", "d", "d#1"));
+
+        assertThat(relay.drain()).as("the waiting head is due later").isOne();
+        Thread.sleep(600); // w#1 is due: drain() hands it, and its wait puts it into the future again
+
+        long started = System.nanoTime();
+        assertThat(relay.drain()).isZero();
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofMillis(1500));
+        assertThat(handler.batches()).hasSize(2);
+        assertThat(handler.batches().get(1))
+                .containsExactly(new Outcome.Waiting(Outcome.Waiting.Kind.HANDLER, "v2 not here", null));
+        assertThat(retryRows("w")).isOne();
+    }
+
+    @Test
     void aShardWhoseParkedRowIsDueIsSteppedWithoutNewRows() throws Exception {
         bootstrap();
         var delivered = new CopyOnWriteArrayList<OutboxRecord>();

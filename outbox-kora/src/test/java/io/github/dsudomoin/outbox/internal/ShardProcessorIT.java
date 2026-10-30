@@ -16,6 +16,7 @@ import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
+import io.github.dsudomoin.outbox.OutboxWaitException;
 import io.github.dsudomoin.outbox.Outcome;
 import io.github.dsudomoin.outbox.internal.Cursors.Cursor;
 import io.github.dsudomoin.outbox.internal.ShardProcessor.ShardResult;
@@ -85,6 +86,9 @@ class ShardProcessorIT {
     private static final Duration INITIAL = Duration.ofMillis(50);
     /** {@link TestOutboxConfig}'s requeue delay. */
     private static final Duration REQUEUE_DELAY = Duration.ofMillis(100);
+    /** {@link TestOutboxConfig}'s wait delay and its max. */
+    private static final Duration WAIT_DELAY = Duration.ofMillis(50);
+    private static final Duration WAIT_MAX = Duration.ofMillis(500);
 
     private final TestDatabase db = TestDb.newDatabase(4);
     private final TestOutboxConfig config = new TestOutboxConfig().shards(1);
@@ -577,6 +581,304 @@ class ShardProcessorIT {
         assertThat(calls).extracting(ShardProcessorIT::payloads).as("f#1 with f#2; w#1 alone, then w#2 with w#3")
                 .containsExactly(List.of("w#1", "f#1", "f#2"), List.of("w#2", "w#3"));
         assertThat(retryRows()).isEmpty();
+    }
+
+    @Test
+    void aStepWhoseRecordsAllWaitAdvancesWithoutAPauseOrAHalvedLimit() throws Exception {
+        config.batchSize(5);
+        bootstrap();
+        script = records -> records.stream().map(r -> Outcome.waitFor("v2 not here")).toList();
+        send(IntStream.range(0, 10).mapToObj(i -> msg("t", "k" + i, "k" + i)).toArray(OutboxMessage[]::new));
+        long t0 = cursor().tickId();
+        long t = tick();
+
+        try (var err = new CapturedStderr()) {
+            assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, false));
+            assertThat(err.text()).doesNotContain("diverted to retry").doesNotContain("paused until");
+        }
+
+        var due = now.plus(WAIT_DELAY);
+        assertThat(cursor()).isEqualTo(new Cursor(0, t0, t, retryIds().get(4), null, 0, due, null));
+        assertThat(retryRows()).containsExactly("k0:0:" + due, "k1:0:" + due, "k2:0:" + due, "k3:0:" + due,
+                "k4:0:" + due);
+        assertThat(counter("outbox.messages.waiting", "topic", "t", "kind", "handler")).isEqualTo(5);
+        assertThat(counter("outbox.messages.failed", "topic", "t", "outcome", "retry")).isZero();
+        calls.clear();
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, false));
+        assertThat(calls).as("the chunk limit is not halved").singleElement()
+                .satisfies(call -> assertThat(call).hasSize(5));
+        assertThat(cursor()).isEqualTo(new Cursor(0, t0, t, retryIds().get(9), null, 0, due, null));
+    }
+
+    @Test
+    void aKeyWhoseFirstOutcomeIsAWaitIsNotFailingNorAreTheRowsItSkipped() throws Exception {
+        bootstrap();
+        script = answering(Map.of("k1#1", Outcome.waitFor("v2 not here"), "k1#2", Outcome.notAttempted(),
+                "k2#1", Outcome.waitFor("v2 not here")));
+        send(msg("t", "k1", "k1#1"), msg("t", "k1", "k1#2"), msg("t", "k2", "k2#1"));
+        long t = tick();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+
+        var due = now.plus(WAIT_DELAY);
+        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, due, null));
+        assertThat(retryRows()).containsExactly("k1#1:0:" + due, "k1#2:0:-", "k2#1:0:" + due);
+        assertThat(waiting()).containsExactly("k1#1:" + now, "k2#1:" + now);
+    }
+
+    @Test
+    void aWaitingHeadSpendsNoAttemptAndIsAskedLessOftenAsItAges() throws Exception {
+        config.retry(INITIAL, Duration.ofMillis(500), 1); // one attempt: a wait counting as one would dead-letter
+        bootstrap();
+        script = answering(Map.of("w#1", Outcome.waitFor("v2 not here")));
+        send(msg("t", "w", "w#1"), msg("t", "d", "d#1"));
+        tick();
+        var since = now;
+        process();
+        assertThat(retryRows()).containsExactly("w#1:0:" + now.plus(WAIT_DELAY));
+
+        // due a quarter of its age later, between the wait delay and its max
+        var ages = List.of(Duration.ofMillis(100), Duration.ofSeconds(1), Duration.ofSeconds(10));
+        var waits = List.of(WAIT_DELAY, Duration.ofMillis(250), WAIT_MAX);
+        for (int i = 0; i < ages.size(); i++) {
+            now = since.plus(ages.get(i));
+            assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+            assertThat(retryRows()).containsExactly("w#1:0:" + now.plus(waits.get(i)));
+        }
+        var notBefore = now.plus(Duration.ofSeconds(3));
+        script = answering(Map.of("w#1", Outcome.waitFor("v2 not here until then", notBefore)));
+        now = now.plus(Duration.ofSeconds(1));
+        process();
+        assertThat(retryRows()).as("no earlier than notBefore").containsExactly("w#1:0:" + notBefore);
+
+        assertThat(deadRows()).isEmpty();
+        assertThat(waiting()).as("since its first wait").containsExactly("w#1:" + since);
+        assertThat(headErrors()).containsExactly("waiting (handler): v2 not here until then");
+        assertThat(cursor().pausedUntil()).isNull();
+        assertThat(cursor().failures()).isZero();
+        assertThat(counter("outbox.messages.waiting", "topic", "t", "kind", "handler")).isEqualTo(5);
+        assertThat(counter("outbox.messages.failed", "topic", "t", "outcome", "retry")).isZero();
+
+        script = null;
+        now = notBefore;
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(delivered()).containsExactly("d#1", "w#1");
+        assertThat(handler.delivered()).extracting(OutboxRecord::attempts).containsOnly(0);
+        assertThat(retryRows()).isEmpty();
+    }
+
+    @Test
+    void aWaitingHeadNotAttemptedIsDueNoSoonerThanItsWaitSays() throws Exception {
+        bootstrap();
+        script = answering(Map.of("w#1", Outcome.waitFor("v2 not here")));
+        send(msg("t", "w", "w#1"));
+        tick();
+        var since = now;
+        process();
+        script = answering(Map.of("w#1", Outcome.notAttempted()));
+
+        now = since.plus(Duration.ofSeconds(10)); // a quarter of its age is past the max wait
+        process();
+
+        assertThat(retryRows()).as("not after initialDelay").containsExactly("w#1:0:" + now.plus(WAIT_MAX));
+        assertThat(waiting()).containsExactly("w#1:" + since);
+        assertThat(headErrors()).containsExactly("waiting (handler): v2 not here");
+    }
+
+    @Test
+    void aWaitingHeadHoldsItsKeyInBothPassesWhileOtherKeysGoOn() throws Exception {
+        bootstrap();
+        var waits = new AtomicBoolean(true);
+        handler.failAlways(r -> waits.get() && key("w").test(r), () -> new OutboxWaitException("v2 not here"));
+        send(msg("t", "w", "w#1"), msg("t", "a", "a#1"), msg("t", "w", "w#2"), msg("t", "a", "a#2"));
+        tick();
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
+        var due = now.plus(WAIT_DELAY);
+        assertThat(retryRows()).containsExactly("w#1:0:" + due, "w#2:0:-");
+
+        send(msg("t", "w", "w#3"), msg("t", "a", "a#3"));
+        tick();
+        assertThat(process()).as("w#3 blocked behind its key").isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(retryRows()).containsExactly("w#1:0:" + due, "w#2:0:-", "w#3:0:-");
+
+        send(msg("t", "a", "a#4"));
+        tick();
+        calls.clear();
+        now = due;
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(calls).extracting(ShardProcessorIT::payloads).as("the retry pass hands w#1 alone")
+                .containsExactly(List.of("w#1"), List.of("a#4"));
+        var dueAgain = now.plus(WAIT_DELAY);
+        assertThat(retryRows()).containsExactly("w#1:0:" + dueAgain, "w#2:0:-", "w#3:0:-");
+
+        waits.set(false);
+        calls.clear();
+        now = dueAgain;
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 3, true));
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads).as("then its followers, in id order")
+                .containsExactly(List.of("w#1"), List.of("w#2", "w#3"));
+        assertThat(delivered()).containsExactly("a#1", "a#2", "a#3", "a#4", "w#1", "w#2", "w#3");
+        assertThat(retryRows()).isEmpty();
+    }
+
+    @Test
+    void aWaitingKeyAndAFailedKeyInOneRetryPassKeepTheirOwnOrder() throws Exception {
+        bootstrap();
+        var waits = new AtomicBoolean(true);
+        handler.failAlways(r -> waits.get() && key("a").test(r), () -> new OutboxWaitException("v2 not here"));
+        handler.failNext(payload("b#1"), () -> new RuntimeException("b down"));
+        send(msg("t", "a", "a#1"), msg("t", "b", "b#1"), msg("t", "a", "a#2"), msg("t", "b", "b#2"),
+                msg("t", "d", "d#1"));
+        tick();
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+        var since = now;
+        var due = now.plus(INITIAL); // the wait delay is 50 ms too
+        assertThat(retryRows()).containsExactly("a#1:0:" + due, "b#1:1:" + due, "a#2:0:-", "b#2:0:-");
+        calls.clear();
+
+        now = due;
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads).as("one call: a#1 alone, b#1 with b#2")
+                .containsExactly(List.of("a#1", "b#1", "b#2"));
+        assertThat(delivered()).containsExactly("d#1", "b#1", "b#2");
+        assertThat(retryRows()).containsExactly("a#1:0:" + now.plus(WAIT_DELAY), "a#2:0:-");
+        assertThat(waiting()).containsExactly("a#1:" + since);
+        assertThat(cursor().pausedUntil()).isNull();
+        assertThat(cursor().failures()).isZero();
+        assertThat(counter("outbox.messages.failed", "topic", "t", "outcome", "retry")).as("b#1, once").isOne();
+        assertThat(counter("outbox.messages.waiting", "topic", "t", "kind", "handler")).isEqualTo(2);
+
+        waits.set(false);
+        now = cursor().retryDueAt();
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
+        assertThat(delivered()).containsExactly("d#1", "b#1", "b#2", "a#1", "a#2");
+        assertThat(retryRows()).isEmpty();
+    }
+
+    @Test
+    void aWaitReportedAsAFailureByACatchAllHandleBatchIsAWait() throws Exception {
+        bootstrap();
+        var wait = new OutboxWaitException("v2 not here"); // what such a handleBatch caught from handle()
+        script = answering(Map.of("r#1", Outcome.retry(wait), "p#1", Outcome.permanent(wait)));
+        send(msg("t", "r", "r#1"), msg("t", "p", "p#1"), msg("t", "d", "d#1"));
+        tick();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 1, true));
+
+        var due = now.plus(WAIT_DELAY);
+        assertThat(retryRows()).containsExactly("r#1:0:" + due, "p#1:0:" + due);
+        assertThat(deadRows()).isEmpty();
+        assertThat(headErrors()).containsOnly("waiting (handler): v2 not here");
+        assertThat(counter("outbox.messages.waiting", "topic", "t", "kind", "handler")).isEqualTo(2);
+    }
+
+    @Test
+    void aCallOfOneRecordThatThrowsAWaitMakesItWait() throws Exception {
+        bootstrap();
+        script = records -> {
+            throw new OutboxWaitException("v2 not here");
+        };
+        send(msg("t", "w", "w#1"));
+        long t = tick();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+
+        var due = now.plus(WAIT_DELAY);
+        assertThat(retryRows()).containsExactly("w#1:0:" + due);
+        assertThat(headErrors()).containsExactly("waiting (handler): v2 not here");
+        assertThat(cursor()).isEqualTo(new Cursor(0, t, null, 0, null, 0, due, null));
+
+        // a call of several records that throws it fails as a whole, as any exception: none of them is known to wait
+        send(msg("t", "a", "a#1"), msg("t", "b", "b#1"));
+        tick();
+        assertThat(process().status()).isEqualTo(PAUSED);
+        assertThat(retryRows()).containsExactly("w#1:0:" + due);
+    }
+
+    @Test
+    void aParkedRowThatWaitsInTheMainPassBecomesAWaitingHeadWithoutAPause() throws Exception {
+        bootstrap();
+        script = answering(Map.of("k#1", Outcome.requeue()));
+        send(msg("t", "k", "k#1"));
+        tick();
+        process();
+        assertThat(parkedRows()).containsExactly("k#1:1:" + now.plus(REQUEUE_DELAY));
+        // k#1 comes back right before k#2 and waits, then the call winds down
+        script = answering(Map.of("k#1", Outcome.waitFor("v2 not here"), "j#1", Outcome.notAttempted(),
+                "k#2", Outcome.notAttempted()));
+        send(msg("t", "j", "j#1"), msg("t", "k", "k#2"));
+        tick();
+        calls.clear();
+
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("k#1", "j#1", "k#2"));
+        assertThat(parkedRows()).isEmpty();
+        var due = now.plus(WAIT_DELAY);
+        assertThat(retryRows()).containsExactly("k#1:0:" + due);
+        assertThat(waiting()).containsExactly("k#1:" + now);
+        assertThat(cursor().pausedUntil()).isNull();
+        assertThat(cursor().failures()).isZero();
+
+        script = null;
+        assertThat(process()).as("j#1 and k#2 read again, k#2 behind k#1")
+                .isEqualTo(new ShardResult(PROGRESS, 1, true));
+        assertThat(retryRows()).containsExactly("k#1:0:" + due, "k#2:0:-");
+    }
+
+    @Test
+    void aDueParkedRowThatWaitsBecomesAWaitingHeadTakingItsNewerParkedRowsAlong() throws Exception {
+        bootstrap();
+        script = answering(Map.of("k#1", Outcome.requeue(), "k#2", Outcome.requeue()));
+        send(msg("t", "k", "k#1"), msg("t", "k", "k#2"));
+        tick();
+        process();
+        assertThat(parkedRows()).hasSize(2);
+        script = null;
+        var waits = new AtomicBoolean(true);
+        handler.failAlways(r -> waits.get() && payload("k#1").test(r), () -> new OutboxWaitException("v2 not here"));
+        calls.clear();
+
+        now = now.plus(REQUEUE_DELAY);
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 0, true));
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads).containsExactly(List.of("k#1", "k#2"));
+        assertThat(parkedRows()).isEmpty();
+        var due = now.plus(WAIT_DELAY);
+        assertThat(retryRows()).containsExactly("k#1:0:" + due, "k#2:0:-");
+        assertThat(waiting()).containsExactly("k#1:" + now);
+        assertThat(counter("outbox.messages.waiting", "topic", "t", "kind", "handler")).isOne();
+        assertThat(counter("outbox.messages.failed", "topic", "t", "outcome", "retry")).isZero();
+
+        waits.set(false);
+        now = due;
+        assertThat(process()).isEqualTo(new ShardResult(PROGRESS, 2, true));
+        assertThat(delivered()).containsExactly("k#1", "k#2");
+        assertThat(retryRows()).isEmpty();
+    }
+
+    @Test
+    void theFollowerBudgetIsSharedOnlyByTheHeadsThatTakeFollowers() throws Exception {
+        config.batchSize(4);
+        bootstrap();
+        handler.failAlways(payload("w#1"), () -> new OutboxWaitException("v2 not here"));
+        handler.failNext(payload("r#1"), () -> new RuntimeException("r down"));
+        send(msg("t", "r", "r#1"), msg("t", "w", "w#1"), msg("t", "d", "d#1"), msg("t", "r", "r#2"),
+                msg("t", "r", "r#3"), msg("t", "r", "r#4"));
+        tick();
+        processUntilNoWork();
+        var due = now.plus(INITIAL);
+        assertThat(retryRows()).containsExactly("r#1:1:" + due, "w#1:0:" + due, "r#2:0:-", "r#3:0:-", "r#4:0:-");
+        calls.clear();
+
+        now = due;
+        process();
+
+        // 4 rows: the 2 heads, and the 2 left all go to r#1, the one head that takes followers
+        assertThat(calls).extracting(ShardProcessorIT::payloads).first()
+                .isEqualTo(List.of("r#1", "w#1", "r#2", "r#3"));
     }
 
     @Test
@@ -3636,6 +3938,23 @@ class ShardProcessorIT {
 
     private static Predicate<OutboxRecord> payload(String payload) {
         return r -> payload.equals(new String(r.payload(), UTF_8));
+    }
+
+    private static Predicate<OutboxRecord> key(String key) {
+        return r -> r.key() != null && key.equals(new String(r.key(), UTF_8));
+    }
+
+    /** {@code payload:waiting_since} of the waiting retry heads, in id order. */
+    private List<String> waiting() throws SQLException {
+        return rows("select payload, waiting_since from " + names.retry() + " where waiting_since is not null"
+                + " order by id", rs -> new String(rs.getBytes(1), UTF_8) + ":"
+                + rs.getObject(2, OffsetDateTime.class).toInstant());
+    }
+
+    /** {@code last_error} of the retry heads, in id order. */
+    private List<String> headErrors() throws SQLException {
+        return rows("select last_error from " + names.retry() + " where next_attempt_at is not null order by id",
+                rs -> rs.getString(1));
     }
 
     /** Payloads the handler delivered, in delivery order. */
