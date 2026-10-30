@@ -114,6 +114,8 @@ public abstract class TypedOutboxTopicHandler<T> implements OutboxTopicHandler {
         T value;
         try {
             value = deserializer.deserialize(record.topic(), payload);
+        } catch (OutboxWaitException | OutboxPermanentException e) {
+            throw e;
         } catch (Exception e) {
             throw CannotHandle.permanent(record, getClass().getName() + " cannot decode its payload", e);
         }

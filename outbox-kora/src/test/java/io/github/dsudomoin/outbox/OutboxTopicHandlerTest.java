@@ -171,6 +171,22 @@ class OutboxTopicHandlerTest {
     }
 
     @Test
+    void deserializerWaitOrPermanentPassesThroughUnwrapped() {
+        var permanent = new OutboxPermanentException("bad event");
+        var typed = new Texts((topic, payload) -> {
+            if (payload[0] == 'w') {
+                throw new OutboxWaitException("unknown sub-type");
+            }
+            throw permanent;
+        });
+
+        var outcomes = typed.handleBatch(List.of(record("text", "k1", "w"), record("text", "k2", "p")));
+
+        assertThat(outcomes).containsExactly(Outcome.waitFor("unknown sub-type"), Outcome.permanent(permanent));
+        assertThat(typed.values).isEmpty();
+    }
+
+    @Test
     void deserializerReturningNullIsPermanent() {
         var typed = new Texts((topic, payload) -> null);
         var record = record("text", "k", "a");
