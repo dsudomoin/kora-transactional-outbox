@@ -340,14 +340,15 @@ public final class ShardProcessor implements AutoCloseable {
             var cursor = s.cursor;
             // the step's time is spent: this shard's retry pass waits for its next step, its full check too
             boolean deferred = anyCall && System.nanoTime() - started >= relay.batchTimeout().toNanos();
-            // Retry rows of a shard are written only under its lock (divert, retry pass), and each (topic, key) group
-            // in the retry table always has exactly one head, the only rows with next_attempt_at; every step that
-            // writes there stores min(next_attempt_at) as the cursor's retry_due_at. So retry_due_at == null means no
-            // retry rows, and the table is read only when it is due or the step wrote to it, not on every step: under
-            // a held xmin horizon each probe walks every dead version a mass divert left. Once per maintenanceInterval
-            // the step checks in full, for rows changed outside the relay: only hand edits change those tables outside
-            // a step, and a shard with no new rows and nothing due is not stepped, so such an edit waits for its next
-            // row or due time.
+            // Retry rows of a shard are written only under its lock (divert, retry pass, the admin's abandon), and each
+            // (topic, key) group in the retry table always has exactly one head, the only rows with next_attempt_at;
+            // every step that writes there stores min(next_attempt_at) as the cursor's retry_due_at, and an abandon
+            // only deletes. So retry_due_at == null means no retry rows, and the table is read only when it is due or
+            // the step wrote to it, not on every step: under a held xmin horizon each probe walks every dead version a
+            // mass divert left. Once per maintenanceInterval the step checks in full, for rows changed outside the
+            // relay: outside a step, hand edits and the admin's abandon change those tables (an abandon leaves
+            // retry_due_at as it was, so a probe at it finds nothing), and a shard with no new rows and nothing due is
+            // not stepped, so a hand edit waits for its next row or due time.
             s.full = !deferred && fullCheckDue(shard);
             s.retryDue = cursor.retryDueAt();
             var heads = !deferred && (s.full || s.retryDue != null && !s.retryDue.isAfter(now))
