@@ -22,11 +22,9 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
@@ -158,22 +156,12 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private List<OutboxStatus.Instance> instances(Connection c) throws SQLException {
         var instances = new ArrayList<OutboxStatus.Instance>();
         try (var st = c.createStatement(); var rs = st.executeQuery("select instance_id, shards, last_seen,"
-                + " hook_active, relay, contracts is not null, array(select key from jsonb_each(contracts) order by"
-                + " key), array(select value::int from jsonb_each(contracts) order by key) from " + names.instance()
+                + " hook_active, relay, " + ContractGuard.REPORT + " from " + names.instance()
                 + " order by instance_id")) {
             while (rs.next()) {
-                Map<String, Integer> contracts = null;
-                if (rs.getBoolean(6)) {
-                    var topics = (String[]) rs.getArray(7).getArray();
-                    var versions = (Integer[]) rs.getArray(8).getArray();
-                    contracts = new HashMap<>();
-                    for (int i = 0; i < topics.length; i++) {
-                        contracts.put(topics[i], versions[i]);
-                    }
-                }
                 instances.add(new OutboxStatus.Instance(rs.getString(1), rs.getInt(2),
                         rs.getObject(3, OffsetDateTime.class).toInstant(), rs.getBoolean(4), rs.getBoolean(5),
-                        contracts));
+                        ContractGuard.report(rs, 6)));
             }
         }
         return instances;

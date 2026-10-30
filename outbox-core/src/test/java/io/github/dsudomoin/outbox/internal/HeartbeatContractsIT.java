@@ -30,6 +30,13 @@ class HeartbeatContractsIT {
             var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, OutboxTelemetry.NONE);
             var v2 = OutboxMessage.of("orders", "k", "p".getBytes(UTF_8))
                     .withHeader(Contracts.HEADER, "2".getBytes(US_ASCII));
+            var row = "select relay || ' ' || contracts::text from " + names.instance() + " where instance_id = ?";
+            String bootstrapped = db.inTx(c -> TestSql.queryString(c, row, schema.instanceId()));
+            new Heartbeat(db, schema, schema.config(), false).beat();
+            String beaten = db.inTx(c -> TestSql.queryString(c, row, schema.instanceId()));
+            assertThat(bootstrapped).as("the bootstrap's row: no typed route reports {}, never null")
+                    .isEqualTo("false {}");
+            assertThat(beaten).as("a beat's").isEqualTo("false {}");
             try (var other = ds.getConnection()) {
                 TestSql.execute(other, "insert into " + names.instance() + " (instance_id, shards, relay, contracts,"
                         + " expires_at) values ('old/1/00000000', 4, true, '{\"orders\": 1}', now() + interval '1h')");

@@ -1,6 +1,5 @@
 package io.github.dsudomoin.outbox;
 
-import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import io.github.dsudomoin.outbox.internal.Contracts;
@@ -49,24 +48,12 @@ public record OutboxRecord(
      * {@link Outcome.Waiting.Kind#CONTRACT}: this instance cannot tell what the payload is, so the record waits.
      */
     public int contractVersion() {
-        for (int i = headers.size() - 1; i >= 0; i--) {
-            var header = headers.get(i);
-            if (header.name().equals(Contracts.HEADER)) {
-                var value = header.value() == null ? null : new String(header.value(), US_ASCII);
-                int version;
-                try {
-                    version = Integer.parseInt(value);
-                } catch (NumberFormatException e) { // a null value too
-                    version = 0;
-                }
-                if (version <= 0) {
-                    throw new OutboxWaitException(Outcome.Waiting.Kind.CONTRACT,
-                            "invalid " + Contracts.HEADER + " header: " + value);
-                }
-                return version;
-            }
+        int version = Contracts.version(headers);
+        if (version == 0) {
+            throw new OutboxWaitException(Outcome.Waiting.Kind.CONTRACT,
+                    "invalid " + Contracts.HEADER + " header: " + Contracts.value(headers));
         }
-        return 1;
+        return version;
     }
 
     public OutboxRecord withHeaders(List<OutboxHeader> headers) {

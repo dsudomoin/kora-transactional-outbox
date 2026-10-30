@@ -12,6 +12,7 @@ import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
 import io.github.dsudomoin.outbox.testing.TestSql;
 import jakarta.annotation.Nullable;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -129,7 +130,7 @@ class WriterGuardIT {
                 return refusal.get() != null && !refusal.get().incompatibleInstances().isEmpty();
             });
             assertThat(refusal.get())
-                    .hasMessageContaining("1 of 1 live relay instances read at most v0 (crashed/1/00000000)");
+                    .hasMessageContaining("1 of 1 live relay instances do not read it (crashed/1/00000000)");
             assertThat(refusal.get().incompatibleInstances()).containsExactly("crashed/1/00000000");
             var allowed = await(() -> send(v2) == null);
 
@@ -138,6 +139,42 @@ class WriterGuardIT {
             long live = transactions.inTx(c -> TestSql.queryLong(c, "select count(*) from " + config.table()
                     + "_instance where instance_id = 'crashed/1/00000000' and expires_at > now()"));
             assertThat(live).isZero();
+        }
+    }
+
+    /**
+     * Reports written by hand, with a version that is no int or one out of range, or no object at all, break neither
+     * the read nor the admin status: such an instance reads none of the topic, or nothing.
+     */
+    @Test
+    void badReportsBlockWithoutBreakingTheReadOrTheStatus() {
+        var first = new TestOutboxConfig().relayEnabled(false);
+        try (var tables = OutboxRuntime.builder(first, transactions, new RecordingHandler()).build()) {
+            tables.start();
+            transactions.inTx(c -> {
+                TestSql.execute(c, "insert into " + first.table() + "_instance (instance_id, shards, relay, contracts,"
+                        + " expires_at) values ('null/1/0', 4, true, '{\"t\": null, \"u\": 2}', now() + interval"
+                        + " '1h'), ('text/1/0', 4, true, '{\"t\": \"x\"}', now() + interval '1h'), ('huge/1/0', 4,"
+                        + " true, '{\"t\": 1e30}', now() + interval '1h'), ('list/1/0', 4, true, '[1]', now()"
+                        + " + interval '1h')");
+                return null;
+            });
+            try (var writer = OutboxRuntime.builder(new TestOutboxConfig().table(first.table()).relayEnabled(false),
+                    transactions, new RecordingHandler()).build()) {
+                writer.start(); // its bootstrap reads them
+
+                assertThatThrownBy(() -> transactions.inTx(c -> typed(writer, V2.class).send("t", "k", new V2("1"))))
+                        .isInstanceOfSatisfying(OutboxIncompatibleContractException.class, e -> {
+                            assertThat(e).hasMessageContaining("4 of 4 live relay instances do not read it");
+                            assertThat(e.incompatibleInstances())
+                                    .containsExactly("huge/1/0", "list/1/0", "null/1/0", "text/1/0");
+                        });
+                var reports = new HashMap<String, Map<String, Integer>>();
+                writer.admin().status().instances().forEach(i -> reports.put(i.id(), i.contracts()));
+                assertThat(reports).containsEntry("null/1/0", Map.of("t", 0, "u", 2))
+                        .containsEntry("text/1/0", Map.of("t", 0)).containsEntry("huge/1/0", Map.of("t", 0))
+                        .containsEntry("list/1/0", null);
+            }
         }
     }
 

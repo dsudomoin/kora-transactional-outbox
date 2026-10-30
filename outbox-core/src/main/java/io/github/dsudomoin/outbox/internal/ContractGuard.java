@@ -1,13 +1,11 @@
 package io.github.dsudomoin.outbox.internal;
 
-import static java.nio.charset.StandardCharsets.US_ASCII;
-
-import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxIncompatibleContractException;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -26,13 +24,16 @@ import org.slf4j.LoggerFactory;
  * The writer guard, one per {@link OutboxSchema}: {@link PgOutbox} refuses a message whose {@code outbox-contract}
  * header gives a version v above 1 with {@link OutboxIncompatibleContractException}, before anything is written,
  * unless every live relay instance ({@code relay}, {@code expires_at} ahead: any of them can take any shard) reports
- * its topic at v or above in {@code contracts}; one whose report is null (unknown) or lacks the topic reads none of
- * it. A topic that no live relay instance reports and no typed route of this instance claims is not checked: its
- * records are forwarded or handled raw, as a Kafka-bound one is. Without a live relay instance nothing is refused. The
- * reports are as the bootstrap, then each beat of this instance's {@link Heartbeat}, last read them: a read older than
- * {@value OutboxSchema#LIVE_INTERVALS} {@code maintenanceInterval}s refuses every such message, as nothing stands
- * behind it. A refusal is counted ({@link OutboxTelemetry#contractRejected}) and logged at WARN with every instance
- * id, at most once a minute.
+ * its topic at v or above in {@code contracts}; one that lacks the topic, or gives a version that is no positive int,
+ * reads none of it. A topic that no live relay instance reports and no typed route of this instance claims is not
+ * checked, as its records are forwarded or handled raw (a Kafka-bound one), unless a live relay instance's report is
+ * unknown ({@code contracts} null or not an object): such an instance is incompatible with every version above 1.
+ * Without a live relay instance nothing is refused. The reports are as the bootstrap, then each beat of this
+ * instance's {@link Heartbeat}, last read them: a read older than {@value OutboxSchema#LIVE_INTERVALS}
+ * {@code maintenanceInterval}s refuses every such message, as nothing stands behind it. A refusal is counted
+ * ({@link OutboxTelemetry#contractRejected}) and logged at WARN with every instance id, at most once a minute. A
+ * header that gives no version (null, not a decimal int, not positive) is refused with
+ * {@link IllegalArgumentException}: the relay would make the record wait for good.
  */
 final class ContractGuard {
 
@@ -40,6 +41,14 @@ final class ContractGuard {
     private static final long WARN_INTERVAL = TimeUnit.MINUTES.toNanos(1);
     /** How many instance ids the exception's message names; its list and the WARN name all. */
     private static final int NAMED = 2;
+    /** {@code contracts} when it is an object, else null, so the reads below never fail on a report written by hand. */
+    private static final String OBJECT = "case jsonb_typeof(contracts) when 'object' then contracts end";
+    /**
+     * An instance row's report in three columns, which {@link #report} reads: whether it is known, then its topics and
+     * their versions as text, in one order.
+     */
+    static final String REPORT = "jsonb_typeof(contracts) = 'object', array(select key from jsonb_each_text(" + OBJECT
+            + ") order by key), array(select value from jsonb_each_text(" + OBJECT + ") order by key)";
 
     private final Map<String, Integer> contracts;
     private final Duration staleAfter;
@@ -62,37 +71,52 @@ final class ContractGuard {
     void refresh(Connection c, TableNames names) throws SQLException {
         long readAt = System.nanoTime();
         var reports = new HashMap<String, Map<String, Integer>>();
-        try (var st = c.createStatement(); var rs = st.executeQuery("select instance_id, contracts is not null,"
-                + " array(select key from jsonb_each(contracts) order by key), array(select value::int from"
-                + " jsonb_each(contracts) order by key) from " + names.instance() + " where relay and expires_at"
-                + " > now()")) {
+        try (var st = c.createStatement(); var rs = st.executeQuery("select instance_id, " + REPORT + " from "
+                + names.instance() + " where relay and expires_at > now()")) {
             while (rs.next()) {
-                Map<String, Integer> report = null;
-                if (rs.getBoolean(2)) {
-                    var topics = (String[]) rs.getArray(3).getArray();
-                    var versions = (Integer[]) rs.getArray(4).getArray();
-                    report = new HashMap<>();
-                    for (int i = 0; i < topics.length; i++) {
-                        report.put(topics[i], versions[i]);
-                    }
-                }
-                reports.put(rs.getString(1), report);
+                reports.put(rs.getString(1), report(rs, 2));
             }
         }
         observed(new Snapshot(readAt, reports));
+    }
+
+    /**
+     * The report in {@link #REPORT}'s columns from {@code first} on: the version read by topic, null when unknown; a
+     * version that is no positive int reads 0.
+     */
+    @Nullable
+    static Map<String, Integer> report(ResultSet rs, int first) throws SQLException {
+        if (!rs.getBoolean(first)) {
+            return null;
+        }
+        var topics = (String[]) rs.getArray(first + 1).getArray();
+        var versions = (String[]) rs.getArray(first + 2).getArray();
+        var report = new HashMap<String, Integer>();
+        for (int i = 0; i < topics.length; i++) {
+            report.put(topics[i], Contracts.parse(versions[i]));
+        }
+        return report;
     }
 
     void observed(Snapshot read) {
         snapshot = read;
     }
 
-    /** Throws {@link OutboxIncompatibleContractException} when {@code message} must not be written (see above). */
+    /**
+     * Throws {@link OutboxIncompatibleContractException} when {@code message} must not be written, and
+     * {@link IllegalArgumentException} for a header that gives no version (see above).
+     */
     void require(TableNames names, OutboxMessage message, String type, OutboxTelemetry telemetry) {
-        int version = version(message.headers());
-        if (version <= 1) {
+        var topic = message.topic();
+        int version = Contracts.version(message.headers());
+        if (version == 0) {
+            throw new IllegalArgumentException("invalid " + Contracts.HEADER + " header of a message to topic " + topic
+                    + ": " + Contracts.value(message.headers()) + "; it must be a positive decimal int, or absent for"
+                    + " version 1");
+        }
+        if (version == 1) {
             return;
         }
-        var topic = message.topic();
         var s = snapshot;
         if (s == null || System.nanoTime() - s.readAt > staleAfter.toNanos()) {
             throw refused(names, telemetry, new OutboxIncompatibleContractException("outbox contract of topic " + topic
@@ -101,27 +125,27 @@ final class ContractGuard {
                     + " them again", topic, type, version, 0, List.of()));
         }
         var lowest = s.lowest.get(topic);
-        if (lowest == null) { // no live relay instance reports it
-            if (!contracts.containsKey(topic) || s.reports.isEmpty()) {
-                return;
-            }
-            lowest = 0;
-        }
-        if (lowest >= version) {
+        // no live relay instance reports it and no route here claims it: only an unknown report stands in the way
+        boolean unguarded = lowest == null && !contracts.containsKey(topic);
+        if (unguarded && !s.unknown || s.reports.isEmpty() || lowest != null && lowest >= version) {
             return;
         }
         var below = new ArrayList<String>();
-        s.reports.forEach((id, report) -> {
-            if (Snapshot.read(report, topic) < version) {
-                below.add(id);
+        int most = 0; // the highest version any of them reads, so the message holds for each one it names
+        for (var e : s.reports.entrySet()) {
+            int read = Snapshot.read(e.getValue(), topic);
+            if (unguarded ? e.getValue() == null : read < version) {
+                below.add(e.getKey());
+                most = Math.max(most, read);
             }
-        });
+        }
         var named = String.join(", ", below.subList(0, Math.min(NAMED, below.size())))
                 + (below.size() > NAMED ? ", +" + (below.size() - NAMED) + " more" : "");
         throw refused(names, telemetry, new OutboxIncompatibleContractException("outbox contract of topic " + topic
                 + ": " + type + " writes v" + version + ", but " + below.size() + " of " + s.reports.size()
-                + " live relay instances read at most v" + lowest + " (" + named + "); deploy the release that reads v"
-                + version + " everywhere first", topic, type, version, lowest, below));
+                + " live relay instances " + (most == 0 ? "do not read it" : "read at most v" + most) + " (" + named
+                + "); deploy the release that reads v" + version + " everywhere first", topic, type, version,
+                lowest == null ? 0 : lowest, below));
     }
 
     private OutboxIncompatibleContractException refused(TableNames names, OutboxTelemetry telemetry,
@@ -137,25 +161,6 @@ final class ContractGuard {
         return e;
     }
 
-    /**
-     * The version the last {@code outbox-contract} header gives, as {@link io.github.dsudomoin.outbox.OutboxRecord}
-     * reads it: 1 without one, at most 0 for a value it rejects.
-     */
-    private static int version(List<OutboxHeader> headers) {
-        for (int i = headers.size() - 1; i >= 0; i--) {
-            var header = headers.get(i);
-            if (header.name().equals(Contracts.HEADER)) {
-                var value = header.value() == null ? null : new String(header.value(), US_ASCII);
-                try {
-                    return Integer.parseInt(value);
-                } catch (NumberFormatException e) { // a null value too
-                    return 0;
-                }
-            }
-        }
-        return 1;
-    }
-
     /** One read of the live relay instances' reports; {@code readAt}: {@link System#nanoTime()} before it ran. */
     static final class Snapshot {
 
@@ -164,10 +169,13 @@ final class ContractGuard {
         final SortedMap<String, Map<String, Integer>> reports;
         /** For each topic an instance reports: the lowest version any reads, 0 when one reads none of it. */
         final Map<String, Integer> lowest;
+        /** A report is unknown. */
+        final boolean unknown;
 
         Snapshot(long readAt, Map<String, Map<String, Integer>> reports) {
             this.readAt = readAt;
             this.reports = Collections.unmodifiableSortedMap(new TreeMap<>(reports));
+            this.unknown = this.reports.containsValue(null); // the copy's: Map.of refuses to look for null
             var lowest = new HashMap<String, Integer>();
             for (var report : reports.values()) {
                 if (report != null) {

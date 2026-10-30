@@ -13,6 +13,7 @@ import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -85,7 +86,7 @@ class ContractGuardTest {
                 .isInstanceOfSatisfying(OutboxIncompatibleContractException.class, e -> {
                     assertThat(e.minSupported()).isZero();
                     assertThat(e.incompatibleInstances()).containsExactly("other", "unknown");
-                    assertThat(e).hasMessageContaining("2 of 3 live relay instances read at most v0 (other, unknown)");
+                    assertThat(e).hasMessageContaining("2 of 3 live relay instances do not read it (other, unknown)");
                 });
     }
 
@@ -147,15 +148,69 @@ class ContractGuardTest {
                 });
     }
 
+    /** The highest version among the instances named, so it holds for each; the fleet's lowest is minSupported. */
     @Test
-    void theLastHeaderCountsAsTheRelayReadsIt() {
+    void theMessageNamesTheHighestVersionTheBlockingInstancesRead() {
+        var reports = new HashMap<String, Map<String, Integer>>();
+        reports.put("a", Map.of("orders", 3));
+        reports.put("b", Map.of("orders", 1));
+        reports.put("c", Map.of("orders", 2));
+        reports.put("d", null);
+        reports.put("e", Map.of("audit", 1));
+        var guard = guard(Map.of(), reports);
+
+        assertThatThrownBy(() -> guard.require(NAMES, message("orders", "3"), "Created", telemetry))
+                .isInstanceOfSatisfying(OutboxIncompatibleContractException.class, e -> {
+                    assertThat(e).hasMessageContaining("4 of 5 live relay instances read at most v2 (b, c, +2 more)");
+                    assertThat(e.minSupported()).isZero();
+                    assertThat(e.incompatibleInstances()).containsExactly("b", "c", "d", "e");
+                });
+    }
+
+    /** Fail closed: an instance whose report is unknown may forward or handle anything, so nothing above v1 passes. */
+    @Test
+    void anUnknownReportGuardsEveryTopic() {
+        var reports = new HashMap<String, Map<String, Integer>>();
+        reports.put("a", Map.of("orders", 2));
+        reports.put("b", Map.of());
+        reports.put("unknown", null);
+        var guard = guard(Map.of(), reports);
+
+        assertThatThrownBy(() -> guard.require(NAMES, message("kafka-bound", "2"), "Created", telemetry))
+                .isInstanceOfSatisfying(OutboxIncompatibleContractException.class, e -> {
+                    assertThat(e).hasMessage("outbox contract of topic kafka-bound: Created writes v2, but 1 of 3 live"
+                            + " relay instances do not read it (unknown); deploy the release that reads v2 everywhere"
+                            + " first");
+                    assertThat(e.minSupported()).isZero();
+                    assertThat(e.incompatibleInstances()).containsExactly("unknown");
+                });
+        assertThatCode(() -> guard.require(NAMES, message("kafka-bound", null), "Created", telemetry))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void theLastHeaderCounts() {
         var guard = guard(Map.of(), Map.of("a", Map.of("orders", 1)));
         var headers = List.of(header("2"), header("1"));
 
         assertThatCode(() -> guard.require(NAMES, new OutboxMessage("orders", null, null, headers), "?", telemetry))
                 .doesNotThrowAnyException();
-        assertThatCode(() -> guard.require(NAMES, message("orders", "two"), "?", telemetry))
-                .as("a value the relay rejects is no version above 1").doesNotThrowAnyException();
+    }
+
+    /** The relay would make such a record wait for good: refused at once, whatever the reports, and not counted. */
+    @Test
+    void aHeaderThatGivesNoVersionIsRefused() {
+        var guard = new ContractGuard(Map.of(), INTERVAL); // never read
+        for (var value : Arrays.asList(null, "", "x", "0", "-1", " 2", "99999999999")) {
+            var headers = List.of(header("2"), new OutboxHeader(Contracts.HEADER,
+                    value == null ? null : value.getBytes(US_ASCII)));
+
+            assertThatThrownBy(() -> guard.require(NAMES, new OutboxMessage("orders", null, null, headers), "?",
+                    telemetry)).as(value).isInstanceOf(IllegalArgumentException.class)
+                    .hasMessage("invalid outbox-contract header of a message to topic orders: " + value + "; it must"
+                            + " be a positive decimal int, or absent for version 1");
+        }
+        assertThat(rejected).isEmpty();
     }
 
     @Test
