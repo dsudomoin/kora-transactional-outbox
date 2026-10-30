@@ -68,6 +68,27 @@ class LocalOnlyTest {
     }
 
     @Test
+    void aCallWithoutALocalRecordKeepsItsDelegatesFailure() {
+        var poison = new OutboxPermanentException("poison");
+        delegate.throwFromBatch(() -> poison);
+
+        assertThatThrownBy(() -> handler.handleBatch(List.of(record("billing", "k"))))
+                .as("the relay dead-letters a lone record whose call throws this").isSameAs(poison);
+
+        var wrapped = new LocalOnly(new OutboxHandler() {
+            @Override
+            public void handle(OutboxRecord record) {}
+
+            @Override
+            public List<Outcome> handleBatch(List<OutboxRecord> records) {
+                return null;
+            }
+        });
+        assertThat(wrapped.handleBatch(List.of(record("billing", "k"), record("billing", null))))
+                .as("the relay fails the whole call").isNull();
+    }
+
+    @Test
     void aThrowingDelegateFailsOnlyItsRecordsAndTheLocalOnesStillWait() {
         var records = List.of(record("billing", "k1", MARKER), record("billing", "k2"), record("billing", null));
         var down = new IllegalStateException("kafka down");
