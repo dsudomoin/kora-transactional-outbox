@@ -40,11 +40,13 @@ import org.slf4j.LoggerFactory;
  * minute, then startup fails. On existing tables the bootstrap takes no lock that writers wait behind (index creation
  * is skipped when the index exists, partition extension is optional and left to maintenance when it times out). A tick
  * table made before {@code max_id}, {@code dirty} or {@code shards}, a cursor table made before
- * {@code parked_due_at}, a retry table made before {@code requeues} and a dead table made before the dead-letter hook's
- * columns get each column once; such an ALTER waits for running relay transactions and fails startup on timeout. The
- * tick table keeps {@code shards}, the shard sets {@code dirty} replaces, for the previous release, which writes and
- * reads it beside or after this one; this version leaves it null (every shard). Ticks without {@code dirty} (null)
- * count as holding rows of every shard; dead letters older than {@code status} are kept and the hook sees new ones only: one ALTER adds the hook's
+ * {@code parked_due_at}, a retry table made before {@code requeues} or {@code waiting_since} (and its
+ * {@code <retry>_waiting} index), an instance table made before {@code relay} or {@code contracts} and a dead table
+ * made before the dead-letter hook's columns get each column once; such an ALTER waits for running relay transactions
+ * and fails startup on timeout. The tick table keeps {@code shards}, the shard sets {@code dirty} replaces, for the
+ * previous release, which writes and reads it beside or after this one; this version leaves it null (every shard).
+ * Ticks without {@code dirty} (null) count as holding rows of every shard; dead letters older than {@code status} are
+ * kept and the hook sees new ones only: one ALTER adds the hook's
  * columns, and their check is not validated, so it scans no row of the dead table under that ALTER's lock. With
  * {@code outbox.schema.bootstrap = false} it creates and alters no base object: {@link SchemaCheck} checks them first,
  * failing startup with every problem, and the rest (partitions, the first tick, cursors, the maintenance and instance
@@ -465,14 +467,17 @@ public final class OutboxSchema implements AutoCloseable {
                       attempts        int not null default 0,
                       next_attempt_at timestamptz,
                       last_error      text,
-                      requeues        int not null default 0
+                      requeues        int not null default 0,
+                      waiting_since   timestamptz
                     )""");
             if (!columnExists(c, n.retry(), "requeues")) { // made before requeue: likewise, a constant default
                 st.execute("alter table " + n.retry() + " add column if not exists requeues int not null default 0");
             }
+            addColumn(c, n.retry(), "waiting_since", "timestamptz"); // made before WAIT: rows get null, not waiting
             createIndex(c, n.retry() + "_key", n.retry() + " (shard, topic, key, id)");
             createIndex(c, n.retry() + "_due",
                     n.retry() + " (shard, next_attempt_at) where next_attempt_at is not null");
+            createIndex(c, n.retry() + "_waiting", n.retry() + " (waiting_since) where waiting_since is not null");
             // requeued records: unlike retry rows, they do not block their key
             st.execute("create table if not exists " + n.parked() + """
                      (
@@ -569,9 +574,13 @@ public final class OutboxSchema implements AutoCloseable {
                       shards      int not null,
                       last_seen   timestamptz not null default now(),
                       hook_active boolean not null default false,
-                      expires_at  timestamptz
+                      expires_at  timestamptz,
+                      relay       boolean not null default false,
+                      contracts   jsonb
                     )""");
             addColumn(c, n.instance(), "expires_at", "timestamptz"); // made by an earlier build of this version
+            addColumn(c, n.instance(), "relay", "boolean not null default false"); // likewise
+            addColumn(c, n.instance(), "contracts", "jsonb"); // likewise; null: unknown
         }
     }
 

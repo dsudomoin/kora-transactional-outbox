@@ -1622,10 +1622,12 @@ create table outbox_cursor (   -- прогресс по шардам, журна
 create table outbox_retry (    -- заблокированные потоки (topic, key): голова (с заданным next_attempt_at) и следующие за ней строки
   id bigint primary key, shard smallint not null, message_id uuid not null, topic text not null,
   key bytea, payload bytea, headers bytea, created_at timestamptz not null,
-  attempts int not null default 0, next_attempt_at timestamptz, last_error text, requeues int not null default 0
+  attempts int not null default 0, next_attempt_at timestamptz, last_error text, requeues int not null default 0,
+  waiting_since timestamptz    -- с какого момента голова ждёт (WAIT); null: не ждёт
 );
 create index outbox_retry_key on outbox_retry (shard, topic, key, id);
 create index outbox_retry_due on outbox_retry (shard, next_attempt_at) where next_attempt_at is not null;
+create index outbox_retry_waiting on outbox_retry (waiting_since) where waiting_since is not null;
 
 create table outbox_parked (   -- отложенные через Outcome.requeue: ключ не блокируют, ждут новой записи ключа или срока
   id bigint primary key, shard smallint not null, message_id uuid not null, topic text not null,
@@ -1678,7 +1680,9 @@ create table outbox_instance (     -- heartbeat работающих инста�
   shards      int not null,
   last_seen   timestamptz not null default now(),
   hook_active boolean not null default false,  -- relay здесь работает, и хук dead letters активен
-  expires_at  timestamptz            -- last_seen + 3 × maintenanceInterval этого инстанса
+  expires_at  timestamptz,           -- last_seen + 3 × maintenanceInterval этого инстанса
+  relay       boolean not null default false,  -- relay здесь работает
+  contracts   jsonb                  -- топик → старшая версия контракта, которую читает инстанс; null: неизвестно
 );
 
 -- inbox (InboxModule), создаётся, когда какой-то компонент использует Inbox

@@ -241,6 +241,35 @@ class OutboxSchemaIT {
     }
 
     @Test
+    void bootstrapAddsWaitingSinceAndInstanceReportsToOlderTables() throws Exception {
+        new OutboxSchema(db, config).start();
+        var n = TableNames.of(config.table());
+        try (var c = TestDb.connect()) {
+            // retry and instance tables made before WAIT and contract reports, each with a row; the index goes with
+            // its column
+            execute(c, "alter table " + n.retry() + " drop column waiting_since");
+            execute(c, "alter table " + n.instance() + " drop column relay, drop column contracts");
+            execute(c, "insert into " + n.retry() + " (id, shard, message_id, topic, created_at, attempts)"
+                    + " values (1, 0, gen_random_uuid(), 't', now(), 2)");
+            execute(c, "insert into " + n.instance() + " (instance_id, shards) values ('old', 4)");
+            assertThat(queryString(c, "select to_regclass(?)::text", n.retry() + "_waiting")).isNull();
+
+            new OutboxSchema(db, config).start();
+
+            assertThat(queryString(c, "select id || ':' || attempts || ':' || (waiting_since is null) from "
+                    + n.retry())).isEqualTo("1:2:true");
+            assertThat(queryString(c, "select pg_get_indexdef(to_regclass(?))", n.retry() + "_waiting"))
+                    .endsWith(" (waiting_since) WHERE (waiting_since IS NOT NULL)");
+            assertThat(queryString(c, "select relay || ':' || (contracts is null) from " + n.instance()
+                    + " where instance_id = 'old'")).isEqualTo("false:true");
+            assertThat(queryString(c, "select string_agg(attname || ' ' || format_type(atttypid, atttypmod) || ' '"
+                    + " || attnotnull, ', ' order by attname) from pg_attribute where attrelid = to_regclass(?)"
+                    + " and attname in ('relay', 'contracts')", n.instance()))
+                    .isEqualTo("contracts jsonb false, relay boolean true");
+        }
+    }
+
+    @Test
     void deadTableIsUpgradedInPlace() throws Exception {
         var n = TableNames.of(config.table());
         String letters = "select string_agg(concat_ws(':', id, status, coalesce(due_at::text, 'null'),"

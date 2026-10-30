@@ -80,11 +80,13 @@ public record SchemaObjects(List<Table> tables) {
                                 column("attempts", "integer", true, "0"),
                                 column("next_attempt_at", TIMESTAMPTZ, false),
                                 column("last_error", "text", false),
-                                column("requeues", "integer", true, "0"))),
+                                column("requeues", "integer", true, "0"),
+                                column("waiting_since", TIMESTAMPTZ, false))),
                         List.of("primary key (id)"), List.of(), List.of(
                                 index(n.retry() + "_key", "(shard, topic, key, id)"),
                                 index(n.retry() + "_due",
-                                        "(shard, next_attempt_at) where next_attempt_at is not null"))),
+                                        "(shard, next_attempt_at) where next_attempt_at is not null"),
+                                index(n.retry() + "_waiting", "(waiting_since) where waiting_since is not null"))),
                 plain(n.parked(), concat(List.of(column("id", "bigint", true), column("shard", "smallint", true)),
                         message, List.of(
                                 column("created_at", TIMESTAMPTZ, true),
@@ -133,7 +135,9 @@ public record SchemaObjects(List<Table> tables) {
                         column("shards", "integer", true),
                         column("last_seen", TIMESTAMPTZ, true, "now()"),
                         column("hook_active", "boolean", true, "false"),
-                        column("expires_at", TIMESTAMPTZ, false)),
+                        column("expires_at", TIMESTAMPTZ, false),
+                        column("relay", "boolean", true, "false"),
+                        column("contracts", "jsonb", false)),
                         List.of("primary key (instance_id)"), List.of(), List.of())));
     }
 
