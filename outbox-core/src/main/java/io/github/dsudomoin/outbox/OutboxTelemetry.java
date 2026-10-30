@@ -62,9 +62,10 @@ public interface OutboxTelemetry {
     default void routeRejected(String topic) {}
 
     /**
-     * A send to {@code topic} allowed unchecked, on the writer's thread, once per message: this instance has not read
-     * the live relay instances' reports lately, so the route or the version check took the last read, which allowed
-     * it.
+     * The writer guard let a message to {@code topic} through unchecked, on the writer's thread, once per message: this
+     * instance has not read the live relay instances' reports lately, and the last read, which the route or the version
+     * check took, allowed it. Counted at the guard, before the insert, so the message may still not be written: a
+     * later message of the same {@code sendAll} refused, or the insert failing.
      */
     default void routeUnchecked(String topic) {}
 

@@ -90,7 +90,7 @@ public final class OutboxMetrics implements OutboxTelemetry {
         }
     }
 
-    /** {@code outbox.messages.route_unchecked{topic}}; a send on a stale read, so the registry looks it up. */
+    /** {@code outbox.messages.route_unchecked{topic}}; the guard's allow on a stale read: the registry looks it up. */
     @Override
     public void routeUnchecked(String topic) {
         if (registry != null) {
