@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.internal;
 import io.github.dsudomoin.outbox.OutboxConfig;
 import io.github.dsudomoin.outbox.OutboxTransactions;
 import java.net.InetAddress;
+import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.time.Duration;
@@ -23,11 +24,12 @@ import org.slf4j.LoggerFactory;
  * {@code relay}: the relay runs here; {@code contracts}: the version each typed route reads, by topic ({@code {}}
  * without one). First, in a statement of its own, a beat reads the live relay instances' reports into the instance's
  * {@link ContractGuard}. Then one statement deletes other instances' rows expired for {@link #FORGET_AFTER} (instances
- * that died without a clean shutdown), upserts the row and reads the cursors' shard count into the instance's
- * {@link ShardGuard}, so a writer-only instance stops writing within one beat of another instance's reshard.
- * {@link #stop()} deletes the row; a beat that commits after it deletes it again. A failed beat is logged, and the
- * next one retries. A beat waits at most {@code 100 ms} for a lock (a recovery holds the cursor table for its run):
- * then the shard count stands as last read, with a one-line WARN; the reports were read before.
+ * that died without a clean shutdown) and upserts the row, committed on their own. Last, in a transaction of its own,
+ * it reads the cursors' shard count into the instance's {@link ShardGuard}, so a writer-only instance stops writing
+ * within one beat of another instance's reshard. {@link #stop()} deletes the row; a beat that commits after it deletes
+ * it again. A failed beat is logged, and the next one retries. A beat waits at most {@code 100 ms} for a lock: a
+ * recovery holds the cursor table for its run, so the shard count then stands as last read, with a one-line WARN; the
+ * reports were read and the row refreshed before, so the guards of other instances keep counting this one.
  */
 public final class Heartbeat {
 
@@ -59,8 +61,7 @@ public final class Heartbeat {
         this.guard = schema.shardGuard();
         this.contracts = schema.contractGuard();
         this.beat = "with gone as (delete from " + names.instance() + " where instance_id <> ? and coalesce(expires_at,"
-                + " last_seen) < now() - " + FORGET_AFTER.toSeconds() + " * interval '1 second'), beat as ("
-                + upsert(names) + ") " + Cursors.shardCount(names);
+                + " last_seen) < now() - " + FORGET_AFTER.toSeconds() + " * interval '1 second') " + upsert(names);
     }
 
     /** {@code <host>/<pid>/<8 hex>}, new on every call. */
@@ -140,30 +141,34 @@ public final class Heartbeat {
     }
 
     void beat() { // package-private for a test
+        boolean refreshed = false;
         try (var c = db.newConnection()) {
             c.setAutoCommit(false);
-            try (var st = c.createStatement()) { // a transaction's: no leak
-                st.execute("set local lock_timeout = " + Maintenance.SHARDS_LOCK_TIMEOUT.toMillis());
-            }
+            lockTimeout(c);
             contracts.refresh(c, names); // before the statement below, which may give up on its lock
             try (var ps = c.prepareStatement(beat)) {
                 ps.setString(1, id); // the cleanup's; the upsert's parameters follow
                 bind(ps, 1, id, shards, hookActive, relay, contracts.contracts(), interval);
-                try (var rs = ps.executeQuery()) {
-                    rs.next();
-                    guard.observed(rs.getInt(1));
-                }
+                ps.executeUpdate();
             }
             if (stopped) {
                 c.rollback(); // stop() deleted the row, or is about to
                 return;
             }
-            c.commit();
+            c.commit(); // before the shard count, whose lock a recovery may hold for its run
+            refreshed = true;
             if (stopped) { // stop() deleted it before this commit
                 delete(db, names, id);
+                return;
             }
+            lockTimeout(c);
+            try (var st = c.createStatement(); var rs = st.executeQuery(Cursors.shardCount(names))) {
+                rs.next();
+                guard.observed(rs.getInt(1));
+            }
+            c.commit();
         } catch (Throwable t) { // logged, never thrown: a throw would cancel every later beat without a word
-            if (t instanceof SQLException e && "55P03".equals(e.getSQLState())) {
+            if (refreshed && t instanceof SQLException e && "55P03".equals(e.getSQLState())) {
                 log.warn("outbox heartbeat of instance {} into {} waited {} ms for a lock (a recovery holds {} for its"
                         + " run?); the shard count stands as last read, retrying in {}", id, names.instance(),
                         Maintenance.SHARDS_LOCK_TIMEOUT.toMillis(), names.cursor(), interval);
@@ -171,6 +176,13 @@ public final class Heartbeat {
             }
             log.warn("outbox heartbeat of instance {} into {} failed; retrying in {}", id, names.instance(), interval,
                     t);
+        }
+    }
+
+    /** Bounds the lock waits of the transaction in progress; a transaction's setting, so none leaks. */
+    private static void lockTimeout(Connection c) throws SQLException {
+        try (var st = c.createStatement()) {
+            st.execute("set local lock_timeout = " + Maintenance.SHARDS_LOCK_TIMEOUT.toMillis());
         }
     }
 

@@ -55,4 +55,37 @@ class HeartbeatContractsIT {
                             e -> assertThat(e.incompatibleInstances()).containsExactly("old/1/00000000"));
         }
     }
+
+    /**
+     * A recovery holds the cursor table for its run, which may outlast the row's expiry: a beat that gives up on that
+     * lock has refreshed the row, so the instance stays live to every guard.
+     */
+    @Test
+    void aBeatThatGivesUpOnTheCursorLockStillRefreshesItsRow() throws Exception {
+        var ds = TestDataSources.newDataSource();
+        var db = new JdbcTransactions(ds);
+        try (var schema = new OutboxSchema(db, db, new TestOutboxConfig(), Map.of())) {
+            schema.start();
+            var names = schema.names();
+            var live = "select (expires_at > now())::text from " + names.instance() + " where instance_id = ?";
+            db.inTx(c -> {
+                TestSql.execute(c, "update " + names.instance() + " set last_seen = now() - interval '2 minutes',"
+                        + " expires_at = now() - interval '1 minute'");
+                return null;
+            });
+            String expired = db.inTx(c -> TestSql.queryString(c, live, schema.instanceId()));
+            assertThat(expired).isEqualTo("false");
+            try (var recovering = ds.getConnection()) {
+                recovering.setAutoCommit(false);
+                TestSql.execute(recovering, "lock table " + names.cursor() + " in access exclusive mode");
+                try (var err = new CapturedStderr()) {
+                    new Heartbeat(db, schema, schema.config(), false).beat();
+                    assertThat(err.text()).contains("waited 100 ms for a lock").doesNotContain("failed");
+                }
+                String refreshed = db.inTx(c -> TestSql.queryString(c, live, schema.instanceId()));
+                assertThat(refreshed).as("refreshed while the cursor table is locked").isEqualTo("true");
+                recovering.rollback();
+            }
+        }
+    }
 }
