@@ -24,6 +24,8 @@ README «Наблюдаемость» → «Контракт по этапам»
 | `outbox.messages.requeued` | counter | `topic` | Records the handler set aside with `Outcome.requeue()`, every requeue counted. Not a failure; the requeue past `relay.requeue.maxRequeues` counts as `failed{outcome="dead"}` instead. |
 | `outbox.messages.waiting` | counter | `topic`, `kind` = `contract` / `no_route` / `handler` | Every «wait» answer (`Outcome.Waiting`), repeats of one head included. Not a failure, never in `failed`. `kind`: a newer contract version, a topic no route claims, the handler's own `waitFor`. |
 | `outbox.messages.contract_rejected` | counter | `topic`, `type`, `version` | Sends refused by the writer guard (`OutboxIncompatibleContractException`); `type` the class, `?` through `Outbox`. Instance ids are in the exception and the WARN, never in tags. |
+| `outbox.messages.route_rejected` | counter | `topic` | Sends to a topic a route of the writer claims, refused by the writer guard (`OutboxMissingRouteException`) because a live relay instance does not report the route. Instance ids are in the exception and the WARN, never in tags. |
+| `outbox.messages.route_unchecked` | counter | `topic` | Messages the writer guard let through unchecked on a stale read of the reports (the writer's heartbeat has not read them for over 3 × `maintenanceInterval`) that allowed them, route and version check alike, one per message. Counted before the insert, so a message may still not be written. |
 | `outbox.delivery.delay` | timer, percentile histogram | `topic` | Row insert to delivered outcome; buckets 1 ms to 6 h (about 110 bucket series per topic). |
 | `outbox.batch.duration` | timer, percentile histogram | | One relay step that found work in at least one of its locked shards; one step may cover several shards. Steps without work are not timed. |
 | `outbox.shard.paused` | counter | | Shard pauses: target down, failing head, no free handler thread. |
@@ -66,17 +68,18 @@ shows only here; `outbox.messages.requeued{topic}` shows which topic requeues. B
 Kafka producer client metrics of the outbox are not bound to Micrometer (JMX only).
 
 Logs: logger `io.github.dsudomoin.outbox`, repeated lines rate-limited. INFO for start, stop, partition DDL and each
-changing admin call; WARN for diverted keys, shard pauses, deferred partition extensions, tail swaps without their
-lock (55P03), a window tail conversion that did not fit `maxStall`, tail overflow, stale maintenance, dead-letter hook
+changing admin call; WARN for diverted keys, shard pauses, deferred partition extensions, tail swaps without their lock
+(55P03), a window tail conversion that did not fit `maxStall`, tail overflow, stale maintenance, dead-letter hook
 failures, letters the Kafka DLQ kept, failed heartbeats («outbox heartbeat of instance ... failed»), waiting records
-(«outbox: N keys of ... wait for an instance that can handle them ...», once a minute) and sends the writer guard
-refused («outbox ... refused a send», once a minute); ERROR for records waiting past `relay.waiting.alertAfter` (the
-same line), dead letters, handler errors, stranded shards, the shard-count mismatch after a reshard («... holds
-cursors for N shards, but this instance runs with outbox.shards = M ...»), the xid regression, `premade < 2`, a
-detached tail, a swap not run on 10 due runs or with ranges running out (hourly, names the cause), a hot tail over
-`maxTailScan` outside the window (hourly), a window that ended without converting it («... ended without a
-conversion», once), orphans and transaction pooling. WARN «outbox tick made without its shard set» (at most once a
-minute): a partition is held by an `ACCESS EXCLUSIVE` lock (`ALTER TABLE`, `VACUUM FULL`, `TRUNCATE`, a manual
+(«outbox: N keys of ... wait for an instance that can handle them ...», once a minute), sends the writer guard refused
+(«outbox ... refused a send», once a minute per check) or let through unchecked («... through unchecked ...»), and
+unmarked writes to a topic a live relay instance routes («... wrote to topic ... unmarked ...»); ERROR for records
+waiting past `relay.waiting.alertAfter` (the same line), dead letters, handler errors, stranded shards, the shard-count
+mismatch after a reshard («... holds cursors for N shards, but this instance runs with outbox.shards = M ...»), the xid
+regression, `premade < 2`, a detached tail, a swap not run on 10 due runs or with ranges running out (hourly, names the
+cause), a hot tail over `maxTailScan` outside the window (hourly), a window that ended without converting it («... ended
+without a conversion», once), orphans and transaction pooling. WARN «outbox tick made without its shard set» (at most
+once a minute): a partition is held by an `ACCESS EXCLUSIVE` lock (`ALTER TABLE`, `VACUUM FULL`, `TRUNCATE`, a manual
 `LOCK`), so ticks step every shard and lag grows while it lasts.
 
 Tracing (with an OpenTelemetry `Tracer` in the graph): one `PRODUCER` span per delivery attempt,

@@ -81,27 +81,35 @@ bound redrive loops with `letter.redrives()`; `active()` false (as `NONE`) keeps
     once (so a deserializer does no network I/O: its failure is never retried);
   - a record of a newer contract version than `T` → waits for an instance that reads it;
   - a topic no route claims while no `OutboxHandler` stands behind the routes (no `KafkaOutboxModule`) → waits for an
-    instance with the route; `send` of such a topic in that app throws `IllegalArgumentException` at once.
+    instance with the route; `send` of such a topic in that app throws `IllegalArgumentException` at once;
+  - a record written for a route this instance lacks (an older release, a rollback) → waits for an instance with the
+    route, never handed to the handler behind the routes (Kafka).
+- A record sent to a route's topic carries the header `outbox-local` with a null value: the library's marker, which a
+  route handler sees in `record.headers()` and Kafka never gets. The name is reserved; never set it. A new route ships
+  to every instance before anything writes its topic (using-outbox, «Routes and their releases»).
 - Deserializers: with `OutboxJsonModule`, every `@Json` class gets one from its `JsonReader`; an app's own
   `OutboxDeserializer<T>` component wins for its `T`. Protobuf has no generic factory: declare
   `OutboxDeserializer<Msg>` as `(topic, payload) -> Msg.parseFrom(payload)`. A String key: `record.keyAsString()`
   (UTF-8, null if keyless).
 - Assembling by hand still works: a factory returning exactly `OutboxHandler`, e.g.
   `OutboxHandler.byTopic(Map.of("audit", toAudit), kafka.handler())` with `toAudit` an `OutboxHandler`, injecting
-  `KafkaOutboxSender`, never `KafkaOutboxHandler`; keep it the only untagged `OutboxHandler` (same Kora error).
+  `KafkaOutboxSender`, never `KafkaOutboxHandler`; keep it the only untagged `OutboxHandler` (same Kora error). Its
+  topics are part of the handler behind the routes, not routes: unmarked and unchecked. Moving one to an
+  `OutboxTopicHandler` is a move between the fallback and a route (using-outbox).
 - A wrapper around `kafka.handler()` delegates `handleBatch` too (else one acks=all round trip per record).
 
 ## Waiting and contract versions
 
 - `Outcome.Waiting` is neither a delivery nor a failure. The record becomes its key's head in `<table>_retry`, later
   records of the key queue behind it, `attempts` stays, `maxAttempts` never applies, the shard does not pause. It is
-  handed again alone after a quarter of its wait so far, within `outbox.relay.waiting.delay` (1 s) and `maxDelay`
-  (5 min), until an instance that can handle it takes it. `kind`: `contract`, `no_route`, `handler` (yours).
+  handed again, with the other due heads but without the records behind it, after a quarter of its wait so far, within
+  `outbox.relay.waiting.delay` (1 s) and `maxDelay` (5 min), until an instance that can handle it takes it. `kind`:
+  `contract`, `no_route`, `handler` (yours).
 - Use it for «another release handles this»; a failing target is `Retry`, a blocked entity is `requeue`. A wait does
   not pause the shard: while the target is down every key of the topic becomes a waiting head and every later record a
-  follower row in `<table>_retry` (an insert, a delete and vacuum per record); each waiting head is handed alone,
-  without batching, and no shard-level breaker protects the target. The API still allows a wait there when chosen
-  explicitly.
+  follower row in `<table>_retry` (an insert, a delete and vacuum per record); each waiting head is handed without
+  the records behind it, and no shard-level breaker protects the target. The API still allows a wait there when
+  chosen explicitly.
 - `@OutboxContract(n)` on an event class is its payload version (none = 1, not inherited). `TypedOutbox<T>` and
   `KafkaOutboxPublisher` stamp `T`'s version in the `outbox-contract` header (none for 1); `record.contractVersion()`
   reads it (1 without; an invalid value throws `OutboxWaitException`).

@@ -1,6 +1,6 @@
 ---
 name: using-outbox
-description: Use when adding dsudomoin/outbox (io.github.dsudomoin:outbox-kora, outbox-kafka-kora, outbox-admin-kora) to a Kora 1.x service, sending events with Outbox, TypedOutbox, ProtobufOutbox or KafkaOutboxPublisher, changing an event's shape or contract version (@OutboxContract, the two-release protocol, OutboxIncompatibleContractException), editing outbox.* or outbox.kafka.driverProperties, or preparing the Postgres role, the schema migration (outbox.schema.bootstrap, OutboxSql, OutboxOwner) and Kafka topics for it. Also «аутбокс», «outbox», «transactional outbox», «отправить событие в Kafka в одной транзакции с БД».
+description: Use when adding dsudomoin/outbox (io.github.dsudomoin:outbox-kora, outbox-kafka-kora, outbox-admin-kora) to a Kora 1.x service, sending events with Outbox, TypedOutbox, ProtobufOutbox or KafkaOutboxPublisher, changing an event's shape or contract version (@OutboxContract, the two-release protocol, OutboxIncompatibleContractException), adding, removing or moving an OutboxTopicHandler route's topic (the outbox-local marker, OutboxMissingRouteException), editing outbox.* or outbox.kafka.driverProperties, or preparing the Postgres role, the schema migration (outbox.schema.bootstrap, OutboxSql, OutboxOwner) and Kafka topics for it. Also «аутбокс», «outbox», «transactional outbox», «отправить событие в Kafka в одной транзакции с БД».
 ---
 
 # Using outbox
@@ -67,16 +67,61 @@ data (a record no running release reads waits; it is never lost or dead-lettered
      records may still arrive (outbox, retry table, dead letters to redrive).
 - A field is removed in two releases (stop requiring it when reading, then stop writing it). One event contract per
   topic.
-- Never move an existing Kafka topic to an `OutboxTopicHandler` route: use a new topic, broker auto-create off. Remove
-  a route in two releases: stop writing its topic, then drop the route once its records are delivered.
 - The writer guard enforces it: a send of version v > 1 to a topic some live relay instance reads below v throws
   `OutboxIncompatibleContractException` before writing (topic, type, versions, instance ids), counted in
   `outbox.messages.contract_rejected`; deploy the reading release everywhere first. Limits: reports are one heartbeat
   (30 s) stale, a crashed old instance blocks up to about 90 s, an old instance started after the check still gets v2
-  (it waits), plain handlers and Kafka-bound topics are not checked, no live relay instance means nothing is refused.
+  (it waits), plain handlers and Kafka-bound topics are not checked, no live relay instance (on a fresh read) means
+  nothing is refused.
+- A writer whose heartbeat has not read the reports for over 3 × `maintenanceInterval` decides both the version and
+  the route check by its last read: refused if there was none, if it found no live relay instance, or if a live relay
+  instance in it had no report (`contracts` or `routes` null) or an incompatible one; otherwise let through, counted in
+  `outbox.messages.route_unchecked`. Such a refusal names no instance.
+
+**Routes and their releases.** A record of an `OutboxTopicHandler` route's topic must never reach Kafka on an instance
+that lacks the route (an older release mid-rollout, or after a rollback). Kafka-bound topics are unaffected: no marker,
+no route check.
+
+- Every send to a topic a route of this instance claims, typed, raw or through `sendAll`, carries the header
+  `outbox-local` with a null value, stamped by the library. `outbox-local` is reserved like `outbox-contract`: never
+  set it; a caller's header of that name is stripped, whatever its value. Route handlers see it in
+  `record.headers()`; Kafka, dead-letter topics included, never gets it.
+- A relay instance without the route makes such a record wait (`no_route`, no attempt spent, its key held) instead of
+  handing it to the handler behind its routes; unmarked records still go there, batched.
+- The route guard: a send to a topic routed here throws `OutboxMissingRouteException` before writing (`topic()`,
+  `instances()`) while a live relay instance does not report the topic in its `routes`, whatever the version (v1
+  included), counted in `outbox.messages.route_rejected`. A v1 send to a topic no route here claims (raw bytes
+  included) is never checked.
+- **Add a route in two steps**: ship the handler to every instance and wait until admin status shows the topic in
+  `routes` of every live relay instance; then turn writing on with a feature flag (or the next release). Writing
+  earlier throws `OutboxMissingRouteException`: that is the expected behaviour, there is no warn-only switch.
+
+  ```java
+  db.inTx(() -> {
+      orders.insert(order);
+      if (flags.auditEvents()) { // on once every live relay instance reports "audit" in its routes
+          auditEvents.send("audit", order.userId(), new AuditEvent(order.id())); // TypedOutbox<AuditEvent>
+      }
+  });
+  ```
+
+- **Remove a route in two releases**: stop writing its topic, then drop the route once its records are delivered.
+  Both in one release: the leftovers wait `no_route`; return the route or abandon them (operating-outbox).
+- **Move a topic between the fallback and a route** in two releases, through a new topic. The fallback is the handler
+  behind the routes: Kafka, or the app's own `OutboxHandler`, a `byTopic(...)` inside it included. Release N adds the
+  new topic on the receiving side (a route, a `byTopic` entry or a Kafka topic) while writers keep the old one; once N
+  runs everywhere (a new route shows in every `routes`), a flag switches writers to the new topic; N+1 removes the old
+  topic once its records are delivered. In one release the side with the route is refused on every write while the
+  other release runs, and after a rollback its marked records wait even where the older `byTopic` would deliver them.
+- Rolling back past the release that added a route loses nothing: the marked records wait; roll forward or abandon
+  them. Rolling back to a release built with a library version that lacks `outbox-local` (5fc60dd) is unsupported once
+  route records exist: it hands them to its handler (Kafka). The guard protects against release mistakes, not every
+  rollback.
+- Every instance that writes a route's topic, relay on or off, registers that route: an unmarked write to a topic
+  some live relay instance routes logs the WARN «... wrote to topic ... unmarked ...».
 - An app without an `OutboxHandler` behind its routes (no `KafkaOutboxModule`) refuses a send to a topic no route
   claims with `IllegalArgumentException` (a typo fails in the transaction).
-- README «Версии контрактов и откат» has the rollback table and every limit.
+- README «Версии контрактов и откат» has the rollback table and every limit, the route rules included.
 
 ## Config rules
 
@@ -118,7 +163,9 @@ for ops:
 5. **Bulk**: `sendAll` with thousands of distinct keys needs `max_locks_per_transaction × (max_connections +
    max_prepared_transactions)` ≥ concurrent bulk transactions × distinct keys each + other locks (SQLState 53200);
    state the numbers. It needs a restart; hot standbys need at least the primary's value.
-6. **Topics** the Kafka handler writes (topics an `OutboxTopicHandler` claims need none), and DLQ topics with
+6. **Topics** the Kafka handler writes (topics an `OutboxTopicHandler` claims need none, but writing to a new route's
+   topic starts only once every live relay instance reports the route, «Routes and their releases» above), and DLQ
+   topics with
    `outbox.kafka.deadLetterTopic`: created before writers deploy, broker
    auto-create off, ACLs (WRITE, DESCRIBE) for the service principal, final partition count (added partitions move
    keys), the producer's `batch.size` ≤ the topic's `max.message.bytes` (the default 16 384 is; else kafka-clients
@@ -128,5 +175,6 @@ for ops:
 8. **Alerts**: `outbox.shard.lag` growing, `outbox.dead.size > 0`, `outbox.maintenance.since_success > 5 ×
    maintenanceInterval`, `outbox.maintenance.transaction_pooling = 1`, `outbox.partitions.premade < 2`,
    `overflow = 1`, `xids_left` not NaN, `orphaned > 0`, `outbox.waiting.oldest > 900` (`relay.waiting.alertAfter`),
-   `outbox.messages.contract_rejected` growing; with a dead-letter hook, `outbox.dead.pending.oldest`. Dead letters:
+   `outbox.messages.contract_rejected` or `outbox.messages.route_rejected` growing; with a dead-letter hook,
+   `outbox.dead.pending.oldest`. Dead letters:
    admin API, never SQL.

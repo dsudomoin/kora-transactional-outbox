@@ -197,10 +197,16 @@ public final class OutboxRuntime implements AutoCloseable {
 
         /**
          * Sends the records of {@code route}'s topics to it instead of the handler, as {@link OutboxHandler#byTopic}
-         * does. {@link #build()} fails when two routes claim one topic, or a route claims none. A
-         * {@link TypedOutboxTopicHandler} route's contract version is reported in this instance's row: a send of a
-         * higher version of its topics is refused while a live relay instance reads below it
-         * ({@link OutboxIncompatibleContractException}).
+         * does. {@link #build()} fails when two routes claim one topic, or a route claims none.
+         * <p>
+         * Its topics are reported in this instance's row ({@code routes}), and {@link OutboxRuntime#outbox()} writes
+         * every message to them with the header {@code outbox-local}, null-valued, which marks its record for the
+         * route: a relay instance without the route, of an older release or after a rollback, makes it wait
+         * ({@link Outcome.Waiting.Kind#NO_ROUTE}) instead of handing it to its handler. A send to them is refused with
+         * {@link OutboxMissingRouteException} while a live relay instance does not report the route, so a new route
+         * takes two steps: deploy it everywhere, then, once every instance reports it, start writing to its topics. A
+         * {@link TypedOutboxTopicHandler} route's contract version is reported too: a send of a higher version of its
+         * topics is refused while a live relay instance reads below it ({@link OutboxIncompatibleContractException}).
          */
         public Builder route(OutboxTopicHandler route) {
             routes.add(Objects.requireNonNull(route, "route"));

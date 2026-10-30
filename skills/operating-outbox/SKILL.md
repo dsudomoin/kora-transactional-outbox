@@ -1,6 +1,6 @@
 ---
 name: operating-outbox
-description: Use when monitoring, alerting on, sizing or troubleshooting dsudomoin/outbox in a running Kora service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, dead letters and the dead-letter hook, the admin API (OutboxAdmin, outbox-admin-kora, /kora-outbox/admin/v1), redrive or discard, tail overflow, orphaned partitions, stranded shards, «outbox relay halted» or «xid regression detected», outbox.shards and the emergency reshard, «refuses this write», records waiting for another release (outbox.waiting.size, outbox.waiting.oldest, «wait for an instance that can handle them», abandoning them), OutboxIncompatibleContractException and outbox.messages.contract_rejected, rolling deploys, upgrades and rollback to the previous release, pg_dump/restore or failover, Kafka delivery slow after RecordTooLargeException or an expired batch. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox», «админка outbox».
+description: Use when monitoring, alerting on, sizing or troubleshooting dsudomoin/outbox in a running Kora service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, dead letters and the dead-letter hook, the admin API (OutboxAdmin, outbox-admin-kora, /kora-outbox/admin/v1), redrive or discard, tail overflow, orphaned partitions, stranded shards, «outbox relay halted» or «xid regression detected», outbox.shards and the emergency reshard, «refuses this write», records waiting for another release (outbox.waiting.size, outbox.waiting.oldest, «wait for an instance that can handle them», abandoning them), OutboxIncompatibleContractException and outbox.messages.contract_rejected, OutboxMissingRouteException («has a local route here»), outbox.messages.route_rejected and route_unchecked, rolling out a new OutboxTopicHandler route (routes in /status), rolling deploys, upgrades and rollback to the previous release, pg_dump/restore or failover, Kafka delivery slow after RecordTooLargeException or an expired batch. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox», «админка outbox».
 ---
 
 # Operating outbox
@@ -21,8 +21,9 @@ against the library's tables**; run only the README's SQL, on a staging copy fir
 | `outbox.dead.pending.oldest` > X (X > `relay.retry.maxDelay`) and `outbox.dead.hook.failures` growing | Hook failing: letters wait | «Dead letters» |
 | ERROR «outbox xid regression detected» | «recovered»: done; «relay halted»: its reason, maybe `POST /recovery/xid-regression` | «Восстановление после регрессии xid» |
 | ERROR «... holds cursors for N shards, but this instance runs with outbox.shards = M ...» or «... refuses this write ...» | Old-count instance after a reshard: restart with the new count or unset | «Решардинг» |
-| `outbox.waiting.oldest` > `outbox.relay.waiting.alertAfter` (15 min, rule `max(outbox_waiting_oldest) > 900`) or ERROR «outbox: N keys of ... wait for an instance that can handle them ...» | No running release reads them (half-rolled-out, or rolled back past the transition release): their keys stand, nothing is lost. N counts keys whose head waits; the later records of each key wait behind it. `outbox.messages.waiting{kind}` and the line name the cause (`contract`, `no_route`). Deploy the release that reads them; for a final rollback, abandon them (below) | «Версии контрактов и откат» |
+| `outbox.waiting.oldest` > `outbox.relay.waiting.alertAfter` (15 min, rule `max(outbox_waiting_oldest) > 900`) or ERROR «outbox: N keys of ... wait for an instance that can handle them ...» | No running release reads them (half-rolled-out, or rolled back past the transition release): their keys stand, nothing is lost. N counts keys whose head waits; the later records of each key wait behind it. `outbox.messages.waiting{kind}` and the line name the cause (`contract`, `no_route`: also a record marked `outbox-local` for a route this release lacks; it never goes to Kafka). Deploy the release that reads them; for a final rollback, abandon them (below) | «Версии контрактов и откат» |
 | `outbox.messages.contract_rejected` growing | A release writes a contract version a live relay instance cannot read: those business transactions fail with `OutboxIncompatibleContractException` (WARN «outbox ... refused a send» names the instances). Deploy the reading release everywhere first | «Версии контрактов и откат» |
+| `outbox.messages.route_rejected` growing | A release writes to its route's topic while a live relay instance does not report that route: those business transactions fail with `OutboxMissingRouteException` (WARN «outbox ... refused a send» names the instances). Writing was switched on before the heartbeat showed the route everywhere, or a release without it still runs: deploy the route everywhere, then switch writing on. A refusal naming no instance («... has not read the live relay instances' reports ...»): the writer's own heartbeat fails | «Версии контрактов и откат» |
 
 ## Morning: nothing lost, waits for a human
 
@@ -33,6 +34,7 @@ against the library's tables**; run only the README's SQL, on a staging copy fir
 | `outbox.partitions.overflow` = 1 past an extension, `premade` < 2 | «Переполнение хвоста (tail overflow)» |
 | ERROR «... has not run», «... over outbox.partitions.maxTailScan» | «Партиции» |
 | `outbox.parked.size` not back to its level | «Алерты» |
+| `outbox.messages.route_unchecked` growing: a writer's heartbeat has not read the reports for over 3 × `maintenanceInterval` (WARN «outbox heartbeat of instance ... failed»), so the writer guard lets sends through by its last read. Nothing is lost (an unreadable record waits); fix the heartbeat (connections, pool) | «Версии контрактов и откат» |
 
 Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dashboards/outbox.json`.
 
@@ -57,6 +59,12 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
 - «Rolling-деплои»: identical schema-qualified `outbox.table`, `outbox.inbox.table`, inbox `retention` and
   `partitionInterval`. An event's breaking change goes out in two releases (using-outbox, «Версии контрактов и
   откат»): rollback to the transition release waits for nothing; past it, the newer records wait.
+- **New `OutboxTopicHandler` route**: ship it everywhere, check that `routes` in `/status` `instances` lists its topic
+  for every live relay instance, then switch writing on (a flag); earlier writes fail with
+  `OutboxMissingRouteException`, as intended. Rolled back past it, its marked records wait (`no_route`), never reach
+  Kafka: roll forward or abandon them. Remove a route in two releases (stop writing, then drop it once drained).
+  Rolling back to a release built with a library version that lacks `outbox-local` (5fc60dd) is unsupported once
+  route records exist.
 - **Final rollback past the transition release**: records nobody will read again wait forever. Dry-run, then abandon
   them per topic (or key) to `kept` dead letters, the whole key at once ([admin-api.md](admin-api.md)); redrive or
   discard them later. Later records of an abandoned key are delivered ahead of it.
