@@ -2,6 +2,7 @@ package io.github.dsudomoin.outbox.micrometer;
 
 import io.github.dsudomoin.outbox.OutboxGauge;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
+import io.github.dsudomoin.outbox.Outcome;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -61,6 +62,14 @@ public final class OutboxMetrics implements OutboxTelemetry {
     public void requeued(String topic) {
         if (registry != null) {
             meters(topic).requeued.increment();
+        }
+    }
+
+    /** {@code outbox.messages.waiting{topic, kind}}; the rare path, so the registry looks the counter up. */
+    @Override
+    public void waited(String topic, Outcome.Waiting.Kind kind) {
+        if (registry != null) {
+            registry.counter("outbox.messages.waiting", "topic", topic, "kind", kind.label()).increment();
         }
     }
 

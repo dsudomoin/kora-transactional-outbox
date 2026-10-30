@@ -88,6 +88,11 @@ public final class KoraOutboxTelemetry implements OutboxTelemetry {
     }
 
     @Override
+    public void waited(String topic, Outcome.Waiting.Kind kind) {
+        metrics.waited(topic, kind);
+    }
+
+    @Override
     public void stepFinished(Duration duration) {
         metrics.stepFinished(duration);
     }
@@ -208,6 +213,8 @@ public final class KoraOutboxTelemetry implements OutboxTelemetry {
                 name = "not_attempted";
             } else if (outcome instanceof Outcome.Requeue) {
                 name = "requeued";
+            } else if (outcome instanceof Outcome.Waiting) {
+                name = "waiting";
             } else {
                 name = "delivered";
             }

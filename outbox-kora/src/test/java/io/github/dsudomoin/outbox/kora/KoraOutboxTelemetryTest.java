@@ -17,6 +17,7 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
@@ -89,6 +90,26 @@ class KoraOutboxTelemetryTest {
         assertThat(traceparent(handed.get(0))).as("the handed record carries the delivery span")
                 .isEqualTo("00-" + TRACE_ID + "-" + span.getSpanId() + "-01");
         assertThat(traceparent(record)).as("the stored record keeps its own").isEqualTo(TRACEPARENT);
+    }
+
+    @Test
+    void aWaitingRecordEndsItsSpanAsWaitingWithoutAnErrorAndIsCounted() {
+        var registry = new SimpleMeterRegistry();
+        var spans = InMemorySpanExporter.create();
+        var tracer = SdkTracerProvider.builder().addSpanProcessor(SimpleSpanProcessor.create(spans)).build()
+                .get("test");
+        var telemetry = new KoraOutboxTelemetry(new OutboxMetrics(registry), tracer);
+
+        var delivery = telemetry.deliveryStarted(List.of(record(List.of())), NOW);
+        delivery.finished(List.of(Outcome.waitFor("v3 is not readable here")));
+        telemetry.waited("orders", Outcome.Waiting.Kind.HANDLER);
+
+        var span = spans.getFinishedSpanItems().get(0);
+        assertThat(span.getAttributes().get(AttributeKey.stringKey("outbox.outcome"))).isEqualTo("waiting");
+        assertThat(span.getStatus().getStatusCode()).isEqualTo(StatusCode.UNSET);
+        assertThat(span.getEvents()).isEmpty();
+        assertThat(registry.get("outbox.messages.waiting").tags("topic", "orders", "kind", "handler").counter()
+                .count()).isEqualTo(1);
     }
 
     @Test

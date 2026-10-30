@@ -109,6 +109,15 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     }
 
     @Override
+    public void waited(String topic, Outcome.Waiting.Kind kind) {
+        try {
+            delegate.waited(topic, kind);
+        } catch (RuntimeException | LinkageError e) {
+            warn("waited", e);
+        }
+    }
+
+    @Override
     public RelayStep stepStarted(List<Integer> shards) {
         RelayStep step;
         try {

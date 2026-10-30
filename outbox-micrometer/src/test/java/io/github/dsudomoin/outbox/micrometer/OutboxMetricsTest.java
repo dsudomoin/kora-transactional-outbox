@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 
 import io.github.dsudomoin.outbox.OutboxGauge;
+import io.github.dsudomoin.outbox.Outcome;
 import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.cumulative.CumulativeTimer;
@@ -30,6 +31,7 @@ class OutboxMetricsTest {
             noop.delivered("orders", Duration.ofMillis(5));
             noop.retried("orders");
             noop.requeued("orders");
+            noop.waited("orders", Outcome.Waiting.Kind.HANDLER);
             noop.stepFinished(Duration.ofMillis(5));
             noop.shardPaused();
             noop.inboxOutsideWindow();
@@ -123,11 +125,29 @@ class OutboxMetricsTest {
     }
 
     @Test
+    void waitedCountsPerTopicAndKind() {
+        metrics.waited("orders", Outcome.Waiting.Kind.CONTRACT);
+        metrics.waited("orders", Outcome.Waiting.Kind.CONTRACT);
+        metrics.waited("orders", Outcome.Waiting.Kind.NO_ROUTE);
+        metrics.waited("payments", Outcome.Waiting.Kind.HANDLER);
+
+        assertThat(waits("orders", "contract")).isEqualTo(2);
+        assertThat(waits("orders", "no_route")).isEqualTo(1);
+        assertThat(waits("payments", "handler")).isEqualTo(1);
+        assertThat(registry.find("outbox.messages.waiting").counters()).as("no series for kinds never seen").hasSize(3);
+        assertThat(registry.find("outbox.messages.failed").counters()).as("not a failure").isEmpty();
+    }
+
+    @Test
     void relayFailuresCount() {
         metrics.relayFailed(new SQLException("x"));
         metrics.relayFailed(new SQLException("y"));
 
         assertThat(registry.counter("outbox.relay.failures").count()).isEqualTo(2.0);
+    }
+
+    private double waits(String topic, String kind) {
+        return registry.get("outbox.messages.waiting").tags("topic", topic, "kind", kind).counter().count();
     }
 
     /** SimpleMeterRegistry never materializes percentile-histogram buckets; Prometheus does, like this one. */

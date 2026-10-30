@@ -327,6 +327,22 @@ class ObservationOutboxTelemetryTest {
     }
 
     @Test
+    void aWaitingRecordIsLabelledWaitingWithoutAnErrorAndCounted() {
+        var telemetry = telemetry();
+        var delivery = telemetry.deliveryStarted(List.of(record(List.of())), NOW);
+        delivery.handed(List.of(record(List.of())));
+        delivery.finished(List.of(Outcome.waitFor("v3 is not readable here")));
+        telemetry.waited("orders", Outcome.Waiting.Kind.CONTRACT);
+
+        var span = finished("outbox deliver orders");
+        assertThat(attribute(span, "outbox.outcome")).isEqualTo("waiting");
+        assertThat(span.getStatus().getStatusCode()).isEqualTo(StatusCode.UNSET);
+        assertThat(meters.get("outbox.deliver").tag("outbox.outcome", "waiting").timer().count()).isEqualTo(1);
+        assertThat(meters.get("outbox.messages.waiting").tags("topic", "orders", "kind", "contract").counter().count())
+                .isEqualTo(1);
+    }
+
+    @Test
     void stepObservationIsCurrentUntilItEnds() {
         var stopped = stoppedSteps();
         var step = telemetry().stepStarted(List.of(1, 3));

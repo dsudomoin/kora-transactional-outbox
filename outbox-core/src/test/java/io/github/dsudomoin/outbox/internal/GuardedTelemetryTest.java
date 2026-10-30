@@ -13,6 +13,7 @@ import io.github.dsudomoin.outbox.testing.CapturedStderr;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Callable;
@@ -75,6 +76,7 @@ class GuardedTelemetryTest {
             t.retried("orders");
             t.deadLettered("orders");
             t.requeued("orders");
+            t.waited("orders", Outcome.Waiting.Kind.CONTRACT);
             t.stepFinished(Duration.ofMillis(1));
             t.shardPaused();
             t.deadLetterDecision("keep");
@@ -83,6 +85,21 @@ class GuardedTelemetryTest {
             t.releaseThread();
             t.gauge(OutboxGauge.SHARD_LAG, () -> 1);
         }).doesNotThrowAnyException();
+    }
+
+    @Test
+    void waitedIsForwarded() {
+        var waits = new ArrayList<String>();
+        var t = GuardedTelemetry.of(new OutboxTelemetry() {
+            @Override
+            public void waited(String topic, Outcome.Waiting.Kind kind) {
+                waits.add(topic + " " + kind);
+            }
+        });
+
+        t.waited("orders", Outcome.Waiting.Kind.NO_ROUTE);
+
+        assertThat(waits).containsExactly("orders NO_ROUTE");
     }
 
     @Test
@@ -278,6 +295,11 @@ class GuardedTelemetryTest {
 
         @Override
         public void requeued(String topic) {
+            throw bug();
+        }
+
+        @Override
+        public void waited(String topic, Outcome.Waiting.Kind kind) {
             throw bug();
         }
 

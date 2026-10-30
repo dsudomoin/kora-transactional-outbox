@@ -239,6 +239,8 @@ package io.github.dsudomoin.outbox {
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge PARTITIONS_XIDS_LEFT;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge RETRY_SIZE;
     enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge SHARD_LAG;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge WAITING_OLDEST;
+    enum_constant public static final io.github.dsudomoin.outbox.OutboxGauge WAITING_SIZE;
   }
 
   public interface OutboxHandler {
@@ -393,6 +395,7 @@ package io.github.dsudomoin.outbox {
     method public default void shardPaused();
     method public default void stepFinished(java.time.Duration!);
     method public default io.github.dsudomoin.outbox.OutboxTelemetry.RelayStep! stepStarted(java.util.List<java.lang.Integer!>!);
+    method public default void waited(String!, io.github.dsudomoin.outbox.Outcome.Waiting.Kind!);
     field public static final io.github.dsudomoin.outbox.OutboxTelemetry! NONE;
   }
 

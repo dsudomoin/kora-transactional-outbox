@@ -64,7 +64,10 @@ import org.slf4j.LoggerFactory;
  * {@code <dead>_due} build when it is missing or invalid ({@link DeadIndexBuilder}: on its own thread, off the
  * maintenance lock; never a failed step; none with {@code outbox.schema.bootstrap = false}), gauges; when none
  * failed, the run is recorded as the last success. One long-lived instance per outbox table: it registers the gauges
- * {@code outbox.shard.lag}, {@code outbox.retry.size}, {@code outbox.dead.size}, {@code outbox.dead.pending}
+ * {@code outbox.shard.lag}, {@code outbox.retry.size}, {@code outbox.waiting.size} (retry heads waiting for an
+ * instance that can handle them), {@code outbox.waiting.oldest} (seconds since the oldest of them began to wait, 0
+ * when none; while any waits, a WARN at most once a minute, an ERROR instead once that is over
+ * {@code outbox.relay.waiting.alertAfter}), {@code outbox.dead.size}, {@code outbox.dead.pending}
  * (letters waiting for the hook), {@code outbox.dead.pending.oldest} (seconds since the oldest of them failed, 0 when
  * none),
  * {@code outbox.parked.size}, {@code outbox.partitions.premade},
@@ -113,6 +116,8 @@ public final class Maintenance {
     private final String deleteOldKept;
     private final String deleteOldRedrives;
     private final String deadPending;
+    private final String waiting;
+    private final Duration waitingAlertAfter;
     private final Duration staleAfter;
     private final AtomicLong poolingLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong staleLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
@@ -120,6 +125,9 @@ public final class Maintenance {
     private final AtomicLong checkpointLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong strandedLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final AtomicLong mismatchLogged = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    /** One each, so the first ERROR past {@code alertAfter} is not held back by a WARN just before it. */
+    private final AtomicLong waitingWarned = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
+    private final AtomicLong waitingAlerted = new AtomicLong(System.nanoTime() - LOG_INTERVAL);
     private final String cursorShards;
     private volatile boolean halted;
     /** Whether a check of the xid counter has answered yet. */
@@ -134,6 +142,8 @@ public final class Maintenance {
 
     private volatile double lag = Double.NaN;
     private volatile double retrySize = Double.NaN;
+    private volatile double waitingSize = Double.NaN;
+    private volatile double waitingOldest = Double.NaN;
     private volatile double deadSize = Double.NaN;
     private volatile double deadPendingCount = Double.NaN;
     private volatile double deadPendingOldest = Double.NaN;
@@ -186,8 +196,15 @@ public final class Maintenance {
         // due_at is set on every pending letter: the partial index finds them, not a scan of all the kept ones
         this.deadPending = "select count(*), coalesce(extract(epoch from now() - min(failed_at)), 0)::float8 from "
                 + names.dead() + " where status = 'pending' and due_at is not null";
+        // the partial index <retry>_waiting finds them; the oldest one's topic and error go into the WARN or ERROR
+        this.waiting = "select (select count(*) from " + names.retry() + " where waiting_since is not null),"
+                + " greatest(extract(epoch from now() - waiting_since), 0)::float8, topic, last_error from "
+                + names.retry() + " where waiting_since is not null order by waiting_since limit 1";
+        this.waitingAlertAfter = config.relay().waiting().alertAfter();
         telemetry.gauge(OutboxGauge.SHARD_LAG, () -> lag);
         telemetry.gauge(OutboxGauge.RETRY_SIZE, () -> retrySize);
+        telemetry.gauge(OutboxGauge.WAITING_SIZE, () -> waitingSize);
+        telemetry.gauge(OutboxGauge.WAITING_OLDEST, () -> waitingOldest);
         telemetry.gauge(OutboxGauge.DEAD_SIZE, () -> deadSize);
         telemetry.gauge(OutboxGauge.DEAD_PENDING, () -> deadPendingCount);
         telemetry.gauge(OutboxGauge.DEAD_PENDING_OLDEST, () -> deadPendingOldest);
@@ -689,6 +706,7 @@ public final class Maintenance {
     private void refreshGauges(Connection c, @Nullable Read read) throws SQLException {
         lag = read == null ? Double.NaN : read.lagSeconds();
         retrySize = retries.size(c);
+        refreshWaiting(c);
         deadSize = retries.deadSize(c);
         try (var st = c.createStatement(); var rs = st.executeQuery(deadPending)) {
             rs.next();
@@ -709,6 +727,41 @@ public final class Maintenance {
         } else if (ahead < 2) {
             log.error("only {} premade xid partitions of {} left; inserts reach the tail soon,"
                     + " see README \"tail overflow\"", ahead, names.base());
+        }
+    }
+
+    /**
+     * The waiting gauges and, while any record waits, the WARN about them, an ERROR once the oldest has waited over
+     * {@code alertAfter}; each at most once a minute.
+     */
+    private void refreshWaiting(Connection c) throws SQLException {
+        long count = 0;
+        double oldest = 0;
+        String topic = null;
+        String error = null;
+        try (var st = c.createStatement(); var rs = st.executeQuery(waiting)) {
+            if (rs.next()) {
+                count = rs.getLong(1);
+                oldest = rs.getDouble(2);
+                topic = rs.getString(3);
+                error = rs.getString(4);
+            }
+        }
+        waitingSize = count;
+        waitingOldest = oldest;
+        if (count == 0) {
+            return;
+        }
+        boolean alert = oldest > waitingAlertAfter.toNanos() / 1e9;
+        if (due(alert ? waitingAlerted : waitingWarned)) {
+            var text = "outbox: {} records wait for an instance that can handle them; the oldest has waited {} (topic"
+                    + " {}, {}): a release half rolled out or rolled back?";
+            var waited = Duration.ofSeconds(Math.round(oldest));
+            if (alert) {
+                log.error(text, count, waited, topic, error);
+            } else {
+                log.warn(text, count, waited, topic, error);
+            }
         }
     }
 

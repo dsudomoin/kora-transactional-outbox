@@ -9,9 +9,9 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * {@code outbox.deliver}, span {@code outbox deliver <topic>}. Low cardinality: {@code messaging.destination.name}
  * and, once known, {@code outbox.outcome} ({@code delivered}, {@code retry}, {@code permanent}, {@code not_attempted},
- * {@code requeued}, or {@code failed} when the handler call ended without outcomes). High cardinality:
- * {@code outbox.message_id}, {@code outbox.attempt} (this attempt, from 1), {@code outbox.delay_ms} and, when the
- * record's shard is known, {@code outbox.shard}.
+ * {@code requeued}, {@code waiting}, or {@code failed} when the handler call ended without outcomes). High
+ * cardinality: {@code outbox.message_id}, {@code outbox.attempt} (this attempt, from 1), {@code outbox.delay_ms} and,
+ * when the record's shard is known, {@code outbox.shard}.
  */
 public class DefaultOutboxDeliveryObservationConvention implements OutboxDeliveryObservationConvention {
 
@@ -72,6 +72,8 @@ public class DefaultOutboxDeliveryObservationConvention implements OutboxDeliver
             return "not_attempted";
         } else if (outcome instanceof Outcome.Requeue) {
             return "requeued";
+        } else if (outcome instanceof Outcome.Waiting) {
+            return "waiting";
         }
         return "delivered";
     }

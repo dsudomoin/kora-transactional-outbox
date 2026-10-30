@@ -169,6 +169,11 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
     }
 
     @Override
+    public void waited(String topic, Outcome.Waiting.Kind kind) {
+        metrics.waited(topic, kind);
+    }
+
+    @Override
     public void stepFinished(Duration duration) {
         metrics.stepFinished(duration);
     }

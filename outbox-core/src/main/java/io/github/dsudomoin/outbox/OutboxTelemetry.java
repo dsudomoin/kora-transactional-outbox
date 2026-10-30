@@ -43,6 +43,12 @@ public interface OutboxTelemetry {
     default void requeued(String topic) {}
 
     /**
+     * A record waits for an instance that can handle it ({@link Outcome.Waiting}): neither a delivery nor a failure,
+     * it spends no attempt. {@code kind}, a closed set, fits a metric label; the reason stays in the record's error.
+     */
+    default void waited(String topic, Outcome.Waiting.Kind kind) {}
+
+    /**
      * A relay step found work, on the thread that steps: called at the first locked shard with work, so only for the
      * steps {@link #stepFinished} measures; a step that locks nothing or finds nothing to do calls neither.
      * {@code shards} is a copy of the shards whose locks the step holds, those without work included. The step's

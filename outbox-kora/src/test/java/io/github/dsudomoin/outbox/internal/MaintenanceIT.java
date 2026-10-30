@@ -1458,8 +1458,9 @@ class MaintenanceIT {
         var registry = new SimpleMeterRegistry();
         var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
         assertThat(registry.getMeters()).extracting(m -> m.getId().getName()).containsExactlyInAnyOrder(
-                "outbox.shard.lag", "outbox.retry.size", "outbox.dead.size", "outbox.dead.pending",
-                "outbox.dead.pending.oldest", "outbox.parked.size", "outbox.partitions.premade",
+                "outbox.shard.lag", "outbox.retry.size", "outbox.waiting.size", "outbox.waiting.oldest",
+                "outbox.dead.size", "outbox.dead.pending", "outbox.dead.pending.oldest", "outbox.parked.size",
+                "outbox.partitions.premade",
                 "outbox.partitions.overflow", "outbox.partitions.xids_left",
                 "outbox.partitions.orphaned", "outbox.maintenance.transaction_pooling",
                 "outbox.maintenance.since_success");
@@ -1519,6 +1520,62 @@ class MaintenanceIT {
         assertThat(gauge(registry, "outbox.dead.pending.oldest")).as("seconds since its failed_at")
                 .isBetween(3600.0, 3700.0);
         assertThat(gauge(registry, "outbox.dead.size")).isEqualTo(4);
+    }
+
+    @Test
+    void waitingRecordsAreGaugedAndTheirWarnTurnsIntoAnErrorPastAlertAfter() throws Exception {
+        bootstrap(); // outbox.relay.waiting.alertAfter = 15 min, the default
+        var registry = new SimpleMeterRegistry();
+        var maintenance = new Maintenance(db, names, config, new OutboxMetrics(registry));
+
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(waitingLog(err)).as("nothing waits").isEmpty();
+        }
+        assertThat(gauge(registry, "outbox.waiting.size")).isZero();
+        assertThat(gauge(registry, "outbox.waiting.oldest")).as("none").isZero();
+
+        try (var c = TestDb.connect()) { // two heads waiting, as the relay leaves them, and one that failed
+            execute(c, "insert into " + names.retry() + " (id, shard, message_id, topic, created_at, next_attempt_at,"
+                    + " last_error, waiting_since) values"
+                    + " (1, 0, gen_random_uuid(), 'orders', now(), now(), 'waiting (contract): v3 is above v2', now()"
+                    + " - interval '10 minutes'),"
+                    + " (2, 0, gen_random_uuid(), 'payments', now(), now(), 'waiting (no_route): no route', now()"
+                    + " - interval '1 minute'),"
+                    + " (3, 0, gen_random_uuid(), 'orders', now() - interval '1 hour', now(), 'target down', null)");
+        }
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(waitingLog(err)).contains("WARN").doesNotContain("ERROR")
+                    .contains("outbox: 2 records wait for an instance that can handle them; the oldest has waited"
+                            + " PT10M")
+                    .contains("(topic orders, waiting (contract): v3 is above v2): a release half rolled out or"
+                            + " rolled back?");
+        }
+        assertThat(gauge(registry, "outbox.waiting.size")).isEqualTo(2);
+        assertThat(gauge(registry, "outbox.waiting.oldest")).as("seconds since its waiting_since")
+                .isBetween(600.0, 660.0);
+        assertThat(gauge(registry, "outbox.retry.size")).isEqualTo(3);
+
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(waitingLog(err)).as("at most once a minute").isEmpty();
+        }
+
+        try (var c = TestDb.connect()) {
+            execute(c, "update " + names.retry() + " set waiting_since = now() - interval '20 minutes' where id = 1");
+        }
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(waitingLog(err)).as("past alertAfter, not held back by the WARN a moment ago")
+                    .contains("ERROR").contains("2 records wait").contains("has waited PT20M")
+                    .contains("(topic orders, waiting (contract): v3 is above v2)");
+        }
+        assertThat(gauge(registry, "outbox.waiting.oldest")).isBetween(1200.0, 1260.0);
+        try (var err = new CapturedStderr()) {
+            assertThat(maintenance.runOnce()).isTrue();
+            assertThat(waitingLog(err)).as("at most once a minute").isEmpty();
+        }
     }
 
     @Test
@@ -2039,6 +2096,11 @@ class MaintenanceIT {
         try (var c = TestDb.connect()) {
             return queryLong(c, "select pg_snapshot_xmax(pg_current_snapshot())::text::bigint");
         }
+    }
+
+    /** The lines of the waiting WARN or ERROR. */
+    private static String waitingLog(CapturedStderr err) {
+        return String.join("\n", err.text().lines().filter(l -> l.contains("records wait for an instance")).toList());
     }
 
     private static double gauge(SimpleMeterRegistry registry, String name) {
