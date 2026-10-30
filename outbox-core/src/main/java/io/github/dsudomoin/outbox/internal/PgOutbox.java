@@ -1,6 +1,7 @@
 package io.github.dsudomoin.outbox.internal;
 
 import io.github.dsudomoin.outbox.Outbox;
+import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxTelemetry;
 import io.github.dsudomoin.outbox.OutboxTransactions;
@@ -20,13 +21,18 @@ import org.slf4j.LoggerFactory;
  * before the identity assigns the row id, so per (topic, key) id order is commit order. Unkeyed rows take no lock and
  * land on a random shard. {@code sendAll} inserts through {@link Resender}, every key locked in one statement first.
  * Without a handler behind the routes, a message of a topic no route claims is refused before anything is written;
- * so is a contract version some live relay instance cannot read ({@link ContractGuard}).
+ * so is a contract version some live relay instance cannot read ({@link ContractGuard}). A message of a topic a
+ * route of this instance claims is written with the {@code outbox-local} header, which marks its record for a route,
+ * after the telemetry's headers and in place of any such header given; any other message is written without one.
  */
 public final class PgOutbox implements Outbox {
 
+    /** The header, null-valued, that marks a record for a route: one of any other value marks nothing. */
+    public static final String LOCAL_HEADER = "outbox-local";
     private static final Logger log = LoggerFactory.getLogger(PgOutbox.class);
     /** The written type of a message sent as is, which {@link ContractGuard} names. */
     private static final String UNKNOWN_TYPE = "?";
+    private static final OutboxHeader LOCAL = new OutboxHeader(LOCAL_HEADER, null);
     private final OutboxTransactions db;
     private final String notInTx;
     private final int keyNamespace;
@@ -117,8 +123,8 @@ public final class PgOutbox implements Outbox {
             for (int i = 0; i < n; i++) {
                 var m = messages.get(i);
                 ids[i] = UuidV7.next();
-                rows.add(new Resender.Row(
-                        ids[i], m.topic(), m.key(), m.payload(), HeaderCodec.encode(enqueue.headers(m.headers()))));
+                var headers = marked(m.topic(), enqueue.headers(m.headers()));
+                rows.add(new Resender.Row(ids[i], m.topic(), m.key(), m.payload(), HeaderCodec.encode(headers)));
             }
             try {
                 resender.insertAll(c, rows);
@@ -152,7 +158,7 @@ public final class PgOutbox implements Outbox {
             ps.setString(3, m.topic());
             ps.setBytes(4, m.key());
             ps.setBytes(5, m.payload());
-            ps.setBytes(6, HeaderCodec.encode(enqueue.headers(m.headers())));
+            ps.setBytes(6, HeaderCodec.encode(marked(m.topic(), enqueue.headers(m.headers()))));
             if (keyed) {
                 ps.setInt(7, keyNamespace);
                 ps.setInt(8, hash);
@@ -180,6 +186,33 @@ public final class PgOutbox implements Outbox {
             throw new IllegalArgumentException("outbox topic " + topic + " is claimed by no OutboxTopicHandler and"
                     + " there is no OutboxHandler: claimed topics are " + new TreeSet<>(claimedTopics));
         }
+    }
+
+    /**
+     * {@code headers} without their {@code outbox-local} headers, plus the marker if a route of this instance claims
+     * {@code topic}; the very list when there is nothing to change, so an unmarked write copies nothing.
+     */
+    private List<OutboxHeader> marked(String topic, List<OutboxHeader> headers) {
+        boolean local = contracts.routes().contains(topic);
+        if (!local && !hasLocal(headers)) {
+            return headers;
+        }
+        var stamped = new ArrayList<>(headers);
+        stamped.removeIf(h -> h.name().equals(LOCAL_HEADER));
+        if (local) {
+            stamped.add(LOCAL);
+        }
+        return stamped;
+    }
+
+    /** A loop, not a stream: every unmarked write runs it. */
+    private static boolean hasLocal(List<OutboxHeader> headers) {
+        for (var h : headers) {
+            if (h.name().equals(LOCAL_HEADER)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private Connection currentTransaction() {

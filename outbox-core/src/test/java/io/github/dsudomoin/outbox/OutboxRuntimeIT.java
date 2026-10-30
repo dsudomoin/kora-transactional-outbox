@@ -1,9 +1,12 @@
 package io.github.dsudomoin.outbox;
 
+import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.dsudomoin.outbox.internal.HeaderCodec;
+import io.github.dsudomoin.outbox.internal.PgOutbox;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -12,12 +15,39 @@ import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import org.junit.jupiter.api.Test;
 
 class OutboxRuntimeIT {
+
+    @OutboxContract(2)
+    record V2(String id) {}
+
+    private static final OutboxHeader H = new OutboxHeader("h", bytes("v"));
+    private static final OutboxHeader CONTRACT = new OutboxHeader("outbox-contract", "2".getBytes(US_ASCII));
+    private static final OutboxHeader TRACE = new OutboxHeader("trace", bytes("t"));
+    private static final OutboxHeader LOCAL = new OutboxHeader(PgOutbox.LOCAL_HEADER, null);
+    /** A message's own headers: two {@code outbox-local}, one of them of a value, which marks nothing. */
+    private static final List<OutboxHeader> OWN =
+            List.of(H, new OutboxHeader(PgOutbox.LOCAL_HEADER, bytes("x")), LOCAL);
+    /** Adds the {@code trace} header to every message, as tracing adds {@code traceparent}. */
+    private static final OutboxTelemetry TRACING = new OutboxTelemetry() {
+        @Override
+        public Enqueue enqueueStarted() {
+            return new Enqueue() {
+                @Override
+                public List<OutboxHeader> headers(List<OutboxHeader> headers) {
+                    var traced = new ArrayList<>(headers);
+                    traced.add(TRACE);
+                    return traced;
+                }
+            };
+        }
+    };
 
     @Test
     void startThenCloseInOrder() throws Exception {
@@ -111,6 +141,70 @@ class OutboxRuntimeIT {
         }
     }
 
+    /**
+     * A write to a topic a route claims, typed or plain, carries {@code outbox-local} with a null value, last: after
+     * the telemetry's headers, in place of the message's own, next to its contract header. A write to any other topic
+     * carries none, the message's own dropped.
+     */
+    @Test
+    void aWriteToARoutedTopicIsMarkedLocalAndNoOtherIs() {
+        var transactions = new JdbcTransactions(TestDataSources.newDataSource());
+        var config = new TestOutboxConfig().relayEnabled(false);
+        try (var runtime = OutboxRuntime.builder(config, transactions, new RecordingHandler())
+                .route(new Claiming(Set.of("audit"))).route(new TypedOutboxTopicHandler<>(Set.of("orders"),
+                        (topic, payload) -> new V2(new String(payload, UTF_8)), V2.class) {
+                    @Override
+                    protected void handle(V2 value, OutboxRecord record) {}
+                }).telemetry(TRACING).build()) {
+            runtime.start();
+            var outbox = runtime.outbox();
+            var typed = new TypedOutbox<>(outbox, (topic, value) -> bytes(value.id()), V2.class);
+
+            var ids = transactions.inTx(c -> {
+                var all = new ArrayList<UUID>();
+                all.add(typed.send("orders", "k", new V2("1"), OWN));
+                all.add(outbox.send(new OutboxMessage("audit", null, bytes("p"), OWN)));
+                all.add(outbox.send(c, OutboxMessage.of("audit", "k", bytes("p"))));
+                all.addAll(outbox.sendAll(List.of(typed.message("orders", "k", new V2("2"), OWN),
+                        OutboxMessage.of("audit", "k", bytes("p")),
+                        new OutboxMessage("kafka", null, bytes("p"), OWN))));
+                return all;
+            });
+
+            assertThat(ids).extracting(id -> headers(transactions, config, id)).containsExactly(
+                    List.of(H, CONTRACT, TRACE, LOCAL),
+                    List.of(H, TRACE, LOCAL),
+                    List.of(TRACE, LOCAL),
+                    List.of(H, CONTRACT, TRACE, LOCAL),
+                    List.of(TRACE, LOCAL),
+                    List.of(H, TRACE));
+        }
+    }
+
+    /** Without routes no write is marked, and a message's own {@code outbox-local} is dropped. */
+    @Test
+    void withoutRoutesNoWriteIsMarkedLocal() {
+        var transactions = new JdbcTransactions(TestDataSources.newDataSource());
+        var config = new TestOutboxConfig().relayEnabled(false);
+        try (var runtime = OutboxRuntime.builder(config, transactions, new RecordingHandler()).build()) {
+            runtime.start();
+            var outbox = runtime.outbox();
+            var typed = new TypedOutbox<>(outbox, (topic, value) -> bytes(value.id()), V2.class);
+
+            var ids = transactions.inTx(c -> {
+                var all = new ArrayList<UUID>();
+                all.add(typed.send("orders", "k", new V2("1"), OWN));
+                all.add(outbox.send(OutboxMessage.of("orders", "k", bytes("p"))));
+                all.addAll(outbox.sendAll(List.of(typed.message("orders", "k", new V2("2"), OWN),
+                        new OutboxMessage("orders", null, bytes("p"), OWN))));
+                return all;
+            });
+
+            assertThat(ids).extracting(id -> headers(transactions, config, id))
+                    .containsExactly(List.of(H, CONTRACT), List.of(), List.of(H, CONTRACT), List.of(H));
+        }
+    }
+
     /** Redrive does not go through {@link Outbox}: a letter of a topic no route claims any more goes back in. */
     @Test
     void aRedriveToATopicNoRouteClaimsStillGoesIn() {
@@ -157,6 +251,19 @@ class OutboxRuntimeIT {
             rs.next();
             assertThat(rs.getInt(1)).as("instance rows five beats after the failed start").isZero();
         }
+    }
+
+    /** The headers stored for the message {@code id}. */
+    private static List<OutboxHeader> headers(JdbcTransactions transactions, TestOutboxConfig config, UUID id) {
+        return transactions.inTx(c -> {
+            try (var ps = c.prepareStatement("select headers from " + config.table() + " where message_id = ?")) {
+                ps.setObject(1, id);
+                try (var rs = ps.executeQuery()) {
+                    assertThat(rs.next()).as("row of %s", id).isTrue();
+                    return HeaderCodec.decode(rs.getBytes(1));
+                }
+            }
+        });
     }
 
     private static long rows(JdbcTransactions transactions, TestOutboxConfig config) {
