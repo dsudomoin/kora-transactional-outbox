@@ -2,6 +2,7 @@ import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTopicHandler;
+import io.github.dsudomoin.outbox.OutboxWaitException;
 import io.github.dsudomoin.outbox.Outcome;
 import java.io.IOException;
 import java.net.URI;
@@ -23,7 +24,7 @@ import java.util.Set;
  * OutboxRuntime.builder(config, transactions, kafka.handler()).route(new AuditHandler(url)).
  *
  * handle() alone is enough for status mapping (the default handleBatch does the rest). handleBatch is overridden
- * here only to honour Retry-After; copy that part only if the target sends it.
+ * here only to honour Retry-After; copy that part only if the target sends it, and keep its OutboxWaitException catch.
  */
 public final class AuditHandler implements OutboxTopicHandler {
 
@@ -43,6 +44,9 @@ public final class AuditHandler implements OutboxTopicHandler {
 
     @Override
     public void handle(OutboxRecord record) throws Exception {
+        if (record.contractVersion() > 1) { // a plain handler checks the version itself; an invalid one throws too
+            throw new OutboxWaitException("audit event v" + record.contractVersion() + ", this release posts v1");
+        }
         var request = HttpRequest.newBuilder(events)
                 .timeout(REQUEST_TIMEOUT)
                 .header("Idempotency-Key", record.messageId().toString()) // stable across redeliveries
@@ -67,7 +71,7 @@ public final class AuditHandler implements OutboxTopicHandler {
     @Override
     public List<Outcome> handleBatch(List<OutboxRecord> records) {
         var outcomes = new ArrayList<Outcome>(records.size());
-        var failedKeys = new HashSet<Object>();
+        var blockedKeys = new HashSet<Object>(); // failed or waiting
         int failures = 0;
         boolean anyDelivered = false;
         Instant targetPausedUntil = null;
@@ -77,7 +81,7 @@ public final class AuditHandler implements OutboxTopicHandler {
                 outcomes.add(Outcome.notAttempted(targetPausedUntil)); // spends no attempt
                 continue;
             }
-            if (failedKeys.contains(key) || (!anyDelivered && failures >= 3) || OutboxHandler.windDownRequested()) {
+            if (blockedKeys.contains(key) || (!anyDelivered && failures >= 3) || OutboxHandler.windDownRequested()) {
                 outcomes.add(Outcome.notAttempted());
                 continue;
             }
@@ -87,6 +91,11 @@ public final class AuditHandler implements OutboxTopicHandler {
                 anyDelivered = true;
             } catch (OutboxPermanentException e) {
                 outcomes.add(Outcome.permanent(e)); // to <table>_dead; the key continues
+            } catch (OutboxWaitException e) { // another release handles it: no attempt spent, never dead by itself
+                outcomes.add(new Outcome.Waiting(e.kind(), e.getMessage(), null));
+                if (key != null) {
+                    blockedKeys.add(key); // its key waits behind it; not a failure of the target
+                }
             } catch (RetryAfter e) {
                 outcomes.add(Outcome.retry(e, e.notBefore)); // capped at 24 h by the relay
                 targetPausedUntil = e.notBefore; // the whole target asked to wait
@@ -97,7 +106,7 @@ public final class AuditHandler implements OutboxTopicHandler {
                 outcomes.add(Outcome.retry(e));
                 failures++;
                 if (key != null) { // unkeyed records never block each other
-                    failedKeys.add(key);
+                    blockedKeys.add(key);
                 }
             }
         }

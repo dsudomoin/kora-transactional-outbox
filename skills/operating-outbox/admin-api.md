@@ -9,12 +9,13 @@ A component of `OutboxModule`. Each call runs its own transactions; inside `inTx
 
 | Method | Does |
 |---|---|
-| `status()` | Relay halt, lag, retry and parked sizes, dead letters by topic and status, orphans, tail overflow, `premade`, `xidsLeft`, seconds since maintenance, shards, and `instances`: every heartbeat row, expired ones included (id, shard count, `lastSeen`, whether its dead-letter hook is active). A `lastSeen` older than 3 × `maintenanceInterval` means the instance is not running; a crashed instance's row stays about an hour after its heartbeat expires, 3 × `maintenanceInterval` + 1 h after its last beat. |
+| `status()` | Relay halt, lag, retry and parked sizes, waiting records (`waitingSize` heads, `waitingOldestSeconds` for the oldest, 0 when none), dead letters by topic and status, orphans, tail overflow, `premade`, `xidsLeft`, seconds since maintenance, shards, and `instances`: every heartbeat row, expired ones included (id, shard count, `lastSeen`, whether its dead-letter hook is active, `relay`, and `contracts`: the highest contract version it reads by topic, null unknown, empty none, a non-positive value shown as 0). A `lastSeen` older than 3 × `maintenanceInterval` means the instance is not running; a crashed instance's row stays about an hour after its heartbeat expires, 3 × `maintenanceInterval` + 1 h after its last beat. |
 | `findDeadLetters(filter, afterId, limit)`, `countDeadLetters(filter)` | Dead letters by `DeadLetterFilter` (topic, key, error substring, `failedFrom` inclusive, `failedTo` exclusive, status), id order, up to 1 000 per page. |
 | `redriveDeadLetters(ids)` / `(filter)` | Back to the outbox as the hook's `redrive`: a new message after the later messages of its key, same message id. Returns the count. |
 | `discardDeadLetters(ids)` / `(filter)` | Delete; returns the count. |
 | `restoreOrphan(table, fromXid)` | Rows at `fromXid` and above back to the outbox, the rest dropped with the table. |
 | `recoverXidRegression()` | The xid regression recovery now, in any mode and for any `maxRows`. |
+| `abandonWaiting(topic, key, reason, dryRun)` | Records of `topic` (of `key` only unless null) waiting for an instance able to handle them, the whole key each (waiting head, its followers, its parked records; an unkeyed head alone), to the dead table as `kept` (the hook is not asked) with error `abandoned: <reason>`. Returns `Abandoned(keys, records)`; `dryRun` counts only. Shard by shard, chunks of 1 000 keys, each under the shard's lock, waited up to `batchTimeout` + 5 s, then `IllegalStateException` «... busy, retry» (done chunks stay done; call again). Later records of the key are delivered ahead of the abandoned ones. |
 
 - Bulk calls take letters dead when the call starts, in chunks of 1 000 by id, one transaction per chunk. Letters
   held by a running hook call, and (redrive) letters whose key an open transaction sends, are skipped without
@@ -43,11 +44,14 @@ curl -s -H "$KEY" -H "$JSON" -d '{"filter":{"topic":"orders","error":"timeout"}}
 curl -s -H "$KEY" -H "$JSON" -d '{"ids":[1003]}' $API/dead-letters/discard
 curl -s -X POST -H "$KEY" "$API/orphans/outbox_x83886080/restore?fromXid=83900000"
 curl -s -X POST -H "$KEY" $API/recovery/xid-regression
+curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","reason":"v2 rolled back for good","dryRun":true}' \
+    $API/waiting/abandon                                                       # {"keys":3,"records":5}
 ```
 
-- 200 with JSON (changing calls: `{"count": N}`); 400 rejected input (unknown field, over 1 000 `ids`, empty filter,
-  not an orphan); 401 / 403 from the authorizer; 409 not now (maintenance running: retry; no xid regression); 500
-  otherwise. Every error body is `{"message": "..."}`.
+- 200 with JSON (changing calls: `{"count": N}`; `waiting/abandon`: `{"keys": N, "records": M}`); 400 rejected input
+  (unknown field, so a mistyped `key` never widens an abandon; over 1 000 `ids`, empty filter, not an orphan, blank
+  `topic` or `reason`); 401 / 403 from the authorizer; 409 not now (maintenance running, or a relay step holding the
+  shard past `batchTimeout` + 5 s: retry; no xid regression); 500 otherwise. Every error body is `{"message": "..."}`.
 - Reads (`/status`, find, count) wait at most 5 s for a lock and 60 s per statement: during an xid regression
   recovery, which holds its tables, `/status` answers 500 (55P03) after 5 s; retry once it is done.
 - A body holds exactly one of `ids` (up to 1 000) and `filter`. `status` is `pending`, `kept` or `scheduled`. A filter
@@ -69,6 +73,11 @@ curl -s -X POST -H "$KEY" $API/recovery/xid-regression
   `<table>_halt` row.
 - **Stranded shards** («Застрявшие шарды»): no admin call. Stop all instances and run the README's single
   transaction exactly as printed, shard numbers from the ERROR, on a copy first; consumers get the shards' rows again.
+- **Waiting records after a final rollback** («Версии контрактов и откат»): `waitingSize` in `/status`, the topic and
+  cause in the ERROR line or `outbox.messages.waiting{kind}`. If the release that reads them will not return,
+  `waiting/abandon` with `dryRun: true`, then without; body `{"topic", "key"?, "reason", "dryRun"?}`, `key` as UTF-8.
+  The audit line carries topic, key, reason and dryRun. Later: redrive with `{"filter":{"topic":"orders",
+  "error":"abandoned"}}` once a reading release runs, or discard. A reshard needs them gone first.
 - **After a rollback window** («Rolling-деплои», «Обновление с предыдущего релиза (5fc60dd), смешанный парк и
   откат»): the previous release writes dead letters `kept` and the hook never sees them:
   `curl -s -H "$KEY" "$API/dead-letters?status=kept&failedFrom=<start>&failedTo=<end>"`.

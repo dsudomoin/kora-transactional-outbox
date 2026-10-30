@@ -1,6 +1,6 @@
 ---
 name: writing-outbox-handlers
-description: Use when writing or reviewing an OutboxTopicHandler, TypedOutboxTopicHandler (with OutboxDeserializer), OutboxHandler or an OutboxDeadLetterHandler (dead-letter hook) for dsudomoin/outbox (delivering outbox records of some topics to an HTTP API, another database or several targets next to Kafka, decoding payloads to typed values, OutboxHandler.byTopic next to kafka.handler(), a wrapper around the Kafka handler), or when choosing outbox.relay.batchSize, batchTimeout or retry.maxAttempts for a slow target, or delivering concurrently inside handleBatch, or setting a record aside with Outcome.requeue so the rest of its key goes on (a running process of the same account blocks it). Also «свой обработчик outbox», «доставка из аутбокса в HTTP», «dead letters», «Retry-After», «отложить событие», «requeue», «хук dead letters», «DLQ», outbox.kafka.deadLetterTopic.
+description: Use when writing or reviewing an OutboxTopicHandler, TypedOutboxTopicHandler (with OutboxDeserializer), OutboxHandler or an OutboxDeadLetterHandler (dead-letter hook) for dsudomoin/outbox (delivering outbox records of some topics to an HTTP API, another database or several targets next to Kafka, decoding payloads to typed values, OutboxHandler.byTopic next to kafka.handler(), a wrapper around the Kafka handler), or when choosing outbox.relay.batchSize, batchTimeout or retry.maxAttempts for a slow target, or delivering concurrently inside handleBatch, or setting a record aside with Outcome.requeue so the rest of its key goes on (a running process of the same account blocks it), or making a record wait for an instance of another release (Outcome.waitFor, OutboxWaitException, Outcome.Waiting), or reading contract versions (@OutboxContract, record.contractVersion()). Also «свой обработчик outbox», «доставка из аутбокса в HTTP», «dead letters», «Retry-After», «отложить событие», «requeue», «хук dead letters», «DLQ», «версия контракта», outbox.kafka.deadLetterTopic.
 ---
 
 # Writing outbox handlers
@@ -32,6 +32,7 @@ The soft deadline is a safety net, not flow control.
 | 429 / Retry-After | throw: plain backoff only | `Outcome.retry(e, notBefore)`, capped at 24 h |
 | Not tried | | `Outcome.notAttempted()`, spends no attempt |
 | Not now, let the key go (a running process of the same entity blocks it) | | [`Outcome.requeue()`](requeue.md) |
+| Not on this instance: another release handles it (a contract version or sub-type this release does not know) | throw `OutboxWaitException(reason)` | `Outcome.waitFor(reason)`, `waitFor(reason, notBefore)`: key blocked, no attempt spent, never dead by itself |
 
 - `relay.retry.maxAttempts` = 0 (default) retries forever: alert on `outbox.shard.lag`. It is global, and a dead
   record lets later records of its key overtake it: with ordered Kafka topics keep 0 and bound only the slow route
@@ -44,7 +45,11 @@ The soft deadline is a safety net, not flow control.
 
 - one `Outcome` per record, input order, no nulls;
 - never throw: a thrown call retries all its records;
-- after a (topic, key) fails, its later records in the call are `notAttempted()`;
+- after a (topic, key) fails or waits, its later records in the call are `notAttempted()`;
+- catch `OutboxWaitException` before any catch-all: `new Outcome.Waiting(e.kind(), e.getMessage(), null)` keeps its
+  reason and kind (`decode(record)` and `record.contractVersion()` throw it with kind `contract`); block the key, but
+  do not count it toward a «target down» stop, since a wait says nothing about the target. The relay also turns a
+  `Retry` or `Permanent` carrying one into a wait, after your loop has counted it as a failure;
 - check `OutboxHandler.windDownRequested()` before each record and, if concurrent, while waiting (Kora's JDK
   HTTP client clears the interrupt flag); restore the flag after `InterruptedException`;
 - run each record in `OutboxHandler.inRecordScope(record, () -> ...)` to keep its trace, like the default.
@@ -69,8 +74,14 @@ bound redrive loops with `letter.redrives()`; `active()` false (as `NONE`) keeps
   one Kora 1.2.23 fails with «More than one component matches dependency type: OutboxHandler (no tags)».
 - Typed values: extend `TypedOutboxTopicHandler<T>`, constructor `(OutboxDeserializer<T> deserializer, ...)` calling
   `super(Set.of("audit"), deserializer)`, override `handle(T value, OutboxRecord record)`. `value` is never null:
-  a null payload (tombstone) goes to `handleTombstone(record)`; override it if the topic carries them. Kotlin
-  declares `value: T` non-null. A `handleBatch` override decodes with `decode(record)` (null for a tombstone).
+  a null payload (tombstone) goes to `handleTombstone(record)`; override it if the topic carries them, else a
+  tombstone goes to the dead table. Kotlin declares `value: T` non-null. A `handleBatch` override decodes with
+  `decode(record)` (null for a tombstone). Defaults:
+  - a payload that does not decode, or a null from the deserializer, at a version the handler reads → dead table at
+    once (so a deserializer does no network I/O: its failure is never retried);
+  - a record of a newer contract version than `T` → waits for an instance that reads it;
+  - a topic no route claims while no `OutboxHandler` stands behind the routes (no `KafkaOutboxModule`) → waits for an
+    instance with the route; `send` of such a topic in that app throws `IllegalArgumentException` at once.
 - Deserializers: with `OutboxJsonModule`, every `@Json` class gets one from its `JsonReader`; an app's own
   `OutboxDeserializer<T>` component wins for its `T`. Protobuf has no generic factory: declare
   `OutboxDeserializer<Msg>` as `(topic, payload) -> Msg.parseFrom(payload)`. A String key: `record.keyAsString()`
@@ -79,3 +90,22 @@ bound redrive loops with `letter.redrives()`; `active()` false (as `NONE`) keeps
   `OutboxHandler.byTopic(Map.of("audit", toAudit), kafka.handler())` with `toAudit` an `OutboxHandler`, injecting
   `KafkaOutboxSender`, never `KafkaOutboxHandler`; keep it the only untagged `OutboxHandler` (same Kora error).
 - A wrapper around `kafka.handler()` delegates `handleBatch` too (else one acks=all round trip per record).
+
+## Waiting and contract versions
+
+- `Outcome.Waiting` is neither a delivery nor a failure. The record becomes its key's head in `<table>_retry`, later
+  records of the key queue behind it, `attempts` stays, `maxAttempts` never applies, the shard does not pause. It is
+  handed again alone after a quarter of its wait so far, within `outbox.relay.waiting.delay` (1 s) and `maxDelay`
+  (5 min), until an instance that can handle it takes it. `kind`: `contract`, `no_route`, `handler` (yours).
+- Use it only for «another release handles this»; a failing target is `Retry`, a blocked entity is `requeue`.
+- `@OutboxContract(n)` on an event class is its payload version (none = 1, not inherited). `TypedOutbox<T>` and
+  `KafkaOutboxPublisher` stamp `T`'s version in the `outbox-contract` header (none for 1); `record.contractVersion()`
+  reads it (1 without; an invalid value throws `OutboxWaitException`).
+- `TypedOutboxTopicHandler<T>` reads versions up to `T`'s; a newer record waits undecoded, an older one arrives and
+  the handler branches on `record.contractVersion()`. `T` is resolved from the subclass declaration (generic
+  intermediates, Kora AOP proxies, Kotlin); else pass it: `super(topics, deserializer, AuditEvent.class)`.
+- A plain `OutboxTopicHandler`, or your own `OutboxHandler` behind the routes, declares no version and is not covered
+  by the writer guard: read `record.contractVersion()` yourself and throw `OutboxWaitException` for a version this
+  release does not know ([AuditHandler.java](AuditHandler.java)).
+- A breaking change of an event goes out in two releases with two classes (`OrderCreatedV1` written,
+  `OrderCreated` read): the release protocol is in using-outbox.

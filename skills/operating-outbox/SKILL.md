@@ -1,6 +1,6 @@
 ---
 name: operating-outbox
-description: Use when monitoring, alerting on, sizing or troubleshooting dsudomoin/outbox in a running Kora service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, dead letters and the dead-letter hook, the admin API (OutboxAdmin, outbox-admin-kora, /kora-outbox/admin/v1), redrive or discard, tail overflow, orphaned partitions, stranded shards, «outbox relay halted» or «xid regression detected», outbox.shards and the emergency reshard, «refuses this write», rolling deploys, upgrades and rollback to the previous release, pg_dump/restore or failover, Kafka delivery slow after RecordTooLargeException or an expired batch. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox», «админка outbox».
+description: Use when monitoring, alerting on, sizing or troubleshooting dsudomoin/outbox in a running Kora service, such as outbox.* metrics and dashboards, growing outbox.shard.lag, dead letters and the dead-letter hook, the admin API (OutboxAdmin, outbox-admin-kora, /kora-outbox/admin/v1), redrive or discard, tail overflow, orphaned partitions, stranded shards, «outbox relay halted» or «xid regression detected», outbox.shards and the emergency reshard, «refuses this write», records waiting for another release (outbox.waiting.size, outbox.waiting.oldest, «wait for an instance that can handle them», abandoning them), OutboxIncompatibleContractException and outbox.messages.contract_rejected, rolling deploys, upgrades and rollback to the previous release, pg_dump/restore or failover, Kafka delivery slow after RecordTooLargeException or an expired batch. Also «алерты outbox», «dead letters», «лаг аутбокса», «эксплуатация outbox», «админка outbox».
 ---
 
 # Operating outbox
@@ -21,6 +21,8 @@ against the library's tables**; run only the README's SQL, on a staging copy fir
 | `outbox.dead.pending.oldest` > X (X > `relay.retry.maxDelay`) and `outbox.dead.hook.failures` growing | Hook failing: letters wait | «Dead letters» |
 | ERROR «outbox xid regression detected» | «recovered»: done; «relay halted»: its reason, maybe `POST /recovery/xid-regression` | «Восстановление после регрессии xid» |
 | ERROR «... holds cursors for N shards, but this instance runs with outbox.shards = M ...» or «... refuses this write ...» | Old-count instance after a reshard: restart with the new count or unset | «Решардинг» |
+| `outbox.waiting.oldest` > `outbox.relay.waiting.alertAfter` (15 min, rule `max(outbox_waiting_oldest) > 900`) or ERROR «outbox: N records of ... wait for an instance that can handle them ...» | No running release reads them (half-rolled-out, or rolled back past the transition release): their keys stand, nothing is lost. `outbox.messages.waiting{kind}` and the line name the cause (`contract`, `no_route`). Deploy the release that reads them; for a final rollback, abandon them (below) | «Версии контрактов и откат» |
+| `outbox.messages.contract_rejected` growing | A release writes a contract version a live relay instance cannot read: those business transactions fail with `OutboxIncompatibleContractException` (WARN «outbox ... refused a send» names the instances). Deploy the reading release everywhere first | «Версии контрактов и откат» |
 
 ## Morning: nothing lost, waits for a human
 
@@ -43,7 +45,8 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
 ## Shards and pool
 
 - **`outbox.shards`: leave it unset** (256 for a new outbox; an existing one keeps its count). A differing set value
-  is the **emergency reshard**: stop writers, wait for `outbox.shard.lag` 0, stop all instances (old release too), start
+  is the **emergency reshard**: stop writers, wait for `outbox.shard.lag` 0 and empty retry and parked tables (waiting
+  records block it until delivered or abandoned), stop all instances (old release too), start
   one with the new value, then the rest; startup refuses while another instance with a different count runs
   («Решардинг», [config-reference.md](../using-outbox/config-reference.md)).
 - **Pool:** `db.maxPoolSize` ≥ own peak + `relay.workers` + 3, + 1 while `drain()` runs. Profiles:
@@ -52,7 +55,11 @@ Meters and logs: [metrics.md](metrics.md); dashboard `observability/grafana/dash
 ## Deploys and incidents
 
 - «Rolling-деплои»: identical schema-qualified `outbox.table`, `outbox.inbox.table`, inbox `retention` and
-  `partitionInterval`.
+  `partitionInterval`. An event's breaking change goes out in two releases (using-outbox, «Версии контрактов и
+  откат»): rollback to the transition release waits for nothing; past it, the newer records wait.
+- **Final rollback past the transition release**: records nobody will read again wait forever. Dry-run, then abandon
+  them per topic (or key) to `kept` dead letters, the whole key at once ([admin-api.md](admin-api.md)); redrive or
+  discard them later. Later records of an abandoned key are delivered ahead of it.
 - **Rollback to 5fc60dd** («Обновление с предыдущего релиза»): set its `outbox.shards` to the cursors' count (256 if
   this release created it); then list the window's `kept` dead letters.
 - «Репликация, failover и PITR»: async failover may deliver events whose data is gone; PITR redelivers.

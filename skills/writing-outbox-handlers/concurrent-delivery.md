@@ -21,8 +21,11 @@ contract in SKILL.md still holds: one outcome per record in input order, no null
   succeeded. The example remembers whether the previous call got any answer and probes only then, so a healthy target
   pays no extra round per call.
 - **One (topic, key) in order.** At most one request per key in flight: start a key's next record only after the
-  previous one was delivered or dead-lettered; after it fails, the key's later records are `notAttempted()`. Unkeyed
-  records never block each other. Keep events that need no order unkeyed so they all go out at once.
+  previous one was delivered or dead-lettered; after it fails or waits, the key's later records are `notAttempted()`.
+  Unkeyed records never block each other. Keep events that need no order unkeyed so they all go out at once.
+- **Decide waits before sending.** A record this release cannot handle (`record.contractVersion()` too new, or invalid)
+  gets `new Outcome.Waiting(e.kind(), e.getMessage(), null)` from the `OutboxWaitException`, before any request: it is
+  no probe, no failure, and never `Outcome.retry(e)` from a catch-all.
 - **Wind-down.** `windDownRequested()` is per thread, and a non-blocking submit loop never sees it: poll it on the
   calling thread while waiting (`future.get(100, MILLISECONDS)`, `semaphore.tryAcquire(100, MILLISECONDS)` in a loop).
   On wind-down, cancel unfinished requests, keep the real outcome of each finished one, and return `notAttempted()` for

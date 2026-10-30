@@ -53,6 +53,18 @@ Records a `handleBatch` override set aside with `Outcome.requeue()` (writing-out
 | `delay` | `1s` | > 0. A requeued record comes back after this unless a new record of its key brings it back first; `requeue(notBefore)` not before `notBefore` (capped at 24 h). A parked record handed back and not attempted waits at least this too. |
 | `maxRequeues` | `0` | ≥ 0. The requeue past this moves the record to `<table>_dead` with «requeue limit reached», attempts unchanged. Every hand-back answered with `requeue` counts, merges ahead of a new record of the key included. `0` = unlimited. Global; a handler can bound per route with `record.requeues()`, or by time, since merges spend requeues at an unpredictable rate: `Duration.between(record.createdAt(), now)` past a limit → `permanent`. |
 
+## `outbox.relay.waiting`
+
+Records that wait for an instance able to handle them (`Outcome.Waiting`: a newer contract version, a topic no route
+here claims, or the handler's `Outcome.waitFor`; writing-outbox-handlers). A waiting head is handed again after a
+quarter of the time it has waited, no sooner than `delay` and no later than `maxDelay`.
+
+| Key | Default | Rule and meaning |
+|---|---|---|
+| `delay` | `1s` | > 0. The shortest gap before a waiting head is handed again. |
+| `maxDelay` | `5m` | ≥ `delay`. The longest gap; 100 000 keys waiting at it cost about 333 UPDATEs per second fleet-wide. |
+| `alertAfter` | `15m` | > 0. While any record waits, maintenance logs a WARN at most once a minute; once the oldest has waited longer, an ERROR instead. The threshold for alerting on `outbox.waiting.oldest`. |
+
 ## `outbox.partitions`
 
 | Key | Default | Rule and meaning |
@@ -130,7 +142,9 @@ must not have `CREATE` on any schema of the owner's `search_path` (startup WARNs
   heartbeat counts too. An instance of the previous release (5fc60dd) with its relay disabled is invisible to both
   checks: stop every old instance before an explicit reshard. Under locks it then requires a drained outbox: empty retry
   and parked tables, no batch in progress, no committed row unrelayed, no standalone range, no xid regression. Each
-  failed check is named with its count, and startup fails. Procedure: stop writers, wait for `outbox.shard.lag` 0, stop
+  failed check is named with its count, and startup fails. Waiting records (`waitingSize` in `/status`) sit in the retry
+  table and block it until a release that reads them delivers them or they are abandoned to dead letters
+  (operating-outbox). Procedure: stop writers, wait for `outbox.shard.lag` 0, stop
   all instances, start one instance with the new value, wait for its INFO «outbox resharded ... from N to M shards»,
   then start the rest with the same value or unset (README «Решардинг»).
 - After a reshard, an instance still running with the old count halts: ERROR «... holds cursors for N shards, but

@@ -2,6 +2,7 @@ import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxPermanentException;
 import io.github.dsudomoin.outbox.OutboxRecord;
 import io.github.dsudomoin.outbox.OutboxTopicHandler;
+import io.github.dsudomoin.outbox.OutboxWaitException;
 import io.github.dsudomoin.outbox.Outcome;
 import java.io.IOException;
 import java.net.URI;
@@ -52,6 +53,7 @@ public final class ConcurrentAuditHandler implements OutboxTopicHandler {
 
     @Override
     public void handle(OutboxRecord record) throws Exception { // the relay calls handleBatch; this is for direct use
+        readable(record);
         check(record, http.send(request(record), HttpResponse.BodyHandlers.discarding()).statusCode());
     }
 
@@ -78,9 +80,15 @@ public final class ConcurrentAuditHandler implements OutboxTopicHandler {
                     var before = limited(records.get(previous), result(records.get(previous), decided[previous],
                             sends[previous]));
                     if (!(before instanceof Outcome.Delivered || before instanceof Outcome.Permanent)) {
-                        decided[i] = Outcome.notAttempted(); // the key failed earlier in this call
+                        decided[i] = Outcome.notAttempted(); // the key failed or waits earlier in this call
                         continue;
                     }
+                }
+                try {
+                    readable(record);
+                } catch (OutboxWaitException e) { // another release handles it: no request, no attempt spent
+                    decided[i] = new Outcome.Waiting(e.kind(), e.getMessage(), null); // neither a probe nor a failure
+                    continue;
                 }
                 if (probing && probes.size() == PROBES) { // breaker: no more requests until a probe is answered
                     if (!awaitAll(probes.stream().map(j -> sends[j]).toList())) {
@@ -138,6 +146,13 @@ public final class ConcurrentAuditHandler implements OutboxTopicHandler {
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofByteArray(record.payload()))
                 .build();
+    }
+
+    /** This release posts audit events of contract v1: a newer one waits for a release that posts it. */
+    private static void readable(OutboxRecord record) {
+        if (record.contractVersion() > 1) { // a plain handler checks the version itself; an invalid one throws too
+            throw new OutboxWaitException("audit event v" + record.contractVersion() + ", this release posts v1");
+        }
     }
 
     private static void check(OutboxRecord record, int status) throws IOException {
