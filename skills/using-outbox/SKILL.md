@@ -113,6 +113,10 @@ no route check.
   runs everywhere (a new route shows in every `routes`), a flag switches writers to the new topic; N+1 removes the old
   topic once its records are delivered. In one release the side with the route is refused on every write while the
   other release runs, and after a rollback its marked records wait even where the older `byTopic` would deliver them.
+  Key order holds per (topic, key), and the old and new topics are different pairs: writers flip at different moments
+  and an old-topic record may sit in retry or wait, so a key's record on the new topic can arrive before an earlier one
+  on the old. If order across the switch matters, make the new handler tolerate it (an entity version in the payload,
+  idempotence), or drain first: stop writing the old topic, wait until its records are delivered, then write the new.
 - Rolling back past the release that added a route loses nothing: the marked records wait; roll forward or abandon
   them. Rolling back to a release built with a library version that lacks `outbox-local` (5fc60dd) is unsupported once
   route records exist: it hands them to its handler (Kafka). The guard protects against release mistakes, not every
