@@ -554,6 +554,32 @@ class ShardProcessorIT {
     }
 
     @Test
+    void aWaitingHeadIsHandedWithoutItsFollowersWhichFollowOnceItIsDelivered() throws Exception {
+        bootstrap();
+        script = records -> records.stream().map(r -> payload("w#1").test(r) ? Outcome.waitFor("v2 not here")
+                : payload("f#1").test(r) ? Outcome.retry(new RuntimeException("f down")) : Outcome.delivered())
+                .toList();
+        send(msg("t", "w", "w#1"), msg("t", "f", "f#1"), msg("t", "d", "d#1"), msg("t", "w", "w#2"),
+                msg("t", "f", "f#2"), msg("t", "w", "w#3"));
+        tick();
+        process();
+        var due = now.plus(INITIAL); // the wait delay is 50 ms too
+        assertThat(retryRows()).containsExactly("w#1:0:" + due, "f#1:1:" + due, "w#2:0:-", "f#2:0:-", "w#3:0:-");
+        assertThat(rows("select payload, waiting_since from " + names.retry() + " where waiting_since is not null",
+                rs -> new String(rs.getBytes(1), UTF_8) + ":" + rs.getObject(2, OffsetDateTime.class).toInstant()))
+                .containsExactly("w#1:" + now);
+        script = null;
+        calls.clear();
+
+        now = due;
+        process();
+
+        assertThat(calls).extracting(ShardProcessorIT::payloads).as("f#1 with f#2; w#1 alone, then w#2 with w#3")
+                .containsExactly(List.of("w#1", "f#1", "f#2"), List.of("w#2", "w#3"));
+        assertThat(retryRows()).isEmpty();
+    }
+
+    @Test
     void retryCallFailingAsAWholeIsRetriedHeadByHeadSoOnlyThePoisonIsDead() throws Exception {
         config.retry(INITIAL, Duration.ofMillis(500), 3);
         bootstrap();

@@ -7,9 +7,9 @@ import java.time.Duration;
  * Mutable config with fast test defaults and fresh {@link TestSql#uniqueTable()} names for both tables. Relay, retry,
  * requeue, partition, tail conversion (its window off by default) and recovery settings live on this object itself
  * ({@link #relay()}, {@link #retry()}, {@link #requeue()}, {@link #partitions()}, {@link #tailConversion()} and
- * {@link #recovery()} return {@code this}); the inbox and dead-letter
- * blocks are separate because their {@code table()}, {@code premake()} and {@code batchSize()} clash with the outbox
- * ones.
+ * {@link #recovery()} return {@code this}); the inbox, dead-letter and wait
+ * blocks are separate because their {@code table()}, {@code premake()}, {@code batchSize()}, {@code delay()} and
+ * {@code maxDelay()} clash with the outbox ones.
  */
 public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayConfig, OutboxConfig.RetryConfig,
         OutboxConfig.RequeueConfig, OutboxConfig.PartitionsConfig, OutboxConfig.TailConversionConfig,
@@ -32,6 +32,9 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
     private int retryMaxAttempts = 0;
     private Duration requeueDelay = Duration.ofMillis(100);
     private int maxRequeues = 0;
+    private Duration waitDelay = Duration.ofMillis(50);
+    private Duration waitMax = Duration.ofMillis(500);
+    private Duration waitAlertAfter = Duration.ofMinutes(15);
     private long xidsPerPartition = 1_000_000L;
     private int premake = 4;
     private Duration maintenanceInterval = Duration.ofHours(1); // tests call maintenance directly
@@ -280,6 +283,34 @@ public final class TestOutboxConfig implements OutboxConfig, OutboxConfig.RelayC
 
     @Override
     public RequeueConfig requeue() {
+        return this;
+    }
+
+    /** Separate, as {@code delay()} and {@code maxDelay()} clash with the requeue and retry ones. */
+    @Override
+    public WaitConfig waiting() {
+        return new WaitConfig() {
+            @Override
+            public Duration delay() {
+                return waitDelay;
+            }
+
+            @Override
+            public Duration maxDelay() {
+                return waitMax;
+            }
+
+            @Override
+            public Duration alertAfter() {
+                return waitAlertAfter;
+            }
+        };
+    }
+
+    public TestOutboxConfig waiting(Duration delay, Duration maxDelay, Duration alertAfter) {
+        this.waitDelay = delay;
+        this.waitMax = maxDelay;
+        this.waitAlertAfter = alertAfter;
         return this;
     }
 

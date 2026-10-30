@@ -1477,7 +1477,7 @@ class MaintenanceIT {
             var parked =
                     new OutboxRecord(1_000_000, UUID.randomUUID(), "t", null, null, List.of(), Instant.now(), 0, 0);
             new ParkedStore(names, new RetryStore(names, false))
-                    .apply(c, 0, List.of(new Park(parked, 1, Instant.now())), Set.of());
+                    .apply(c, 0, List.of(new Park(parked, 1, Instant.now())), Set.of(), Instant.now());
         }
 
         assertThat(maintenance.runOnce()).isTrue();

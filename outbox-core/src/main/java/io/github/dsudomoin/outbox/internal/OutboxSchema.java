@@ -127,6 +127,7 @@ public final class OutboxSchema implements AutoCloseable {
         var relay = config.relay();
         var retry = relay.retry();
         var requeue = relay.requeue();
+        var waiting = relay.waiting();
         var partitions = config.partitions();
         var deadLetters = config.deadLetters();
         if (config.shards() != null) {
@@ -156,6 +157,12 @@ public final class OutboxSchema implements AutoCloseable {
                 "outbox.relay.requeue.delay must be positive: " + requeue.delay());
         require(requeue.maxRequeues() >= 0,
                 "outbox.relay.requeue.maxRequeues must not be negative: " + requeue.maxRequeues());
+        require(waiting.delay().compareTo(Duration.ZERO) > 0,
+                "outbox.relay.waiting.delay must be positive: " + waiting.delay());
+        require(waiting.maxDelay().compareTo(waiting.delay()) >= 0,
+                "outbox.relay.waiting.maxDelay must be at least outbox.relay.waiting.delay: " + waiting.maxDelay());
+        require(waiting.alertAfter().compareTo(Duration.ZERO) > 0,
+                "outbox.relay.waiting.alertAfter must be positive: " + waiting.alertAfter());
         require(partitions.xidsPerPartition() >= 1000,
                 "outbox.partitions.xidsPerPartition must be at least 1000: " + partitions.xidsPerPartition());
         require(partitions.premake() >= 2, "outbox.partitions.premake must be at least 2: " + partitions.premake());

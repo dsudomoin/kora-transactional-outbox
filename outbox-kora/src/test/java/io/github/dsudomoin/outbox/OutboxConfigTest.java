@@ -15,6 +15,7 @@ import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraRequeueConfig_Confi
 import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraRetryConfig_ConfigValueExtractor;
 import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraSchemaConfig_ConfigValueExtractor;
 import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraTailConversionConfig_ConfigValueExtractor;
+import io.github.dsudomoin.outbox.kora.$KoraOutboxConfig_KoraWaitConfig_ConfigValueExtractor;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
 import ru.tinkoff.kora.config.common.extractor.DurationConfigValueExtractor;
@@ -27,7 +28,8 @@ class OutboxConfigTest {
     private static final $KoraOutboxConfig_ConfigValueExtractor EXTRACTOR = new $KoraOutboxConfig_ConfigValueExtractor(
             new $KoraOutboxConfig_KoraRelayConfig_ConfigValueExtractor(
                     new $KoraOutboxConfig_KoraRetryConfig_ConfigValueExtractor(DURATION),
-                    new $KoraOutboxConfig_KoraRequeueConfig_ConfigValueExtractor(DURATION), DURATION),
+                    new $KoraOutboxConfig_KoraRequeueConfig_ConfigValueExtractor(DURATION),
+                    new $KoraOutboxConfig_KoraWaitConfig_ConfigValueExtractor(DURATION), DURATION),
             new $KoraOutboxConfig_KoraPartitionsConfig_ConfigValueExtractor(
                     new $KoraOutboxConfig_KoraTailConversionConfig_ConfigValueExtractor(DURATION), DURATION),
             new $KoraOutboxConfig_KoraInboxConfig_ConfigValueExtractor(DURATION),
@@ -172,6 +174,21 @@ class OutboxConfigTest {
     }
 
     @Test
+    void waitingKeysAreReadAndValidated() {
+        var waiting = parse("outbox.relay.waiting { delay = 2s, maxDelay = 1m, alertAfter = 1h }").relay().waiting();
+
+        assertThat(waiting.delay()).isEqualTo(Duration.ofSeconds(2));
+        assertThat(waiting.maxDelay()).isEqualTo(Duration.ofMinutes(1));
+        assertThat(waiting.alertAfter()).isEqualTo(Duration.ofHours(1));
+        OutboxSchema.validate(parse("outbox.relay.waiting { delay = 1m, maxDelay = 1m }"));
+        assertRejected("outbox.relay.waiting.delay = 0s", "outbox.relay.waiting.delay must be positive: PT0S");
+        assertRejected("outbox.relay.waiting { delay = 2m, maxDelay = 1m }",
+                "outbox.relay.waiting.maxDelay must be at least outbox.relay.waiting.delay: PT1M");
+        assertRejected("outbox.relay.waiting.alertAfter = 0s",
+                "outbox.relay.waiting.alertAfter must be positive: PT0S");
+    }
+
+    @Test
     void badDeadLettersValuesAreRejected() {
         assertRejected("outbox.deadLetters.batchSize = 0", "outbox.deadLetters.batchSize must be at least 1: 0");
         assertRejected("outbox.deadLetters.batchSize = 1001",
@@ -225,6 +242,9 @@ class OutboxConfigTest {
         assertThat(relay.retry().maxAttempts()).isZero();
         assertThat(relay.requeue().delay()).isEqualTo(Duration.ofSeconds(1));
         assertThat(relay.requeue().maxRequeues()).isZero();
+        assertThat(relay.waiting().delay()).isEqualTo(Duration.ofSeconds(1));
+        assertThat(relay.waiting().maxDelay()).isEqualTo(Duration.ofMinutes(5));
+        assertThat(relay.waiting().alertAfter()).isEqualTo(Duration.ofMinutes(15));
 
         var partitions = config.partitions();
         assertThat(partitions.xidsPerPartition()).isEqualTo(16_777_216L);

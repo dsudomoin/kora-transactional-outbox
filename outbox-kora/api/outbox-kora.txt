@@ -31,6 +31,7 @@ package io.github.dsudomoin.outbox.kora {
   @ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor public static interface KoraOutboxConfig.KoraRelayConfig extends io.github.dsudomoin.outbox.OutboxConfig.RelayConfig {
     method public default io.github.dsudomoin.outbox.kora.KoraOutboxConfig.KoraRequeueConfig! requeue();
     method public default io.github.dsudomoin.outbox.kora.KoraOutboxConfig.KoraRetryConfig! retry();
+    method public default io.github.dsudomoin.outbox.kora.KoraOutboxConfig.KoraWaitConfig! waiting();
   }
 
   @ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor public static interface KoraOutboxConfig.KoraRequeueConfig extends io.github.dsudomoin.outbox.OutboxConfig.RequeueConfig {
@@ -43,6 +44,9 @@ package io.github.dsudomoin.outbox.kora {
   }
 
   @ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor public static interface KoraOutboxConfig.KoraTailConversionConfig extends io.github.dsudomoin.outbox.OutboxConfig.TailConversionConfig {
+  }
+
+  @ru.tinkoff.kora.config.common.annotation.ConfigValueExtractor public static interface KoraOutboxConfig.KoraWaitConfig extends io.github.dsudomoin.outbox.OutboxConfig.WaitConfig {
   }
 
   public final class KoraOutboxTelemetry implements io.github.dsudomoin.outbox.OutboxTelemetry {

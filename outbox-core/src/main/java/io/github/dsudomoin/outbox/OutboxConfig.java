@@ -116,6 +116,10 @@ public interface OutboxConfig {
         default RequeueConfig requeue() {
             return new RequeueConfig() {};
         }
+
+        default WaitConfig waiting() {
+            return new WaitConfig() {};
+        }
     }
 
     interface RetryConfig {
@@ -145,6 +149,26 @@ public interface OutboxConfig {
         /** Requeues a record may take; the one past it moves the record to the dead table. 0 = unlimited. */
         default int maxRequeues() {
             return 0;
+        }
+    }
+
+    /**
+     * Records waiting for an instance that can handle them ({@link Outcome.Waiting}): each is handed again after a
+     * quarter of the time it has waited, at least {@code delay} and at most {@code maxDelay} later.
+     */
+    interface WaitConfig {
+
+        default Duration delay() {
+            return Duration.ofSeconds(1);
+        }
+
+        default Duration maxDelay() {
+            return Duration.ofMinutes(5);
+        }
+
+        /** A record waiting longer turns the periodic WARN about waiting records into an ERROR. */
+        default Duration alertAfter() {
+            return Duration.ofMinutes(15);
         }
     }
 

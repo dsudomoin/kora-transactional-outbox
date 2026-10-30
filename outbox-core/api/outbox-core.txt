@@ -182,6 +182,7 @@ package io.github.dsudomoin.outbox {
     method public default io.github.dsudomoin.outbox.OutboxConfig.RequeueConfig! requeue();
     method public default io.github.dsudomoin.outbox.OutboxConfig.RetryConfig! retry();
     method public default java.time.Duration! shutdownTimeout();
+    method public default io.github.dsudomoin.outbox.OutboxConfig.WaitConfig! waiting();
     method public default int workers();
   }
 
@@ -204,6 +205,12 @@ package io.github.dsudomoin.outbox {
     method public default java.time.Duration! maxStall();
     method public default String! window();
     method public default String! zone();
+  }
+
+  public static interface OutboxConfig.WaitConfig {
+    method public default java.time.Duration! alertAfter();
+    method public default java.time.Duration! delay();
+    method public default java.time.Duration! maxDelay();
   }
 
   public interface OutboxDeadLetterHandler {

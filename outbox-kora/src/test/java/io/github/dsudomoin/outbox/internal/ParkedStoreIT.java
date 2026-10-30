@@ -7,12 +7,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxRecord;
+import io.github.dsudomoin.outbox.Outcome.Waiting.Kind;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Dead;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Follower;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Head;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Keep;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Park;
 import io.github.dsudomoin.outbox.internal.BatchClassifier.Unpark;
+import io.github.dsudomoin.outbox.internal.RetryStore.DueHead;
 import io.github.dsudomoin.outbox.testing.TestDatabase;
 import io.github.dsudomoin.outbox.testing.TestDb;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
@@ -81,7 +83,7 @@ class ParkedStoreIT {
                 new Park(followed, 1, NOW.plusSeconds(3)),
                 new Park(failing, 1, NOW.plusSeconds(4)),
                 new Park(carried, 1, NOW.plusSeconds(5)),
-                new Park(poison, 1, NOW.plusSeconds(6))), Set.of());
+                new Park(poison, 1, NOW.plusSeconds(6))), Set.of(), NOW);
 
         assertThat(parkedRows()).as("main-stream rows other than Park are not its business").containsExactly(
                 keyed.id() + ":0:0:1:" + NOW.plusSeconds(1),
@@ -98,7 +100,7 @@ class ParkedStoreIT {
         // followed: blocked by a retry head of its key in a retry-pass call; carried: by failing, whose move takes it
         store.apply(c, 0, List.of(new Park(stored, 2, NOW), new Unpark(unkeyed), new Follower(followed),
                         new Head(failing, 2, LATER, "e"), new Follower(carried), new Dead(poison, 1, "boom")),
-                Set.of(keyed.id(), unkeyed.id(), followed.id(), failing.id(), carried.id(), poison.id()));
+                Set.of(keyed.id(), unkeyed.id(), followed.id(), failing.id(), carried.id(), poison.id()), NOW);
 
         assertThat(parkedRows()).as("re-parked at the new due, even an earlier one; the follower untouched")
                 .containsExactly(keyed.id() + ":0:0:2:" + NOW, followed.id() + ":0:0:1:" + NOW.plusSeconds(3));
@@ -111,10 +113,10 @@ class ParkedStoreIT {
     void keepNeverMovesADueTimeEarlier() throws SQLException {
         var late = record("t", "a");
         var early = record("t", "b");
-        store.apply(c, 0, List.of(new Park(late, 3, NOW.plusSeconds(10)), new Park(early, 1, NOW)), Set.of());
+        store.apply(c, 0, List.of(new Park(late, 3, NOW.plusSeconds(10)), new Park(early, 1, NOW)), Set.of(), NOW);
 
         store.apply(c, 0, List.of(new Keep(late, NOW.plusSeconds(5)), new Keep(early, NOW.plusSeconds(5))),
-                Set.of(late.id(), early.id()));
+                Set.of(late.id(), early.id()), NOW);
 
         assertThat(parkedRows()).containsExactly(
                 late.id() + ":0:0:3:" + NOW.plusSeconds(10), early.id() + ":0:0:1:" + NOW.plusSeconds(5));
@@ -124,11 +126,11 @@ class ParkedStoreIT {
     void unparkOfAMissingRowFails() throws SQLException {
         var parked = record("t", "k");
         var other = record("t", "j");
-        store.apply(c, 0, List.of(new Park(parked, 1, NOW), new Park(other, 1, NOW)), Set.of());
+        store.apply(c, 0, List.of(new Park(parked, 1, NOW), new Park(other, 1, NOW)), Set.of(), NOW);
         var gone = record("t", "k");
 
         assertThatThrownBy(() -> store.unpark(c, List.of(gone))).isInstanceOf(IllegalStateException.class);
-        assertThatThrownBy(() -> store.apply(c, 0, List.of(new Unpark(gone)), Set.of(gone.id())))
+        assertThatThrownBy(() -> store.apply(c, 0, List.of(new Unpark(gone)), Set.of(gone.id()), NOW))
                 .isInstanceOf(IllegalStateException.class);
         assertThat(store.size(c)).isEqualTo(2);
 
@@ -152,14 +154,14 @@ class ParkedStoreIT {
         var otherHead = record(14, "t", "j", 1, 0);
         var otherShardHead = record(15, "t", "k", 1, 0);
         store.apply(c, 0, List.of(new Park(p5, 2, NOW), new Park(p7, 3, NOW), new Park(p9, 5, NOW),
-                new Park(otherTopic, 1, NOW), new Park(otherKey, 1, NOW)), Set.of());
-        store.apply(c, 1, List.of(new Park(otherShard, 1, NOW)), Set.of());
+                new Park(otherTopic, 1, NOW), new Park(otherKey, 1, NOW)), Set.of(), NOW);
+        store.apply(c, 1, List.of(new Park(otherShard, 1, NOW)), Set.of(), NOW);
         retries.apply(c, 0, List.of(new Head(r8, 1, NOW, "e8"), new Follower(r10),
-                new Head(otherHead, 1, NOW, "ej")));
-        retries.apply(c, 1, List.of(new Head(otherShardHead, 1, NOW, "es")));
+                new Head(otherHead, 1, NOW, "ej")), NOW);
+        retries.apply(c, 1, List.of(new Head(otherShardHead, 1, NOW, "es")), NOW);
         var next = NOW.plusSeconds(30);
 
-        store.toRetry(c, 0, p7, 3, next, "e7");
+        store.toRetry(c, 0, p7, 3, next, "e7", null);
 
         assertThat(retryRows()).containsExactly(
                 "7:0:3:3:" + next + ":e7",
@@ -169,9 +171,52 @@ class ParkedStoreIT {
                 "14:0:1:0:" + NOW + ":ej",
                 "15:1:1:0:" + NOW + ":es");
         assertThat(parkedIds()).containsExactly(5L, 11L, 12L, 13L);
-        assertSameRecord(retries.dueHeads(c, 0, next, 1).get(0), p7, 3, 3);
-        assertThat(retries.followers(c, List.of(p7), 10).get(7L)).extracting(OutboxRecord::id)
+        assertSameRecord(retries.dueHeads(c, 0, next, 1).get(0).r(), p7, 3, 3);
+        assertThat(retries.followers(c, List.of(new DueHead(p7, null)), 10).get(7L)).extracting(OutboxRecord::id)
                 .containsExactly(8L, 9L, 10L);
+    }
+
+    @Test
+    void toRetryOfAWaitingRowStartsItsWaitAndNewerHeadsOfItsKeyStopWaiting() throws SQLException {
+        var p5 = record(5, "t", "k", 1, 2);
+        var r7 = record(7, "t", "k", 0, 0);
+        var r8 = record(8, "t", "j", 0, 0); // another key's waiting head waits on
+        var p9 = record(9, "t", "k", 0, 0);
+        store.apply(c, 0, List.of(new Park(p5, 2, NOW), new Park(p9, 1, NOW)), Set.of(), NOW);
+        var since = NOW.minusSeconds(60);
+        retries.apply(c, 0, List.of(new Head(r7, 0, NOW, "w7", Kind.HANDLER), new Head(r8, 0, NOW, "w8",
+                Kind.HANDLER)), since);
+
+        store.toRetry(c, 0, p5, 1, LATER, "waiting (contract): v3", NOW);
+
+        assertThat(retryRows()).containsExactly("5:0:1:2:" + LATER + ":waiting (contract): v3",
+                "7:0:0:0:null:w7", "8:0:0:0:" + NOW + ":w8", "9:0:0:1:null:null");
+        assertThat(waits()).containsExactly("5:" + NOW, "7:null", "8:" + since, "9:null");
+    }
+
+    @Test
+    void applyMakesAWaitingParkedRowAHeadWaitingSinceNow() throws SQLException {
+        var waits = record("t", "w");
+        var fails = record("t", "f");
+        store.apply(c, 0, List.of(new Park(waits, 1, NOW), new Park(fails, 1, NOW)), Set.of(), NOW);
+        var now = NOW.plusSeconds(5);
+
+        store.apply(c, 0, List.of(new Head(waits, 0, LATER, "w", Kind.NO_ROUTE), new Head(fails, 1, LATER, "e")),
+                Set.of(waits.id(), fails.id()), now);
+
+        assertThat(waits()).containsExactly(waits.id() + ":" + now, fails.id() + ":null");
+    }
+
+    @Test
+    void aWaitingHeadParkedFromRetryLeavesItsWaitBehind() throws SQLException {
+        var head = record("t", "k");
+        retries.apply(c, 0, List.of(new Head(head, 0, NOW, "w", Kind.HANDLER)), NOW);
+
+        store.fromRetry(c, head, 1, NOW);
+        assertThat(waits()).isEmpty();
+        store.toRetry(c, 0, head, 1, LATER, "e", null);
+
+        assertThat(waits()).containsExactly(head.id() + ":null");
     }
 
     @Test
@@ -179,10 +224,10 @@ class ParkedStoreIT {
         var u = record("t", null);
         var v = record("t", null);
         var w = record("t", null);
-        store.apply(c, 0, List.of(new Park(u, 1, NOW), new Park(v, 1, NOW)), Set.of());
-        retries.apply(c, 0, List.of(new Head(w, 1, NOW, "ew")));
+        store.apply(c, 0, List.of(new Park(u, 1, NOW), new Park(v, 1, NOW)), Set.of(), NOW);
+        retries.apply(c, 0, List.of(new Head(w, 1, NOW, "ew")), NOW);
 
-        store.toRetry(c, 0, u, 1, LATER, "eu");
+        store.toRetry(c, 0, u, 1, LATER, "eu", null);
 
         assertThat(retryRows()).containsExactly(
                 u.id() + ":0:1:1:" + LATER + ":eu", w.id() + ":0:1:0:" + NOW + ":ew");
@@ -196,10 +241,11 @@ class ParkedStoreIT {
         // rows the statement moves and demotes although the row itself is missing
         var newer = record("t", "k");
         var head = record("t", "k");
-        store.apply(c, 0, List.of(new Park(parked, 1, NOW), new Park(newer, 1, NOW)), Set.of());
-        retries.apply(c, 0, List.of(new Head(head, 1, NOW, "e")));
+        store.apply(c, 0, List.of(new Park(parked, 1, NOW), new Park(newer, 1, NOW)), Set.of(), NOW);
+        retries.apply(c, 0, List.of(new Head(head, 1, NOW, "e")), NOW);
 
-        assertThatThrownBy(() -> store.toRetry(c, 0, gone, 1, LATER, "e")).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> store.toRetry(c, 0, gone, 1, LATER, "e", null))
+                .isInstanceOf(IllegalStateException.class);
     }
 
     @Test
@@ -208,8 +254,8 @@ class ParkedStoreIT {
         var newer = record("t", "k");
         var head = record(100, "t", "r", 3, 1);
         var follower = record("t", "r");
-        store.apply(c, 0, List.of(new Park(parked, 2, NOW), new Park(newer, 1, NOW)), Set.of());
-        retries.apply(c, 1, List.of(new Head(head, 3, NOW, "e"), new Follower(follower)));
+        store.apply(c, 0, List.of(new Park(parked, 2, NOW), new Park(newer, 1, NOW)), Set.of(), NOW);
+        retries.apply(c, 1, List.of(new Head(head, 3, NOW, "e"), new Follower(follower)), NOW);
 
         store.toDead(c, parked, 4, "x\u0000y");
         store.fromRetry(c, head, 2, LATER);
@@ -245,8 +291,8 @@ class ParkedStoreIT {
         var otherShard = record("t", "a");
         var e = record("t", "a");
         store.apply(c, 0, List.of(new Park(a, 1, NOW), new Park(b, 1, NOW.plusSeconds(10)),
-                new Park(cc, 2, NOW.minusSeconds(1)), new Park(e, 1, NOW.minusSeconds(5))), Set.of());
-        store.apply(c, 1, List.of(new Park(otherShard, 1, NOW)), Set.of());
+                new Park(cc, 2, NOW.minusSeconds(1)), new Park(e, 1, NOW.minusSeconds(5))), Set.of(), NOW);
+        store.apply(c, 1, List.of(new Park(otherShard, 1, NOW)), Set.of(), NOW);
 
         assertThat(store.due(c, 0, NOW, 10)).extracting(OutboxRecord::id).containsExactly(a.id(), cc.id(), e.id());
         assertThat(store.due(c, 0, NOW, 2)).extracting(OutboxRecord::id).containsExactly(a.id(), cc.id());
@@ -268,8 +314,8 @@ class ParkedStoreIT {
         var k3 = record("t", "k");
         store.apply(c, 0, List.of(new Park(k1, 1, LATER), new Park(j1, 1, LATER), new Park(otherTopic, 1, LATER),
                 new Park(k2, 2, LATER), new Park(longerKey, 1, LATER), new Park(unkeyed, 1, LATER),
-                new Park(k3, 1, LATER)), Set.of());
-        store.apply(c, 1, List.of(new Park(otherShard, 1, LATER)), Set.of());
+                new Park(k3, 1, LATER)), Set.of(), NOW);
+        store.apply(c, 1, List.of(new Park(otherShard, 1, LATER)), Set.of(), NOW);
         var chunkK = record("t", "k");
         var chunkJ = record("t", "j");
 
@@ -288,8 +334,8 @@ class ParkedStoreIT {
         assertThat(store.minDue(c, 0)).isNull();
         assertThat(store.size(c)).isZero();
         store.apply(c, 0, List.of(new Park(record("t", "a"), 1, NOW.plusSeconds(20)),
-                new Park(record("t", null), 1, NOW.plusSeconds(10))), Set.of());
-        store.apply(c, 1, List.of(new Park(record("t", "c"), 1, NOW)), Set.of());
+                new Park(record("t", null), 1, NOW.plusSeconds(10))), Set.of(), NOW);
+        store.apply(c, 1, List.of(new Park(record("t", "c"), 1, NOW)), Set.of(), NOW);
 
         assertThat(store.minDue(c, 0)).isEqualTo(NOW.plusSeconds(10));
         assertThat(store.minDue(c, 1)).isEqualTo(NOW);
@@ -333,6 +379,18 @@ class ParkedStoreIT {
             while (rs.next()) {
                 rows.add(rs.getLong(1) + ":" + rs.getShort(2) + ":" + rs.getInt(3) + ":" + rs.getInt(4) + ":"
                         + instant(rs.getObject(5, OffsetDateTime.class)) + ":" + rs.getString(6));
+            }
+            return rows;
+        }
+    }
+
+    /** {@code id:waiting_since} of the retry rows in id order. */
+    private List<String> waits() throws SQLException {
+        try (var st = c.createStatement(); var rs = st.executeQuery(
+                "select id, waiting_since from " + names.retry() + " order by id")) {
+            var rows = new ArrayList<String>();
+            while (rs.next()) {
+                rows.add(rs.getLong(1) + ":" + instant(rs.getObject(2, OffsetDateTime.class)));
             }
             return rows;
         }

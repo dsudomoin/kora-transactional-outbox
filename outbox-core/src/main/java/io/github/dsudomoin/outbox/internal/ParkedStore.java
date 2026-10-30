@@ -54,10 +54,11 @@ public final class ParkedStore {
         // every part sees the tables as before the statement; key = null matches nothing, so an unkeyed row moves alone
         toRetry = "with moved as (delete from " + parked + " where id = ? or (shard = ? and topic = ? and key = ?"
                 + " and id > ?) returning " + COLUMNS + ", attempts, requeues),"
-                + " demoted as (update " + retry + " set next_attempt_at = null where shard = ? and topic = ?"
-                + " and key = ? and id > ? and next_attempt_at is not null),"
+                + " demoted as (update " + retry + " set next_attempt_at = null, waiting_since = null where shard = ?"
+                + " and topic = ? and key = ? and id > ? and next_attempt_at is not null),"
                 + " head as (insert into " + retry + " (" + COLUMNS + ", attempts, next_attempt_at, last_error,"
-                + " requeues) select " + COLUMNS + ", ?, ?, ?, requeues from moved where id = ? returning id),"
+                + " requeues, waiting_since) select " + COLUMNS + ", ?, ?, ?, requeues, ?::timestamptz from moved"
+                + " where id = ? returning id),"
                 + " followers as (insert into " + retry + " (" + COLUMNS + ", attempts, requeues)"
                 + " select " + COLUMNS + ", attempts, requeues from moved where id <> ?)"
                 + " select count(*) from head";
@@ -79,17 +80,18 @@ public final class ParkedStore {
      * Writes the actions of one handler call, routed by origin ({@code parkedIds}: rows handed from this table).
      * {@link Park}: a main-stream record is inserted, a parked one gets its new {@code requeues} and due time.
      * {@link Keep}: the due time moves later, never earlier. {@link Unpark}: {@link #unpark}. A parked {@link Head}:
-     * {@link #toRetry}; a parked {@link Dead}: {@link #toDead}. A parked follower: nothing, as a row before it in the
-     * call blocks its key: a parked head, whose {@link #toRetry} carries it, or, in the retry pass (retry heads first),
-     * a retry head of its key, whose id is higher, so the row stays parked below every retry row of its key. Other
-     * actions of main-stream rows belong to {@link RetryStore#apply}.
+     * {@link #toRetry}, a waiting one waiting since {@code now}; a parked {@link Dead}: {@link #toDead}. A parked
+     * follower: nothing, as a row before it in the call blocks its key: a parked head, whose {@link #toRetry} carries
+     * it, or, in the retry pass (retry heads first), a retry head of its key, whose id is higher, so the row stays
+     * parked below every retry row of its key. Other actions of main-stream rows belong to {@link RetryStore#apply}.
      *
      * <p>Precondition: {@code actions} are in the call's order, where every parked row precedes the newer main-stream
      * rows of its key (the relay builds its calls that way). A parked head turns the later rows of its key into
      * followers, so no main-stream {@link Park} of its key comes after it: moving the head at once, before the batched
      * inserts, leaves behind no row it should have carried.
      */
-    public void apply(Connection inTx, int shard, List<Action> actions, Set<Long> parkedIds) throws SQLException {
+    public void apply(Connection inTx, int shard, List<Action> actions, Set<Long> parkedIds, Instant now)
+            throws SQLException {
         var inserts = new ArrayList<Park>();
         var reparks = new ArrayList<Park>();
         var keeps = new ArrayList<Keep>();
@@ -107,7 +109,7 @@ public final class ParkedStore {
             } else if (action instanceof Unpark) {
                 unparked.add(r);
             } else if (action instanceof Head h) {
-                toRetry(inTx, shard, r, h.attempts(), h.nextAttemptAt(), h.error());
+                toRetry(inTx, shard, r, h.attempts(), h.nextAttemptAt(), h.error(), h.waiting() == null ? null : now);
             } else if (action instanceof Dead d) {
                 toDead(inTx, r, d.attempts(), d.error());
             }
@@ -165,12 +167,12 @@ public final class ParkedStore {
 
     /**
      * Makes {@code row} the retry head of its (topic, key), due at {@code nextAttemptAt}, keeping its
-     * {@code requeues}: the key's retry heads with a higher id become followers, and its parked rows with a higher id
-     * follow it, keeping their {@code attempts} and {@code requeues}, so nothing newer of the key overtakes it. An
-     * unkeyed row moves alone.
+     * {@code requeues} and waiting since {@code waitingSince} (null: not waiting): the key's retry heads with a higher
+     * id become followers, which do not wait, and its parked rows with a higher id follow it, keeping their
+     * {@code attempts} and {@code requeues}, so nothing newer of the key overtakes it. An unkeyed row moves alone.
      */
-    public void toRetry(Connection c, int shard, OutboxRecord row, int attempts, Instant nextAttemptAt, String error)
-            throws SQLException {
+    public void toRetry(Connection c, int shard, OutboxRecord row, int attempts, Instant nextAttemptAt, String error,
+            @Nullable Instant waitingSince) throws SQLException {
         try (var ps = c.prepareStatement(toRetry)) {
             ps.setLong(1, row.id());
             bindNewerOfKey(ps, 2, shard, row); // parked rows
@@ -178,8 +180,9 @@ public final class ParkedStore {
             ps.setInt(10, attempts);
             ps.setObject(11, timestamp(nextAttemptAt));
             ps.setString(12, errorText(error));
-            ps.setLong(13, row.id());
+            ps.setObject(13, waitingSince == null ? null : timestamp(waitingSince));
             ps.setLong(14, row.id());
+            ps.setLong(15, row.id());
             try (var rs = ps.executeQuery()) {
                 rs.next();
                 requireOneRow(rs.getInt(1), "parked", row);

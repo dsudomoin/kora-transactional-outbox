@@ -23,10 +23,12 @@ import java.util.UUID;
 
 /**
  * The rare path: blocked (topic, key) streams in {@code <base>_retry} (a head with
- * {@code next_attempt_at}, followers with null) and permanently failed rows in {@code <base>_dead}. Error texts are
- * cut to 2000 chars, NUL characters (rejected by Postgres text) replaced by {@code ?}. Every dead row, here and in
- * {@link ParkedStore}, is written by {@link #toDead} or {@link #apply}: pending and due at once while a dead-letter
- * hook is active, kept otherwise, with the redrives {@code <base>_redriven} counts for its message.
+ * {@code next_attempt_at}, followers with null) and permanently failed rows in {@code <base>_dead}. A head that waits
+ * for an instance able to handle it has {@code waiting_since}, the caller's {@code now} of its first wait; every other
+ * row has null. Error texts are cut to 2000 chars, NUL characters (rejected by Postgres text) replaced by {@code ?}.
+ * Every dead row, here and in {@link ParkedStore}, is written by {@link #toDead} or {@link #apply}: pending and due at
+ * once while a dead-letter hook is active, kept otherwise, with the redrives {@code <base>_redriven} counts for its
+ * message.
  */
 public final class RetryStore {
 
@@ -46,6 +48,8 @@ public final class RetryStore {
     private final String delete;
     private final String promote;
     private final String reschedule;
+    private final String postpone;
+    private final String rescheduleWaiting;
     private final String moveToDead;
     private final String minDue;
     private final String size;
@@ -56,11 +60,12 @@ public final class RetryStore {
         this.deadTable = names.dead();
         this.redriven = names.redriven();
         this.hookActive = hookActive;
-        insertRetry = "insert into " + retry + " (" + COLUMNS + ", attempts, next_attempt_at, last_error, requeues)"
-                + " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        insertRetry = "insert into " + retry + " (" + COLUMNS + ", attempts, next_attempt_at, last_error, requeues,"
+                + " waiting_since) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         insertDead = "insert into " + deadColumns() + " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, " + deadState("?") + ")";
-        selectDue = "select " + RECORD_COLUMNS + " from " + retry
-                + " where shard = ? and next_attempt_at <= ? order by id limit ?";
+        // waiting heads last: a head that may fail or deliver never starves behind ones that wait
+        selectDue = "select " + RECORD_COLUMNS + ", waiting_since from " + retry
+                + " where shard = ? and next_attempt_at <= ? order by waiting_since is not null, id limit ?";
         selectFollowers = "select h.id, f.id, f.message_id, f.topic, f.key, f.payload, f.headers, f.created_at,"
                 + " f.attempts, f.requeues, f.shard from " + retry + " h cross join lateral (select * from " + retry
                 + " f where f.shard = h.shard and f.topic = h.topic and f.key = h.key and f.id > h.id"
@@ -68,8 +73,11 @@ public final class RetryStore {
         delete = "delete from " + retry + " where id = any(?)";
         promote = "update " + retry + " set next_attempt_at = ? where id = (select id from " + retry
                 + " where shard = ? and topic = ? and key = ? order by id limit 1)";
-        reschedule = "update " + retry
-                + " set attempts = ?, next_attempt_at = ?, last_error = coalesce(?, last_error) where id = ?";
+        reschedule = "update " + retry + " set attempts = ?, next_attempt_at = ?, last_error = coalesce(?, last_error),"
+                + " waiting_since = null where id = ?";
+        postpone = "update " + retry + " set next_attempt_at = ? where id = ?";
+        rescheduleWaiting = "update " + retry + " set next_attempt_at = ?, last_error = ?,"
+                + " waiting_since = coalesce(waiting_since, ?) where id = ?";
         moveToDead = toDead("delete from " + retry + " where id = ? returning " + COLUMNS + ", last_error",
                 "coalesce(?, last_error)");
         minDue = "select min(next_attempt_at) from " + retry + " where shard = ? and next_attempt_at is not null";
@@ -98,10 +106,22 @@ public final class RetryStore {
     }
 
     /**
-     * Heads and followers into the retry table, dead rows into the dead table; one JDBC batch each. Any other action
-     * fails, so the shard step rolls back.
+     * A head {@link #dueHeads} selected, waiting since {@code waitingSince} (the caller's {@code now} of its first
+     * wait), null when it does not wait.
      */
-    public void apply(Connection inTx, int shard, List<Action> actions) throws SQLException {
+    public record DueHead(OutboxRecord r, @Nullable Instant waitingSince) {
+
+        /** Handed with the rows of its key after it: keyed and not waiting. A waiting head is handed alone. */
+        public boolean takesFollowers() {
+            return r.key() != null && waitingSince == null;
+        }
+    }
+
+    /**
+     * Heads and followers into the retry table, a waiting head waiting since {@code now}, dead rows into the dead
+     * table; one JDBC batch each. Any other action fails, so the shard step rolls back.
+     */
+    public void apply(Connection inTx, int shard, List<Action> actions, Instant now) throws SQLException {
         if (actions.isEmpty()) {
             return;
         }
@@ -127,6 +147,11 @@ public final class RetryStore {
                     }
                     retry.setString(11, head == null ? null : errorText(head.error()));
                     retry.setInt(12, action.r().requeues());
+                    if (head == null || head.waiting() == null) {
+                        retry.setNull(13, Types.TIMESTAMP_WITH_TIMEZONE);
+                    } else {
+                        retry.setObject(13, timestamp(now));
+                    }
                     retry.addBatch();
                     retries++;
                 } else {
@@ -142,16 +167,20 @@ public final class RetryStore {
         }
     }
 
-    /** Heads of {@code shard} due at {@code now}, in id order; {@code attempts} as stored. */
-    public List<OutboxRecord> dueHeads(Connection c, int shard, Instant now, int limit) throws SQLException {
+    /**
+     * Heads of {@code shard} due at {@code now}: those that do not wait in id order, then the waiting ones in id
+     * order; {@code attempts} as stored.
+     */
+    public List<DueHead> dueHeads(Connection c, int shard, Instant now, int limit) throws SQLException {
         try (var ps = c.prepareStatement(selectDue)) {
             ps.setShort(1, (short) shard);
             ps.setObject(2, timestamp(now));
             ps.setInt(3, limit);
             try (var rs = ps.executeQuery()) {
-                var heads = new ArrayList<OutboxRecord>();
+                var heads = new ArrayList<DueHead>();
                 while (rs.next()) {
-                    heads.add(record(rs, 1));
+                    var waitingSince = rs.getObject(11, OffsetDateTime.class);
+                    heads.add(new DueHead(record(rs, 1), waitingSince == null ? null : waitingSince.toInstant()));
                 }
                 return heads;
             }
@@ -159,14 +188,15 @@ public final class RetryStore {
     }
 
     /**
-     * The followers of each keyed head in {@code heads} (rows of its (topic, key) after it), at most {@code perKey}
-     * each, in id order, keyed by the head's id; a head without followers is absent.
+     * The followers of each head in {@code heads} that {@linkplain DueHead#takesFollowers takes them} (rows of its
+     * (topic, key) after it), at most {@code perKey} each, in id order, keyed by the head's id; a head without
+     * followers is absent.
      */
-    public Map<Long, List<OutboxRecord>> followers(Connection c, List<OutboxRecord> heads, int perKey)
+    public Map<Long, List<OutboxRecord>> followers(Connection c, List<DueHead> heads, int perKey)
             throws SQLException {
         try (var ps = c.prepareStatement(selectFollowers)) {
             ps.setInt(1, perKey);
-            ps.setArray(2, ids(c, heads.stream().filter(h -> h.key() != null).toList()));
+            ps.setArray(2, ids(c, heads.stream().filter(DueHead::takesFollowers).map(DueHead::r).toList()));
             try (var rs = ps.executeQuery()) {
                 var followers = new HashMap<Long, List<OutboxRecord>>();
                 while (rs.next()) {
@@ -192,13 +222,37 @@ public final class RetryStore {
         }
     }
 
-    /** A null {@code error} keeps the head's last error. */
+    /** A head that failed: due at {@code next}, it no longer waits. A null {@code error} keeps its last error. */
     public void reschedule(Connection c, OutboxRecord head, int attempts, Instant next, @Nullable String error)
             throws SQLException {
         try (var ps = c.prepareStatement(reschedule)) {
             ps.setInt(1, attempts);
             ps.setObject(2, timestamp(next));
             ps.setString(3, errorText(error));
+            ps.setLong(4, head.id());
+            ps.executeUpdate();
+        }
+    }
+
+    /** A head that was not attempted: due at {@code next}; its attempts, last error and wait stay. */
+    public void postpone(Connection c, OutboxRecord head, Instant next) throws SQLException {
+        try (var ps = c.prepareStatement(postpone)) {
+            ps.setObject(1, timestamp(next));
+            ps.setLong(2, head.id());
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * A head that waits: due at {@code next} with {@code error} as its last error, its attempts kept; waiting since
+     * {@code now} unless it already waited.
+     */
+    public void rescheduleWaiting(Connection c, OutboxRecord head, Instant next, String error, Instant now)
+            throws SQLException {
+        try (var ps = c.prepareStatement(rescheduleWaiting)) {
+            ps.setObject(1, timestamp(next));
+            ps.setString(2, errorText(error));
+            ps.setObject(3, timestamp(now));
             ps.setLong(4, head.id());
             ps.executeUpdate();
         }

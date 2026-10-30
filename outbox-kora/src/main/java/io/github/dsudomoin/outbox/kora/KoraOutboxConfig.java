@@ -52,6 +52,11 @@ public interface KoraOutboxConfig extends OutboxConfig {
         default KoraRequeueConfig requeue() {
             return new KoraRequeueConfig() {};
         }
+
+        @Override
+        default KoraWaitConfig waiting() {
+            return new KoraWaitConfig() {};
+        }
     }
 
     @ConfigValueExtractor
@@ -59,6 +64,9 @@ public interface KoraOutboxConfig extends OutboxConfig {
 
     @ConfigValueExtractor
     interface KoraRequeueConfig extends RequeueConfig {}
+
+    @ConfigValueExtractor
+    interface KoraWaitConfig extends WaitConfig {}
 
     @ConfigValueExtractor
     interface KoraPartitionsConfig extends PartitionsConfig {
