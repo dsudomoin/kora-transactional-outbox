@@ -22,7 +22,8 @@ import org.apache.kafka.common.serialization.Serializer;
  * run inside the application's transaction (see {@link io.github.dsudomoin.outbox.OutboxTransactions}). Every
  * message, tombstones included, carries the {@link io.github.dsudomoin.outbox.OutboxContract} version of the declared
  * value type in its {@code outbox-contract} header, in place of any such header given or added by a serializer;
- * version 1 writes none.
+ * version 1 writes none. A higher version that a live relay instance cannot read is refused with
+ * {@link io.github.dsudomoin.outbox.OutboxIncompatibleContractException}, before anything is written.
  */
 public final class KafkaOutboxPublisher<K, V> {
 
@@ -32,6 +33,8 @@ public final class KafkaOutboxPublisher<K, V> {
     private final String topic;
     private final Serializer<K> keySerializer;
     private final Serializer<V> valueSerializer;
+    /** The declared value type's name and contract version, for the outbox's writer guard and the header. */
+    private final String type;
     private final int version;
 
     /** {@code valueType} is {@code V}; its contract version is read once, here. */
@@ -45,7 +48,8 @@ public final class KafkaOutboxPublisher<K, V> {
         this.topic = topic;
         this.keySerializer = Objects.requireNonNull(keySerializer, "keySerializer");
         this.valueSerializer = Objects.requireNonNull(valueSerializer, "valueSerializer");
-        this.version = Contracts.version(Objects.requireNonNull(valueType, "valueType"));
+        this.type = Objects.requireNonNull(valueType, "valueType").getName();
+        this.version = Contracts.version(valueType);
     }
 
     /** Kafka's rule for topic names (Topic.validate, not public API), which refuses the rest. */
@@ -70,7 +74,8 @@ public final class KafkaOutboxPublisher<K, V> {
         for (var h : copy) {
             outboxHeaders.add(new OutboxHeader(h.key(), h.value()));
         }
-        return outbox.send(new OutboxMessage(topic, keyBytes, valueBytes, Contracts.stamp(outboxHeaders, version)));
+        var message = new OutboxMessage(topic, keyBytes, valueBytes, Contracts.stamp(outboxHeaders, version));
+        return Contracts.send(outbox, message, type);
     }
 
     /** M2: null for a non-null key would drop its ordering, for a non-null value write a tombstone. */

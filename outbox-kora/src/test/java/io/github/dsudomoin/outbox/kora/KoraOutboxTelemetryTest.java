@@ -93,6 +93,16 @@ class KoraOutboxTelemetryTest {
     }
 
     @Test
+    void aRejectedContractIsCounted() {
+        var registry = new SimpleMeterRegistry();
+
+        new KoraOutboxTelemetry(new OutboxMetrics(registry), null).contractRejected("orders", "Created", 2);
+
+        assertThat(registry.get("outbox.messages.contract_rejected").tags("topic", "orders", "type", "Created",
+                "version", "2").counter().count()).isEqualTo(1);
+    }
+
+    @Test
     void aWaitingRecordEndsItsSpanAsWaitingWithoutAnErrorAndIsCounted() {
         var registry = new SimpleMeterRegistry();
         var spans = InMemorySpanExporter.create();

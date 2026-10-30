@@ -17,7 +17,9 @@ import java.util.UUID;
  * <p>
  * Every message, tombstones included, carries the {@link OutboxContract} version of the declared type {@code T} (never
  * of the value's runtime class) in its {@code outbox-contract} header, in place of any such header given; version 1
- * writes none. {@link #message} builds the same message for {@link Outbox#sendAll}.
+ * writes none. A higher version that a live relay instance cannot read is refused with
+ * {@link OutboxIncompatibleContractException}, before anything is written. {@link #message} builds the same message for
+ * {@link Outbox#sendAll}.
  * <pre>{@code
  * var events = new TypedOutbox<>(runtime.outbox(), (topic, event) -> json.writeValueAsBytes(event),
  *         OrderCreated.class);
@@ -43,15 +45,15 @@ public final class TypedOutbox<T> {
     }
 
     public UUID send(String topic, @Nullable String key, @Nullable T value) {
-        return outbox.send(message(topic, key, value));
+        return Contracts.send(outbox, message(topic, key, value), typeName());
     }
 
     public UUID send(String topic, @Nullable String key, @Nullable T value, List<OutboxHeader> headers) {
-        return outbox.send(message(topic, key, value, headers));
+        return Contracts.send(outbox, message(topic, key, value, headers), typeName());
     }
 
     public UUID send(String topic, @Nullable byte[] key, @Nullable T value, List<OutboxHeader> headers) {
-        return outbox.send(message(topic, key, value, headers));
+        return Contracts.send(outbox, message(topic, key, value, headers), typeName());
     }
 
     /** The message {@code send} would write, for {@link Outbox#sendAll}. */

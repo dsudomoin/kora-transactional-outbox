@@ -73,6 +73,15 @@ public final class OutboxMetrics implements OutboxTelemetry {
         }
     }
 
+    /** {@code outbox.messages.contract_rejected{topic, type, version}}; a refused send, so the registry looks it up. */
+    @Override
+    public void contractRejected(String topic, String type, int version) {
+        if (registry != null) {
+            registry.counter("outbox.messages.contract_rejected", "topic", topic, "type", type, "version",
+                    Integer.toString(version)).increment();
+        }
+    }
+
     @Override
     public void stepFinished(Duration duration) {
         if (registry != null) {

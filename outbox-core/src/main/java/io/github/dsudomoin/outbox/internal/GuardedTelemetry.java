@@ -118,6 +118,15 @@ public final class GuardedTelemetry implements OutboxTelemetry {
     }
 
     @Override
+    public void contractRejected(String topic, String type, int version) {
+        try {
+            delegate.contractRejected(topic, type, version);
+        } catch (RuntimeException | LinkageError e) {
+            warn("contractRejected", e);
+        }
+    }
+
+    @Override
     public RelayStep stepStarted(List<Integer> shards) {
         RelayStep step;
         try {

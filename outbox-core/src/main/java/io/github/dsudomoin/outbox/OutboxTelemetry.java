@@ -49,6 +49,13 @@ public interface OutboxTelemetry {
     default void waited(String topic, Outcome.Waiting.Kind kind) {}
 
     /**
+     * A send refused with {@link OutboxIncompatibleContractException}, on the writer's thread: some live relay
+     * instance cannot read {@code version} of {@code topic}. {@code type}: the class name it was written as, {@code ?}
+     * when unknown.
+     */
+    default void contractRejected(String topic, String type, int version) {}
+
+    /**
      * A relay step found work, on the thread that steps: called at the first locked shard with work, so only for the
      * steps {@link #stepFinished} measures; a step that locks nothing or finds nothing to do calls neither.
      * {@code shards} is a copy of the shards whose locks the step holds, those without work included. The step's

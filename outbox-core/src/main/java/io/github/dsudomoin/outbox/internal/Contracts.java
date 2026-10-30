@@ -2,10 +2,13 @@ package io.github.dsudomoin.outbox.internal;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
 
+import io.github.dsudomoin.outbox.Outbox;
 import io.github.dsudomoin.outbox.OutboxContract;
 import io.github.dsudomoin.outbox.OutboxHeader;
+import io.github.dsudomoin.outbox.OutboxMessage;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 /** The {@code outbox-contract} header: the {@link OutboxContract} version of the type a payload was written as. */
 public final class Contracts {
@@ -35,5 +38,10 @@ public final class Contracts {
             stamped.add(new OutboxHeader(HEADER, Integer.toString(version).getBytes(US_ASCII)));
         }
         return stamped;
+    }
+
+    /** {@code outbox.send(message)}, naming {@code type}, the class the payload was written as, to its writer guard. */
+    public static UUID send(Outbox outbox, OutboxMessage message, String type) {
+        return outbox instanceof PgOutbox pg ? pg.send(message, type) : outbox.send(message);
     }
 }

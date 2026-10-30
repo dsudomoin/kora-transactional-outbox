@@ -174,6 +174,11 @@ public final class ObservationOutboxTelemetry implements OutboxTelemetry {
     }
 
     @Override
+    public void contractRejected(String topic, String type, int version) {
+        metrics.contractRejected(topic, type, version);
+    }
+
+    @Override
     public void stepFinished(Duration duration) {
         metrics.stepFinished(duration);
     }

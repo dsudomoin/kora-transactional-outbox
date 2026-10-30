@@ -77,6 +77,7 @@ class GuardedTelemetryTest {
             t.deadLettered("orders");
             t.requeued("orders");
             t.waited("orders", Outcome.Waiting.Kind.CONTRACT);
+            t.contractRejected("orders", "Created", 2);
             t.stepFinished(Duration.ofMillis(1));
             t.shardPaused();
             t.deadLetterDecision("keep");
@@ -100,6 +101,21 @@ class GuardedTelemetryTest {
         t.waited("orders", Outcome.Waiting.Kind.NO_ROUTE);
 
         assertThat(waits).containsExactly("orders NO_ROUTE");
+    }
+
+    @Test
+    void contractRejectedIsForwarded() {
+        var rejected = new ArrayList<String>();
+        var t = GuardedTelemetry.of(new OutboxTelemetry() {
+            @Override
+            public void contractRejected(String topic, String type, int version) {
+                rejected.add(topic + " " + type + " " + version);
+            }
+        });
+
+        t.contractRejected("orders", "Created", 2);
+
+        assertThat(rejected).containsExactly("orders Created 2");
     }
 
     @Test
@@ -300,6 +316,11 @@ class GuardedTelemetryTest {
 
         @Override
         public void waited(String topic, Outcome.Waiting.Kind kind) {
+            throw bug();
+        }
+
+        @Override
+        public void contractRejected(String topic, String type, int version) {
             throw bug();
         }
 

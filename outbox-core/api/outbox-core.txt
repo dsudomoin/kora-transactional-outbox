@@ -268,6 +268,14 @@ package io.github.dsudomoin.outbox {
     method public byte[]? value();
   }
 
+  public final class OutboxIncompatibleContractException extends java.lang.RuntimeException {
+    method public java.util.List<java.lang.String!>! incompatibleInstances();
+    method public int minSupported();
+    method public String! topic();
+    method public String! type();
+    method public int version();
+  }
+
   public final class OutboxMessage {
     ctor public OutboxMessage(String!, byte[]?, byte[]?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
     method public java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>! headers();
@@ -394,6 +402,7 @@ package io.github.dsudomoin.outbox {
   }
 
   public interface OutboxTelemetry {
+    method public default void contractRejected(String!, String!, int);
     method public default void deadLetterDecision(String!);
     method public default void deadLetterHookFailed();
     method public default void deadLettered(String!);

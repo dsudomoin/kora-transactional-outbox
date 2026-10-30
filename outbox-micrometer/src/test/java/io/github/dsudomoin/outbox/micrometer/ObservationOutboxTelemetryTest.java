@@ -327,6 +327,14 @@ class ObservationOutboxTelemetryTest {
     }
 
     @Test
+    void aRejectedContractIsCounted() {
+        telemetry().contractRejected("orders", "Created", 2);
+
+        assertThat(meters.get("outbox.messages.contract_rejected").tags("topic", "orders", "type", "Created",
+                "version", "2").counter().count()).isEqualTo(1);
+    }
+
+    @Test
     void aWaitingRecordIsLabelledWaitingWithoutAnErrorAndCounted() {
         var telemetry = telemetry();
         var delivery = telemetry.deliveryStarted(List.of(record(List.of())), NOW);

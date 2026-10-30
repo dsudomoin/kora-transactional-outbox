@@ -1,0 +1,51 @@
+package io.github.dsudomoin.outbox.internal;
+
+import static java.nio.charset.StandardCharsets.US_ASCII;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import io.github.dsudomoin.outbox.JdbcTransactions;
+import io.github.dsudomoin.outbox.OutboxIncompatibleContractException;
+import io.github.dsudomoin.outbox.OutboxMessage;
+import io.github.dsudomoin.outbox.OutboxTelemetry;
+import io.github.dsudomoin.outbox.testing.CapturedStderr;
+import io.github.dsudomoin.outbox.testing.TestDataSources;
+import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
+import java.util.Map;
+import org.junit.jupiter.api.Test;
+
+class HeartbeatContractsIT {
+
+    /** A beat that gives up on the cursor table's lock, which a recovery holds, has read the reports before. */
+    @Test
+    void aBeatThatGivesUpOnItsLockStillReadsTheReports() throws Exception {
+        var ds = TestDataSources.newDataSource();
+        var db = new JdbcTransactions(ds);
+        var config = new TestOutboxConfig().relayEnabled(false); // its own row, reporting nothing, does not count
+        try (var schema = new OutboxSchema(db, db, config, Map.of())) {
+            schema.start();
+            var names = schema.names();
+            var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, OutboxTelemetry.NONE);
+            var v2 = OutboxMessage.of("orders", "k", "p".getBytes(UTF_8))
+                    .withHeader(Contracts.HEADER, "2".getBytes(US_ASCII));
+            try (var other = ds.getConnection()) {
+                TestSql.execute(other, "insert into " + names.instance() + " (instance_id, shards, relay, contracts,"
+                        + " expires_at) values ('old/1/00000000', 4, true, '{\"orders\": 1}', now() + interval '1h')");
+                db.inTx(c -> outbox.send(v2)); // the bootstrap's read is from before that row
+                other.setAutoCommit(false);
+                TestSql.execute(other, "lock table " + names.cursor() + " in access exclusive mode");
+                try (var err = new CapturedStderr()) {
+                    new Heartbeat(db, schema, schema.config(), false).beat();
+                    assertThat(err.text()).contains("waited 100 ms for a lock");
+                }
+                other.rollback();
+            }
+
+            assertThatThrownBy(() -> db.inTx(c -> outbox.send(v2)))
+                    .isInstanceOfSatisfying(OutboxIncompatibleContractException.class,
+                            e -> assertThat(e.incompatibleInstances()).containsExactly("old/1/00000000"));
+        }
+    }
+}

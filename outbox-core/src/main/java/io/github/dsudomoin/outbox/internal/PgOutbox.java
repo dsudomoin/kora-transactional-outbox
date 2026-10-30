@@ -19,11 +19,14 @@ import org.slf4j.LoggerFactory;
  * Enqueue. A keyed row takes {@code pg_advisory_xact_lock(keyNamespace, keyHash)} in its INSERT statement,
  * before the identity assigns the row id, so per (topic, key) id order is commit order. Unkeyed rows take no lock and
  * land on a random shard. {@code sendAll} inserts through {@link Resender}, every key locked in one statement first.
- * Without a handler behind the routes, a message of a topic no route claims is refused before anything is written.
+ * Without a handler behind the routes, a message of a topic no route claims is refused before anything is written;
+ * so is a contract version some live relay instance cannot read ({@link ContractGuard}).
  */
 public final class PgOutbox implements Outbox {
 
     private static final Logger log = LoggerFactory.getLogger(PgOutbox.class);
+    /** The written type of a message sent as is, which {@link ContractGuard} names. */
+    private static final String UNKNOWN_TYPE = "?";
     private final OutboxTransactions db;
     private final String notInTx;
     private final int keyNamespace;
@@ -35,6 +38,7 @@ public final class PgOutbox implements Outbox {
     private final Resender resender;
     private final TableNames names;
     private final ShardGuard guard;
+    private final ContractGuard contracts;
     /** The topics the routes claim; null: a handler takes every other topic, so every topic goes in. */
     @Nullable
     private final Set<String> claimedTopics;
@@ -68,13 +72,19 @@ public final class PgOutbox implements Outbox {
         this.names = schema.names();
         this.guard = schema.shardGuard(); // the cursors' count as this instance's heartbeat last read it
         this.resender = new Resender(names, shards, guard);
+        this.contracts = schema.contractGuard(); // the live relay instances' reports as its heartbeat last read them
         this.claimedTopics = claimedTopics == null ? null : Set.copyOf(claimedTopics);
     }
 
     @Override
     public UUID send(OutboxMessage message) {
+        return send(message, UNKNOWN_TYPE);
+    }
+
+    /** {@link #send(OutboxMessage)} of a message written as {@code type}, the class name a refusal names. */
+    UUID send(OutboxMessage message, String type) {
         var c = currentTransaction();
-        var id = insert(c, message);
+        var id = insert(c, message, type);
         wakeUpAfterCommit();
         return id;
     }
@@ -82,7 +92,7 @@ public final class PgOutbox implements Outbox {
     @Override
     public UUID send(Connection connection, OutboxMessage message) {
         requireTransaction(connection);
-        var id = insert(connection, message);
+        var id = insert(connection, message, UNKNOWN_TYPE);
         if (connection == db.currentConnection()) {
             wakeUpAfterCommit(); // the caller passed its transaction's own connection
         }
@@ -98,6 +108,7 @@ public final class PgOutbox implements Outbox {
         }
         for (var m : messages) {
             requireClaimed(m.topic());
+            contracts.require(names, m, UNKNOWN_TYPE, telemetry);
         }
         var enqueue = telemetry.enqueueStarted();
         var ids = new UUID[n];
@@ -127,9 +138,10 @@ public final class PgOutbox implements Outbox {
     }
 
     /** One message, one enqueue of the telemetry. */
-    private UUID insert(Connection c, OutboxMessage m) {
+    private UUID insert(Connection c, OutboxMessage m, String type) {
         guard.require(names, shards);
         requireClaimed(m.topic());
+        contracts.require(names, m, type, telemetry);
         var enqueue = telemetry.enqueueStarted();
         var id = UuidV7.next();
         boolean keyed = m.key() != null;

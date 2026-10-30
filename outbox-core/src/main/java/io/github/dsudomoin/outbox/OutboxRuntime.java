@@ -51,6 +51,8 @@ public final class OutboxRuntime implements AutoCloseable {
     /** The topics the routes claim, the only ones {@link #outbox()} takes; null with a handler behind them. */
     @Nullable
     private final Set<String> claimedTopics;
+    /** The version each {@link TypedOutboxTopicHandler} route reads, by topic: what this instance's row reports. */
+    private final Map<String, Integer> contracts;
     private final OutboxDeadLetterHandler deadLetterHandler;
     private final OutboxTelemetry telemetry;
     /** The transactions with the owner's new connections, or {@link #transactions} without an owner source. */
@@ -58,11 +60,13 @@ public final class OutboxRuntime implements AutoCloseable {
     @Nullable
     private volatile Parts parts;
 
-    private OutboxRuntime(Builder builder, OutboxHandler handler, @Nullable Set<String> claimedTopics) {
+    private OutboxRuntime(Builder builder, OutboxHandler handler, @Nullable Set<String> claimedTopics,
+            Map<String, Integer> contracts) {
         this.config = builder.config;
         this.transactions = builder.transactions;
         this.handler = handler;
         this.claimedTopics = claimedTopics;
+        this.contracts = contracts;
         this.deadLetterHandler = builder.deadLetterHandler;
         this.telemetry = GuardedTelemetry.of(builder.telemetry);
         this.ddl = OwnerTransactions.of(transactions, builder.owner);
@@ -118,7 +122,7 @@ public final class OutboxRuntime implements AutoCloseable {
         if (parts != null) {
             throw new IllegalStateException("OutboxRuntime.start() has run already");
         }
-        var schema = new OutboxSchema(transactions, ddl, config);
+        var schema = new OutboxSchema(transactions, ddl, config, contracts);
         try {
             schema.start();
         } catch (SQLException e) {
@@ -184,7 +188,10 @@ public final class OutboxRuntime implements AutoCloseable {
 
         /**
          * Sends the records of {@code route}'s topics to it instead of the handler, as {@link OutboxHandler#byTopic}
-         * does. {@link #build()} fails when two routes claim one topic, or a route claims none.
+         * does. {@link #build()} fails when two routes claim one topic, or a route claims none. A
+         * {@link TypedOutboxTopicHandler} route's contract version is reported in this instance's row: a send of a
+         * higher version of its topics is refused while a live relay instance reads below it
+         * ({@link OutboxIncompatibleContractException}).
          */
         public Builder route(OutboxTopicHandler route) {
             routes.add(Objects.requireNonNull(route, "route"));
@@ -221,7 +228,13 @@ public final class OutboxRuntime implements AutoCloseable {
             }
             var claims = new HashMap<String, OutboxTopicHandler>();
             var routed = routed(claims);
-            return new OutboxRuntime(this, routed, handler != null ? null : claims.keySet());
+            var contracts = new HashMap<String, Integer>();
+            claims.forEach((topic, route) -> {
+                if (route instanceof TypedOutboxTopicHandler<?> typed) {
+                    contracts.put(topic, typed.contractVersion());
+                }
+            });
+            return new OutboxRuntime(this, routed, handler != null ? null : claims.keySet(), contracts);
         }
 
         /** Fills {@code claims} with each claimed topic's route. */

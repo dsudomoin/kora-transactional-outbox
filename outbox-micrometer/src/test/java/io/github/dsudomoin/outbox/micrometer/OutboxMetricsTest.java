@@ -32,6 +32,7 @@ class OutboxMetricsTest {
             noop.retried("orders");
             noop.requeued("orders");
             noop.waited("orders", Outcome.Waiting.Kind.HANDLER);
+            noop.contractRejected("orders", "Created", 2);
             noop.stepFinished(Duration.ofMillis(5));
             noop.shardPaused();
             noop.inboxOutsideWindow();
@@ -136,6 +137,19 @@ class OutboxMetricsTest {
         assertThat(waits("payments", "handler")).isEqualTo(1);
         assertThat(registry.find("outbox.messages.waiting").counters()).as("no series for kinds never seen").hasSize(3);
         assertThat(registry.find("outbox.messages.failed").counters()).as("not a failure").isEmpty();
+    }
+
+    @Test
+    void contractRejectedCountsPerTopicTypeAndVersion() {
+        metrics.contractRejected("orders", "com.acme.OrderCreated", 2);
+        metrics.contractRejected("orders", "com.acme.OrderCreated", 2);
+        metrics.contractRejected("orders", "?", 3);
+
+        assertThat(registry.get("outbox.messages.contract_rejected")
+                .tags("topic", "orders", "type", "com.acme.OrderCreated", "version", "2").counter().count())
+                .isEqualTo(2);
+        assertThat(registry.get("outbox.messages.contract_rejected")
+                .tags("topic", "orders", "type", "?", "version", "3").counter().count()).isEqualTo(1);
     }
 
     @Test

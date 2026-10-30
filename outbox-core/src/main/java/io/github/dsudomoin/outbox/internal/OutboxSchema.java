@@ -11,6 +11,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -83,6 +84,7 @@ public final class OutboxSchema implements AutoCloseable {
     private final int schemaLockAttempts;
     private final String instanceId = Heartbeat.newId();
     private final ShardGuard guard = new ShardGuard();
+    private final ContractGuard contracts;
     /** The tick guard's lower bound, whatever the intervals say; shorter in tests. */
     Duration tickFloor = Duration.ofMinutes(1);
     /** How long the reshard waits for the tick guard alone to pass before it refuses; shorter in tests. */
@@ -102,20 +104,28 @@ public final class OutboxSchema implements AutoCloseable {
 
     /** {@code ddl}: the transactions whose new connections run the bootstrap, the owner's ones when it has its own. */
     public OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config) {
-        this(db, ddl, config, SCHEMA_LOCK_ATTEMPTS);
+        this(db, ddl, config, Map.of());
+    }
+
+    /** {@code contracts}: the contract version each typed route of the instance reads, by topic; its row reports it. */
+    public OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config,
+            Map<String, Integer> contracts) {
+        this(db, ddl, config, SCHEMA_LOCK_ATTEMPTS, contracts);
     }
 
     OutboxSchema(OutboxTransactions db, OutboxConfig config, int schemaLockAttempts) {
-        this(db, db, config, schemaLockAttempts);
+        this(db, db, config, schemaLockAttempts, Map.of());
     }
 
-    private OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config, int schemaLockAttempts) {
+    private OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config, int schemaLockAttempts,
+            Map<String, Integer> contracts) {
         validate(config);
         this.db = db;
         this.ddl = ddl;
         this.config = config;
         this.spelled = TableNames.of(config.table());
         this.schemaLockAttempts = schemaLockAttempts;
+        this.contracts = new ContractGuard(contracts, config.partitions().maintenanceInterval());
     }
 
     /**
@@ -263,6 +273,11 @@ public final class OutboxSchema implements AutoCloseable {
         return guard;
     }
 
+    /** The live relay instances' contract reports as this instance last read them, which its sends check. */
+    ContractGuard contractGuard() {
+        return contracts;
+    }
+
     /**
      * {@code config} with the shard count resolved at bootstrap, and this instance's {@link ShardGuard}, which the
      * writes of every component built from it check ({@link ShardGuard#of}).
@@ -395,9 +410,11 @@ public final class OutboxSchema implements AutoCloseable {
             }
             // still under the schema lock: from here on, another instance's reshard sees this one
             try (var ps = c.prepareStatement(Heartbeat.upsert(n))) {
-                Heartbeat.bind(ps, 0, instanceId, shards, false, config.partitions().maintenanceInterval());
+                Heartbeat.bind(ps, 0, instanceId, shards, false, config.relay().enabled(), contracts.contracts(),
+                        config.partitions().maintenanceInterval());
                 ps.executeUpdate();
             }
+            contracts.refresh(c, n); // this row too: a send right after start is guarded
             resolved = r;
         }
     }
