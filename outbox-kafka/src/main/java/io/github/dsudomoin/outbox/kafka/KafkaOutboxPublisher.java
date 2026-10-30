@@ -4,6 +4,7 @@ import io.github.dsudomoin.outbox.Outbox;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxSerializationException;
+import io.github.dsudomoin.outbox.internal.Contracts;
 import jakarta.annotation.Nullable;
 import java.util.ArrayList;
 import java.util.Objects;
@@ -18,7 +19,10 @@ import org.apache.kafka.common.serialization.Serializer;
  * {@code @Json} ones included). The ordering key is the serialized Kafka key, the bytes Kafka partitions by; a
  * {@code null} key is unordered and a {@code null} value a tombstone. A serializer returning {@code null} for a
  * non-null key or value throws {@link OutboxSerializationException}. Like {@link Outbox#send(OutboxMessage)} it must
- * run inside the application's transaction (see {@link io.github.dsudomoin.outbox.OutboxTransactions}).
+ * run inside the application's transaction (see {@link io.github.dsudomoin.outbox.OutboxTransactions}). Every
+ * message, tombstones included, carries the {@link io.github.dsudomoin.outbox.OutboxContract} version of the declared
+ * value type in its {@code outbox-contract} header, in place of any such header given or added by a serializer;
+ * version 1 writes none.
  */
 public final class KafkaOutboxPublisher<K, V> {
 
@@ -28,9 +32,11 @@ public final class KafkaOutboxPublisher<K, V> {
     private final String topic;
     private final Serializer<K> keySerializer;
     private final Serializer<V> valueSerializer;
+    private final int version;
 
-    public KafkaOutboxPublisher(
-            Outbox outbox, String topic, Serializer<K> keySerializer, Serializer<V> valueSerializer) {
+    /** {@code valueType} is {@code V}; its contract version is read once, here. */
+    public KafkaOutboxPublisher(Outbox outbox, String topic, Serializer<K> keySerializer,
+            Serializer<V> valueSerializer, Class<V> valueType) {
         this.outbox = Objects.requireNonNull(outbox, "outbox");
         // validated now, not on the first send
         if (!validTopic(topic)) {
@@ -39,6 +45,7 @@ public final class KafkaOutboxPublisher<K, V> {
         this.topic = topic;
         this.keySerializer = Objects.requireNonNull(keySerializer, "keySerializer");
         this.valueSerializer = Objects.requireNonNull(valueSerializer, "valueSerializer");
+        this.version = Contracts.version(Objects.requireNonNull(valueType, "valueType"));
     }
 
     /** Kafka's rule for topic names (Topic.validate, not public API), which refuses the rest. */
@@ -63,7 +70,7 @@ public final class KafkaOutboxPublisher<K, V> {
         for (var h : copy) {
             outboxHeaders.add(new OutboxHeader(h.key(), h.value()));
         }
-        return outbox.send(new OutboxMessage(topic, keyBytes, valueBytes, outboxHeaders));
+        return outbox.send(new OutboxMessage(topic, keyBytes, valueBytes, Contracts.stamp(outboxHeaders, version)));
     }
 
     /** M2: null for a non-null key would drop its ordering, for a non-null value write a tombstone. */

@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
+import io.github.dsudomoin.outbox.internal.Contracts;
 import jakarta.annotation.Nullable;
 import java.time.Instant;
 import java.util.List;
@@ -25,8 +26,6 @@ public record OutboxRecord(
         int attempts,
         int requeues,
         int shard) {
-
-    static final String CONTRACT_HEADER = "outbox-contract";
 
     public OutboxRecord {
         headers = List.copyOf(headers);
@@ -52,7 +51,7 @@ public record OutboxRecord(
     public int contractVersion() {
         for (int i = headers.size() - 1; i >= 0; i--) {
             var header = headers.get(i);
-            if (header.name().equals(CONTRACT_HEADER)) {
+            if (header.name().equals(Contracts.HEADER)) {
                 var value = header.value() == null ? null : new String(header.value(), US_ASCII);
                 int version;
                 try {
@@ -62,7 +61,7 @@ public record OutboxRecord(
                 }
                 if (version <= 0) {
                     throw new OutboxWaitException(Outcome.Waiting.Kind.CONTRACT,
-                            "invalid " + CONTRACT_HEADER + " header: " + value);
+                            "invalid " + Contracts.HEADER + " header: " + value);
                 }
                 return version;
             }

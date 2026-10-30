@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.wiring;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import io.github.dsudomoin.outbox.kora.OutboxModule;
+import io.github.dsudomoin.outbox.OutboxContract;
 import io.github.dsudomoin.outbox.OutboxDeserializer;
 import io.github.dsudomoin.outbox.OutboxSerializer;
 import io.github.dsudomoin.outbox.TypedOutbox;
@@ -25,7 +26,8 @@ import ru.tinkoff.kora.json.common.annotation.Json;
 public interface TypedTestApp extends HoconConfigModule, JdbcDatabaseModule, OutboxModule, OutboxJsonModule,
         OutboxProtobufModule {
 
-    /** Sent as JSON: no serializer of its own. */
+    /** Sent as JSON: no serializer of its own. Version 2, so its messages carry the contract header. */
+    @OutboxContract(2)
     @Json
     record OrderCreated(long id, String userId) {}
 

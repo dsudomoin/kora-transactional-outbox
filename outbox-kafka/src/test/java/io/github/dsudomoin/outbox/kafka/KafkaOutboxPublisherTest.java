@@ -1,10 +1,12 @@
 package io.github.dsudomoin.outbox.kafka;
 
+import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.Outbox;
+import io.github.dsudomoin.outbox.OutboxContract;
 import io.github.dsudomoin.outbox.OutboxHeader;
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.OutboxSerializationException;
@@ -20,6 +22,9 @@ import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.Test;
 
 class KafkaOutboxPublisherTest {
+
+    @OutboxContract(2)
+    record Created(String id) {}
 
     private final UUID id = UUID.randomUUID();
     private final List<OutboxMessage> sent = new ArrayList<>();
@@ -43,7 +48,8 @@ class KafkaOutboxPublisherTest {
 
     @Test
     void serializesKeyAndValueAndUsesKeyBytesForOrdering() {
-        var publisher = new KafkaOutboxPublisher<>(outbox, "orders", new LongSerializer(), new StringSerializer());
+        var publisher = new KafkaOutboxPublisher<>(outbox, "orders", new LongSerializer(), new StringSerializer(),
+                String.class);
 
         assertThat(publisher.send(42L, "created")).isEqualTo(id);
         assertThat(publisher.send(null, null)).isEqualTo(id);
@@ -73,7 +79,7 @@ class KafkaOutboxPublisherTest {
                 return bytes(data);
             }
         };
-        var publisher = new KafkaOutboxPublisher<>(outbox, "orders", new StringSerializer(), typed);
+        var publisher = new KafkaOutboxPublisher<>(outbox, "orders", new StringSerializer(), typed, String.class);
         var headers = new RecordHeaders().add("a", bytes("1")).add("b", null).add("a", bytes("2"));
 
         publisher.send("k", "v", headers);
@@ -88,8 +94,8 @@ class KafkaOutboxPublisherTest {
     @Test
     void serializerReturningNullForNonNullThrows() {
         Serializer<String> nulls = (topic, data) -> null;
-        var nullValue = new KafkaOutboxPublisher<>(outbox, "orders", new StringSerializer(), nulls);
-        var nullKey = new KafkaOutboxPublisher<>(outbox, "orders", nulls, new StringSerializer());
+        var nullValue = new KafkaOutboxPublisher<>(outbox, "orders", new StringSerializer(), nulls, String.class);
+        var nullKey = new KafkaOutboxPublisher<>(outbox, "orders", nulls, new StringSerializer(), String.class);
 
         assertThatThrownBy(() -> nullValue.send("k", "v")).isInstanceOf(OutboxSerializationException.class);
         assertThatThrownBy(() -> nullKey.send("k", "v")).isInstanceOf(OutboxSerializationException.class);
@@ -103,14 +109,46 @@ class KafkaOutboxPublisherTest {
     @Test
     void topicNameValidatedLikeKafka() {
         for (var bad : List.of("orders/created", "a b", "ä", ".", "..", "", " ", "x".repeat(250))) {
-            assertThatThrownBy(() -> new KafkaOutboxPublisher<>(outbox, bad, new StringSerializer(), new StringSerializer()))
-                    .as(bad)
-                    .isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> publisher(bad)).as(bad).isInstanceOf(IllegalArgumentException.class);
         }
         for (var good : List.of("orders.created-v2_X", "...", "x".repeat(249))) {
-            assertThat(new KafkaOutboxPublisher<>(outbox, good, new StringSerializer(), new StringSerializer())).as(good)
-                    .isNotNull();
+            assertThat(publisher(good)).as(good).isNotNull();
         }
+    }
+
+    @Test
+    void everySendCarriesTheValueTypesVersionInPlaceOfAGivenOrAddedOne() {
+        // a serializer that adds its own contract header loses it too
+        Serializer<Created> value = new Serializer<>() {
+            @Override
+            public byte[] serialize(String topic, Created data) {
+                throw new AssertionError("the headers overload must be used");
+            }
+
+            @Override
+            public byte[] serialize(String topic, Headers headers, Created data) {
+                headers.add("outbox-contract", bytes("9"));
+                return data == null ? null : bytes(data.id());
+            }
+        };
+        var publisher = new KafkaOutboxPublisher<>(outbox, "orders", new StringSerializer(), value, Created.class);
+
+        publisher.send("k", new Created("1"), new RecordHeaders().add("outbox-contract", bytes("7")).add("h", null));
+        publisher.send("k", null);
+        publisher("orders").send("k", "v", new RecordHeaders().add("outbox-contract", bytes("7")));
+
+        assertThat(sent).extracting(OutboxMessage::headers).containsExactly(
+                List.of(new OutboxHeader("h", null), contract("2")),
+                List.of(contract("2")), // the tombstone too
+                List.of()); // String: version 1, no header
+    }
+
+    private KafkaOutboxPublisher<String, String> publisher(String topic) {
+        return new KafkaOutboxPublisher<>(outbox, topic, new StringSerializer(), new StringSerializer(), String.class);
+    }
+
+    private static OutboxHeader contract(String version) {
+        return new OutboxHeader("outbox-contract", version.getBytes(US_ASCII));
     }
 
     private static byte[] bytes(String s) {

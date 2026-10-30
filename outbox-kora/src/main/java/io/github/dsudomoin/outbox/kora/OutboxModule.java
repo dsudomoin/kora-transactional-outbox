@@ -4,6 +4,7 @@ import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.Outbox;
 import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.OutboxConfig;
+import io.github.dsudomoin.outbox.OutboxContract;
 import io.github.dsudomoin.outbox.OutboxDeadLetterHandler;
 import io.github.dsudomoin.outbox.OutboxHandler;
 import io.github.dsudomoin.outbox.OutboxRelay;
@@ -20,6 +21,7 @@ import io.opentelemetry.api.trace.Tracer;
 import jakarta.annotation.Nullable;
 import ru.tinkoff.kora.application.graph.All;
 import ru.tinkoff.kora.application.graph.LifecycleWrapper;
+import ru.tinkoff.kora.application.graph.TypeRef;
 import ru.tinkoff.kora.common.Tag;
 import ru.tinkoff.kora.common.annotation.Root;
 import ru.tinkoff.kora.database.jdbc.JdbcConnectionFactory;
@@ -108,8 +110,11 @@ public interface OutboxModule extends OutboxCommonModule {
         return runtime.deadLetterPass();
     }
 
-    /** {@link TypedOutbox} for every {@code T} the app has an {@link OutboxSerializer} for. */
-    default <T> TypedOutbox<T> typedOutbox(Outbox outbox, OutboxSerializer<T> serializer) {
-        return new TypedOutbox<>(outbox, serializer);
+    /**
+     * {@link TypedOutbox} for every {@code T} the app has an {@link OutboxSerializer} for, stamping {@code T}'s
+     * {@link OutboxContract} version.
+     */
+    default <T> TypedOutbox<T> typedOutbox(Outbox outbox, OutboxSerializer<T> serializer, TypeRef<T> type) {
+        return new TypedOutbox<>(outbox, serializer, type.getRawType());
     }
 }

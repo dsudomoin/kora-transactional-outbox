@@ -213,6 +213,10 @@ package io.github.dsudomoin.outbox {
     method public default java.time.Duration! maxDelay();
   }
 
+  @java.lang.annotation.Documented @java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) @java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE) public @interface OutboxContract {
+    method public abstract int value();
+  }
+
   public interface OutboxDeadLetterHandler {
     method public default boolean active();
     method public java.util.List<io.github.dsudomoin.outbox.DeadLetterDecision!>! handle(java.util.List<io.github.dsudomoin.outbox.DeadLetter!>!) throws java.lang.Exception;
@@ -491,7 +495,10 @@ package io.github.dsudomoin.outbox {
   }
 
   public final class TypedOutbox<T> {
-    ctor public TypedOutbox(io.github.dsudomoin.outbox.Outbox!, io.github.dsudomoin.outbox.OutboxSerializer<T>!);
+    ctor public TypedOutbox(io.github.dsudomoin.outbox.Outbox!, io.github.dsudomoin.outbox.OutboxSerializer<T>!, Class<T>!);
+    method public io.github.dsudomoin.outbox.OutboxMessage! message(String!, byte[]?, T?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
+    method public io.github.dsudomoin.outbox.OutboxMessage! message(String!, String?, T?);
+    method public io.github.dsudomoin.outbox.OutboxMessage! message(String!, String?, T?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
     method public java.util.UUID! send(String!, byte[]?, T?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);
     method public java.util.UUID! send(String!, String?, T?);
     method public java.util.UUID! send(String!, String?, T?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!);

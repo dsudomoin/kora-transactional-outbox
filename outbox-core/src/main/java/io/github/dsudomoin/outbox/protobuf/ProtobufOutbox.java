@@ -24,7 +24,7 @@ public final class ProtobufOutbox {
     private final TypedOutbox<MessageLite> outbox;
 
     public ProtobufOutbox(Outbox outbox) {
-        this.outbox = new TypedOutbox<>(outbox, (topic, message) -> message.toByteArray());
+        this.outbox = new TypedOutbox<>(outbox, (topic, message) -> message.toByteArray(), MessageLite.class);
     }
 
     public UUID send(String topic, @Nullable String key, @Nullable MessageLite message) {
