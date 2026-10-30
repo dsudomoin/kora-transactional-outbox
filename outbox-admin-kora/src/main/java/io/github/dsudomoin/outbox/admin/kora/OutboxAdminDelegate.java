@@ -7,6 +7,10 @@ import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.OutboxStatus;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiDelegate;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.AbandonWaitingApiResponse;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.AbandonWaitingApiResponse.AbandonWaiting200ApiResponse;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.AbandonWaitingApiResponse.AbandonWaiting400ApiResponse;
+import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.AbandonWaitingApiResponse.AbandonWaiting409ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.CountDeadLettersApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.CountDeadLettersApiResponse.CountDeadLetters200ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.CountDeadLettersApiResponse.CountDeadLetters400ApiResponse;
@@ -35,6 +39,8 @@ import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.Restore
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.RestoreOrphanApiResponse.RestoreOrphan200ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.RestoreOrphanApiResponse.RestoreOrphan400ApiResponse;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiResponses.RestoreOrphanApiResponse.RestoreOrphan409ApiResponse;
+import io.github.dsudomoin.outbox.admin.kora.model.AbandonWaiting;
+import io.github.dsudomoin.outbox.admin.kora.model.Abandoned;
 import io.github.dsudomoin.outbox.admin.kora.model.Count;
 import io.github.dsudomoin.outbox.admin.kora.model.DeadLetter;
 import io.github.dsudomoin.outbox.admin.kora.model.DeadLetterCount;
@@ -54,6 +60,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Objects;
+import java.util.TreeMap;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -135,6 +142,18 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
                 RecoverXidRegression400ApiResponse::new, RecoverXidRegression409ApiResponse::new);
     }
 
+    @Override
+    public AbandonWaitingApiResponse abandonWaiting(@Nullable AbandonWaiting body) {
+        return call(() -> {
+            if (body == null) {
+                throw new IllegalArgumentException("give the topic and the reason");
+            }
+            var abandoned = admin.abandonWaiting(body.topic(), body.key() == null ? null : body.key().getBytes(UTF_8),
+                    body.reason(), Boolean.TRUE.equals(body.dryRun()));
+            return new AbandonWaiting200ApiResponse(new Abandoned(abandoned.keys(), abandoned.records()));
+        }, AbandonWaiting400ApiResponse::new, AbandonWaiting409ApiResponse::new);
+    }
+
     /** {@code ok}, or the 400 or 409 for the refusals {@link OutboxAdmin} names; any other failure propagates. */
     private static <R> R call(Supplier<R> ok, Function<ModelError, R> badRequest, Function<ModelError, R> conflict) {
         try {
@@ -203,13 +222,14 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
     }
 
     private static Status status(OutboxStatus s) {
-        return new Status(s.halted(), s.lagSeconds(), s.retrySize(), s.parkedSize(),
+        return new Status(s.halted(), s.lagSeconds(), s.retrySize(), s.parkedSize(), s.waitingSize(),
+                s.waitingOldestSeconds(),
                 s.deadLetters().stream().map(c -> new DeadLetterCount(c.topic(), status(c.status()), c.count()))
                         .toList(),
                 s.orphans().stream().map(o -> new Orphan(o.table(), kind(o.kind()))).toList(),
                 s.tailOverflow(), s.premade(), s.xidsLeft(), s.maintenanceSinceSuccessSeconds(), s.shards(),
-                s.instances().stream().map(i -> new Instance(i.id(), i.shards(), utc(i.lastSeen()), i.hookActive()))
-                        .toList());
+                s.instances().stream().map(i -> new Instance(i.id(), i.shards(), utc(i.lastSeen()), i.hookActive(),
+                        i.relay(), i.contracts() == null ? null : new TreeMap<>(i.contracts()))).toList());
     }
 
     private static DeadLetter letter(io.github.dsudomoin.outbox.DeadLetter l) {

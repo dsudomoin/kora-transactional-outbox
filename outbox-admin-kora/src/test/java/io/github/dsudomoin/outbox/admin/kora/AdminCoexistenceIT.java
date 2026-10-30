@@ -52,7 +52,7 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         }
     }
 
-    /** All seven, in the contract's order, each acting on what {@link #seed} made when allowed. */
+    /** All eight, in the contract's order, each acting on what {@link #seed} made when allowed. */
     static final List<Route> ROUTES = List.of(
             new Route("getStatus", "GET", API + "/status", null),
             new Route("findDeadLetters", "GET", API + "/dead-letters?topic=t", null),
@@ -60,7 +60,8 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
             new Route("redriveDeadLetters", "POST", API + "/dead-letters/redrive", "{\"ids\":[1]}"),
             new Route("discardDeadLetters", "POST", API + "/dead-letters/discard", "{\"ids\":[1]}"),
             new Route("restoreOrphan", "POST", API + "/orphans/{orphan}/restore?fromXid=0", null),
-            new Route("recoverXidRegression", "POST", API + "/recovery/xid-regression", null));
+            new Route("recoverXidRegression", "POST", API + "/recovery/xid-regression", null),
+            new Route("abandonWaiting", "POST", API + "/waiting/abandon", "{\"topic\":\"t\",\"reason\":\"test\"}"));
 
     @TestComponent
     private AdminTestApp.KeyAuthorizer authorizer;
@@ -270,12 +271,14 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
 
     /**
      * Something for every mutating route to change: kept dead letter 1, the foreign orphan {@code <table>_x1000}
-     * with one row, one outbox row, and a tick whose snapshot xmax lies 10⁹ xids past the counter, as after a
-     * dump/restore.
+     * with one row, one outbox row, a tick whose snapshot xmax lies 10⁹ xids past the counter, as after a
+     * dump/restore, and waiting retry head 2.
      */
     private void seed() throws SQLException {
         execute("insert into " + table + "_dead (id, shard, message_id, topic, created_at, attempts)"
                 + " values (1, 0, gen_random_uuid(), 't', now(), 3)");
+        execute("insert into " + table + "_retry (id, shard, message_id, topic, created_at, next_attempt_at,"
+                + " waiting_since) values (2, 0, gen_random_uuid(), 't', now(), now(), now())");
         execute("create table " + orphan() + " (like " + table + " including defaults)");
         execute("insert into " + orphan() + " (id, shard, xid, message_id, topic)"
                 + " values (1, 0, '10', gen_random_uuid(), 't')");

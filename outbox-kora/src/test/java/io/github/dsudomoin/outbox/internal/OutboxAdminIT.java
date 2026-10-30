@@ -13,10 +13,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.github.dsudomoin.outbox.DeadLetter;
 import io.github.dsudomoin.outbox.DeadLetterDecision;
 import io.github.dsudomoin.outbox.DeadLetterFilter;
+import io.github.dsudomoin.outbox.OutboxAdmin.Abandoned;
 import io.github.dsudomoin.outbox.OutboxMessage;
+import io.github.dsudomoin.outbox.OutboxStatus;
 import io.github.dsudomoin.outbox.OutboxStatus.DeadLetterCount;
 import io.github.dsudomoin.outbox.OutboxStatus.Orphan;
 import io.github.dsudomoin.outbox.OutboxStatus.OrphanKind;
+import io.github.dsudomoin.outbox.OutboxWaitException;
 import io.github.dsudomoin.outbox.internal.PartitionDdl.Bound;
 import io.github.dsudomoin.outbox.micrometer.OutboxMetrics;
 import io.github.dsudomoin.outbox.testing.CapturedStderr;
@@ -554,7 +557,8 @@ class OutboxAdminIT {
                 () -> admin.discardDeadLetters(List.of(id)),
                 () -> admin.discardDeadLetters(filter),
                 () -> admin.restoreOrphan(names.partitionPrefix() + "1000", 0),
-                admin::recoverXidRegression);
+                admin::recoverXidRegression,
+                () -> admin.abandonWaiting("t", null, "rollback", false));
 
         for (var call : calls) {
             db.inTx((SqlFunction0<Void>) () -> {
@@ -568,10 +572,16 @@ class OutboxAdminIT {
     @Test
     void statusReportsTheState() throws Exception {
         execute("insert into " + names.halt() + " (max_tick_xmax) values ('1')");
-        execute("insert into " + names.retry() + " (id, shard, message_id, topic, created_at) values"
-                + " (1, 0, gen_random_uuid(), 't', now()), (2, 0, gen_random_uuid(), 't', now())");
+        execute("insert into " + names.retry() + " (id, shard, message_id, topic, created_at, waiting_since) values"
+                + " (1, 0, gen_random_uuid(), 't', now(), now() - interval '1 hour'),"
+                + " (2, 0, gen_random_uuid(), 't', now(), null)");
         execute("insert into " + names.parked() + " (id, shard, message_id, topic, created_at, due_at)"
                 + " values (3, 0, gen_random_uuid(), 't', now(), now())");
+        execute("delete from " + names.instance());
+        execute("insert into " + names.instance() + " (instance_id, shards, last_seen, hook_active, relay, contracts)"
+                + " values ('a', 4, '2026-01-15T10:00:00Z', true, true, '{\"t2\": 2, \"t1\": 1}'),"
+                + " ('b', 4, '2026-01-15T10:00:00Z', false, true, null),"
+                + " ('c', 4, '2026-01-15T10:00:00Z', false, false, '{}')");
         var now = Instant.now();
         letter("a", "1", "boom", now, KEPT);
         letter("a", "2", "boom", now, KEPT);
@@ -598,6 +608,8 @@ class OutboxAdminIT {
         assertThat(status.lagSeconds()).isZero();
         assertThat(status.retrySize()).isEqualTo(2);
         assertThat(status.parkedSize()).isOne();
+        assertThat(status.waitingSize()).isOne();
+        assertThat(status.waitingOldestSeconds()).isBetween(3600.0, 3660.0);
         assertThat(status.deadLetters()).containsExactlyInAnyOrder(new DeadLetterCount("a", KEPT, 2),
                 new DeadLetterCount("a", PENDING, 1), new DeadLetterCount("b", SCHEDULED, 1));
         assertThat(status.orphans()).as("not the pre-created range").containsExactlyInAnyOrder(
@@ -608,6 +620,192 @@ class OutboxAdminIT {
         assertThat(status.xidsLeft()).as("the tail is attached").isNull();
         assertThat(status.maintenanceSinceSuccessSeconds()).isNotNull().isNotNegative();
         assertThat(status.shards()).isEqualTo(config.shards());
+        var seen = Instant.parse("2026-01-15T10:00:00Z");
+        assertThat(status.instances()).containsExactly(
+                new OutboxStatus.Instance("a", 4, seen, true, true, Map.of("t1", 1, "t2", 2)),
+                new OutboxStatus.Instance("b", 4, seen, false, true, null),
+                new OutboxStatus.Instance("c", 4, seen, false, false, Map.of()));
+    }
+
+    @Test
+    void abandonMovesEachWaitingKeyWholeToKeptDeadLetters() throws Exception {
+        seedWaiting();
+
+        assertThat(admin.abandonWaiting("t", bytes("k"), "rolled back to v1", false)).as("the head, its followers"
+                + " and its key's parked rows").isEqualTo(new Abandoned(1, 5));
+        assertThat(ids(names.retry())).containsExactly(20L, 30L, 31L, 40L);
+        assertThat(ids(names.parked())).containsExactly(32L, 33L);
+        assertThat(admin.abandonWaiting("t", null, "rolled back to v1", false)).as("the unkeyed head alone")
+                .isEqualTo(new Abandoned(1, 1));
+
+        assertThat(ids(names.retry())).as("a failing key and another topic's stay").containsExactly(30L, 31L, 40L);
+        assertThat(ids(names.parked())).as("an unkeyed one is no follower").containsExactly(32L, 33L);
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select string_agg(id || ':' || attempts || ':' || status || ':' || coalesce("
+                    + "due_at::text, '-') || ':' || error, ', ' order by id) from " + names.dead())).isEqualTo(
+                    "5:1:kept:-:abandoned: rolled back to v1, 10:2:kept:-:abandoned: rolled back to v1,"
+                    + " 11:0:kept:-:abandoned: rolled back to v1, 12:0:kept:-:abandoned: rolled back to v1,"
+                    + " 13:0:kept:-:abandoned: rolled back to v1, 20:0:kept:-:abandoned: rolled back to v1");
+        }
+        assertThat(wakes).as("nothing put back").hasValue(0);
+    }
+
+    @Test
+    void aDryRunCountsAndMovesNothing() throws Exception {
+        seedWaiting();
+
+        assertThat(admin.abandonWaiting("t", null, "rollback", true)).isEqualTo(new Abandoned(2, 6));
+        assertThat(admin.abandonWaiting("t", bytes("k"), "rollback", true)).isEqualTo(new Abandoned(1, 5));
+        assertThat(admin.abandonWaiting("t", bytes("j"), "rollback", true)).as("j fails, it does not wait")
+                .isEqualTo(new Abandoned(0, 0));
+
+        assertThat(ids(names.retry())).containsExactly(10L, 11L, 12L, 20L, 30L, 31L, 40L);
+        assertThat(ids(names.parked())).containsExactly(5L, 13L, 32L, 33L);
+        assertThat(deadIds()).isEmpty();
+    }
+
+    @Test
+    void abandonGoesThroughChunksOfAThousandKeys() throws Exception {
+        // 1001 waiting heads with a follower each, so two chunks
+        execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at, next_attempt_at,"
+                + " waiting_since) select g, 0, gen_random_uuid(), 't', convert_to('k' || g, 'UTF8'), now(), now(),"
+                + " now() from generate_series(1, 1001) g");
+        execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at)"
+                + " select 2000 + g, 0, gen_random_uuid(), 't', convert_to('k' || g, 'UTF8'), now()"
+                + " from generate_series(1, 1001) g");
+
+        assertThat(admin.abandonWaiting("t", null, "rollback", true)).isEqualTo(new Abandoned(1001, 2002));
+        assertThat(admin.abandonWaiting("t", null, "rollback", false)).isEqualTo(new Abandoned(1001, 2002));
+
+        assertThat(count(names.retry())).isZero();
+        assertThat(count(names.dead())).isEqualTo(2002);
+    }
+
+    @Test
+    void abandonNeedsATopicAndAReason() throws Exception {
+        seedWaiting();
+
+        for (var blank : List.of("", " ")) {
+            assertThatThrownBy(() -> admin.abandonWaiting(blank, null, "rollback", false))
+                    .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("topic");
+            assertThatThrownBy(() -> admin.abandonWaiting("t", null, blank, false))
+                    .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("reason");
+        }
+        assertThat(deadIds()).isEmpty();
+    }
+
+    /**
+     * A relay step holds the shard's lock while its handler runs and adds a follower to the waiting key after it: the
+     * abandon waits for the step's commit, then moves the follower too, or gives up with "retry" after its wait.
+     */
+    @Test
+    void abandonWaitsForARelayStepOnItsShard() throws Exception {
+        var outbox = new PgOutbox(db, schema, config.shards(), () -> {}, TestTelemetry.kora());
+        var ticks = new Ticks(names, config.shards());
+        int shard = Hashing.shard(Hashing.keyHash("t", bytes("w")), config.shards());
+        var inHandler = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var block = new AtomicBoolean();
+        var processor = new ShardProcessor(names, config, record -> {
+            if (block.compareAndSet(true, false)) {
+                inHandler.countDown();
+                release.await();
+            }
+            throw new OutboxWaitException("v2 not here");
+        }, TestTelemetry.kora(), false);
+        try {
+            var now = Instant.now();
+            db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "w", bytes("w#1"))));
+            step(processor, ticks, shard, now);
+            assertThat(payloads(names.retry())).as("waiting").containsExactly("w#1");
+            db.inTx((SqlFunction0<UUID>) () -> outbox.send(OutboxMessage.of("t", "w", bytes("w#2"))));
+            block.set(true);
+            var step = pool.submit(() -> step(processor, ticks, shard, now.plusSeconds(1)));
+            assertThat(inHandler.await(10, SECONDS)).isTrue();
+
+            admin.shardWait = Duration.ofMillis(200);
+            assertThatThrownBy(() -> admin.abandonWaiting("t", bytes("w"), "rollback", false))
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("is busy, retry");
+            assertThat(payloads(names.retry())).containsExactly("w#1");
+
+            admin.shardWait = Duration.ofSeconds(10);
+            var abandon = pool.submit(() -> admin.abandonWaiting("t", bytes("w"), "rollback", false));
+            awaitShardLockWaiter(shard);
+            assertThat(abandon.isDone()).as("waits for the step").isFalse();
+            release.countDown();
+            step.get(10, SECONDS);
+
+            assertThat(abandon.get(10, SECONDS)).isEqualTo(new Abandoned(1, 2));
+        } finally {
+            release.countDown();
+            processor.close();
+        }
+        assertThat(count(names.retry())).as("no follower left without its head").isZero();
+        assertThat(payloads(names.dead())).containsExactly("w#1", "w#2");
+    }
+    /**
+     * Topic t: waiting head 10 of key k with followers 11 and 12 and parked rows 5 and 13 of its key; unkeyed waiting
+     * head 20 on shard 1; failing head 30 of key j with follower 31 and parked row 32; unkeyed parked row 33. Topic u:
+     * waiting head 40 of key k.
+     */
+    private void seedWaiting() throws SQLException {
+        execute("insert into " + names.retry() + " (id, shard, message_id, topic, key, created_at, attempts,"
+                + " next_attempt_at, last_error, waiting_since) values"
+                + " (10, 0, gen_random_uuid(), 't', 'k', now(), 2, now(), 'waiting (contract): v2', now()),"
+                + " (11, 0, gen_random_uuid(), 't', 'k', now(), 0, null, null, null),"
+                + " (12, 0, gen_random_uuid(), 't', 'k', now(), 0, null, null, null),"
+                + " (20, 1, gen_random_uuid(), 't', null, now(), 0, now(), 'waiting (no_route): none', now()),"
+                + " (30, 0, gen_random_uuid(), 't', 'j', now(), 1, now(), 'boom', null),"
+                + " (31, 0, gen_random_uuid(), 't', 'j', now(), 0, null, null, null),"
+                + " (40, 0, gen_random_uuid(), 'u', 'k', now(), 0, now(), 'waiting (contract): v2', now())");
+        execute("insert into " + names.parked() + " (id, shard, message_id, topic, key, created_at, attempts, due_at)"
+                + " values (5, 0, gen_random_uuid(), 't', 'k', now(), 1, now()),"
+                + " (13, 0, gen_random_uuid(), 't', 'k', now(), 0, now()),"
+                + " (32, 0, gen_random_uuid(), 't', 'j', now(), 0, now()),"
+                + " (33, 1, gen_random_uuid(), 't', null, now(), 0, now())");
+    }
+
+    /** One relay step of {@code shard} at {@code now} after a new tick, committed. */
+    private Void step(ShardProcessor processor, Ticks ticks, int shard, Instant now) throws Exception {
+        long latest;
+        try (var c = TestDb.connect()) {
+            assertThat(ticks.make(c, Duration.ZERO)).isTrue();
+            latest = ticks.latest(c).id();
+        }
+        try (var c = TestDb.connect()) {
+            ShardProcessor.prepareTransaction(c, config.batchTimeout());
+            processor.tryProcess(c, shard, latest, now);
+            c.commit();
+        }
+        return null;
+    }
+
+    /** Until a session waits for the lock of {@code shard}. */
+    private void awaitShardLockWaiter(int shard) throws Exception {
+        long deadline = System.nanoTime() + SECONDS.toNanos(10);
+        try (var c = TestDb.connect()) {
+            while (queryLong(c, "select count(*) from pg_locks where locktype = 'advisory' and not granted and"
+                    + " classid::bigint = " + Integer.toUnsignedLong(names.internalNamespace()) + " and objid = "
+                    + (TableNames.LOCK_SHARD_BASE + shard)) == 0) {
+                assertThat(System.nanoTime()).as("a waiter for the shard's lock").isLessThan(deadline);
+                Thread.sleep(10);
+            }
+        }
+    }
+
+    private List<Long> ids(String table) throws SQLException {
+        return longs("select id from " + table + " order by id");
+    }
+
+    private List<String> payloads(String table) throws SQLException {
+        var all = new ArrayList<String>();
+        try (var c = TestDb.connect(); var st = c.createStatement();
+                var rs = st.executeQuery("select payload from " + table + " order by id")) {
+            while (rs.next()) {
+                all.add(new String(rs.getBytes(1), UTF_8));
+            }
+        }
+        return all;
     }
 
     private long letter(String topic, String key) throws SQLException {

@@ -5,7 +5,7 @@ import java.util.Collection;
 
 /**
  * The morning tool, for any code of the service (an endpoint, a job, a test): the outbox's status, dead letters, kept
- * orphans and the xid-regression recovery. Every call manages its own transactions, so it fails with
+ * orphans, the xid-regression recovery and waiting records. Every call manages its own transactions, so it fails with
  * {@link IllegalStateException} inside the application's transaction; any instance gives the same answers, as all act
  * on the shared database.
  *
@@ -86,4 +86,25 @@ public interface OutboxAdmin {
      *     retries, finishing it first
      */
     long recoverXidRegression();
+
+    /**
+     * Gives up on the records of {@code topic} that wait for an instance able to handle them ({@link Outcome.Waiting}),
+     * of {@code key} only unless it is null: for a rollback that is final. The whole key goes, so no record of it runs
+     * without the one before it: each waiting head, the records of its key queued behind it and its key's requeued
+     * records become dead letters, kept (the dead-letter hook is not asked), with the error {@code "abandoned: "} +
+     * {@code reason}; an unkeyed head goes alone. Records of the key sent later are delivered, ahead of the abandoned
+     * ones. Returns the keys (an unkeyed head counts as one) and records moved; with {@code dryRun}, those it would
+     * move, moving nothing.
+     *
+     * <p>Shard by shard, in chunks of 1 000 keys, one transaction each under the shard's lock, the one a relay step
+     * holds while it runs: it waits up to {@code outbox.relay.batchTimeout} + 5 s for it, then fails with
+     * {@link IllegalStateException} "... busy, retry", the chunks before it staying done; calling again goes on. A dry
+     * run takes no lock.
+     *
+     * @throws IllegalArgumentException for a blank {@code topic} or {@code reason}
+     */
+    Abandoned abandonWaiting(String topic, @Nullable byte[] key, String reason, boolean dryRun);
+
+    /** What {@link #abandonWaiting} moved, or would move: the waiting keys and all their records. */
+    record Abandoned(long keys, long records) {}
 }

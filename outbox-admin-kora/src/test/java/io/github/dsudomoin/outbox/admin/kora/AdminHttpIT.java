@@ -81,7 +81,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
                 outbox {
                   table = %s
                   shards = 2
-                  relay.enabled = false
+                  relay { enabled = false, batchTimeout = 100ms } # a busy shard is waited for 5.1 s
                   partitions { xidsPerPartition = 1000000, premake = 2 }
                 }
                 httpServer { publicApiHttpPort = %d, privateApiHttpPort = %d }
@@ -93,8 +93,9 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
     @Test
     void statusMapsEveryField() throws Exception {
         execute("insert into " + names().halt() + " (max_tick_xmax) values ('1')");
-        execute("insert into " + names().retry() + " (id, shard, message_id, topic, created_at) values"
-                + " (1, 0, gen_random_uuid(), 't', now()), (2, 0, gen_random_uuid(), 't', now())");
+        execute("insert into " + names().retry() + " (id, shard, message_id, topic, created_at, waiting_since) values"
+                + " (1, 0, gen_random_uuid(), 't', now(), now() - interval '1 hour'),"
+                + " (2, 0, gen_random_uuid(), 't', now(), null)");
         letter(1, "a", "1", "boom", T0, KEPT);
         letter(2, "a", "2", "boom", T0, KEPT);
         letter(3, "a", "3", "boom", T0, PENDING);
@@ -109,21 +110,29 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
             }
         }
         execute("delete from " + names().instance());
-        execute("insert into " + names().instance() + " (instance_id, shards, last_seen, hook_active) values"
-                + " ('host-b/7/0000beef', 2, '2026-01-15T10:00:00Z', true)");
+        execute("insert into " + names().instance() + " (instance_id, shards, last_seen, hook_active, relay,"
+                + " contracts) values ('host-b/7/0000beef', 2, '2026-01-15T10:00:00Z', true, true,"
+                + " '{\"t2\": 2, \"t1\": 1}'), ('host-c/8/0000cafe', 2, '2026-01-15T10:00:00Z', false, false, null)");
 
         var response = call("GET", "/status", null);
 
         assertJson(response, 200);
+        var oldest = Pattern.compile("\"waitingOldestSeconds\":([-+0-9.E]+)").matcher(response.body());
+        assertThat(oldest.find()).isTrue();
+        assertThat(Double.parseDouble(oldest.group(1))).isBetween(3600.0, 3660.0);
         assertThat(response.body().replaceAll("\"maintenanceSinceSuccessSeconds\":[-+0-9.E]+",
-                "\"maintenanceSinceSuccessSeconds\":S")).isEqualTo("{\"halted\":true,\"lagSeconds\":0.0,"
-                + "\"retrySize\":2,\"parkedSize\":0,\"deadLetters\":[{\"topic\":\"a\",\"status\":\"kept\",\"count\":2},"
+                "\"maintenanceSinceSuccessSeconds\":S").replace(oldest.group(), "\"waitingOldestSeconds\":W"))
+                .isEqualTo("{\"halted\":true,\"lagSeconds\":0.0,\"retrySize\":2,\"parkedSize\":0,"
+                + "\"waitingSize\":1,\"waitingOldestSeconds\":W,"
+                + "\"deadLetters\":[{\"topic\":\"a\",\"status\":\"kept\",\"count\":2},"
                 + "{\"topic\":\"a\",\"status\":\"pending\",\"count\":1},"
                 + "{\"topic\":\"b\",\"status\":\"scheduled\",\"count\":1}],"
                 + "\"orphans\":[{\"table\":\"" + orphan + "\",\"kind\":\"foreign\"}],\"tailOverflow\":false,"
                 + "\"premade\":2,\"maintenanceSinceSuccessSeconds\":S,\"shards\":2,\"instances\":[{\"id\":"
                 + "\"host-b/7/0000beef\",\"shards\":2,\"lastSeen\":\"2026-01-15T10:00:00.000Z\","
-                + "\"hookActive\":true}]}");
+                + "\"hookActive\":true,\"relay\":true,\"contracts\":{\"t1\":1,\"t2\":2}},"
+                + "{\"id\":\"host-c/8/0000cafe\",\"shards\":2,\"lastSeen\":\"2026-01-15T10:00:00.000Z\","
+                + "\"hookActive\":false,\"relay\":false}]}");
     }
 
     @Test
@@ -353,6 +362,73 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         assertThat(call("GET", "/status", null).body()).startsWith("{\"halted\":false,");
     }
 
+    @Test
+    void abandonsWaitingKeysWhole() throws Exception {
+        seedWaiting();
+
+        var dryRun = call("POST", "/waiting/abandon",
+                "{\"topic\":\"t\",\"reason\":\"rolled back\",\"dryRun\":true}");
+        assertJson(dryRun, 200);
+        assertThat(dryRun.body()).isEqualTo("{\"keys\":3,\"records\":5}");
+        assertThat(deadIds()).as("a dry run moves nothing").isEmpty();
+
+        var oneKey = call("POST", "/waiting/abandon",
+                "{\"topic\":\"t\",\"key\":\"ключ\",\"reason\":\"rolled back\"}");
+        assertJson(oneKey, 200);
+        assertThat(oneKey.body()).as("the key's UTF-8 bytes").isEqualTo("{\"keys\":1,\"records\":1}");
+        assertThat(deadIds()).containsExactly(30L);
+
+        var rest = call("POST", "/waiting/abandon",
+                "{\"topic\":\"t\",\"reason\":\"rolled back\",\"dryRun\":false}");
+        assertThat(rest.body()).isEqualTo("{\"keys\":2,\"records\":4}");
+        assertThat(deadIds()).containsExactly(5L, 10L, 11L, 20L, 30L);
+        try (var c = TestDb.connect()) {
+            assertThat(queryString(c, "select string_agg(distinct status || ' ' || error, ', ') from "
+                    + names().dead())).isEqualTo("kept abandoned: rolled back");
+            assertThat(queryLong(c, "select count(*) from " + names().retry())).isZero();
+        }
+    }
+
+    /** A typo must never widen the call: {@code kye} ignored would abandon every key of the topic. */
+    @Test
+    void abandonRefusesBadInput() throws Exception {
+        seedWaiting();
+
+        for (var body : List.of("{\"reason\":\"r\"}", "{\"topic\":\"t\"}", "{\"topic\":\"t\",\"reason\":\" \"}",
+                "{\"topic\":\"\",\"reason\":\"r\"}", "{\"topic\":\"t\",\"kye\":\"k\",\"reason\":\"r\"}",
+                "{\"topic\":\"t\",\"reason\":\"r\",\"dryRun\":\"no\"}", "{\"topic\":1,\"reason\":\"r\"}", "null",
+                "[]")) {
+            var response = call("POST", "/waiting/abandon", body);
+
+            assertJson(response, 400);
+            assertThat(response.body()).as(body).startsWith("{\"message\":\"");
+        }
+        assertThat(call("POST", "/waiting/abandon", "{\"topic\":\"t\",\"kye\":\"k\",\"reason\":\"r\"}").body())
+                .startsWith("{\"message\":\"unknown field 'kye'");
+        assertThat(deadIds()).isEmpty();
+    }
+
+    /** The shard's lock, held as a relay step holds it, is waited for batchTimeout + 5 s: then a 409, retry. */
+    @Test
+    void abandonOnABusyShardIs409() throws Exception {
+        seedWaiting();
+
+        try (var step = TestDb.connect()) {
+            step.setAutoCommit(false);
+            TestSql.execute(step, "select pg_advisory_xact_lock(" + names().internalNamespace() + ", "
+                    + TableNames.LOCK_SHARD_BASE + ")");
+
+            var busy = call("POST", "/waiting/abandon", "{\"topic\":\"t\",\"reason\":\"r\"}");
+
+            assertJson(busy, 409);
+            assertThat(busy.body()).startsWith("{\"message\":\"shard 0 of ").contains(" is busy, retry");
+            step.rollback();
+        }
+        assertThat(deadIds()).isEmpty();
+        assertThat(call("POST", "/waiting/abandon", "{\"topic\":\"t\",\"reason\":\"r\"}").body())
+                .isEqualTo("{\"keys\":3,\"records\":5}");
+    }
+
     /** What the generated server or the call refuses for its input answers 400 before anything runs. */
     @Test
     void badInputIs400() throws Exception {
@@ -442,6 +518,20 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
             ps.executeUpdate();
         }
         return id;
+    }
+
+    /**
+     * Topic t, shard 0: waiting head 10 of key k with follower 11 and parked row 5; unkeyed waiting head 20; waiting
+     * head 30 of key ключ.
+     */
+    private void seedWaiting() throws SQLException {
+        execute("insert into " + names().retry() + " (id, shard, message_id, topic, key, created_at, next_attempt_at,"
+                + " waiting_since) values (10, 0, gen_random_uuid(), 't', 'k', now(), now(), now()),"
+                + " (11, 0, gen_random_uuid(), 't', 'k', now(), null, null),"
+                + " (20, 0, gen_random_uuid(), 't', null, now(), now(), now()),"
+                + " (30, 0, gen_random_uuid(), 't', convert_to('ключ', 'UTF8'), now(), now(), now())");
+        execute("insert into " + names().parked() + " (id, shard, message_id, topic, key, created_at, due_at)"
+                + " values (5, 0, gen_random_uuid(), 't', 'k', now(), now())");
     }
 
     private UUID messageId(long letter) throws SQLException {

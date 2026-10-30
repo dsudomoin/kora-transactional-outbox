@@ -22,8 +22,11 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
@@ -40,6 +43,8 @@ import org.slf4j.LoggerFactory;
  * interpolated; user text is logged with control characters escaped ({@link #printable}). {@code restoreOrphan} and
  * {@code recoverXidRegression} hold the maintenance lock for their whole run, so maintenance's steps never run beside
  * them. The reads, {@code status} and the dead-letter find and count, give up on a statement after 60 s (57014).
+ * {@code abandonWaiting} moves each chunk under its shard's lock, which every relay step holds while it writes the
+ * retry and parked tables, so no step adds a record to a key it moves or makes a key it reads wait meanwhile.
  */
 public final class PgOutboxAdmin implements OutboxAdmin {
 
@@ -65,10 +70,16 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private final XidRecovery recovery;
     final OrphanRestore orphanRestore; // for a test's seam
     private final String dead;
+    /** Moves, then counts, the rows of a chunk's waiting heads: of the retry table, then of the parked one. */
+    private final List<String> abandon;
+    private final List<String> countAbandoned;
+    private final String waitingOldest;
     /** How long a call under the maintenance lock waits for a maintenance run in progress; shorter in tests. */
     Duration maintenanceWait = Duration.ofSeconds(60);
     /** Each statement's limit in {@code status} and the dead-letter reads; shorter in tests. */
     Duration readTimeout = Duration.ofSeconds(60);
+    /** How long {@code abandonWaiting} waits for a relay step holding a shard: batchTimeout + 5 s; shorter in tests. */
+    Duration shardWait;
     /** For tests: runs after each bulk chunk's commit. */
     @Nullable
     SqlConsumer<Connection> afterChunk;
@@ -96,12 +107,22 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         this.wakeRelay = wakeRelay;
         this.rows = new DeadLetters(names, config);
         this.partitions = new XidPartitions(names, config.partitions());
-        this.retries = new RetryStore(names, false); // counts rows only, writes no dead row
+        this.retries = new RetryStore(names, false); // its dead rows are kept: the abandoned ones
         this.parked = new ParkedStore(names, retries);
         this.recovery = new XidRecovery(names, config);
         this.orphanRestore = new OrphanRestore(
                 names, new Resender(names, config), XidPartitions.lockWait(config.partitions()));
         this.dead = names.dead();
+        this.shardWait = Maintenance.quiesceTimeout(config);
+        // the rows of a chunk's waiting heads: each head by id (in the retry table), and every row of its key
+        var ofHeads = " where shard = ? and topic = ? and (id = any(?) or key = any(?))";
+        var tables = List.of(names.retry(), names.parked());
+        this.abandon = tables.stream().map(t -> retries.toDead("delete from " + t + ofHeads + " returning "
+                + RetryStore.COLUMNS + ", attempts", "attempts", "?")).toList();
+        this.countAbandoned = tables.stream().map(t -> "select count(*) from " + t + ofHeads).toList();
+        // the relay's clock set waiting_since: it may be ahead of the database's
+        this.waitingOldest = "select greatest(coalesce(extract(epoch from now() - min(waiting_since)), 0), 0)::float8"
+                + " from " + names.retry() + " where waiting_since is not null";
     }
 
     @Override
@@ -117,6 +138,8 @@ public final class PgOutboxAdmin implements OutboxAdmin {
                     maintenance.lagSeconds(c),
                     retries.size(c),
                     parked.size(c),
+                    RetryStore.count(c, "select count(*) from " + names.retry() + " where waiting_since is not null"),
+                    queryDouble(c, waitingOldest),
                     deadLetterCounts(c),
                     partitions.orphans(c).stream().map(o -> new OutboxStatus.Orphan(o.table(), o.setAside()
                             ? OrphanKind.SET_ASIDE : o.ours() ? OrphanKind.DETACHED_BY_LIBRARY : OrphanKind.FOREIGN))
@@ -134,11 +157,23 @@ public final class PgOutboxAdmin implements OutboxAdmin {
 
     private List<OutboxStatus.Instance> instances(Connection c) throws SQLException {
         var instances = new ArrayList<OutboxStatus.Instance>();
-        try (var st = c.createStatement(); var rs = st.executeQuery("select instance_id, shards, last_seen, hook_active"
-                + " from " + names.instance() + " order by instance_id")) {
+        try (var st = c.createStatement(); var rs = st.executeQuery("select instance_id, shards, last_seen,"
+                + " hook_active, relay, contracts is not null, array(select key from jsonb_each(contracts) order by"
+                + " key), array(select value::int from jsonb_each(contracts) order by key) from " + names.instance()
+                + " order by instance_id")) {
             while (rs.next()) {
+                Map<String, Integer> contracts = null;
+                if (rs.getBoolean(6)) {
+                    var topics = (String[]) rs.getArray(7).getArray();
+                    var versions = (Integer[]) rs.getArray(8).getArray();
+                    contracts = new HashMap<>();
+                    for (int i = 0; i < topics.length; i++) {
+                        contracts.put(topics[i], versions[i]);
+                    }
+                }
                 instances.add(new OutboxStatus.Instance(rs.getString(1), rs.getInt(2),
-                        rs.getObject(3, OffsetDateTime.class).toInstant(), rs.getBoolean(4)));
+                        rs.getObject(3, OffsetDateTime.class).toInstant(), rs.getBoolean(4), rs.getBoolean(5),
+                        contracts));
             }
         }
         return instances;
@@ -317,6 +352,149 @@ public final class PgOutboxAdmin implements OutboxAdmin {
             wakeRelay.run();
         }
         return sent.get();
+    }
+
+    /**
+     * The shards with a head of {@code topic} (and {@code key}) waiting when the call began, each chunk after chunk
+     * ({@link #abandonChunk}) until one finds fewer than {@link #CHUNK} heads; one INFO line, or a WARN on a failure.
+     */
+    @Override
+    public Abandoned abandonWaiting(String topic, @Nullable byte[] key, String reason, boolean dryRun) {
+        requireOwnTransactions();
+        if (topic == null || topic.isBlank()) {
+            throw new IllegalArgumentException("name the topic whose waiting records to abandon");
+        }
+        if (reason == null || reason.isBlank()) {
+            throw new IllegalArgumentException("give a reason to abandon waiting records: it goes into the log line"
+                    + " of the call and their dead letters' error");
+        }
+        var call = printable("abandonWaiting(" + topic + ", " + (key == null ? null : HexFormat.of().formatHex(key))
+                + ", " + reason + ", " + (dryRun ? "dry run" : "for real") + ")");
+        var error = "abandoned: " + reason;
+        long keys = 0;
+        long records = 0;
+        try (var c = db.newConnection()) {
+            c.setAutoCommit(true);
+            for (int shard : waitingShards(c, topic, key)) {
+                long after = Long.MIN_VALUE;
+                while (true) {
+                    long above = after;
+                    var chunk = dryRun ? read(c, tx -> abandonChunk(tx, shard, topic, key, above, true, error))
+                            : inTx(c, tx -> abandonChunk(tx, shard, topic, key, above, false, error));
+                    keys += chunk.claimed();
+                    records += chunk.done();
+                    if (chunk.claimed() < CHUNK) {
+                        break;
+                    }
+                    after = chunk.lastId();
+                }
+            }
+        } catch (SQLException | RuntimeException e) {
+            log.warn("outbox admin {} on {} failed after {} keys ({} records) {}; calling again goes on: {}", call,
+                    names.base(), keys, records, dryRun ? "counted" : "moved, which stay dead letters",
+                    printable(e.toString()));
+            throw e instanceof SQLException s ? db.translate(s) : (RuntimeException) e;
+        }
+        var abandoned = new Abandoned(keys, records);
+        log.info("outbox admin {} on {} returned {}", call, names.base(), abandoned);
+        return abandoned;
+    }
+
+    private List<Integer> waitingShards(Connection c, String topic, @Nullable byte[] key) throws SQLException {
+        try (var ps = c.prepareStatement("select distinct shard from " + names.retry() + " where topic = ? and"
+                + " waiting_since is not null" + (key == null ? "" : " and key = ?") + " order by shard")) {
+            ps.setString(1, topic);
+            if (key != null) {
+                ps.setBytes(2, key);
+            }
+            var shards = new ArrayList<Integer>();
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    shards.add(rs.getInt(1));
+                }
+            }
+            return shards;
+        }
+    }
+
+    /**
+     * Up to {@link #CHUNK} heads of {@code shard} waiting with an id above {@code after}, read after the shard's lock
+     * ({@link #lockShard}), so after any relay step that held it: each with every row of its key in the retry and
+     * parked tables (an unkeyed head alone) moved to the dead table with {@code error}; with {@code dryRun}, counted,
+     * without the lock.
+     */
+    private Chunk abandonChunk(Connection tx, int shard, String topic, @Nullable byte[] key, long after,
+            boolean dryRun, String error) throws SQLException {
+        if (!dryRun) {
+            lockShard(tx, shard);
+        }
+        var ids = new ArrayList<Long>();
+        var keys = new ArrayList<byte[]>();
+        try (var ps = tx.prepareStatement("select id, key from " + names.retry() + " where shard = ? and topic = ?"
+                + " and waiting_since is not null" + (key == null ? "" : " and key = ?") + " and id > ? order by id"
+                + " limit " + CHUNK)) {
+            int i = 1;
+            ps.setShort(i++, (short) shard);
+            ps.setString(i++, topic);
+            if (key != null) {
+                ps.setBytes(i++, key);
+            }
+            ps.setLong(i, after);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    ids.add(rs.getLong(1));
+                    var headKey = rs.getBytes(2);
+                    if (headKey != null) {
+                        keys.add(headKey);
+                    }
+                }
+            }
+        }
+        if (ids.isEmpty()) {
+            return new Chunk(0, after, 0);
+        }
+        var idArray = tx.createArrayOf("bigint", ids.toArray());
+        var keyArray = tx.createArrayOf("bytea", keys.toArray(byte[][]::new));
+        long rows = 0;
+        for (var sql : dryRun ? countAbandoned : abandon) {
+            try (var ps = tx.prepareStatement(sql)) {
+                ps.setShort(1, (short) shard);
+                ps.setString(2, topic);
+                ps.setArray(3, idArray);
+                ps.setArray(4, keyArray);
+                if (dryRun) {
+                    try (var rs = ps.executeQuery()) {
+                        rs.next();
+                        rows += rs.getLong(1);
+                    }
+                } else {
+                    ps.setString(5, RetryStore.errorText(error));
+                    rows += ps.executeUpdate();
+                }
+            }
+        }
+        return new Chunk(ids.size(), ids.get(ids.size() - 1), rows);
+    }
+
+    /**
+     * The shard's lock, the one every relay step holds ({@code pg_advisory_xact_lock(internalNs, LOCK_SHARD_BASE +
+     * shard)}), waited for at most {@link #shardWait}; held until the transaction ends.
+     */
+    private void lockShard(Connection tx, int shard) throws SQLException {
+        execute(tx, "set local lock_timeout = " + shardWait.toMillis());
+        try (var ps = tx.prepareStatement("select pg_advisory_xact_lock(?, ?)")) {
+            ps.setInt(1, names.internalNamespace());
+            ps.setInt(2, TableNames.LOCK_SHARD_BASE + shard);
+            ps.execute();
+        } catch (SQLException e) {
+            if (!LOCK_NOT_AVAILABLE.equals(e.getSQLState())) {
+                throw e;
+            }
+            throw new IllegalStateException("shard " + shard + " of " + names.base() + " is busy, retry: a relay step"
+                    + " held its lock pg_advisory_xact_lock(" + names.internalNamespace() + ", "
+                    + (TableNames.LOCK_SHARD_BASE + shard) + ") for longer than " + shardWait.toMillis() / 1e3 + " s",
+                    e);
+        }
     }
 
     /**
@@ -552,6 +730,13 @@ public final class PgOutboxAdmin implements OutboxAdmin {
         try (var st = c.createStatement(); var rs = st.executeQuery(sql)) {
             rs.next();
             return rs.getBoolean(1);
+        }
+    }
+
+    private static double queryDouble(Connection c, String sql) throws SQLException {
+        try (var st = c.createStatement(); var rs = st.executeQuery(sql)) {
+            rs.next();
+            return rs.getDouble(1);
         }
     }
 

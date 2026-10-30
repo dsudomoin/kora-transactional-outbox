@@ -4,6 +4,7 @@ import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.OutboxAdmin;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiControllerModule;
 import io.github.dsudomoin.outbox.admin.kora.api.OutboxAdminApiDelegate;
+import io.github.dsudomoin.outbox.admin.kora.model.AbandonWaiting;
 import io.github.dsudomoin.outbox.admin.kora.model.DeadLetterStatus;
 import io.github.dsudomoin.outbox.admin.kora.model.Filter;
 import io.github.dsudomoin.outbox.admin.kora.model.ModelError;
@@ -87,5 +88,14 @@ public interface OutboxAdminHttpModule extends OutboxAdminApiControllerModule {
     default JsonReader<Filter> outboxAdminFilterJsonReader(JsonReader<OffsetDateTime> times,
             JsonReader<DeadLetterStatus> statuses) {
         return RequestReaders.filter(times, statuses);
+    }
+
+    /**
+     * Internal type, unstable: for the adapters of this repository. Refuses a field the contract does not name, which
+     * the generated reader would skip: a typo of {@code key} would abandon every key of the topic.
+     */
+    @InternalApi
+    default JsonReader<AbandonWaiting> outboxAdminAbandonWaitingJsonReader() {
+        return RequestReaders.abandonWaiting();
     }
 }

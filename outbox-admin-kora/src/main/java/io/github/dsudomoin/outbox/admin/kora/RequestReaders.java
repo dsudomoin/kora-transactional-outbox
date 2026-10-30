@@ -3,6 +3,7 @@ package io.github.dsudomoin.outbox.admin.kora;
 import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonToken;
+import io.github.dsudomoin.outbox.admin.kora.model.AbandonWaiting;
 import io.github.dsudomoin.outbox.admin.kora.model.DeadLetterStatus;
 import io.github.dsudomoin.outbox.admin.kora.model.Filter;
 import io.github.dsudomoin.outbox.admin.kora.model.Selection;
@@ -67,6 +68,33 @@ final class RequestReaders {
         };
     }
 
+    static JsonReader<AbandonWaiting> abandonWaiting() {
+        return parser -> {
+            if (!startObject(parser)) {
+                return null;
+            }
+            String topic = null;
+            String key = null;
+            String reason = null;
+            Boolean dryRun = null;
+            for (var field = parser.nextFieldName(); field != null; field = parser.nextFieldName()) {
+                parser.nextToken();
+                switch (field) {
+                    case "topic" -> topic = string(parser, field);
+                    case "key" -> key = string(parser, field);
+                    case "reason" -> reason = string(parser, field);
+                    case "dryRun" -> dryRun = bool(parser, field);
+                    default -> throw unknown(parser, field, "AbandonWaiting", "topic, key, reason, dryRun");
+                }
+            }
+            if (topic == null || reason == null) {
+                throw new JsonParseException(parser, "missing field '" + (topic == null ? "topic" : "reason")
+                        + "' in AbandonWaiting");
+            }
+            return new AbandonWaiting(topic, key, reason, dryRun);
+        };
+    }
+
     /** False for {@code null}; true at the start of an object. */
     private static boolean startObject(JsonParser parser) throws IOException {
         var token = parser.currentToken();
@@ -85,6 +113,17 @@ final class RequestReaders {
             case VALUE_STRING -> parser.getText();
             case VALUE_NULL -> null;
             default -> throw new JsonParseException(parser, "Expecting a string for field '" + field + "', got "
+                    + parser.currentToken());
+        };
+    }
+
+    @Nullable
+    private static Boolean bool(JsonParser parser, String field) throws IOException {
+        return switch (parser.currentToken()) {
+            case VALUE_TRUE -> true;
+            case VALUE_FALSE -> false;
+            case VALUE_NULL -> null;
+            default -> throw new JsonParseException(parser, "Expecting a boolean for field '" + field + "', got "
                     + parser.currentToken());
         };
     }

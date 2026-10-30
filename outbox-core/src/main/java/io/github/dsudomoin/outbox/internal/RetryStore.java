@@ -78,7 +78,7 @@ public final class RetryStore {
         postpone = "update " + retry + " set next_attempt_at = ? where id = ?";
         rescheduleWaiting = "update " + retry + " set next_attempt_at = ?, last_error = ?,"
                 + " waiting_since = coalesce(waiting_since, ?) where id = ?";
-        moveToDead = toDead("delete from " + retry + " where id = ? returning " + COLUMNS + ", last_error",
+        moveToDead = toDead("delete from " + retry + " where id = ? returning " + COLUMNS + ", last_error", "?",
                 "coalesce(?, last_error)");
         minDue = "select min(next_attempt_at) from " + retry + " where shard = ? and next_attempt_at is not null";
         size = "select count(*) from " + retry;
@@ -86,13 +86,13 @@ public final class RetryStore {
     }
 
     /**
-     * Moves the row {@code delete} removes ({@code delete ... where id = ? returning} {@link #COLUMNS} and more) to the
-     * dead table: parameter 2 its attempts, {@code error} its error text, an expression over parameter 3 and the
-     * returned columns.
+     * Moves the rows {@code delete} removes ({@code delete ... returning} {@link #COLUMNS} and more) to the dead table:
+     * {@code attempts} their attempts and {@code error} their error text, expressions over the returned columns and
+     * the parameters after those of {@code delete}.
      */
-    String toDead(String delete, String error) {
-        return "with moved as (" + delete + ") insert into " + deadColumns() + " select " + COLUMNS + ", ?, " + error
-                + ", " + deadState("moved.message_id") + " from moved";
+    String toDead(String delete, String attempts, String error) {
+        return "with moved as (" + delete + ") insert into " + deadColumns() + " select " + COLUMNS + ", " + attempts
+                + ", " + error + ", " + deadState("moved.message_id") + " from moved";
     }
 
     private String deadColumns() {

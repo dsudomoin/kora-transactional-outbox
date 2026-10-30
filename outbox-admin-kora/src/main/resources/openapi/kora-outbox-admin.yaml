@@ -3,14 +3,14 @@ info:
   title: kora-outbox admin
   version: v1
   description: >-
-    The kora-outbox admin API: status, dead letters, orphans and the xid-regression recovery, each call acting on the
-    shared database, so any instance answers the same. No security scheme is declared: access is decided by the
-    service's OutboxAdminAuthorizer, which runs before every operation and answers 401 or 403 with an Error (500,
-    "authorization failed", when it fails). A call refused for its input answers 400, a request body with a field
-    this contract does not name included; one that cannot run in the outbox's current state (maintenance running, no
-    xid regression to recover) answers 409; any other failure of an allowed call answers 500 with the failure's
-    message, or the HTTP server's own status for one it raised itself (a 503, say). Every one of them carries an
-    Error.
+    The kora-outbox admin API: status, dead letters, orphans, the xid-regression recovery and waiting records, each call
+    acting on the shared database, so any instance answers the same. No security scheme is declared: access is decided
+    by the service's OutboxAdminAuthorizer, which runs before every operation and answers 401 or 403 with an Error (500,
+    "authorization failed", when it fails). A call refused for its input answers 400, a request body with a field this
+    contract does not name included; one that cannot run in the outbox's current state (maintenance or a relay step
+    running, no xid regression to recover) answers 409; any other failure of an allowed call answers 500 with the
+    failure's message, or the HTTP server's own status for one it raised itself (a 503, say). Every one of them carries
+    an Error.
 paths:
   /kora-outbox/admin/v1/status:
     get:
@@ -230,6 +230,41 @@ paths:
           $ref: '#/components/responses/Conflict'
         '500':
           $ref: '#/components/responses/ServerError'
+  /kora-outbox/admin/v1/waiting/abandon:
+    post:
+      operationId: abandonWaiting
+      tags: [OutboxAdmin]
+      summary: Moves the records of a topic that wait for an instance able to handle them to dead letters
+      description: >-
+        For a rollback that is final. The whole key goes, so no record of it runs without the one before it: each
+        waiting head, the records of its key queued behind it and its key's requeued records become kept dead letters
+        with the error "abandoned: <reason>"; an unkeyed head goes alone. Records of the key sent later are delivered,
+        ahead of the abandoned ones. Works shard by shard in chunks of 1 000 keys, each under the shard's lock, which
+        a relay step holds while it runs: waits up to outbox.relay.batchTimeout + 5 s for it, then answers 409: retry,
+        the chunks before it staying done.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AbandonWaiting'
+      responses:
+        '200':
+          description: What was moved, or with dryRun would be
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Abandoned'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/ServerError'
 components:
   parameters:
     Topic:
@@ -306,8 +341,8 @@ components:
   schemas:
     Status:
       type: object
-      required: [halted, lagSeconds, retrySize, parkedSize, deadLetters, orphans, tailOverflow, premade, shards,
-        instances]
+      required: [halted, lagSeconds, retrySize, parkedSize, waitingSize, waitingOldestSeconds, deadLetters, orphans,
+        tailOverflow, premade, shards, instances]
       properties:
         halted:
           type: boolean
@@ -324,6 +359,14 @@ components:
           type: integer
           format: int64
           description: Rows in <base>_parked, 0 without that table
+        waitingSize:
+          type: integer
+          format: int64
+          description: Retry heads waiting for an instance able to handle them
+        waitingOldestSeconds:
+          type: number
+          format: double
+          description: Since the oldest of them began to wait, 0 when none waits
         deadLetters:
           type: array
           description: Dead letters by topic and status
@@ -362,7 +405,7 @@ components:
             $ref: '#/components/schemas/Instance'
     Instance:
       type: object
-      required: [id, shards, lastSeen, hookActive]
+      required: [id, shards, lastSeen, hookActive, relay]
       properties:
         id:
           type: string
@@ -377,6 +420,15 @@ components:
         hookActive:
           type: boolean
           description: It has an active dead-letter hook
+        relay:
+          type: boolean
+          description: The relay runs there
+        contracts:
+          type: object
+          description: The highest contract version it reads, by topic; absent when unknown, empty when it reports none
+          additionalProperties:
+            type: integer
+            format: int32
     DeadLetterCount:
       type: object
       required: [topic, status, count]
@@ -523,6 +575,36 @@ components:
           description: Exclusive
         status:
           $ref: '#/components/schemas/DeadLetterStatus'
+    AbandonWaiting:
+      type: object
+      description: A field not named here is refused
+      additionalProperties: false
+      required: [topic, reason]
+      properties:
+        topic:
+          type: string
+        key:
+          type: string
+          description: Only this key, as its UTF-8 bytes; absent, every key of the topic, unkeyed records included
+        reason:
+          type: string
+          description: Why, logged with the call and put into the dead letters' error
+        dryRun:
+          type: boolean
+          default: false
+          description: Count what would be moved, moving nothing
+    Abandoned:
+      type: object
+      required: [keys, records]
+      properties:
+        keys:
+          type: integer
+          format: int64
+          description: Waiting keys, an unkeyed head counting as one
+        records:
+          type: integer
+          format: int64
+          description: Their records, the waiting heads included
     Count:
       type: object
       required: [count]

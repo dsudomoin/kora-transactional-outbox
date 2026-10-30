@@ -3,13 +3,16 @@ package io.github.dsudomoin.outbox;
 import jakarta.annotation.Nullable;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 /**
  * The outbox at a glance ({@link OutboxAdmin#status()}), read from the database at the call, so every instance gives
  * the same answer. {@code halted}: an xid-regression halt is recorded, and no relay delivers; {@code lagSeconds}: from
  * the tick the slowest shard with rows to relay stands at to the latest, 0 when every shard is caught up
  * ({@code outbox.shard.lag}); {@code retrySize}: rows of blocked keys waiting for a retry ({@code outbox.retry.size});
- * {@code parkedSize}: rows in {@code <base>_parked}; {@code deadLetters}: dead letters by topic and status;
+ * {@code parkedSize}: rows in {@code <base>_parked}; {@code waitingSize}: retry heads waiting for an instance that can
+ * handle them ({@code outbox.waiting.size}); {@code waitingOldestSeconds}: since the oldest of them began to wait, 0
+ * when none waits ({@code outbox.waiting.oldest}); {@code deadLetters}: dead letters by topic and status;
  * {@code orphans}: standalone ranges whose rows lie outside the outbox, which the relay cannot deliver;
  * {@code tailOverflow}: rows went to the partition tail ({@code outbox.partitions.overflow}); {@code premade}: ranges
  * ahead of the current xid ({@code outbox.partitions.premade}); {@code xidsLeft}: xids before inserts fail, null while
@@ -24,6 +27,8 @@ public record OutboxStatus(
         double lagSeconds,
         long retrySize,
         long parkedSize,
+        long waitingSize,
+        double waitingOldestSeconds,
         List<DeadLetterCount> deadLetters,
         List<Orphan> orphans,
         boolean tailOverflow,
@@ -41,9 +46,17 @@ public record OutboxStatus(
 
     /**
      * A running instance, by its heartbeat: {@code id} {@code <host>/<pid>/<8 hex>}, its shard count, when it was last
-     * seen (database clock, every {@code maintenanceInterval}) and whether it has an active dead-letter hook.
+     * seen (database clock, every {@code maintenanceInterval}), whether it has an active dead-letter hook, whether the
+     * relay runs there, and {@code contracts}: the highest contract version it reads, by topic, null when unknown,
+     * empty when it reports none.
      */
-    public record Instance(String id, int shards, Instant lastSeen, boolean hookActive) {}
+    public record Instance(String id, int shards, Instant lastSeen, boolean hookActive, boolean relay,
+            @Nullable Map<String, Integer> contracts) {
+
+        public Instance {
+            contracts = contracts == null ? null : Map.copyOf(contracts);
+        }
+    }
 
     public record DeadLetterCount(String topic, DeadLetter.Status status, long count) {}
 

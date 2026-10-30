@@ -115,6 +115,7 @@ package io.github.dsudomoin.outbox {
   }
 
   public interface OutboxAdmin {
+    method public io.github.dsudomoin.outbox.OutboxAdmin.Abandoned! abandonWaiting(String!, byte[]?, String!, boolean);
     method public long countDeadLetters(io.github.dsudomoin.outbox.DeadLetterFilter!);
     method public long discardDeadLetters(io.github.dsudomoin.outbox.DeadLetterFilter!);
     method public long discardDeadLetters(java.util.Collection<java.lang.Long!>!);
@@ -124,6 +125,12 @@ package io.github.dsudomoin.outbox {
     method public long redriveDeadLetters(java.util.Collection<java.lang.Long!>!);
     method public long restoreOrphan(String!, long);
     method public io.github.dsudomoin.outbox.OutboxStatus! status();
+  }
+
+  public static final class OutboxAdmin.Abandoned {
+    ctor public OutboxAdmin.Abandoned(long, long);
+    method public long keys();
+    method public long records();
   }
 
   public interface OutboxConfig {
@@ -340,7 +347,7 @@ package io.github.dsudomoin.outbox {
   }
 
   public final class OutboxStatus {
-    ctor public OutboxStatus(boolean, double, long, long, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.DeadLetterCount!>!, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.Orphan!>!, boolean, int, Long?, Double?, int, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.Instance!>!);
+    ctor public OutboxStatus(boolean, double, long, long, long, double, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.DeadLetterCount!>!, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.Orphan!>!, boolean, int, Long?, Double?, int, java.util.List<io.github.dsudomoin.outbox.OutboxStatus.Instance!>!);
     method public java.util.List<io.github.dsudomoin.outbox.OutboxStatus.DeadLetterCount!>! deadLetters();
     method public boolean halted();
     method public java.util.List<io.github.dsudomoin.outbox.OutboxStatus.Instance!>! instances();
@@ -352,6 +359,8 @@ package io.github.dsudomoin.outbox {
     method public long retrySize();
     method public int shards();
     method public boolean tailOverflow();
+    method public double waitingOldestSeconds();
+    method public long waitingSize();
     method public Long? xidsLeft();
   }
 
@@ -363,10 +372,12 @@ package io.github.dsudomoin.outbox {
   }
 
   public static final class OutboxStatus.Instance {
-    ctor public OutboxStatus.Instance(String!, int, java.time.Instant!, boolean);
+    ctor public OutboxStatus.Instance(String!, int, java.time.Instant!, boolean, boolean, java.util.Map<java.lang.String!,java.lang.Integer!>?);
+    method public java.util.Map<java.lang.String!,java.lang.Integer!>? contracts();
     method public boolean hookActive();
     method public String! id();
     method public java.time.Instant! lastSeen();
+    method public boolean relay();
     method public int shards();
   }
 

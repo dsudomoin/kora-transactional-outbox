@@ -62,7 +62,7 @@ public final class ParkedStore {
                 + " followers as (insert into " + retry + " (" + COLUMNS + ", attempts, requeues)"
                 + " select " + COLUMNS + ", attempts, requeues from moved where id <> ?)"
                 + " select count(*) from head";
-        toDead = retries.toDead("delete from " + parked + " where id = ? returning " + COLUMNS, "?");
+        toDead = retries.toDead("delete from " + parked + " where id = ? returning " + COLUMNS, "?", "?");
         fromRetry = "with moved as (delete from " + retry + " where id = ? returning " + COLUMNS + ", attempts)"
                 + " insert into " + parked + " (" + COLUMNS + ", attempts, requeues, due_at)"
                 + " select " + COLUMNS + ", attempts, ?, ? from moved";
