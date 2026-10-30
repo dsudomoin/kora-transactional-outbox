@@ -8,6 +8,12 @@ import java.util.UUID;
  * Writes messages in the caller's transaction; the relay hands them to the handler after commit. Messages with equal
  * topic and key are delivered in commit order, and in call order within one transaction. Each method returns the
  * message id (UUIDv7, Kafka header {@code outbox-message-id}).
+ *
+ * <p>Each method refuses a message before anything is written: with {@link OutboxIncompatibleContractException} when
+ * its {@code outbox-contract} header gives a version above 1 of its topic that a live relay instance cannot read; with
+ * {@link IllegalArgumentException} when that header gives no version (not a positive decimal int), and, in a runtime
+ * whose routes have no handler behind them, when no route claims its topic. {@code sendAll} writes none of its
+ * messages then.
  */
 public interface Outbox {
 

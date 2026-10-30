@@ -54,7 +54,8 @@ flowchart TD
 - [Обработка сбоев](#обработка-сбоев)
 - [Справочник по конфигурации](#справочник-по-конфигурации)
 - [Требования к Kafka](#требования-к-kafka)
-- [Эксплуатация](#эксплуатация): таблицы, партиции, админ-API и HTTP, dead letters, восстановление, деплои
+- [Эксплуатация](#эксплуатация): таблицы, партиции, админ-API и HTTP, dead letters, восстановление, деплои, версии
+  контрактов и откат
 - [Наблюдаемость](#наблюдаемость): метрики, трассы, Micrometer Observation, контракт по этапам
 - [Тестирование вашего сервиса](#тестирование-вашего-сервиса)
 - [Бенчмарки](#бенчмарки)
@@ -93,6 +94,10 @@ flowchart TD
   доставляются вовремя (см. [Заметки о дизайне](#заметки-о-дизайне)).
 - **Изоляция.** Сбойная пара (topic, key) блокирует только себя. Недоступная цель приостанавливает доставку и ничего не
   теряет. Одно плохое сообщение не может застопорить шард: его изолируют и откладывают в сторону.
+- **Откат релиза не теряет записей.** Запись, которую инстанс прочитать не может (версия контракта новее той, что
+  читает его типизированный обработчик, или топик, который не забрал ни один маршрут, когда обработчика за маршрутами
+  нет), ждёт инстанс, который может: попыток не тратит, в dead letters сама не уходит и держит порядок своего ключа
+  ([Версии контрактов и откат](#версии-контрактов-и-откат)).
 
 ### Не гарантируется
 
@@ -110,7 +115,8 @@ flowchart TD
 - **Асинхронная репликация.** После failover на реплику, где нет части коммитов, сообщения этих коммитов могут быть уже
   доставлены (фантомы). Их бизнес-данные тоже потеряны. Если это важно, используйте синхронную репликацию.
 - **Верхняя граница задержки.** Когда цель здорова, доставка быстрая (десятки миллисекунд), но во время сбоев, backoff
-  (`relay.retry.maxDelay`) или долгих вызовов обработчика верхней границы нет.
+  (`relay.retry.maxDelay`), долгих вызовов обработчика или пока запись ждёт релиз, который её прочитает, верхней
+  границы нет.
 - **Базы с несколькими пишущими узлами.** Блокировки шардов, тики и курсоры живут в primary той же базы, что и
   бизнес-данные; это и есть точка синхронизации всех инстансов, в каком бы ЦОДе они ни работали. Мульти-мастер и
   распределённые SQL-базы, где одну таблицу пишут несколько узлов, не поддерживаются, а split-brain двух primary ломает
@@ -150,6 +156,7 @@ flowchart LR
 | Остановка и рестарт | `close()` ждёт идущий шаг до `relay.shutdownTimeout`, и тот коммитится (после таймаута воркеры прерываются, а их записи доставляются снова); невыполненную работу берут другие инстансы или этот после старта, вместе с паузами и начатыми батчами | Ничего не теряется | `KafkaGuaranteesIT#aStoppedRuntimeLeavesItsBacklogToTheNext` (повторов в тесте не больше `batchSize × workers`), `OutboxRelayIT#shutdownWaitsForInFlightBatch`, `OutboxRelayIT#restartResumesPausedAndChunkedShards` |
 | Порядок по ключу | Блокировка ключа держится до коммита писателя, relay читает шард по тикам | Порядок коммитов для пары (topic, key), см. [Гарантируется](#гарантируется) | `PgOutboxIT#sameKeyIdsFollowCommitOrder`, `KafkaEndToEndIT#perKeyOrderSurvivesBrokerRestart` (брокер заморожен на 15 с), проверка порядка в каждом тесте `KafkaGuaranteesIT` |
 | Дубликаты | Повтор после отката шага, таймаута Kafka или остановки | At-least-once: дубликат несёт тот же `outbox-message-id`, inbox отсеивает его в своём scope | `KafkaGuaranteesIT#crashAfterTheKafkaSendBeforeTheCursorCommitRedelivers` (не меньше двух копий одного id), `KafkaEndToEndIT#perKeyOrderSurvivesBrokerRestart` (повторы допустимы, пропусков нет), `PgInboxIT#duplicateAcrossConcurrentConsumersOnlyOneWins`, `FrameworkFreeIT#inboxAcceptsAnIdOnce` |
+| Новая версия контракта события и откат релиза | Релиз, писавший v2, откатили на релиз, который читает только v1: записи v2 ждут, остальные ключи и записи v1 идут; вернувшийся релиз, который читает v2, их доставляет. Релиз, который пишет v2 рядом с живым релизом, читающим только v1, получает отказ при записи | Ничего не теряется и не уходит в dead letters, порядок ключа сохранён; отвергнутая запись не записана, её транзакция решает сама | `ContractReleasesIT#aRollbackPastTheTransitionReleaseWaitsUntilItReturns`, `ContractReleasesIT#theTransitionReleaseReadsWhatTheNewOneWritesAlsoAfterItsRollback`, `ContractReleasesIT#theNewContractIsRefusedWhileTheOldReleaseRelays`, `ContractReleasesIT#aRollingUpdateKeepsKeyOrderAndNeverWaits` |
 | Всё сразу | Конкурентные писатели с откатами, три relay, обработчик с временными и постоянными сбоями, requeue, падениями посреди батча и окнами недоступности цели, хук dead letters со случайными решениями, транзакция, открытая 20 с | Все строки выше | `TortureIT#invariantsHoldUnderConcurrencyCrashesAndALongTransaction` |
 
 Запуск одного класса: `./gradlew :outbox-kafka:test --tests '*KafkaGuaranteesIT'` (нужен Docker). Телеметрию на том же
@@ -628,6 +635,20 @@ class Orders(private val db: JdbcConnectionFactory, private val events: TypedOut
   `TypedOutbox` бросает `OutboxSerializationException`, а не отправляет случайный tombstone, который удалил бы ключ в
   compacted-топике. Сериализатор, бросивший исключение, приводит к тому же исключению. В обоих случаях ничего не
   записывается, и что делать дальше, решает ваша транзакция.
+- **Версия контракта.** Каждое сообщение, tombstone тоже, несёт в заголовке `outbox-contract` версию `@OutboxContract`
+  объявленного типа `T` (не класса значения) вместо такого заголовка, переданного в `send`; у версии 1 (класс без
+  аннотации) заголовка нет. Если топик читает `TypedOutboxTopicHandler`, версию выше 1 `send` отвергает до записи с
+  `OutboxIncompatibleContractException`, пока какой-то живой инстанс с relay читает этот топик ниже неё. Несовместимое
+  изменение события выкатывается в два релиза: [Версии контрактов и откат](#версии-контрактов-и-откат).
+- **`sendAll`.** `message(topic, key, value)` возвращает то же `OutboxMessage`, что записал бы `send`, с заголовком
+  версии, для одного `sendAll` на несколько ключей ([Отправка в транзакции](#отправка-в-транзакции)):
+
+  ```java
+  outbox.sendAll(List.of(
+          orderEvents.message("orders", order.userId(), created),
+          paymentEvents.message("payments", order.userId(), payment)));
+  ```
+
 - Обратная сторона — `TypedOutboxTopicHandler<T>` с `OutboxDeserializer<T>`, который `OutboxJsonModule` выводит из
   `JsonReader` ([Типизированный обработчик](#свой-обработчик)).
 
@@ -643,7 +664,9 @@ db.inTx(() -> {
 });
 ```
 
-Сообщение `null` — это tombstone, как и в `TypedOutbox`.
+Сообщение `null` — это tombstone, как и в `TypedOutbox`. Сгенерированный класс не несёт `@OutboxContract`, поэтому
+заголовки уходят как переданы: версию protobuf-сообщения задаёт заголовок `outbox-contract`, выставленный вручную
+(`new OutboxHeader("outbox-contract", "2".getBytes(US_ASCII))`), а без него это версия 1.
 
 ### Доставка в Kafka
 
@@ -665,10 +688,11 @@ db.inTx(() -> {
 гарантии.
 
 `KafkaOutboxPublisher<K, V>` отправляет в один топик через `Serializer`-ы Kafka (включая `@Json`-сериализаторы Kora).
-Ключ порядка — сериализованный ключ Kafka:
+Ключ порядка — сериализованный ключ Kafka. Последний аргумент — класс значения `V`: версию его `@OutboxContract`
+publisher пишет в заголовок `outbox-contract`, как `TypedOutbox`, и так же проверяет при записи:
 
 ```java
-var publisher = new KafkaOutboxPublisher<>(outbox, "orders", keySerializer, valueSerializer);
+var publisher = new KafkaOutboxPublisher<>(outbox, "orders", keySerializer, valueSerializer, OrderCreated.class);
 db.inTx(() -> {
     publisher.send(order.userId(), event);
 });
@@ -707,17 +731,19 @@ public interface OutboxHandler {
 предыдущих неудачных попыток), `requeues` (сколько раз запись уже откладывали через `Outcome.requeue()`) и `shard`
 (шард, из которого relay её прочитал; `-1`, если неизвестен: запись собрана вручную или восстановлена из dead letter).
 `keyAsString()` возвращает ключ в UTF-8, как его пишут `TypedOutbox` и `OutboxMessage.of(topic, String key, …)`, и
-`null` для записи без ключа.
+`null` для записи без ключа. `contractVersion()` — версия контракта payload из заголовка `outbox-contract`, 1 без
+него ([Версии контрактов и откат](#версии-контрактов-и-откат)).
 
 **`handle`: простая форма.** Доставьте одну запись и верните управление. Для записи, которая никогда не сможет пройти,
-бросьте `OutboxPermanentException`: она переносится в dead-таблицу, а её ключ продолжает со следующего сообщения.
-Любое другое исключение, включая `Error`, означает «повторить позже». `handleBatch` по умолчанию вызывает `handle` для
-каждой записи по порядку:
+бросьте `OutboxPermanentException`: она переносится в dead-таблицу, а её ключ продолжает со следующего сообщения. Для
+записи, которую этот инстанс обработать пока не может, а инстанс другого релиза сможет, бросьте
+`OutboxWaitException(reason)`: она ждёт («Ждать» ниже). Любое другое исключение, включая `Error`, означает
+«повторить позже». `handleBatch` по умолчанию вызывает `handle` для каждой записи по порядку:
 
-- после сбоя пара (topic, key) этой записи пропускается до конца вызова (`NotAttempted`); записи без ключа никогда не
-  блокируют друг друга;
+- после сбоя или `OutboxWaitException` пара (topic, key) этой записи пропускается до конца вызова (`NotAttempted`);
+  записи без ключа никогда не блокируют друг друга;
 - пока ничего не доставлено, он останавливается после сбоев на 3 различных ключах, так как цель, похоже, недоступна, и
-  возвращает `NotAttempted` для остальных;
+  возвращает `NotAttempted` для остальных; ожидание сбоем не считается, как и пропущенные за ним записи его ключа;
 - перед каждой записью он проверяет `OutboxHandler.windDownRequested()` и останавливается, если сворачивание запрошено
   (см. дедлайны ниже);
 - каждый вызов `handle` выполняется в контексте Kora, несущем трассу записи, поэтому клиенты Kora, вызванные из него,
@@ -806,17 +832,31 @@ class AuditEventsHandler(deserializer: OutboxDeserializer<AuditEvent>, private v
   типа свой парсер): объявите фабрику `OutboxDeserializer<OrderEvent>`, возвращающую
   `(topic, payload) -> OrderEvent.parseFrom(payload)`. Без Kora десериализатор передаётся в конструктор.
 - `value` никогда не `null`. Запись с payload `null` (tombstone) идёт в `handleTombstone(record)`: переопределите его,
-  если топик их несёт. Поэтому и в Kotlin параметр объявляется ненулевым.
-- Переопределённый `handleBatch` получает значение через `decode(record)` (`null` для tombstone).
+  если топик их несёт; без переопределения tombstone уходит в dead-таблицу. Поэтому и в Kotlin параметр объявляется
+  ненулевым.
+- Payload, который не декодируется, и `null` от десериализатора уходят в dead-таблицу сразу (`Permanent`; в ошибке
+  топик, id сообщения, класс обработчика и причина): версию записи обработчик читает, значит, не прочитает её и другой
+  релиз, читающий эту версию. Поэтому десериализатор не ходит в сеть: его сбой не повторяется.
+- **Версия контракта.** Обработчик читает версии до `@OutboxContract` своего `T` (без аннотации — 1). Запись более
+  новой версии ждёт инстанс, который её читает, а её payload не декодируется; более старые приходят как обычно, и
+  обработчик версии 2 ветвится по `record.contractVersion()` ([Версии контрактов и
+  откат](#версии-контрактов-и-откат)).
+- `T` берётся из объявления подкласса, в том числе через промежуточные generic-классы и AOP-прокси Kora, и в Kotlin.
+  Если иерархия его не называет, конструктор бросает `IllegalArgumentException`: передайте класс третьим аргументом,
+  `super(topics, deserializer, AuditEvent.class)`.
+- Переопределённый `handleBatch` получает значение через `decode(record)` (`null` для tombstone). `decode` сначала
+  проверяет версию и бросает `OutboxWaitException` для более новой и `OutboxPermanentException` для payload, который не
+  декодируется: ловите их отдельно, как показано в разделе «Ждать» ниже.
 
 **`handleBatch`: быстрая форма.** Переопределите его, чтобы доставлять много записей за один round trip, как это
 делает обработчик Kafka. Контракт:
 
 - Верните по одному `Outcome` на запись, в том же порядке: `Outcome.delivered()`, `Outcome.retry(error)`,
   `Outcome.retry(error, notBefore)`, `Outcome.permanent(error)`, `Outcome.notAttempted()`,
-  `Outcome.notAttempted(notBefore)`, `Outcome.requeue()` или `Outcome.requeue(notBefore)` (см. ниже). `notBefore`
-  ограничен 24 ч. `NotAttempted` не тратит попытку записи.
-- Никогда не доставляйте запись, чья пара (topic, key) уже дала сбой раньше в этом же вызове.
+  `Outcome.notAttempted(notBefore)`, `Outcome.requeue()`, `Outcome.requeue(notBefore)`, `Outcome.waitFor(reason)` или
+  `Outcome.waitFor(reason, notBefore)` (см. ниже). `notBefore` ограничен 24 ч. `NotAttempted` и ожидание не тратят
+  попытку записи.
+- Никогда не доставляйте запись, чья пара (topic, key) уже дала сбой или ждёт раньше в этом же вызове.
 - Один вызов может нести записи нескольких шардов: relay выполняет шаги шардов группами
   ([Заметки о дизайне](#заметки-о-дизайне)), записи идут шард за шардом, внутри шарда в порядке id. Ключ всегда в
   одном шарде, поэтому правила по ключу те же; а предел `handleBatch` по умолчанию «3 различных ключа» считает ключи
@@ -825,8 +865,8 @@ class AuditEventsHandler(deserializer: OutboxDeserializer<AuditEvent>, private v
   вернул некорректный список (null, неверный размер, элемент null), проваливает все свои записи как `Retry`, в том
   числе уже доставленные, и они доставляются повторно. Затем relay приостанавливает шард и уменьшает вдвое число
   записей, передаваемых за вызов, пока сбойная запись не останется одна, и отводит её. В dead letters запись попадает
-  только из вызова с одной этой записью, который бросил `OutboxPermanentException`. Исключения и некорректные списки
-  пишутся в лог с уровнем ERROR.
+  только из вызова с одной этой записью, который бросил `OutboxPermanentException`; ждать — из вызова с одной записью,
+  который бросил `OutboxWaitException`. Исключения и некорректные списки пишутся в лог с уровнем ERROR.
 
 **Отложить запись: `Outcome.requeue()`.** Нужен обработчику, который ведёт по ключу очередь задач (ключ — id счёта),
 когда запись пока нельзя обработать: идёт другой процесс того же счёта, и он закончится сам. `Outcome.retry` тут не
@@ -928,6 +968,51 @@ public final class AccountJobsHandler implements OutboxTopicHandler {
 Отложив запись ключа, откладывайте и более поздние записи этого ключа того же типа в том же вызове, иначе
 FEE_RELEASE#2 обгонит отложенную FEE_RELEASE#1, если блокирующий процесс закончится посреди вызова; записи других
 типов идут дальше (отложенная SYNCHRONIZE#2 не держит FEE_RELEASE).
+
+**Ждать: `Outcome.waitFor`.** Так отвечают о записи, которую этот инстанс обработать пока не может, а инстанс другого
+релиза сможет: версия её контракта новее той, что читает обработчик, или маршрута её топика в этом релизе ещё (или уже)
+нет. Это не сбой цели: повтор потратил бы попытки, с `maxAttempts` привёл бы в dead letters, а пауза шарда остановила бы
+его на всех инстансах.
+
+- Причина ожидания — тег `kind` счётчика `outbox.messages.waiting`:
+  - `contract`: `TypedOutboxTopicHandler` получил версию новее своего `T` или некорректный заголовок `outbox-contract`
+    (`record.contractVersion()` бросает для него `OutboxWaitException` и в вашем коде);
+  - `no_route`: топик не забрал ни один маршрут, а обработчика за маршрутами нет (в Kora — ни `KafkaOutboxModule`, ни
+    своего `OutboxHandler`; без Kora — `builder(config, transactions, null)` с `route`);
+  - `handler`: решение обработчика, `Outcome.waitFor(reason)` или `Outcome.waitFor(reason, notBefore)` из
+    `handleBatch`, `OutboxWaitException(reason)` из `handle`.
+- Запись становится головой своего ключа в retry-таблице, как после `Retry`: более поздние записи ключа ждут за ней,
+  порядок держится. Но это не сбой: `attempts` не меняется, `maxAttempts` не действует, сама в dead letters запись не
+  уходит, шард не встаёт на паузу, число записей на вызов не меняется. Ошибка головы (`last_error`) —
+  `waiting (<kind>): <reason>`.
+- Ждущую голову relay передаёт обработчику снова, одну, без следующих за ней записей, через четверть того времени, что
+  она уже ждёт, но не раньше чем через `outbox.relay.waiting.delay` (1 с) и не позже чем через `maxDelay` (5 мин); с
+  `notBefore` — не раньше него. Блокировка шарда держится один шаг, а следующий шаг делает любой инстанс, поэтому
+  запись сама доходит до инстанса, который её прочитает.
+- Видно: gauges `outbox.waiting.size` и `outbox.waiting.oldest`, `waitingSize` и `waitingOldestSeconds` в `/status`,
+  WARN обслуживания раз в минуту, пока хоть одна запись ждёт, и ERROR, когда самая старая ждёт дольше
+  `outbox.relay.waiting.alertAfter` (15 мин, [Алерты](#алерты)). Предела ожидания нет: если релиз, который прочитает
+  записи, не вернётся, их отдают в dead letters вызовом админ-API ([Версии контрактов и
+  откат](#версии-контрактов-и-откат)).
+- `drain()` возвращается, пока записи ждут: их срок отодвинут вперёд.
+- Не путайте с `requeue`: отложенная запись пропускает вперёд остальные записи своего ключа, ждущая держит их за собой.
+
+Переопределённый `handleBatch` ловит `OutboxWaitException` отдельно от остальных исключений: ответ сохраняет причину
+и её вид, ключ пропускается до конца вызова, а в предел «цель недоступна» ожидание не идёт:
+
+```java
+} catch (OutboxWaitException e) { // ждёт инстанс, который её прочитает; попытка не тратится
+    outcomes.add(new Outcome.Waiting(e.kind(), e.getMessage(), null));
+    blockedKeys.add(key);  // более поздние записи ключа — notAttempted, как после сбоя
+} catch (Exception e) {
+    outcomes.add(Outcome.retry(e));
+    blockedKeys.add(key);
+    failures++;            // а сбой идёт в предел «3 ключа»
+}
+```
+
+Ответ `Retry` или `Permanent`, чья ошибка — `OutboxWaitException`, relay и сам превращает в ожидание. `byTopic` отдаёт
+ожидание всем записям маршрута, чей `handleBatch` бросил `OutboxWaitException`.
 
 **Дедлайны.** Каждый вызов выполняется на потоке обработчика relay и ограничен `outbox.relay.batchTimeout` (по
 умолчанию 30 с):
@@ -1192,7 +1277,9 @@ var runtime = OutboxRuntime.builder(config, new JdbcTransactions(appDataSource),
 - Обработчик своих топиков реализует `OutboxTopicHandler`, обработчик всех топиков — `OutboxHandler`
   ([Свой обработчик](#свой-обработчик)). `route` ставит обработчики топиков перед обработчиком из `builder(...)`, а
   тот получает остальные топики; два `route` с общим топиком валят `build()`. Обработчик из `builder(...)` может быть
-  `null`, если есть хотя бы один `route`:
+  `null`, если есть хотя бы один `route`; тогда `send` в топик, который не забрал ни один `route`, бросает
+  `IllegalArgumentException` со списком забранных топиков до записи ([опечатка в
+  топике](#версии-контрактов-и-откат)):
 
 ```java
 var runtime = OutboxRuntime.builder(config, transactions, sender.handler())
@@ -1240,17 +1327,20 @@ sender.close();
 
 ### Типизированная отправка
 
-`TypedOutbox<T>` сериализует значение функцией приложения; библиотеке JSON-зависимость не нужна:
+`TypedOutbox<T>` сериализует значение функцией приложения; библиотеке JSON-зависимость не нужна. Третий аргумент —
+класс `T`: версию его `@OutboxContract` `TypedOutbox` пишет в заголовок `outbox-contract`
+([Версии контрактов и откат](#версии-контрактов-и-откат)):
 
 ```java
-var events = new TypedOutbox<OrderCreated>(runtime.outbox(), (topic, event) -> json.writeValueAsBytes(event));
+var events = new TypedOutbox<>(runtime.outbox(), (topic, event) -> json.writeValueAsBytes(event), OrderCreated.class);
 transactions.inTx(c -> events.send("orders", order.userId(), new OrderCreated(order.id(), order.userId())));
 ```
 
 `json` здесь — JSON-маппер приложения (например, `ObjectMapper` из Jackson). `null` вместо значения отправляет
 tombstone. Сериализатор, который упал или вернул `null`, даёт `OutboxSerializationException` до записи. Protobuf —
 `new ProtobufOutbox(runtime.outbox())`, сериализаторы Kafka — `new KafkaOutboxPublisher<>(runtime.outbox(), topic,
-keySerializer, valueSerializer)`; правила те же, что в [Отправке в транзакции](#отправка-в-транзакции).
+keySerializer, valueSerializer, OrderCreated.class)`; правила те же, что в [Отправке в
+транзакции](#отправка-в-транзакции) и [Типизированных сообщениях](#типизированные-сообщения-typedoutboxt).
 
 ### Телеметрия
 
@@ -1294,10 +1384,10 @@ sequenceDiagram
     DB-->>W: чанк после last_id, не больше batchSize строк
     W->>H: handleBatch(отложенные записи ключей чанка,<br/>затем чанк без строк ключей, ждущих в outbox_retry)
     Note over W,H: 80 % batchTimeout: windDownRequested() и прерывание<br/>100 %: от вызова отказываются, все его записи Retry
-    H-->>W: Delivered / Retry / Permanent / NotAttempted / Requeue
+    H-->>W: Delivered / Retry / Permanent / NotAttempted / Requeue / Waiting
     W->>W: BatchClassifier: дальше или пауза
     alt дальше
-        W->>DB: сбойные ключи в outbox_retry, Permanent в outbox_dead, Requeue в outbox_parked
+        W->>DB: сбойные и ждущие ключи в outbox_retry, Permanent в outbox_dead, Requeue в outbox_parked
     else пауза: ничего не доставлено
         Note over W,DB: ни одна строка не отводится, курсор встаёт на паузу с backoff
     end
@@ -1323,9 +1413,13 @@ flowchart TD
     outcome -->|Permanent| dead(["outbox_dead: ERROR в логе,<br/>ключ идёт дальше"])
     outcome -->|Requeue| parked(["outbox_parked: не сбой, ключ идёт дальше,<br/>запись вернётся перед следующей<br/>записью ключа или по сроку"])
     outcome -->|"Retry / NotAttempted"| head["ключ отведён в outbox_retry:<br/>запись — голова с next_attempt_at,<br/>следующие записи ключа — последователи"]
+    outcome -->|Waiting| waits["ключ отведён в outbox_retry:<br/>запись — ждущая голова, не сбой:<br/>попытка не тратится, паузы нет"]
     head -.-> others(["остальные ключи идут дальше,<br/>новые записи этого ключа<br/>встают в последователи"])
+    waits -.-> others
     head --> due{{"срок головы наступил:<br/>голова и последователи<br/>снова у обработчика"}}
+    waits --> due
     due -->|"Retry / NotAttempted:<br/>новый backoff"| due
+    due -->|"Waiting: снова через четверть<br/>времени ожидания, одна"| due
     due -->|"Permanent или<br/>исчерпан maxAttempts"| dead
     due -->|Requeue| parked
     due -->|Delivered| next{{"у ключа остались<br/>записи в outbox_retry?"}}
@@ -1355,6 +1449,11 @@ flowchart TD
 - **`Requeue`** — не сбой: запись переносится в `<base>_parked`, ключ идёт дальше, паузы и backoff нет, попытка не
   тратится. Запись вернётся перед следующей записью своего ключа или по сроку ([Свой обработчик](#свой-обработчик)).
   Счётчик `outbox.messages.requeued`.
+- **`Waiting`** — тоже не сбой: запись становится головой ключа в retry-таблице, ключ ждёт за ней, но попытка не
+  тратится, `maxAttempts` не действует, паузы и backoff шарда нет. Голова снова идёт к обработчику через четверть
+  времени ожидания (от `relay.waiting.delay` до `relay.waiting.maxDelay`), пока её не возьмёт инстанс, который её
+  прочитает ([Свой обработчик](#свой-обработчик), «Ждать»). Счётчик `outbox.messages.waiting{kind}`, gauges
+  `outbox.waiting.size` и `outbox.waiting.oldest`.
 - **Головы в retry-таблице** повторяются на последующих шагах шарда вместе со следующими за ними записями. Ключ, у
   которого в retry-таблице не осталось строк, разблокируется. При `relay.retry.maxAttempts = N > 0` запись, провалившая
   N попыток, переносится в dead-таблицу. При значении по умолчанию 0 временные сбои никогда не приводят в dead letters.
@@ -1405,6 +1504,18 @@ flowchart TD
 |---|---|---|
 | `delay` | `1s` | > 0. Через сколько отложенная запись возвращается к обработчику, если раньше не придёт новая запись её ключа; с `requeue(notBefore)` — не раньше `notBefore` (не дальше 24 ч). Отложенная запись, которую обработчик не попробовал, тоже ждёт не меньше `delay`. |
 | `maxRequeues` | `0` | ≥ 0. Сколько раз запись можно отложить: `requeue` сверх этого переносит её в dead-таблицу с ошибкой «requeue limit reached», `attempts` не меняется. Считается каждый ответ `requeue`, в том числе на запись, подмешанную в вызов перед новой записью ключа. `0` — без предела. |
+
+### `outbox.relay.waiting`
+
+Записи, которые ждут инстанс, способный их обработать (`Outcome.Waiting`, «Ждать» в [Своём
+обработчике](#свой-обработчик)). Ждущая голова снова передаётся обработчику через четверть того времени, что она уже
+ждёт, но не раньше чем через `delay` и не позже чем через `maxDelay`.
+
+| Ключ | По умолчанию | Значение |
+|---|---|---|
+| `delay` | `1s` | > 0. Самый короткий промежуток до следующей передачи ждущей головы. |
+| `maxDelay` | `5m` | ≥ `delay`. Самый длинный такой промежуток. 100 000 ключей, ждущих на нём, — около 333 UPDATE в секунду на весь кластер. |
+| `alertAfter` | `15m` | > 0. Пока хоть одна запись ждёт, обслуживание пишет WARN не чаще раза в минуту; когда самая старая ждёт дольше этого, вместо него ERROR, тоже не чаще раза в минуту. Порог для алерта по `outbox.waiting.oldest` ([Алерты](#алерты)). |
 
 ### `outbox.partitions`
 
@@ -1682,7 +1793,8 @@ create table outbox_instance (     -- heartbeat работающих инста�
   hook_active boolean not null default false,  -- relay здесь работает, и хук dead letters активен
   expires_at  timestamptz,           -- last_seen + 3 × maintenanceInterval этого инстанса
   relay       boolean not null default false,  -- relay здесь работает
-  contracts   jsonb                  -- топик → старшая версия контракта, которую читает инстанс; null: неизвестно
+  contracts   jsonb                  -- топик → старшая версия контракта, которую читает инстанс; null: неизвестно,
+                                     -- {}: не сообщает ничего (нет типизированных обработчиков)
 );
 
 -- inbox (InboxModule), создаётся, когда какой-то компонент использует Inbox
@@ -1890,6 +2002,16 @@ Gauge показывает, сколько xid осталось, а обслуж
 | `outbox.dead.pending.oldest` > X, а `outbox.dead.hook.failures` растёт | Хук dead letters падает дольше X: письма ждут, ничего не теряется, но алерт из хука не уходит. X берите больше `relay.retry.maxDelay` (5 мин), потолка backoff хука. |
 | ERROR «outbox xid regression detected» | Регрессия xid. С «recovered: N rows re-sent» библиотека восстановилась сама. С «relay halted» причина в конце строки: блокировку обслуживания держит другая сессия или восстановление упало — следующий запуск повторит сам; режим `halt` или строк больше `maxRows` — нужен один вызов ([Восстановление после регрессии xid](#восстановление-после-регрессии-xid-xid-regression-recovery)). |
 | ERROR «... holds cursors for N shards, but this instance runs with outbox.shards = M ...» или `IllegalStateException` «outbox ... refuses this write ...» | После решардинга работает инстанс со старым числом шардов: его relay и обслуживание стоят, `send` и переотправки падают. Перезапустите его с новым значением или без `outbox.shards` ([Решардинг](#решардинг)). |
+| `outbox.waiting.oldest` > `outbox.relay.waiting.alertAfter` (15 мин) или ERROR «outbox: N records of ... wait for an instance that can handle them ...» | Записи ждут инстанс, который их прочитает, а его нет: релиз выкачен наполовину или откачен за переходный. Их ключи стоят, ничего не теряется. Причина и топик самой старой — в той же строке и в `last_error` (`waiting (contract)`, `waiting (no_route)`); `outbox.messages.waiting{kind}` показывает, какие. Докатите релиз, который их читает, или, если откат окончательный, отдайте их в dead letters ([Версии контрактов и откат](#версии-контрактов-и-откат)). |
+| `outbox.messages.contract_rejected` растёт | Релиз пишет версию контракта, которую не читает живой инстанс с relay: его бизнес-транзакции с этими отправками падают с `OutboxIncompatibleContractException` (и WARN «outbox ... refused a send» раз в минуту называет инстансы). Сначала выкатите везде релиз, который эту версию читает ([Версии контрактов и откат](#версии-контрактов-и-откат)). |
+
+Правило Prometheus для ожидания (gauge обновляет обслуживание раз в `maintenanceInterval`; порог — `alertAfter`):
+
+```yaml
+- alert: OutboxRecordsWaiting
+  expr: max(outbox_waiting_oldest) > 900
+  for: 1m
+```
 
 **Утром.** Само не теряет и не останавливает доставку, но ждёт человека:
 
@@ -1912,12 +2034,13 @@ Gauge показывает, сколько xid осталось, а обслуж
 
 | Метод | Что делает |
 |---|---|
-| `status()` | Всё на одном экране: остановка relay, лаг, размеры retry и parked, dead letters по топику и статусу, сироты, хвост со строками, `premade`, `xidsLeft`, время с последнего обслуживания, шарды и `instances`: все строки heartbeat, истёкшие тоже (id, число шардов, `lastSeen`, активен ли хук dead letters). `lastSeen` старше 3 × `maintenanceInterval` — инстанс не работает; строка упавшего инстанса остаётся около часа после истечения, то есть 3 × `maintenanceInterval` + 1 ч после последнего heartbeat. |
+| `status()` | Всё на одном экране: остановка relay, лаг, размеры retry и parked, ждущие записи (`waitingSize` — сколько голов ждёт, `waitingOldestSeconds` — сколько ждёт самая старая, 0, если ни одна), dead letters по топику и статусу, сироты, хвост со строками, `premade`, `xidsLeft`, время с последнего обслуживания, шарды и `instances`: все строки heartbeat, истёкшие тоже (id, число шардов, `lastSeen`, активен ли хук dead letters, работает ли relay (`relay`) и `contracts` — старшая версия контракта, которую он читает, по топику: null — неизвестно, пусто — не сообщает ничего, версия, которая не положительное целое, показана как 0). `lastSeen` старше 3 × `maintenanceInterval` — инстанс не работает; строка упавшего инстанса остаётся около часа после истечения, то есть 3 × `maintenanceInterval` + 1 ч после последнего heartbeat. |
 | `findDeadLetters(filter, afterId, limit)`, `countDeadLetters(filter)` | Dead letters по `DeadLetterFilter` (топик, ключ, подстрока ошибки, `failedFrom` включительно, `failedTo` исключительно, статус), в порядке id, до 1 000 на страницу. |
 | `redriveDeadLetters(ids)`, `redriveDeadLetters(filter)` | Обратно в outbox, как решение хука `redrive`: новое сообщение после более поздних сообщений своего ключа, с тем же message id. Возвращает число. |
 | `discardDeadLetters(ids)`, `discardDeadLetters(filter)` | Удалить; возвращает число. |
 | `restoreOrphan(table, fromXid)` | Вернуть строки сироты ([Осиротевшие партиции](#осиротевшие-партиции)). |
 | `recoverXidRegression()` | Восстановление после регрессии xid сейчас ([Восстановление после регрессии xid](#восстановление-после-регрессии-xid-xid-regression-recovery)). |
+| `abandonWaiting(topic, key, reason, dryRun)` | Отказаться от записей топика, которые ждут инстанс, способный их обработать (для окончательного отката): ключ целиком в dead-таблицу как `kept`, с ошибкой `abandoned: <reason>`. Возвращает `Abandoned(keys, records)`; с `dryRun` — сколько перенёс бы, ничего не перенося ([Версии контрактов и откат](#версии-контрактов-и-откат)). |
 
 - Массовые вызовы работают с письмами, мёртвыми на момент начала вызова, чанками по 1 000 в порядке id, по
   транзакции на чанк: не держат больше 1 000 блокировок ключей. Упавший чанк откатывается один; повторный вызов
@@ -1977,7 +2100,8 @@ public final class ApiKeyAuthorizer implements OutboxAdminAuthorizer {
   WARN, не вызывающему. `authorize` выполняется на блокирующем пуле сервера, не на I/O-потоке: ему можно ходить в базу
   или во внешний сервис.
 - Каждый вызов оставляет строку INFO: `outbox admin POST "/kora-outbox/admin/v1/..." by "admin-key": 200` или
-  `... denied: 401`.
+  `... denied: 401`. У `waiting/abandon` перед статусом стоят его аргументы, каждое значение в кавычках:
+  `... by "admin-key" with topic "orders", key null, reason "v2 rolled back for good", dryRun "false": 200`.
 - Открывайте админ-API только во внутренней сети или за TLS: ключ в заголовке без TLS читается по дороге, а
   ответы несут dead letters с payload.
 - Решайте по тому, что клиент отправляет намеренно (заголовок с ключом или токеном), а не по тому, что браузер
@@ -2038,12 +2162,15 @@ curl -s -H "$KEY" -H "$JSON" -d '{"filter":{"topic":"orders","error":"timeout"}}
 curl -s -H "$KEY" -H "$JSON" -d '{"ids":[1003]}' $API/dead-letters/discard
 curl -s -X POST -H "$KEY" "$API/orphans/outbox_x83886080/restore?fromXid=83900000"
 curl -s -X POST -H "$KEY" $API/recovery/xid-regression
+curl -s -H "$KEY" -H "$JSON" -d '{"topic":"orders","reason":"v2 rolled back for good","dryRun":true}' \
+    $API/waiting/abandon                                                       # {"keys":3,"records":5}
 ```
 
-- Ответы: 200 с JSON (изменяющие вызовы — `{"count": N}`); 400 — отвергнутый ввод (в том числе поле, которого нет в
-  контракте, больше 1 000 `ids`, пустой фильтр, не сирота); 401 и 403 — от `OutboxAdminAuthorizer` (403 — ещё и
-  изменяющий вызов с другого сайта); 409 — нельзя в
-  текущем состоянии (идёт обслуживание: повторите; нет регрессии xid); 500 — прочее. Тело любой ошибки, 500
+- Ответы: 200 с JSON (изменяющие вызовы — `{"count": N}`, `waiting/abandon` — `{"keys": N, "records": M}`); 400 —
+  отвергнутый ввод (в том числе поле, которого нет в контракте, больше 1 000 `ids`, пустой фильтр, не сирота, пустые
+  `topic` или `reason`); 401 и 403 — от `OutboxAdminAuthorizer` (403 — ещё и изменяющий вызов с другого сайта); 409 —
+  нельзя в текущем состоянии (идёт обслуживание или шаг relay держит шард дольше `batchTimeout` + 5 с: повторите; нет
+  регрессии xid); 500 — прочее. Тело любой ошибки, 500
   тоже, — `{"message": "..."}`. У 500 в `message` текст исключения, в том числе текст ошибки SQL, а у 4xx, который
   Kora отдаёт до операции (некорректный параметр или тело), — её собственный текст: их видят только вызывающие,
   которых пропустил `OutboxAdminAuthorizer`. Сбой самого `OutboxAdminAuthorizer` — всегда «authorization
@@ -2498,7 +2625,9 @@ outbox, не повторяется ни следующим запуском, н
 
 1. Остановите писателей и дождитесь, пока relay доставит всё: `outbox.shard.lag` = 0, retry- и parked-таблицы пусты
    (`retrySize`, `parkedSize` в `/status`; отложенные записи возвращаются по сроку, пока обработчик не перестанет их
-   откладывать), сирот нет.
+   откладывать), сирот нет. Ждущие записи (`waitingSize`) лежат в retry-таблице и держат решардинг, пока их не
+   доставит релиз, который их читает, или пока их не отдадут в dead letters (`waiting/abandon`, [Версии контрактов и
+   откат](#версии-контрактов-и-откат)); переносить их между шардами библиотека не умеет.
 2. Остановите все инстансы, включая инстансы предыдущего релиза (см. ниже).
 3. Запустите один инстанс с новым значением и дождитесь его INFO «outbox resharded ... from N to M shards». Только
    затем запускайте остальные, с тем же значением или без `outbox.shards`. Инстанс без значения, взявший блокировку
@@ -2613,9 +2742,205 @@ instance ... failed»), не виден проверке живых инстан
   наступило.
 - **Переход на версию с хуком dead letters.** Bootstrap один раз добавляет столбцы dead-таблицы (только метаданные),
   старые письма становятся `kept`. Индекс `<base>_dead_due` строится отдельно ([Таблицы](#таблицы)).
+- **Несовместимое изменение события** (поле, без которого нельзя обработать, смена смысла, удаление поля) — только в
+  два релиза, а маршрут топика добавляется и удаляется по правилам из [Версий контрактов и
+  отката](#версии-контрактов-и-откат).
 - **Остановка** мягкая: воркеры перестают брать шарды, выполняющиеся вызовы обработчика получают
   `relay.shutdownTimeout`, затем прерываются, а их незакоммиченные батчи позже доставляются снова — другим инстансом
   или после рестарта (дубликаты, а не потери).
+
+### Версии контрактов и откат
+
+Событие, записанное одним релизом сервиса, может обработать другой: в rolling-деплое старые и новые инстансы работают
+рядом, и шаг любого шарда делает любой из них, а после отката старый релиз обрабатывает то, что успел записать новый.
+Версия контракта говорит обработчику, в какой форме payload.
+
+**Версия.**
+
+- `@OutboxContract(n)` на классе события — версия формы его payload, не меньше 1; класс без аннотации — версия 1.
+  Аннотация не наследуется: подкласс объявляет свою.
+- `TypedOutbox<T>` и `KafkaOutboxPublisher<K, V>` пишут версию объявленного класса в заголовок `outbox-contract`
+  (десятичное число в ASCII). У версии 1 заголовка нет, поэтому записи, сделанные до версий, и сырые байты через
+  `Outbox.send` читаются как версия 1. Заголовок едет дальше вместе с записью, в Kafka тоже.
+- `record.contractVersion()` — версия записи: последний заголовок `outbox-contract`, 1 без него. Значение, которое не
+  положительное десятичное число, даёт `OutboxWaitException`, и запись ждёт; отправку с таким заголовком `send`
+  отвергает сразу (`IllegalArgumentException`), так что записать его может только код в обход библиотеки.
+- `TypedOutboxTopicHandler<T>` читает версии до версии своего `T`. Запись более новой ждёт инстанс, который её читает
+  (`Waiting` вида `contract`), а её payload не декодируется; более старые приходят как обычно.
+- Один контракт события на топик: версии и проверка при записи различают события по топику.
+
+**Две гарантии отката.**
+
+- **Данные целы благодаря ожиданию.** Запись версии, которую инстанс не читает, не теряется, не уходит в dead
+  letters и не читается неверно: она ждёт («Ждать» в [Своём обработчике](#свой-обработчик)), пока её не возьмёт
+  инстанс релиза, который её читает (выкаченного снова или вернувшегося), а её ключ ждёт за ней. Это сетка
+  безопасности, а не способ доставки: сколько ждать, ничем не ограничено.
+- **Сервис доступен благодаря правилу двух релизов.** Релиз, на который откатываются, читает всё, что пишет текущий,
+  поэтому ничего даже не ждёт. Это даёт только протокол ниже, и он обязателен.
+
+**Протокол двух релизов.** Несовместимое изменение события — поле, без которого событие не обработать правильно, или
+поле, сменившее смысл, — выкатывается в два релиза. Пример: `OrderCreated` получает `currency`.
+
+Релиз N (переходный) читает v1 и v2, а пишет по-прежнему v1. У события два класса: старый пишется, новый читается.
+
+```java
+@Json
+public record OrderCreatedV1(long id, String userId) {} // как писал N-1; без аннотации — версия 1
+
+@OutboxContract(2)
+@Json
+public record OrderCreated(long id, String userId, @Nullable String currency) {} // у payload v1 currency нет
+
+@Component
+public final class Orders {
+
+    private final JdbcConnectionFactory db;
+    private final TypedOutbox<OrderCreatedV1> events; // N пишет v1
+
+    public Orders(JdbcConnectionFactory db, TypedOutbox<OrderCreatedV1> events) {
+        this.db = db;
+        this.events = events;
+    }
+
+    public void create(Order order) {
+        db.inTx(() -> {
+            // вставка заказа ...
+            events.send("orders", order.userId(), new OrderCreatedV1(order.id(), order.userId()));
+        });
+    }
+}
+
+@Component
+public final class OrderCreatedHandler extends TypedOutboxTopicHandler<OrderCreated> { // читает v1 и v2
+
+    private final Billing billing;
+
+    public OrderCreatedHandler(OutboxDeserializer<OrderCreated> deserializer, Billing billing) {
+        super(Set.of("orders"), deserializer);
+        this.billing = billing;
+    }
+
+    @Override
+    protected void handle(OrderCreated event, OutboxRecord record) {
+        var currency = record.contractVersion() == 1 ? "RUB" : event.currency(); // v1 писали только в рублях
+        billing.charge(record.messageId(), event.id(), currency);
+    }
+}
+```
+
+Релиз N+1 пишет v2: `TypedOutbox<OrderCreated>` и `new OrderCreated(order.id(), order.userId(), order.currency())`,
+а `OrderCreatedV1` удаляется. Ветку `contractVersion() == 1` обработчик держит, пока записи v1 ещё могут прийти: пока
+они лежат в outbox, в retry-таблице или среди dead letters, которые переотправят.
+
+| Что происходит | Итог |
+|---|---|
+| Работает N-1 (читает только v1), выкатывают N+1, пропустив N | Первая же отправка v2 отвергается с `OutboxIncompatibleContractException` до записи; ничего не записано и ничего не ждёт |
+| N и N+1 рядом, N+1 пишет v2 | Доставляют оба: N читает v2 |
+| Откат с N+1 на N | N читает записанное N+1, ничего не ждёт |
+| Откат с N+1 на N-1, когда v2 уже записаны | Записи v2 ждут, по одной голове на ключ, и держат свои ключи; записи v1 и остальные ключи идут. Вернётся N или N+1 — ждущие записи доставятся в порядке ключа. Откат окончательный — отказ от ожидания (ниже) |
+
+Проверяет `ContractReleasesIT`, в том числе rolling-деплой N-1 → N → N+1 под непрерывной записью: ни одного отказа,
+ни одного ожидания, порядок ключей сохранён.
+
+**Проверка при записи (writer guard).** Протокол проверяется при записи, чтобы его не нарушили случайно.
+
+- Каждый инстанс пишет в свою строку `<base>_instance`, работает ли на нём relay (`relay`) и какую старшую версию
+  каждого топика читают его `TypedOutboxTopicHandler` (`contracts`): при bootstrap и каждым heartbeat
+  (`maintenanceInterval`). Bootstrap до первой отправки, а затем каждый heartbeat читает отчёты живых инстансов с
+  relay (их `expires_at` впереди): любой из них может взять любой шард.
+- `send` сообщения версии v выше 1 в топик X проходит, только если каждый живой инстанс с relay читает X версии v или
+  выше. Иначе он до записи бросает `OutboxIncompatibleContractException`, а что дальше, решает транзакция
+  вызывающего:
+
+  ```
+  outbox contract of topic orders: com.example.OrderCreated writes v2, but 3 of 10 live relay instances read at most v1 (host-a/41/0f3c9a1e, host-b/17/a9d2c4b0, +1 more); deploy the release that reads v2 everywhere first
+  ```
+
+  Аксессоры: `topic()`, `type()` (класс; `?` для сообщения, отправленного через `Outbox`), `version()`,
+  `minSupported()`, `incompatibleInstances()`. Отказ считает `outbox.messages.contract_rejected{topic, type, version}`,
+  а WARN «outbox ... refused a send» не чаще раза в минуту называет все инстансы: отказ виден, даже если приложение
+  проглотило исключение.
+- Проверяются `TypedOutbox`, `KafkaOutboxPublisher`, а также `Outbox.send` и `sendAll` с заголовком `outbox-contract`,
+  в том числе сообщения из `TypedOutbox.message(...)`. Версия 1 не проверяется никогда; цена проверки — поиск в
+  памяти на каждую отправку версии выше 1.
+- Не проверяются топики, которые не читает ни один `TypedOutboxTopicHandler`: их нет ни в отчётах живых инстансов, ни
+  в маршрутах этого инстанса. Это топики Kafka и простых обработчиков: байты уходят как есть, заголовок вместе с ними,
+  и правило двух релизов соблюдают их потребители.
+
+Пределы проверки. Она защищает от случайности и протокол не заменяет:
+
+- **Отчёты устаревают на один heartbeat** (`maintenanceInterval`, 30 с). Чисто остановленный инстанс удаляет свою
+  строку сразу, упавший держит её до `expires_at`: записи остаются отвергнутыми до 3 интервалов (около 90 с) после
+  падения последнего старого инстанса.
+- **Проверка не атомарна.** Инстанс старого релиза, стартовавший после неё (автоскейлер посреди выкатки), получит
+  записи новой версии: они ждут, данные целы.
+- **Простые обработчики не защищены.** `OutboxTopicHandler` без типа и обработчик за маршрутами (кроме Kafka)
+  получают сырые записи и версию не объявляют: они сами читают `record.contractVersion()` и для версии, которую не
+  знают, бросают `OutboxWaitException`:
+
+  ```java
+  @Override
+  public void handle(OutboxRecord record) throws Exception {
+      if (record.contractVersion() > 1) { // этот релиз знает только v1, запись прочитает следующий
+          throw new OutboxWaitException("audit event v" + record.contractVersion() + ", this release reads v1");
+      }
+      client.post(record.messageId().toString(), record.payload());
+  }
+  ```
+
+- **`drain()` на инстансе с `relay.enabled = false`.** Такой инстанс в проверке не участвует, но его `drain()`
+  доставляет: записи версии, которую не читают его обработчики, ждут.
+- **Инстанс с relay без отчёта** (`contracts` null: строку записал не этот код) несовместим со всем: пока его строка
+  жива, отвергается отправка версии выше 1 в любой топик, в топики Kafka тоже.
+- **Без живых инстансов с relay** не отвергается ничего: сверяться не с кем. Старый релиз, поднятый потом, оставит
+  записи новой версии ждать.
+- Инстанс, который сам не читал отчёты дольше 3 × `maintenanceInterval` (его heartbeat не проходит), отвергает каждую
+  отправку версии выше 1.
+
+**Опечатка в топике.** Приложение, у которого за маршрутами нет обработчика (в Kora — ни `KafkaOutboxModule`, ни
+своего `OutboxHandler`, только компоненты `OutboxTopicHandler`; без Kora — `builder(config, transactions, null)` с
+`route`), пишет только в топики своих маршрутов: `send` и `sendAll` в любой другой бросают `IllegalArgumentException`
+со списком забранных топиков до записи. Опечатка падает в бизнес-транзакции, а не застревает. Запись такого топика,
+которую написал другой релиз (маршрут, которого в этом релизе ещё или уже нет), здесь ждёт (вид `no_route`) инстанс с
+маршрутом.
+
+**Правила схемы.**
+
+- Новое поле — nullable или со значением по умолчанию; тогда версия не меняется: новый класс читает payload без этого
+  поля, а десериализатор прежнего релиза должен пропускать незнакомые поля.
+- Поле, которое меняет смысл события, и любое несовместимое изменение — новая версия, в два релиза (протокол выше).
+- Поле удаляется в два релиза: сначала релиз, который больше не требует его при чтении (в читающем классе оно
+  nullable), затем релиз, который перестаёт его писать.
+- Никогда не переносите существующий топик Kafka в маршрут (`OutboxTopicHandler`): инстанс прежнего релиза о маршруте
+  не знает и отправит записи топика в Kafka. Для маршрута заведите новый топик.
+- Новый маршрут в приложении с Kafka: пока рядом работают инстансы прежнего релиза, записи его топика у них уходят в
+  Kafka. С выключенным на брокере auto-create отправка падает и повторяется (попытки тратятся, с `maxAttempts` запись
+  может уйти в dead letters), пока шард не возьмёт новый инстанс; с включённым запись молча уходит в созданный топик.
+  Держите auto-create выключенным ([Требования к Kafka](#требования-к-kafka)).
+- Маршрут удаляется в два релиза: сначала перестают писать в его топик, затем, когда его записи доставлены, удаляют
+  маршрут. Иначе оставшиеся записи ждут (`no_route`), а в приложении с Kafka уходят в Kafka.
+
+**Окончательный откат: отказ от ожидания.** Если релиз, который прочитает ждущие записи, не вернётся, отдайте их в
+dead letters: `OutboxAdmin.abandonWaiting(topic, key, reason, dryRun)` или `POST /kora-outbox/admin/v1/waiting/abandon`
+с телом `{"topic": "...", "key": "...", "reason": "...", "dryRun": true}` ([Админ-API и HTTP](#админ-api-и-http)).
+
+- `topic` и `reason` обязательны. `key` (строка в UTF-8) сужает вызов до одного ключа, без него — все ключи топика,
+  записи без ключа тоже. Поле, которого нет в контракте, — 400: опечатка в `key` не расширит вызов на весь топик.
+- Уходит ключ целиком: ждущая голова, записи ключа за ней в retry-таблице и его отложенные записи переносятся в
+  dead-таблицу как `kept` (хук dead letters их не получает) с ошибкой `abandoned: <reason>`; голова без ключа — одна.
+  Так ни одна запись ключа не пойдёт без предыдущей. Записи ключа, отправленные позже, доставляются раньше отданных.
+- `dryRun` (по умолчанию `false`) только считает. Ответ — `{"keys": N, "records": M}`: ключи (голова без ключа — один
+  ключ) и все их записи, головы тоже.
+- Вызов идёт по шардам, чанками по 1 000 ключей, транзакция на чанк под блокировкой шарда, которую держит шаг relay.
+  Её он ждёт до `outbox.relay.batchTimeout` + 5 с, затем отвечает 409 «... is busy, retry» (из кода —
+  `IllegalStateException`); перенесённые чанки остаются перенесёнными, повторный вызов продолжает. Пробный вызов
+  блокировок не берёт.
+- Строка аудита HTTP несёт `topic`, `key`, `reason` и `dryRun`, строка INFO ядра — аргументы и результат.
+- Когда релиз, который их читает, выкачен, отданные письма переотправляют (`dead-letters/redrive` с фильтром
+  `{"topic": "...", "error": "abandoned"}`) или удаляют.
+
+**Видно.** `outbox.waiting.size`, `outbox.waiting.oldest`, `outbox.messages.waiting{topic, kind}` и
+`outbox.messages.contract_rejected{topic, type, version}` ([Метрики](#метрики)); правила — в [Алертах](#алерты).
 
 ### Стоимость простоя
 
@@ -2650,12 +2975,16 @@ Gauges регистрируются один раз на имя, и побежд
 | `outbox.messages.delivered` | counter | `topic` | Записи, о доставке которых сообщил обработчик. |
 | `outbox.messages.failed` | counter | `topic`, `outcome` = `retry` / `dead` | Записи, отведённые в retry-таблицу (или снова не прошедшие в ней), и записи, ушедшие в dead letters. |
 | `outbox.messages.requeued` | counter | `topic` | Записи, отложенные через `Outcome.requeue()`: каждый раз, включая повторные. `requeue` сверх `maxRequeues` считается в `failed{outcome="dead"}`. |
+| `outbox.messages.waiting` | counter | `topic`, `kind` = `contract` / `no_route` / `handler` | Ответы «ждать» (`Outcome.Waiting`): каждый, включая повторные одной и той же головы. Не сбой: в `failed` не попадают. `kind` — причина: версия контракта, топик без маршрута, решение обработчика. |
+| `outbox.messages.contract_rejected` | counter | `topic`, `type`, `version` | Отправки, отвергнутые проверкой при записи (`OutboxIncompatibleContractException`); `type` — класс, `?` для сообщения через `Outbox`. Id инстансов — в исключении и WARN, не в тегах. |
 | `outbox.delivery.delay` | timer, percentile histogram | `topic` | От вставки строки до outcome «доставлено». Бакеты от 1 мс до 6 ч, чтобы сбои оставались видны в p99; около 110 серий бакетов на топик. |
 | `outbox.batch.duration` | timer, percentile histogram | — | Один шаг шарда, записавший строку курсора (прогресс или пауза). |
 | `outbox.shard.paused` | counter | — | Паузы шардов (цель недоступна, сбойная голова, нет свободного потока обработчика). |
 | `outbox.relay.failures` | counter | — | Сбои relay, о которых он пишет WARN: проход вне шага (тик, чтение курсоров, соединение, в том числе потерянное) и откатившийся шаг одного шарда. Шаг нескольких шардов, который relay сразу переделывает по одному, не считается: сбой посчитается на шаге виновного шарда. Не считаются обслуживание, heartbeat, проход dead letters и сбои во время остановки. |
 | `outbox.shard.lag` | gauge, с | — | Насколько тик самого медленного шарда отстаёт от последнего тика. |
 | `outbox.retry.size`, `outbox.parked.size`, `outbox.dead.size` | gauges | — | Число строк в retry-таблице, среди отложенных записей (`<base>_parked`) и в dead-таблице (все статусы). |
+| `outbox.waiting.size` | gauge | — | Головы в retry-таблице, которые ждут инстанс, способный их обработать. Они и записи их ключей за ними входят и в `outbox.retry.size`. |
+| `outbox.waiting.oldest` | gauge, с | — | Сколько ждёт самая старая из них, с её первого ответа «ждать»; 0, если ни одна. Порог алерта — `outbox.relay.waiting.alertAfter` ([Алерты](#алерты)). |
 | `outbox.dead.pending` | gauge | — | Письма, ждущие решения хука (`pending`). Без активного хука 0. |
 | `outbox.dead.pending.oldest` | gauge, с | — | Сколько прошло с `failed_at` самого старого письма `pending`; 0, если таких нет. |
 | `outbox.dead.decisions` | counter | `decision` = `keep` / `discard` / `redrive` / `redrive_at` | Закоммиченные решения хука. Вызовы админ-API здесь не считаются. |
@@ -2677,9 +3006,11 @@ Gauges регистрируются один раз на имя, и побежд
 первого запуска). `since_success` читает каждый инстанс.
 
 Логи (SLF4J, `io.github.dsudomoin.outbox`): INFO — старт, остановка и DDL партиций; WARN — отведённые ключи, паузы
-шардов, отложенные расширения, tail overflow, устаревшее обслуживание, сбои хука dead letters и оставленные Kafka DLQ
-письма; ERROR — dead letters, ошибки в обработчиках, застрявшие шарды, регрессия xid, `premade < 2`, отсоединённый
-хвост, сироты и transaction pooling. Повторяющиеся сообщения ограничены по частоте.
+шардов, отложенные расширения, tail overflow, устаревшее обслуживание, сбои хука dead letters, оставленные Kafka DLQ
+письма, ждущие записи («... wait for an instance that can handle them ...») и отправки, отвергнутые проверкой при
+записи; ERROR — dead letters, ошибки в обработчиках, застрявшие шарды, регрессия xid, `premade < 2`, отсоединённый
+хвост, сироты, transaction pooling и записи, ждущие дольше `relay.waiting.alertAfter`. Повторяющиеся сообщения
+ограничены по частоте.
 
 ### Трассировка
 
@@ -2688,8 +3019,8 @@ Gauges регистрируются один раз на имя, и побежд
 1. `send` сохраняет трассу писателя (`traceparent`, `tracestate`) в заголовках сообщения.
 2. Relay начинает один span на каждую попытку доставки, **`outbox deliver <topic>`**, kind `PRODUCER`, дочерний к
    трассе писателя, с атрибутами `messaging.destination.name`, `outbox.message_id`, `outbox.attempt`,
-   `outbox.delay_ms` и `outbox.outcome` (`delivered`, `retry`, `permanent`, `not_attempted`, `requeued`); сбои
-   записываются в него.
+   `outbox.delay_ms` и `outbox.outcome` (`delivered`, `retry`, `permanent`, `not_attempted`, `requeued`,
+   `waiting`); сбои записываются в него.
 3. Обработчик получает запись, в которой заголовки трассы заменены на заголовки этого span. Обработчик Kafka пересылает
    их, поэтому Kafka-потребитель на Kora продолжает ту же трассу; `handleBatch` по умолчанию выполняет `handle` в
    контексте Kora, несущем этот span, поэтому клиенты Kora, вызванные из него, тоже продолжают трассу. Свой
@@ -2737,9 +3068,9 @@ var runtime = OutboxRuntime.builder(config, transactions, handler).telemetry(tel
   (с `observeUnsampled(true)` — на каждую, см. ниже). Это наблюдение получателя
   (`ReceiverContext`): родитель — контекст, сохранённый при отправке, поэтому span имеет kind `CONSUMER` (в Kora —
   `PRODUCER`). Ключи с низкой кардинальностью: `messaging.destination.name`, `outbox.outcome` (`delivered`, `retry`,
-  `permanent`, `not_attempted`, `requeued`, `failed`, если вызов обработчика прервался); с высокой: `outbox.message_id`,
-  `outbox.attempt`, `outbox.delay_ms` и `outbox.shard`, если шард записи известен. Ошибки `retry` и `permanent`
-  записываются в наблюдение.
+  `permanent`, `not_attempted`, `requeued`, `waiting`, `failed`, если вызов обработчика прервался); с высокой:
+  `outbox.message_id`, `outbox.attempt`, `outbox.delay_ms` и `outbox.shard`, если шард записи известен. Ошибки `retry`
+  и `permanent` записываются в наблюдение.
 - С `tracing(tracer, propagator)` запись, которую получает обработчик, несёт заголовки span-а доставки, а в
   `handleBatch` по умолчанию (и в `OutboxHandler.inRecordScope`) это наблюдение текущее. Без этого вызова запись
   приходит с сохранёнными заголовками, а micrometer-tracing в classpath не нужен. С сохранёнными заголовками приходит и
@@ -2779,11 +3110,11 @@ relay-воркер `outbox-relay-N` или поток, вызвавший `Outbo
 
 | Этап | Когда и где | Observation: наблюдение и span | Kora: span | Метры |
 |---|---|---|---|---|
-| Запись | Одно на вызов `send`/`sendAll`, на потоке писателя, внутри его транзакции | `outbox.enqueue`, span `outbox enqueue`, kind `PRODUCER` (`SenderContext`), без ключей. Propagating-обработчик приложения кладёт его контекст в заголовки сообщений (`traceparent`, `tracestate`); сообщение со своими заголовками трассы оставляет их. Вне любого span-а это корневой span, и контекст всё равно сохраняется | Нет. Сохраняется трасса текущего контекста Kora, если она есть, а у сообщения нет своего `traceparent` | `outbox.messages.enqueued{topic}` на сообщение, включая откатившиеся |
+| Запись | Одно на вызов `send`/`sendAll`, на потоке писателя, внутри его транзакции | `outbox.enqueue`, span `outbox enqueue`, kind `PRODUCER` (`SenderContext`), без ключей. Propagating-обработчик приложения кладёт его контекст в заголовки сообщений (`traceparent`, `tracestate`); сообщение со своими заголовками трассы оставляет их. Вне любого span-а это корневой span, и контекст всё равно сохраняется | Нет. Сохраняется трасса текущего контекста Kora, если она есть, а у сообщения нет своего `traceparent` | `outbox.messages.enqueued{topic}` на сообщение, включая откатившиеся; `outbox.messages.contract_rejected{topic,type,version}` на отвергнутое проверкой при записи |
 | Шаг relay | Одно на шаг, нашедший работу хотя бы в одном заблокированном шарде (те же шаги, что меряет `outbox.batch.duration`); шаг без работы наблюдения не создаёт. На потоке шага, от первого шарда с работой (чтение курсоров, выбор цели и поиск повторов и отложенных записей до этого шарда — раньше) до конца работы шага, до его коммита | `outbox.relay.step`, span `outbox relay step`, kind `INTERNAL`; на relay-воркере — корень своей трассы, у `drain()`, вызванного внутри наблюдения, — дочерний span. Высокая кардинальность: `outbox.shards` — заблокированные шарды через запятую; низкой нет. Пока шаг идёт, наблюдение текущее, и JDBC-наблюдения приложения для его запросов (если оно их пишет) становятся дочерними. Ошибка шага записывается в наблюдение; ошибка до первого шарда с работой наблюдения не создаёт | Нет | `outbox.batch.duration`, `outbox.shard.paused`; `outbox.relay.failures` считает и сбои вне шага (проход relay) |
 | Доставка записи | Одно на запись вызова обработчика: начинается на потоке шага перед вызовом, заканчивается с outcome записи | `outbox.deliver`, span `outbox deliver <topic>`, kind `CONSUMER` (`ReceiverContext`), родитель — сохранённый при записи контекст; по умолчанию его нет у записи, чья сохранённая W3C-трасса не сэмплирована (`observeUnsampled(true)` — есть у каждой). Низкая кардинальность: `messaging.destination.name`, `outbox.outcome`; высокая: `outbox.message_id`, `outbox.attempt` (эта попытка, с 1), `outbox.delay_ms`, `outbox.shard` (шард записи; нет, если неизвестен). С `tracing(...)` обработчик получает запись с заголовками этого span-а, а в `inRecordScope` наблюдение текущее | `outbox deliver <topic>`, kind `PRODUCER`, родитель — сохранённая трасса, без неё — корневой span. Атрибуты `messaging.destination.name`, `outbox.message_id`, `outbox.attempt`, `outbox.delay_ms`, `outbox.outcome`; `outbox.shard` нет. Обработчик получает запись с заголовками span-а, а `handle` — контекст Kora с ним | — |
-| Исходы | По одному на запись, когда relay разбирает outcomes вызова, до коммита шага | `outbox.outcome` = `delivered`, `retry`, `permanent`, `not_attempted`, `requeued`; `failed`, если вызов кончился без outcomes (прерван, relay закрывается). Ошибки `retry`, `permanent` и `failed` записываются в наблюдение | Те же значения `outbox.outcome`, кроме `failed`: прерванный вызов даёт span-ам статус ERROR с исключением. Ошибки `retry` и `permanent` — тоже ERROR | `outbox.messages.delivered{topic}`, `outbox.delivery.delay{topic}`, `outbox.messages.failed{topic,outcome}` (`retry`, `dead`), `outbox.messages.requeued{topic}`; решения хука — `outbox.dead.decisions{decision}`, его сбои — `outbox.dead.hook.failures` |
-| Курсор и лаг | Шаг шарда пишет строку курсора (прогресс или пауза); gauges обновляет обслуживание раз в `maintenanceInterval` на инстансе, который его выполняет | Нет | Нет | `outbox.shard.lag` (самый медленный шард, с), `outbox.retry.size`, `outbox.parked.size`, `outbox.dead.size`, `outbox.dead.pending`, `outbox.dead.pending.oldest`, gauges партиций и обслуживания |
+| Исходы | По одному на запись, когда relay разбирает outcomes вызова, до коммита шага | `outbox.outcome` = `delivered`, `retry`, `permanent`, `not_attempted`, `requeued`, `waiting`; `failed`, если вызов кончился без outcomes (прерван, relay закрывается). Ошибки `retry`, `permanent` и `failed` записываются в наблюдение | Те же значения `outbox.outcome`, кроме `failed`: прерванный вызов даёт span-ам статус ERROR с исключением. Ошибки `retry` и `permanent` — тоже ERROR | `outbox.messages.delivered{topic}`, `outbox.delivery.delay{topic}`, `outbox.messages.failed{topic,outcome}` (`retry`, `dead`), `outbox.messages.requeued{topic}`, `outbox.messages.waiting{topic,kind}`; решения хука — `outbox.dead.decisions{decision}`, его сбои — `outbox.dead.hook.failures` |
+| Курсор и лаг | Шаг шарда пишет строку курсора (прогресс или пауза); gauges обновляет обслуживание раз в `maintenanceInterval` на инстансе, который его выполняет | Нет | Нет | `outbox.shard.lag` (самый медленный шард, с), `outbox.retry.size`, `outbox.waiting.size`, `outbox.waiting.oldest`, `outbox.parked.size`, `outbox.dead.size`, `outbox.dead.pending`, `outbox.dead.pending.oldest`, gauges партиций и обслуживания |
 
 Если в `ObservationRegistry` зарегистрирован `DefaultMeterObservationHandler`, каждое наблюдение ещё и таймер с тем же
 именем (`outbox.enqueue`, `outbox.relay.step`, `outbox.deliver`), с низкокардинальными ключами и тегом `error`.
@@ -2858,15 +3189,15 @@ docker compose -f observability/docker-compose.yml up -d
 ```
 
 Grafana на http://localhost:3000 открывает дашборд **Outbox** (uid `outbox`): пропускная способность, задержка
-доставки, лаг шардов, сбои, retry- и dead-таблицы, партиции, панели Postgres и потребителя. Трассы — в Explore → Tempo
-(http://localhost:3200, OTLP gRPC на `localhost:4317`); Prometheus на http://localhost:9090 собирает метрики
-бенчмарк-приложения с `host.docker.internal:8085`. Чтобы использовать дашборд со своим сервисом, импортируйте
+доставки, лаг шардов, сбои, retry- и dead-таблицы, ждущие записи, партиции, панели Postgres и потребителя. Трассы — в
+Explore → Tempo (http://localhost:3200, OTLP gRPC на `localhost:4317`); Prometheus на http://localhost:9090 собирает
+метрики бенчмарк-приложения с `host.docker.internal:8085`. Чтобы использовать дашборд со своим сервисом, импортируйте
 `observability/grafana/dashboards/outbox.json`. Подробности: `observability/README.md`.
 
 ## Тестирование вашего сервиса
 
-- **Юнит-тесты.** `Outbox` и `Inbox` — интерфейсы: мокайте их. `TypedOutbox` принимает в конструкторе `Outbox` и
-  `OutboxSerializer`.
+- **Юнит-тесты.** `Outbox` и `Inbox` — интерфейсы: мокайте их. `TypedOutbox` принимает в конструкторе `Outbox`,
+  `OutboxSerializer` и класс `T`.
 - **Интеграционные тесты** запускают настоящий модуль на Postgres 16 (Testcontainers). Выключите фоновый relay и
   доставляйте синхронно через `OutboxRelay.drain()`: он делает тик, затем обрабатывает каждый шард, пока все шарды не
   дойдут до этого тика и не останется голов в retry-таблице и отложенных записей, срок которых наступил, и возвращает
@@ -2917,7 +3248,7 @@ class OrdersTest implements KoraAppTestConfigModifier {
 
 - `drain()` останавливается, когда не осталось голов в retry-таблице и отложенных записей, срок которых наступил:
   запись, чья отправка упала и которая ждёт своего backoff, ещё не доставлена; запись, отложенная через `requeue` до
-  своего срока, — тоже.
+  своего срока, — тоже; запись, которая ждёт инстанс, способный её обработать (`Waiting`), — тоже.
   Создайте топик до теста и дополнительно проверяйте, что `select count(*) from outbox_retry` = 0 (а с обработчиком,
   который откладывает записи, — и `outbox_parked`). С меньшим `batchTimeout` `drain()` быстрее сдаётся при тестовом
   обработчике, запоминающем записи; с Kafka значение должно оставаться ≥ `delivery.timeout.ms + 5 s + max.block.ms`.
@@ -3108,6 +3439,7 @@ retry и dead пусты. Прогон на более ранней версии
 - пакета `io.github.dsudomoin.outbox.internal` и вложенных в него: это реализация, она меняется в любом релизе;
 - членов с аннотацией `@InternalApi` (`io.github.dsudomoin.outbox.InternalApi`). Они публичны только для адаптеров
   этого репозитория: `OutboxRuntime.schema()`, `maintenance()` и `deadLetterPass()`, конструктор `OutboxRelay`,
+  `TypedOutboxTopicHandler.contractVersion()`, конструктор `OutboxIncompatibleContractException`,
   `KafkaOutboxSender.warnIfLongerThan`, фабрики `OutboxModule` и `OutboxAdminHttpModule` для внутренних типов,
   классы `OutboxAdminDelegate`, `OutboxAdminInterceptor`, `KoraRecordScope` и `OutboxTracing`;
 - пакетов `io.github.dsudomoin.outbox.admin.kora.api` и `io.github.dsudomoin.outbox.admin.kora.model`, сгенерированных
@@ -3162,11 +3494,11 @@ record (`case OutboxRecord(var id, ...)`) должны добавить новы
 
 | Скилл | Когда агент его загружает |
 |---|---|
-| `using-outbox` | Подключение, настройка и отправка; версии, роль в базе и схема в миграциях, соединения, топики Kafka перед деплоем |
-| `writing-outbox-handlers` | Свой `OutboxTopicHandler` или `OutboxHandler`, типизированный обработчик, `byTopic`, `batchSize` и `batchTimeout` под медленную цель, dead letters, `Outcome.requeue` |
+| `using-outbox` | Подключение, настройка и отправка; версии, роль в базе и схема в миграциях, соединения, топики Kafka перед деплоем; версии контрактов и протокол двух релизов |
+| `writing-outbox-handlers` | Свой `OutboxTopicHandler` или `OutboxHandler`, типизированный обработчик, `byTopic`, `batchSize` и `batchTimeout` под медленную цель, dead letters, `Outcome.requeue`, `Outcome.waitFor` и версии контрактов |
 | `consuming-with-outbox-inbox` | Потребитель с `Inbox`: дедупликация, scope, записи без заголовка `outbox-message-id` |
 | `testing-outbox` | Интеграционные тесты с Testcontainers и `OutboxRelay.drain()`, тесты, не проверяющие доставку |
-| `operating-outbox` | Метрики, алерты, dead letters, процедуры восстановления, решардинг, деплои, медленная доставка в Kafka после слишком большой записи |
+| `operating-outbox` | Метрики, алерты, dead letters, процедуры восстановления, решардинг, деплои, медленная доставка в Kafka после слишком большой записи, ждущие записи и отказ от них |
 
 **Claude Code.** Репозиторий — маркетплейс с одним плагином `outbox`:
 

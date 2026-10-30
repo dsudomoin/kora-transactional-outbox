@@ -48,7 +48,7 @@ public record OutboxStatus(
      * A running instance, by its heartbeat: {@code id} {@code <host>/<pid>/<8 hex>}, its shard count, when it was last
      * seen (database clock, every {@code maintenanceInterval}), whether it has an active dead-letter hook, whether the
      * relay runs there, and {@code contracts}: the highest contract version it reads, by topic, null when unknown,
-     * empty when it reports none.
+     * empty when it reports none; a version that is no positive int shows as 0.
      */
     public record Instance(String id, int shards, Instant lastSeen, boolean hookActive, boolean relay,
             @Nullable Map<String, Integer> contracts) {
