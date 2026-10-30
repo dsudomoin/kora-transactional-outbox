@@ -299,6 +299,21 @@ class ContractGuardTest {
         assertThat(rejected).containsExactly("orders Created v2", "orders Created v2");
     }
 
+    /** Fresh up to three intervals old, stale past them: without a live relay instance, a local send passes or not. */
+    @Test
+    void aReadTurnsStaleAfterThreeIntervals() {
+        var guard = new ContractGuard(Map.of(), Set.of("orders"), INTERVAL);
+        long now = System.nanoTime();
+        guard.nanoTime = () -> now;
+        var threeIntervals = INTERVAL.multipliedBy(3);
+
+        guard.observed(new ContractGuard.Snapshot(now - threeIntervals.toNanos(), Map.of(), Map.of()));
+        assertThatCode(() -> require(guard, message("orders", null), "?")).as("fresh").doesNotThrowAnyException();
+        guard.observed(new ContractGuard.Snapshot(now - threeIntervals.plusNanos(1).toNanos(), Map.of(), Map.of()));
+        assertThatThrownBy(() -> require(guard, message("orders", null), "?")).as("stale")
+                .isInstanceOf(OutboxMissingRouteException.class);
+    }
+
     /** Raw or typed at version 1, a message of a topic a route here claims needs every live relay to route it. */
     @Test
     void aLocalMessageOfAnyVersionNeedsEveryLiveRelayToRouteIt() {

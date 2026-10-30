@@ -22,6 +22,7 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -86,6 +87,8 @@ final class ContractGuard {
     private final AtomicLong unmarkedWarned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
     @Nullable
     private volatile Snapshot snapshot;
+    /** {@link System#nanoTime()}, which dates a read and ages it; for tests, to stand at an exact age. */
+    LongSupplier nanoTime = System::nanoTime;
 
     /**
      * {@code contracts}: this instance's typed routes, the version each reads by topic; {@code routes}: every topic a
@@ -109,7 +112,7 @@ final class ContractGuard {
 
     /** Reads the live relay instances' reports, in a statement of its own. */
     void refresh(Connection c, TableNames names) throws SQLException {
-        long readAt = System.nanoTime();
+        long readAt = nanoTime.getAsLong();
         var reports = new HashMap<String, Map<String, Integer>>();
         var routed = new HashMap<String, Set<String>>();
         try (var st = c.createStatement(); var rs = st.executeQuery("select instance_id, " + REPORT + ", " + ROUTES
@@ -174,7 +177,7 @@ final class ContractGuard {
         }
         var s = snapshot;
         if (local || version > 1) {
-            boolean stale = s == null || System.nanoTime() - s.readAt > staleAfter.toNanos();
+            boolean stale = s == null || nanoTime.getAsLong() - s.readAt > staleAfter.toNanos();
             if (local) {
                 requireRouted(names, s, stale, topic, telemetry);
             }
@@ -257,7 +260,7 @@ final class ContractGuard {
      * Why a stale read refuses, after "this instance": how long ago it read the reports, and, when it did, that the
      * last read found no live relay instance ({@code none}) or not every one that {@code does} so.
      */
-    private static String staleRefusal(@Nullable Snapshot s, boolean none, String does) {
+    private String staleRefusal(@Nullable Snapshot s, boolean none, String does) {
         if (s == null) {
             return "has never read the live relay instances' reports (its heartbeat fails?); refused until a fresh"
                     + " read allows it";
@@ -296,8 +299,8 @@ final class ContractGuard {
     }
 
     /** How long ago {@code s} was read, in whole seconds. */
-    private static long age(Snapshot s) {
-        return TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - s.readAt);
+    private long age(Snapshot s) {
+        return TimeUnit.NANOSECONDS.toSeconds(nanoTime.getAsLong() - s.readAt);
     }
 
     /** Whether the WARN that {@code warned} limits may log now, at most once a {@link #WARN_INTERVAL}. */
@@ -307,7 +310,7 @@ final class ContractGuard {
         return now - last >= WARN_INTERVAL && warned.compareAndSet(last, now);
     }
 
-    /** One read of the live relay instances' reports; {@code readAt}: {@link System#nanoTime()} before it ran. */
+    /** One read of the live relay instances' reports; {@code readAt}: {@link #nanoTime} before it ran. */
     static final class Snapshot {
 
         final long readAt;
