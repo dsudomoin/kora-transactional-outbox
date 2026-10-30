@@ -137,6 +137,36 @@ class OutboxHandlerTest {
     }
 
     @Test
+    void waitBlocksItsKeyButNeverCountsTowardTheProbeStop() {
+        var attempted = new ArrayList<OutboxRecord>();
+        var k1 = record("t", "k1");
+        var k1Again = record("t", "k1");
+        var f1 = record("t", "f1");
+        var f2 = record("t", "f2");
+        var ok = record("t", "ok");
+        OutboxHandler handler = r -> {
+            attempted.add(r);
+            if (r == f1 || r == f2) {
+                throw new RuntimeException("down");
+            }
+            if (r != ok) {
+                throw new OutboxWaitException("not yet");
+            }
+        };
+        // 4 waiting keys, one with a skipped record, and 2 failing ones: only the 2 failures count, so ok is tried
+        var records = List.of(k1, k1Again, record("t", "k2"), record("t", "k3"), f1, f2, record("t", "k4"), ok);
+
+        var outcomes = handler.handleBatch(records);
+
+        var waiting = new Outcome.Waiting(Outcome.Waiting.Kind.HANDLER, "not yet", null);
+        assertThat(outcomes).hasSize(8);
+        assertThat(outcomes.subList(0, 4)).containsExactly(waiting, Outcome.notAttempted(), waiting, waiting);
+        assertThat(outcomes.subList(4, 6)).allMatch(o -> o instanceof Outcome.Retry);
+        assertThat(outcomes.subList(6, 8)).containsExactly(waiting, Outcome.delivered());
+        assertThat(attempted).doesNotContain(k1Again).hasSize(7);
+    }
+
+    @Test
     void errorFailsOnlyItsRecordAndBlocksItsKey() {
         var poison = record("t", "k");
         var errors = List.<Error>of(new AssertionError("fatal"), new StackOverflowError("deep"),
@@ -226,6 +256,21 @@ class OutboxHandlerTest {
     }
 
     @Test
+    void byTopicRouteThrowingAWaitMakesAllItsRecordsWait() {
+        var a = new RecordingHandler();
+        var b = new RecordingHandler();
+        var a1 = record("a", "k");
+        var b1 = record("b", "k");
+        var a2 = record("a", null);
+        a.throwFromBatch(() -> new OutboxWaitException(Outcome.Waiting.Kind.NO_ROUTE, "no route for a"));
+        var handler = OutboxHandler.byTopic(Map.of("a", a, "b", b), new RecordingHandler());
+
+        var waiting = new Outcome.Waiting(Outcome.Waiting.Kind.NO_ROUTE, "no route for a", null);
+        assertThat(handler.handleBatch(List.of(a1, b1, a2))).containsExactly(waiting, Outcome.delivered(), waiting);
+        assertThat(b.delivered()).containsExactly(b1);
+    }
+
+    @Test
     void byTopicRouteReturningAnInvalidListFailsOnlyItsRecords() {
         var answers = List.<Function<List<OutboxRecord>, List<Outcome>>>of(
                 records -> Collections.emptyList(),
@@ -304,6 +349,13 @@ class OutboxHandlerTest {
         assertThat(Outcome.requeue(at)).isEqualTo(new Outcome.Requeue(at));
         assertThatThrownBy(() -> Outcome.requeue(null)).isInstanceOf(NullPointerException.class);
         assertThat(new OutboxPermanentException("m", e)).hasMessage("m").hasCause(e);
+        assertThat(Outcome.waitFor("r")).isEqualTo(new Outcome.Waiting(Outcome.Waiting.Kind.HANDLER, "r", null));
+        assertThat(Outcome.waitFor("r", at)).isEqualTo(new Outcome.Waiting(Outcome.Waiting.Kind.HANDLER, "r", at));
+        assertThatThrownBy(() -> Outcome.waitFor("r", null)).isInstanceOf(NullPointerException.class);
+        assertThat(new OutboxWaitException("r")).hasMessage("r")
+                .extracting(OutboxWaitException::kind).isEqualTo(Outcome.Waiting.Kind.HANDLER);
+        assertThat(Arrays.stream(Outcome.Waiting.Kind.values()).map(Outcome.Waiting.Kind::label))
+                .containsExactly("contract", "no_route", "handler");
     }
 
     private static OutboxRecord record(String topic, @Nullable String key) {

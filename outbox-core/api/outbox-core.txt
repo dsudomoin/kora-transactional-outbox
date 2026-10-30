@@ -269,6 +269,7 @@ package io.github.dsudomoin.outbox {
     ctor public OutboxRecord(long, java.util.UUID!, String!, byte[]?, byte[]?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!, java.time.Instant!, int, int);
     ctor public OutboxRecord(long, java.util.UUID!, String!, byte[]?, byte[]?, java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>!, java.time.Instant!, int, int, int);
     method public int attempts();
+    method public int contractVersion();
     method public java.time.Instant! createdAt();
     method public java.util.List<io.github.dsudomoin.outbox.OutboxHeader!>! headers();
     method public long id();
@@ -422,6 +423,11 @@ package io.github.dsudomoin.outbox {
     method public default RuntimeException! translate(java.sql.SQLException!);
   }
 
+  public class OutboxWaitException extends java.lang.RuntimeException {
+    ctor public OutboxWaitException(String!);
+    method public io.github.dsudomoin.outbox.Outcome.Waiting.Kind! kind();
+  }
+
   public interface Outcome {
     method public static io.github.dsudomoin.outbox.Outcome! delivered();
     method public static io.github.dsudomoin.outbox.Outcome! notAttempted();
@@ -431,6 +437,8 @@ package io.github.dsudomoin.outbox {
     method public static io.github.dsudomoin.outbox.Outcome! requeue(java.time.Instant!);
     method public static io.github.dsudomoin.outbox.Outcome! retry(Throwable!);
     method public static io.github.dsudomoin.outbox.Outcome! retry(Throwable!, java.time.Instant!);
+    method public static io.github.dsudomoin.outbox.Outcome! waitFor(String!);
+    method public static io.github.dsudomoin.outbox.Outcome! waitFor(String!, java.time.Instant!);
   }
 
   public enum Outcome.Delivered implements io.github.dsudomoin.outbox.Outcome {
@@ -456,6 +464,20 @@ package io.github.dsudomoin.outbox {
     ctor public Outcome.Retry(Throwable!, java.time.Instant?);
     method public Throwable! error();
     method public java.time.Instant? notBefore();
+  }
+
+  public static final class Outcome.Waiting implements io.github.dsudomoin.outbox.Outcome {
+    ctor public Outcome.Waiting(io.github.dsudomoin.outbox.Outcome.Waiting.Kind!, String!, java.time.Instant?);
+    method public io.github.dsudomoin.outbox.Outcome.Waiting.Kind! kind();
+    method public java.time.Instant? notBefore();
+    method public String! reason();
+  }
+
+  public enum Outcome.Waiting.Kind {
+    method public String! label();
+    enum_constant public static final io.github.dsudomoin.outbox.Outcome.Waiting.Kind CONTRACT;
+    enum_constant public static final io.github.dsudomoin.outbox.Outcome.Waiting.Kind HANDLER;
+    enum_constant public static final io.github.dsudomoin.outbox.Outcome.Waiting.Kind NO_ROUTE;
   }
 
   public final class TypedOutbox<T> {

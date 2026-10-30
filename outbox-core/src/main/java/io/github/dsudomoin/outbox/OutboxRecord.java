@@ -1,5 +1,6 @@
 package io.github.dsudomoin.outbox;
 
+import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import jakarta.annotation.Nullable;
@@ -25,6 +26,8 @@ public record OutboxRecord(
         int requeues,
         int shard) {
 
+    static final String CONTRACT_HEADER = "outbox-contract";
+
     public OutboxRecord {
         headers = List.copyOf(headers);
     }
@@ -39,6 +42,32 @@ public record OutboxRecord(
     @Nullable
     public String keyAsString() {
         return key == null ? null : new String(key, UTF_8);
+    }
+
+    /**
+     * The version of the payload's contract: the last {@code outbox-contract} header, a decimal int, or 1 without one.
+     * A null, unparseable or non-positive value throws {@link OutboxWaitException} of kind
+     * {@link Outcome.Waiting.Kind#CONTRACT}: this instance cannot tell what the payload is, so the record waits.
+     */
+    public int contractVersion() {
+        for (int i = headers.size() - 1; i >= 0; i--) {
+            var header = headers.get(i);
+            if (header.name().equals(CONTRACT_HEADER)) {
+                var value = header.value() == null ? null : new String(header.value(), US_ASCII);
+                int version;
+                try {
+                    version = Integer.parseInt(value);
+                } catch (NumberFormatException e) { // a null value too
+                    version = 0;
+                }
+                if (version <= 0) {
+                    throw new OutboxWaitException(Outcome.Waiting.Kind.CONTRACT,
+                            "invalid " + CONTRACT_HEADER + " header: " + value);
+                }
+                return version;
+            }
+        }
+        return 1;
     }
 
     public OutboxRecord withHeaders(List<OutboxHeader> headers) {

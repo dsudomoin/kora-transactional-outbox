@@ -23,7 +23,8 @@ import org.slf4j.LoggerFactory;
 public interface OutboxHandler {
 
     /**
-     * Delivers one record. Throw {@link OutboxPermanentException} for a record that can never succeed; anything else
+     * Delivers one record. Throw {@link OutboxPermanentException} for a record that can never succeed,
+     * {@link OutboxWaitException} for one this instance cannot handle now ({@link Outcome#waitFor}); anything else
      * thrown, an {@link Error} included, means "retry later". The default {@link #handleBatch} runs it in the
      * record's scope ({@link #inRecordScope}), so clients called from here continue the record's trace when the
      * telemetry binds one (the Kora adapter; the Micrometer Observation telemetry with tracing, for the records it
@@ -33,7 +34,7 @@ public interface OutboxHandler {
 
     /**
      * Delivers records in list order and returns one {@link Outcome} per record, in the same order. Contract: never
-     * deliver a record whose (topic, key) already failed earlier in this call.
+     * deliver a record whose (topic, key) already failed or waited earlier in this call.
      *
      * <p>{@link Outcome#requeue()} sets a record aside without blocking its key. The default never returns it: a
      * handler that needs it overrides {@code handleBatch}; {@link #byTopic} passes it through like any outcome.
@@ -59,17 +60,19 @@ public interface OutboxHandler {
      * unkeyed records never block each other. While nothing has succeeded yet, it stops after failures on 3 distinct
      * (topic, key) pairs (the target looks down; each failing unkeyed record counts as a pair) and returns
      * {@code NotAttempted} for the rest; so does a call asked to wind down. {@link OutboxPermanentException} gives
-     * {@code Permanent} and does not block the key; anything else {@code handle} throws, an {@link Error} included,
-     * gives {@code Retry} and blocks the key (the relay logs a {@code Retry} carrying an Error at ERROR, at most once
-     * per 10 s). So the default never fails a whole call.
+     * {@code Permanent} and does not block the key. {@link OutboxWaitException} gives {@code Waiting} and blocks the
+     * key, but neither it nor the key's skipped records count toward the 3-pair stop. Anything else {@code handle}
+     * throws, an {@link Error} included, gives {@code Retry} and blocks the key (the relay logs a {@code Retry}
+     * carrying an Error at ERROR, at most once per 10 s). So the default never fails a whole call.
      */
     default List<Outcome> handleBatch(List<OutboxRecord> records) {
         var outcomes = new ArrayList<Outcome>(records.size());
-        var failed = new HashSet<Object>();
+        var blocked = new HashSet<Object>(); // keys skipped for the rest of the call: failed or waiting
+        var failed = new HashSet<Object>(); // the ones the 3-pair stop counts: a wait says nothing about the target
         boolean anyDelivered = false;
         for (var record : records) {
             var key = BatchClassifier.orderingKey(record);
-            if (failed.contains(key) || (!anyDelivered && failed.size() >= 3) || windDownRequested()) {
+            if (blocked.contains(key) || (!anyDelivered && failed.size() >= 3) || windDownRequested()) {
                 outcomes.add(Outcome.notAttempted());
                 continue;
             }
@@ -82,11 +85,15 @@ public interface OutboxHandler {
                 anyDelivered = true;
             } catch (OutboxPermanentException e) {
                 outcomes.add(Outcome.permanent(e));
+            } catch (OutboxWaitException e) {
+                outcomes.add(new Outcome.Waiting(e.kind(), e.getMessage(), null));
+                blocked.add(key);
             } catch (Throwable e) { // an Error too: one record's bug must not fail the records around it
                 if (e instanceof InterruptedException) {
                     Thread.currentThread().interrupt();
                 }
                 outcomes.add(Outcome.retry(e));
+                blocked.add(key);
                 failed.add(key);
             }
         }
@@ -122,7 +129,8 @@ public interface OutboxHandler {
      * route's
      * {@link #handleBatch} gets its records in their original order; outcomes come back in the input positions. A
      * route whose {@code handleBatch} throws an exception, or returns an invalid list (null, wrong size, a null
-     * element; logged at ERROR, at most once per 10 s), gets {@code Retry} for all its records; an {@link Error}
+     * element; logged at ERROR, at most once per 10 s), gets {@code Retry} for all its records; one that throws
+     * {@link OutboxWaitException} gets {@code Waiting} (its kind and message) for all of them; an {@link Error}
      * propagates and fails the whole call. Routes run one after another on one thread: once the soft deadline asks
      * the call to wind down, the routes that follow return {@code NotAttempted} (default {@code handleBatch}). A route
      * that ignores it holds the call until the hard {@code batchTimeout}, and then every record of the call is
@@ -154,6 +162,9 @@ public interface OutboxHandler {
                     List<Outcome> routed;
                     try {
                         routed = route.handleBatch(indexes.stream().map(records::get).toList());
+                    } catch (OutboxWaitException e) { // the route cannot take any of them now
+                        Outcome waiting = new Outcome.Waiting(e.kind(), e.getMessage(), null);
+                        routed = indexes.stream().map(i -> waiting).toList();
                     } catch (Exception e) { // one broken route must not block the others; Errors propagate
                         routed = indexes.stream().map(i -> Outcome.retry(e)).toList();
                     }

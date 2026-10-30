@@ -50,6 +50,20 @@ public sealed interface Outcome {
         return new Requeue(Objects.requireNonNull(notBefore, "notBefore"));
     }
 
+    /**
+     * This instance cannot handle the record now: it spends no attempt, never goes to the dead table by itself, blocks
+     * its (topic, key), and a capable instance takes it later. Kind {@link Waiting.Kind#HANDLER};
+     * {@link OutboxWaitException} is the same, thrown from {@link OutboxHandler#handle}.
+     */
+    static Outcome waitFor(String reason) {
+        return new Waiting(Waiting.Kind.HANDLER, reason, null);
+    }
+
+    /** {@link #waitFor(String)}, handed again no earlier than {@code notBefore}. */
+    static Outcome waitFor(String reason, Instant notBefore) {
+        return new Waiting(Waiting.Kind.HANDLER, reason, Objects.requireNonNull(notBefore, "notBefore"));
+    }
+
     enum Delivered implements Outcome {
         INSTANCE;
 
@@ -74,4 +88,33 @@ public sealed interface Outcome {
     record NotAttempted(@Nullable Instant notBefore) implements Outcome {}
 
     record Requeue(@Nullable Instant notBefore) implements Outcome {}
+
+    /** See {@link #waitFor(String)}; {@code reason} is free text, {@code kind} a closed set fit for a metric label. */
+    record Waiting(Kind kind, String reason, @Nullable Instant notBefore) implements Outcome {
+        public Waiting {
+            Objects.requireNonNull(kind, "kind");
+            Objects.requireNonNull(reason, "reason");
+        }
+
+        /** Why the record waits. */
+        public enum Kind {
+            /** The record's contract version is unreadable or above the one this instance reads. */
+            CONTRACT("contract"),
+            /** No route on this instance claims the record's topic. */
+            NO_ROUTE("no_route"),
+            /** The handler said so ({@link Outcome#waitFor}, {@link OutboxWaitException}). */
+            HANDLER("handler");
+
+            private final String label;
+
+            Kind(String label) {
+                this.label = label;
+            }
+
+            /** The metric label: {@code contract}, {@code no_route} or {@code handler}. */
+            public String label() {
+                return label;
+            }
+        }
+    }
 }
