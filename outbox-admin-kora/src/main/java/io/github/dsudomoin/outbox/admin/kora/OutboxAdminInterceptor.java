@@ -3,7 +3,9 @@ package io.github.dsudomoin.outbox.admin.kora;
 import io.github.dsudomoin.outbox.InternalApi;
 import io.github.dsudomoin.outbox.admin.kora.model.ModelError;
 import jakarta.annotation.Nullable;
+import java.util.Map;
 import java.util.Objects;
+import java.util.StringJoiner;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
@@ -35,9 +37,11 @@ import ru.tinkoff.kora.json.common.JsonWriter;
  *
  * <p>Every call leaves one INFO audit line, written before its response completes:
  * {@code outbox admin <method> "<path>" by "<identity>": <status>} when allowed, {@code outbox admin <method>
- * "<path>" denied: <status>} when denied or when the authorizer fails. The path (its {@code {table}} is caller text,
- * logged before any authorization) and the identity (perhaps a token's subject) are quoted, with their quotes,
- * backslashes and control characters escaped, so no caller can forge a line or a part of one.
+ * "<path>" denied: <status>} when denied or when the authorizer fails. An allowed call whose operation put its
+ * arguments under {@link #DETAIL} has them before the status: {@code by "<identity>" with <name> "<value>", ...}, a
+ * null value as {@code null}. The path (its {@code {table}} is caller text, logged before any authorization), the
+ * identity (perhaps a token's subject) and each value are quoted, with their quotes, backslashes and control characters
+ * escaped, so no caller can forge a line or a part of one.
  *
  * <p>Internal type, unstable: for the adapters of this repository.
  */
@@ -45,6 +49,12 @@ import ru.tinkoff.kora.json.common.JsonWriter;
 public final class OutboxAdminInterceptor implements HttpServerInterceptor {
 
     private static final Logger log = LoggerFactory.getLogger(OutboxAdminInterceptor.class);
+    /**
+     * An operation's arguments for its audit line, by name in order, put on {@code Context.current()} by the delegate:
+     * the server's blocking executor injects the context this interceptor got, so the line written once the call
+     * completes reads them.
+     */
+    static final Context.KeyImmutable<Map<String, String>> DETAIL = new Context.KeyImmutable<>() {};
 
     private final OutboxAdminAuthorizer authorizer;
     private final BlockingRequestExecutor executor;
@@ -83,7 +93,7 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
             var caller = call + " by \"" + printable(allow.identity()) + "\"";
             return process(context, request, chain)
                     .exceptionallyCompose(e -> CompletableFuture.completedFuture(failure(context, caller, e)))
-                    .whenComplete((response, e) -> log.info("outbox admin {}: {}", caller,
+                    .whenComplete((response, e) -> log.info("outbox admin {}{}: {}", caller, detail(context),
                             response != null ? response.code() : status(e)));
         }
         var deny = (OutboxAdminAuthorizer.Deny) decision;
@@ -131,6 +141,18 @@ public final class OutboxAdminInterceptor implements HttpServerInterceptor {
         } catch (Exception e) {
             return CompletableFuture.failedFuture(e);
         }
+    }
+
+    /** {@code  with <name> "<value>", ...} of {@link #DETAIL}, each value {@link #printable}; empty without it. */
+    private static String detail(Context context) {
+        var detail = context.get(DETAIL);
+        if (detail == null) {
+            return "";
+        }
+        var out = new StringJoiner(", ", " with ", "");
+        detail.forEach((name, value) -> out.add(name + " "
+                + (value == null ? "null" : "\"" + printable(value) + "\"")));
+        return out.toString();
     }
 
     /**

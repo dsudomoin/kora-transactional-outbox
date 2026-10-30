@@ -216,7 +216,9 @@ class AdminCoexistenceIT implements KoraAppTestConfigModifier {
         var expected = new ArrayList<String>();
         for (var route : ROUTES) {
             var call = "outbox admin " + route.method() + " \"" + path(route) + "\"";
-            expected.addAll(List.of(call + " denied: 401", call + " denied: 403", call + " by \"tester\": 200"));
+            var allowed = call + " by \"tester\"" + (route.operation().equals("abandonWaiting")
+                    ? " with topic \"t\", key null, reason \"test\", dryRun \"false\"" : "") + ": 200";
+            expected.addAll(List.of(call + " denied: 401", call + " denied: 403", allowed));
         }
         assertThat(audit(log)).as("one INFO line per call").containsExactlyElementsOf(expected);
         assertThat(delegate.operations).containsExactlyElementsOf(ROUTES.stream().map(Route::operation).toList());

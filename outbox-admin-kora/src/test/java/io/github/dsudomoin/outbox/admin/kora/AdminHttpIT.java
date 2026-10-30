@@ -389,6 +389,28 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         }
     }
 
+    /** The one audit line names the caller and the reason, each value quoted and escaped, so none forges a part. */
+    @Test
+    void abandonAuditLineCarriesItsReason() throws Exception {
+        seedWaiting();
+
+        HttpResponse<String> response;
+        String log;
+        try (var stderr = new CapturedStderr()) {
+            response = call("POST", "/waiting/abandon", "{\"topic\":\"t\",\"key\":\"ключ\",\"reason\":"
+                    + "\"v2 rolled back\\\", dryRun \\\"true\\r\\nINFO forged\"}");
+            log = stderr.text();
+        }
+
+        assertJson(response, 200);
+        var audit = log.lines().filter(l -> l.contains("INFO " + OutboxAdminInterceptor.class.getName() + " - "))
+                .toList();
+        assertThat(audit).singleElement().asString().endsWith("outbox admin POST \"" + API + "/waiting/abandon\""
+                + " by \"tester\" with topic \"t\", key \"ключ\", reason \"v2 rolled back\\\", dryRun"
+                + " \\\"true\\r\\nINFO forged\", dryRun \"false\": 200");
+        assertThat(log).doesNotContain("\nINFO forged");
+    }
+
     /** A typo must never widen the call: {@code kye} ignored would abandon every key of the topic. */
     @Test
     void abandonRefusesBadInput() throws Exception {

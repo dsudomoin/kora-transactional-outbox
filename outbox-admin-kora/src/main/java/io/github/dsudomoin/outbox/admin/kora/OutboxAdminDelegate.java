@@ -58,11 +58,13 @@ import jakarta.annotation.Nullable;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.TreeMap;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import ru.tinkoff.kora.common.Context;
 
 /**
  * The admin API over {@link OutboxAdmin}: an {@link IllegalArgumentException} of a call answers 400, an
@@ -148,8 +150,15 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
             if (body == null) {
                 throw new IllegalArgumentException("give the topic and the reason");
             }
+            boolean dryRun = Boolean.TRUE.equals(body.dryRun());
+            var detail = new LinkedHashMap<String, String>(); // the reason goes into the audit line
+            detail.put("topic", body.topic());
+            detail.put("key", body.key());
+            detail.put("reason", body.reason());
+            detail.put("dryRun", String.valueOf(dryRun));
+            Context.current().set(OutboxAdminInterceptor.DETAIL, detail);
             var abandoned = admin.abandonWaiting(body.topic(), body.key() == null ? null : body.key().getBytes(UTF_8),
-                    body.reason(), Boolean.TRUE.equals(body.dryRun()));
+                    body.reason(), dryRun);
             return new AbandonWaiting200ApiResponse(new Abandoned(abandoned.keys(), abandoned.records()));
         }, AbandonWaiting400ApiResponse::new, AbandonWaiting409ApiResponse::new);
     }
