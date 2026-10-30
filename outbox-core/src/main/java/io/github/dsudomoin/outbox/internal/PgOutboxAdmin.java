@@ -156,12 +156,12 @@ public final class PgOutboxAdmin implements OutboxAdmin {
     private List<OutboxStatus.Instance> instances(Connection c) throws SQLException {
         var instances = new ArrayList<OutboxStatus.Instance>();
         try (var st = c.createStatement(); var rs = st.executeQuery("select instance_id, shards, last_seen,"
-                + " hook_active, relay, " + ContractGuard.REPORT + " from " + names.instance()
-                + " order by instance_id")) {
+                + " hook_active, relay, " + ContractGuard.REPORT + ", " + ContractGuard.ROUTES + " from "
+                + names.instance() + " order by instance_id")) {
             while (rs.next()) {
                 instances.add(new OutboxStatus.Instance(rs.getString(1), rs.getInt(2),
                         rs.getObject(3, OffsetDateTime.class).toInstant(), rs.getBoolean(4), rs.getBoolean(5),
-                        ContractGuard.report(rs, 6)));
+                        ContractGuard.report(rs, 6), ContractGuard.routes(rs, 9)));
             }
         }
         return instances;

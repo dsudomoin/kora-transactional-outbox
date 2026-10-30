@@ -429,6 +429,12 @@ components:
           additionalProperties:
             type: integer
             format: int32
+        routes:
+          type: array
+          description: >-
+            Every topic a route of it claims, typed or plain, sorted; absent when unknown, empty when it has none
+          items:
+            type: string
     DeadLetterCount:
       type: object
       required: [topic, status, count]

@@ -137,7 +137,8 @@ public record SchemaObjects(List<Table> tables) {
                         column("hook_active", "boolean", true, "false"),
                         column("expires_at", TIMESTAMPTZ, false),
                         column("relay", "boolean", true, "false"),
-                        column("contracts", "jsonb", false)),
+                        column("contracts", "jsonb", false),
+                        column("routes", "text[]", false)),
                         List.of("primary key (instance_id)"), List.of(), List.of())));
     }
 

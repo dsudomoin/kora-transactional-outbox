@@ -17,6 +17,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 
 class ContractGuardTest {
@@ -34,7 +35,7 @@ class ContractGuardTest {
 
     @Test
     void version1IsNeverChecked() {
-        var guard = new ContractGuard(Map.of("orders", 1), INTERVAL); // never read, as if stale
+        var guard = new ContractGuard(Map.of("orders", 1), Set.of("orders"), INTERVAL); // never read, as if stale
 
         assertThatCode(() -> {
             guard.require(NAMES, message("orders", null), "Created", telemetry);
@@ -104,10 +105,10 @@ class ContractGuardTest {
 
     @Test
     void aReadOlderThanThreeIntervalsRefusesEveryVersionAbove1() {
-        var guard = new ContractGuard(Map.of(), INTERVAL);
+        var guard = new ContractGuard(Map.of(), Set.of(), INTERVAL);
         guard.observed(new ContractGuard.Snapshot(System.nanoTime() - INTERVAL.multipliedBy(3).toNanos() - 1,
-                Map.of("a", Map.of("orders", 5))));
-        var neverRead = new ContractGuard(Map.of(), INTERVAL);
+                Map.of("a", Map.of("orders", 5)), Map.of("a", Set.of("orders"))));
+        var neverRead = new ContractGuard(Map.of(), Set.of(), INTERVAL);
 
         for (var g : List.of(guard, neverRead)) {
             assertThatThrownBy(() -> g.require(NAMES, message("kafka-bound", "2"), "Created", telemetry))
@@ -200,7 +201,7 @@ class ContractGuardTest {
     /** The relay would make such a record wait for good: refused at once, whatever the reports, and not counted. */
     @Test
     void aHeaderThatGivesNoVersionIsRefused() {
-        var guard = new ContractGuard(Map.of(), INTERVAL); // never read
+        var guard = new ContractGuard(Map.of(), Set.of(), INTERVAL); // never read
         for (var value : Arrays.asList(null, "", "x", "0", "-1", " 2", "99999999999")) {
             var headers = List.of(header("2"), new OutboxHeader(Contracts.HEADER,
                     value == null ? null : value.getBytes(US_ASCII)));
@@ -235,8 +236,8 @@ class ContractGuardTest {
     }
 
     private static ContractGuard guard(Map<String, Integer> contracts, Map<String, Map<String, Integer>> reports) {
-        var guard = new ContractGuard(contracts, INTERVAL);
-        guard.observed(new ContractGuard.Snapshot(System.nanoTime(), reports));
+        var guard = new ContractGuard(contracts, contracts.keySet(), INTERVAL);
+        guard.observed(new ContractGuard.Snapshot(System.nanoTime(), reports, Map.of())); // the version check reads no route
         return guard;
     }
 

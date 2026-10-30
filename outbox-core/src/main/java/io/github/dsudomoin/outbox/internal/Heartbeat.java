@@ -7,6 +7,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -17,12 +18,13 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Keeps this instance's row in {@code <base>_instance} fresh: {@code (instance_id, shards, last_seen, hook_active,
- * expires_at, relay, contracts)}, which the bootstrap first writes ({@link OutboxSchema}), upserted right after
+ * expires_at, relay, contracts, routes)}, which the bootstrap first writes ({@link OutboxSchema}), upserted right after
  * {@link #start()} and then every {@code maintenanceInterval} on the daemon thread {@code outbox-heartbeat}, by the
  * database clock, with {@code expires_at} {@value OutboxSchema#LIVE_INTERVALS} intervals ahead, so readers need not
  * know this instance's interval. {@code hook_active}: the relay runs here and its dead-letter hook is active;
  * {@code relay}: the relay runs here; {@code contracts}: the version each typed route reads, by topic ({@code {}}
- * without one). First, in a statement of its own, a beat reads the live relay instances' reports into the instance's
+ * without one); {@code routes}: every topic a route claims, typed or plain, sorted ({@code {}} without one). First, in
+ * a statement of its own, a beat reads the live relay instances' reports into the instance's
  * {@link ContractGuard}. Then one statement deletes other instances' rows expired for {@link #FORGET_AFTER} (instances
  * that died without a clean shutdown) and upserts the row, committed on their own. Last, in a transaction of its own,
  * it reads the cursors' shard count into the instance's {@link ShardGuard}, so a writer-only instance stops writing
@@ -72,17 +74,17 @@ public final class Heartbeat {
 
     /** The upsert of a row; {@link #bind} sets its parameters. */
     static String upsert(TableNames names) {
-        return "insert into " + names.instance() + " (instance_id, shards, hook_active, relay, contracts, last_seen,"
-                + " expires_at) values (?, ?, ?, ?, (select coalesce(jsonb_object_agg(t, v), '{}') from"
-                + " unnest(?::text[], ?::int[]) u(t, v)), now(), now() + make_interval(secs => ?)) on conflict"
+        return "insert into " + names.instance() + " (instance_id, shards, hook_active, relay, contracts, routes,"
+                + " last_seen, expires_at) values (?, ?, ?, ?, (select coalesce(jsonb_object_agg(t, v), '{}') from"
+                + " unnest(?::text[], ?::int[]) u(t, v)), ?, now(), now() + make_interval(secs => ?)) on conflict"
                 + " (instance_id) do update set shards = excluded.shards, hook_active = excluded.hook_active,"
-                + " relay = excluded.relay, contracts = excluded.contracts, last_seen = excluded.last_seen,"
-                + " expires_at = excluded.expires_at";
+                + " relay = excluded.relay, contracts = excluded.contracts, routes = excluded.routes,"
+                + " last_seen = excluded.last_seen, expires_at = excluded.expires_at";
     }
 
     /** Binds {@link #upsert}'s parameters after the first {@code before} ones of {@code ps}. */
     static void bind(PreparedStatement ps, int before, String id, int shards, boolean hookActive, boolean relay,
-            Map<String, Integer> contracts, Duration interval) throws SQLException {
+            Map<String, Integer> contracts, Collection<String> routes, Duration interval) throws SQLException {
         ps.setString(before + 1, id);
         ps.setInt(before + 2, shards);
         ps.setBoolean(before + 3, hookActive);
@@ -96,7 +98,8 @@ public final class Heartbeat {
         }
         ps.setArray(before + 5, ps.getConnection().createArrayOf("text", topics));
         ps.setArray(before + 6, ps.getConnection().createArrayOf("int4", versions));
-        ps.setDouble(before + 7, interval.multipliedBy(OutboxSchema.LIVE_INTERVALS).toNanos() / 1e9);
+        ps.setArray(before + 7, ps.getConnection().createArrayOf("text", routes.toArray()));
+        ps.setDouble(before + 8, interval.multipliedBy(OutboxSchema.LIVE_INTERVALS).toNanos() / 1e9);
     }
 
     /** Deletes the row of {@code id}; a failure is a WARN, as the row expires anyway. */
@@ -148,7 +151,7 @@ public final class Heartbeat {
             contracts.refresh(c, names); // before the statement below, which may give up on its lock
             try (var ps = c.prepareStatement(beat)) {
                 ps.setString(1, id); // the cleanup's; the upsert's parameters follow
-                bind(ps, 1, id, shards, hookActive, relay, contracts.contracts(), interval);
+                bind(ps, 1, id, shards, hookActive, relay, contracts.contracts(), contracts.routes(), interval);
                 ps.executeUpdate();
             }
             if (stopped) {

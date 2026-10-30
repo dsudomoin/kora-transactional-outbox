@@ -380,12 +380,13 @@ package io.github.dsudomoin.outbox {
   }
 
   public static final class OutboxStatus.Instance {
-    ctor public OutboxStatus.Instance(String!, int, java.time.Instant!, boolean, boolean, java.util.Map<java.lang.String!,java.lang.Integer!>?);
+    ctor public OutboxStatus.Instance(String!, int, java.time.Instant!, boolean, boolean, java.util.Map<java.lang.String!,java.lang.Integer!>?, java.util.List<java.lang.String!>?);
     method public java.util.Map<java.lang.String!,java.lang.Integer!>? contracts();
     method public boolean hookActive();
     method public String! id();
     method public java.time.Instant! lastSeen();
     method public boolean relay();
+    method public java.util.List<java.lang.String!>? routes();
     method public int shards();
   }
 

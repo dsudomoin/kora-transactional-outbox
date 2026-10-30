@@ -111,8 +111,9 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
         }
         execute("delete from " + names().instance());
         execute("insert into " + names().instance() + " (instance_id, shards, last_seen, hook_active, relay,"
-                + " contracts) values ('host-b/7/0000beef', 2, '2026-01-15T10:00:00Z', true, true,"
-                + " '{\"t2\": 2, \"t1\": 1}'), ('host-c/8/0000cafe', 2, '2026-01-15T10:00:00Z', false, false, null)");
+                + " contracts, routes) values ('host-b/7/0000beef', 2, '2026-01-15T10:00:00Z', true, true,"
+                + " '{\"t2\": 2, \"t1\": 1}', '{t2,t1}'), ('host-c/8/0000cafe', 2, '2026-01-15T10:00:00Z', false,"
+                + " false, null, null)");
 
         var response = call("GET", "/status", null);
 
@@ -130,7 +131,7 @@ class AdminHttpIT implements KoraAppTestConfigModifier {
                 + "\"orphans\":[{\"table\":\"" + orphan + "\",\"kind\":\"foreign\"}],\"tailOverflow\":false,"
                 + "\"premade\":2,\"maintenanceSinceSuccessSeconds\":S,\"shards\":2,\"instances\":[{\"id\":"
                 + "\"host-b/7/0000beef\",\"shards\":2,\"lastSeen\":\"2026-01-15T10:00:00.000Z\","
-                + "\"hookActive\":true,\"relay\":true,\"contracts\":{\"t1\":1,\"t2\":2}},"
+                + "\"hookActive\":true,\"relay\":true,\"contracts\":{\"t1\":1,\"t2\":2},\"routes\":[\"t1\",\"t2\"]},"
                 + "{\"id\":\"host-c/8/0000cafe\",\"shards\":2,\"lastSeen\":\"2026-01-15T10:00:00.000Z\","
                 + "\"hookActive\":false,\"relay\":false}]}");
     }

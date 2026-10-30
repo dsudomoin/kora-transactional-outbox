@@ -238,7 +238,8 @@ public final class OutboxAdminDelegate implements OutboxAdminApiDelegate {
                 s.orphans().stream().map(o -> new Orphan(o.table(), kind(o.kind()))).toList(),
                 s.tailOverflow(), s.premade(), s.xidsLeft(), s.maintenanceSinceSuccessSeconds(), s.shards(),
                 s.instances().stream().map(i -> new Instance(i.id(), i.shards(), utc(i.lastSeen()), i.hookActive(),
-                        i.relay(), i.contracts() == null ? null : new TreeMap<>(i.contracts()))).toList());
+                        i.relay(), i.contracts() == null ? null : new TreeMap<>(i.contracts()), i.routes()))
+                        .toList());
     }
 
     private static DeadLetter letter(io.github.dsudomoin.outbox.DeadLetter l) {

@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,12 +43,12 @@ import org.slf4j.LoggerFactory;
  * is skipped when the index exists, partition extension is optional and left to maintenance when it times out). A tick
  * table made before {@code max_id}, {@code dirty} or {@code shards}, a cursor table made before
  * {@code parked_due_at}, a retry table made before {@code requeues} or {@code waiting_since} (and its
- * {@code <retry>_waiting} index), an instance table made before {@code relay} or {@code contracts} and a dead table
- * made before the dead-letter hook's columns get each column once; such an ALTER waits for running relay transactions
- * and fails startup on timeout. The tick table keeps {@code shards}, the shard sets {@code dirty} replaces, for the
- * previous release, which writes and reads it beside or after this one; this version leaves it null (every shard).
- * Ticks without {@code dirty} (null) count as holding rows of every shard; dead letters older than {@code status} are
- * kept and the hook sees new ones only: one ALTER adds the hook's
+ * {@code <retry>_waiting} index), an instance table made before {@code relay}, {@code contracts} or {@code routes}
+ * and a dead table made before the dead-letter hook's columns get each column once; such an ALTER waits for running
+ * relay transactions and fails startup on timeout. The tick table keeps {@code shards}, the shard sets
+ * {@code dirty} replaces, for the previous release, which writes and reads it beside or after this one; this version
+ * leaves it null (every shard). Ticks without {@code dirty} (null) count as holding rows of every shard; dead letters
+ * older than {@code status} are kept and the hook sees new ones only: one ALTER adds the hook's
  * columns, and their check is not validated, so it scans no row of the dead table under that ALTER's lock. With
  * {@code outbox.schema.bootstrap = false} it creates and alters no base object: {@link SchemaCheck} checks them first,
  * failing startup with every problem, and the rest (partitions, the first tick, cursors, the maintenance and instance
@@ -104,28 +105,31 @@ public final class OutboxSchema implements AutoCloseable {
 
     /** {@code ddl}: the transactions whose new connections run the bootstrap, the owner's ones when it has its own. */
     public OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config) {
-        this(db, ddl, config, Map.of());
+        this(db, ddl, config, Map.of(), Set.of());
     }
 
-    /** {@code contracts}: the contract version each typed route of the instance reads, by topic; its row reports it. */
+    /**
+     * {@code contracts}: the contract version each typed route of the instance reads, by topic; {@code routes}: every
+     * topic a route of the instance claims, typed or plain. Its row reports both, the routes sorted.
+     */
     public OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config,
-            Map<String, Integer> contracts) {
-        this(db, ddl, config, SCHEMA_LOCK_ATTEMPTS, contracts);
+            Map<String, Integer> contracts, Set<String> routes) {
+        this(db, ddl, config, SCHEMA_LOCK_ATTEMPTS, contracts, routes);
     }
 
     OutboxSchema(OutboxTransactions db, OutboxConfig config, int schemaLockAttempts) {
-        this(db, db, config, schemaLockAttempts, Map.of());
+        this(db, db, config, schemaLockAttempts, Map.of(), Set.of());
     }
 
     private OutboxSchema(OutboxTransactions db, OutboxTransactions ddl, OutboxConfig config, int schemaLockAttempts,
-            Map<String, Integer> contracts) {
+            Map<String, Integer> contracts, Set<String> routes) {
         validate(config);
         this.db = db;
         this.ddl = ddl;
         this.config = config;
         this.spelled = TableNames.of(config.table());
         this.schemaLockAttempts = schemaLockAttempts;
-        this.contracts = new ContractGuard(contracts, config.partitions().maintenanceInterval());
+        this.contracts = new ContractGuard(contracts, routes, config.partitions().maintenanceInterval());
     }
 
     /**
@@ -273,7 +277,10 @@ public final class OutboxSchema implements AutoCloseable {
         return guard;
     }
 
-    /** The live relay instances' contract reports as this instance last read them, which its sends check. */
+    /**
+     * This instance's contracts and routes, and the live relay instances' reports of theirs as this instance last read
+     * them, which its sends check.
+     */
     ContractGuard contractGuard() {
         return contracts;
     }
@@ -411,7 +418,7 @@ public final class OutboxSchema implements AutoCloseable {
             // still under the schema lock: from here on, another instance's reshard sees this one
             try (var ps = c.prepareStatement(Heartbeat.upsert(n))) {
                 Heartbeat.bind(ps, 0, instanceId, shards, false, config.relay().enabled(), contracts.contracts(),
-                        config.partitions().maintenanceInterval());
+                        contracts.routes(), config.partitions().maintenanceInterval());
                 ps.executeUpdate();
             }
             contracts.refresh(c, n); // this row too: a send right after start is guarded
@@ -600,11 +607,13 @@ public final class OutboxSchema implements AutoCloseable {
                       hook_active boolean not null default false,
                       expires_at  timestamptz,
                       relay       boolean not null default false,
-                      contracts   jsonb
+                      contracts   jsonb,
+                      routes      text[]
                     )""");
             addColumn(c, n.instance(), "expires_at", "timestamptz"); // made by an earlier build of this version
             addColumn(c, n.instance(), "relay", "boolean not null default false"); // likewise
             addColumn(c, n.instance(), "contracts", "jsonb"); // likewise; null: unknown
+            addColumn(c, n.instance(), "routes", "text[]"); // likewise; null: unknown
         }
     }
 

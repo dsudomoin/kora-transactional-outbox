@@ -73,7 +73,7 @@ class WriterGuardIT {
     @Test
     void aSendRightAfterTheBootstrapIsGuarded() throws Exception {
         var config = new TestOutboxConfig();
-        try (var schema = new OutboxSchema(transactions, transactions, config, Map.of("orders", 1))) {
+        try (var schema = new OutboxSchema(transactions, transactions, config, Map.of("orders", 1), Set.of("orders"))) {
             schema.start();
             var outbox = new PgOutbox(transactions, schema, config.shards(), () -> {}, OutboxTelemetry.NONE);
             var v2 = new TypedOutbox<>(outbox, (topic, value) -> bytes(value.id()), V2.class);

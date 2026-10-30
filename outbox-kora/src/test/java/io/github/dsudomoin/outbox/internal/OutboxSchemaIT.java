@@ -248,7 +248,7 @@ class OutboxSchemaIT {
             // retry and instance tables made before WAIT and contract reports, each with a row; the index goes with
             // its column
             execute(c, "alter table " + n.retry() + " drop column waiting_since");
-            execute(c, "alter table " + n.instance() + " drop column relay, drop column contracts");
+            execute(c, "alter table " + n.instance() + " drop column relay, drop column contracts, drop column routes");
             execute(c, "insert into " + n.retry() + " (id, shard, message_id, topic, created_at, attempts)"
                     + " values (1, 0, gen_random_uuid(), 't', now(), 2)");
             execute(c, "insert into " + n.instance() + " (instance_id, shards) values ('old', 4)");
@@ -260,12 +260,12 @@ class OutboxSchemaIT {
                     + n.retry())).isEqualTo("1:2:true");
             assertThat(queryString(c, "select pg_get_indexdef(to_regclass(?))", n.retry() + "_waiting"))
                     .endsWith(" (waiting_since) WHERE (waiting_since IS NOT NULL)");
-            assertThat(queryString(c, "select relay || ':' || (contracts is null) from " + n.instance()
-                    + " where instance_id = 'old'")).isEqualTo("false:true");
+            assertThat(queryString(c, "select relay || ':' || (contracts is null) || ':' || (routes is null) from "
+                    + n.instance() + " where instance_id = 'old'")).isEqualTo("false:true:true");
             assertThat(queryString(c, "select string_agg(attname || ' ' || format_type(atttypid, atttypmod) || ' '"
                     + " || attnotnull, ', ' order by attname) from pg_attribute where attrelid = to_regclass(?)"
-                    + " and attname in ('relay', 'contracts')", n.instance()))
-                    .isEqualTo("contracts jsonb false, relay boolean true");
+                    + " and attname in ('relay', 'contracts', 'routes')", n.instance()))
+                    .isEqualTo("contracts jsonb false, relay boolean true, routes text[] false");
         }
     }
 

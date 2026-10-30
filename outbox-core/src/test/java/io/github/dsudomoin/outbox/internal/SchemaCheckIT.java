@@ -53,6 +53,24 @@ class SchemaCheckIT {
     }
 
     @Test
+    void missingRoutesFails() throws Exception {
+        var schema = "s" + TestSql.uniqueTable();
+        var config = new TestOutboxConfig().table(schema + ".outbox");
+        var names = TableNames.of(config.table());
+
+        try (var c = TestDataSources.newDataSource().getConnection()) {
+            TestSql.execute(c, "create schema " + schema);
+            TestSql.execute(c, OutboxSql.outbox(config, null));
+            TestSql.execute(c, "alter table " + names.instance() + " drop column routes");
+
+            assertThatThrownBy(() -> SchemaCheck.run(c, c, SchemaObjects.outbox(names), config.table(),
+                    "OutboxSql.outbox"))
+                    .hasMessageContaining("column " + names.instance() + ".routes is missing (schema version 1:"
+                            + " apply OutboxSql.outbox)");
+        }
+    }
+
+    @Test
     void missingWaitingIndexFails() throws Exception {
         var schema = "s" + TestSql.uniqueTable();
         var config = new TestOutboxConfig().table(schema + ".outbox");

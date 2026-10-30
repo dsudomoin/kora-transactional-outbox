@@ -13,8 +13,11 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.SortedMap;
+import java.util.SortedSet;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
@@ -33,7 +36,8 @@ import org.slf4j.LoggerFactory;
  * {@code maintenanceInterval}s refuses every such message, as nothing stands behind it. A refusal is counted
  * ({@link OutboxTelemetry#contractRejected}) and logged at WARN with every instance id, at most once a minute. A
  * header that gives no version (null, not a decimal int, not positive) is refused with
- * {@link IllegalArgumentException}: the relay would make the record wait for good.
+ * {@link IllegalArgumentException}: the relay would make the record wait for good. The guard also holds this
+ * instance's routes, which its row reports, and each read takes the live relay instances' {@code routes} too.
  */
 final class ContractGuard {
 
@@ -49,16 +53,27 @@ final class ContractGuard {
      */
     static final String REPORT = "jsonb_typeof(contracts) = 'object', array(select key from jsonb_each_text(" + OBJECT
             + ") order by key), array(select value from jsonb_each_text(" + OBJECT + ") order by key)";
+    /**
+     * An instance row's {@code routes} as {@link #routes(ResultSet, int)} reads it: its topics sorted, whatever the
+     * database's locale, with no null and in one dimension whatever was written by hand; null when unknown.
+     */
+    static final String ROUTES = "case when routes is not null then array(select t from unnest(routes) t where t is"
+            + " not null order by t collate \"C\") end";
 
     private final Map<String, Integer> contracts;
+    private final SortedSet<String> routes;
     private final Duration staleAfter;
     private final AtomicLong warned = new AtomicLong(System.nanoTime() - WARN_INTERVAL);
     @Nullable
     private volatile Snapshot snapshot;
 
-    /** {@code contracts}: this instance's typed routes, the version each reads by topic. */
-    ContractGuard(Map<String, Integer> contracts, Duration maintenanceInterval) {
+    /**
+     * {@code contracts}: this instance's typed routes, the version each reads by topic; {@code routes}: every topic a
+     * route of this instance claims, typed or plain.
+     */
+    ContractGuard(Map<String, Integer> contracts, Set<String> routes, Duration maintenanceInterval) {
         this.contracts = Map.copyOf(contracts);
+        this.routes = Collections.unmodifiableSortedSet(new TreeSet<>(routes));
         this.staleAfter = maintenanceInterval.multipliedBy(OutboxSchema.LIVE_INTERVALS);
     }
 
@@ -67,17 +82,26 @@ final class ContractGuard {
         return contracts;
     }
 
+    /** What this instance's row reports in {@code routes}: every topic a route of it claims, sorted. */
+    SortedSet<String> routes() {
+        return routes;
+    }
+
     /** Reads the live relay instances' reports, in a statement of its own. */
     void refresh(Connection c, TableNames names) throws SQLException {
         long readAt = System.nanoTime();
         var reports = new HashMap<String, Map<String, Integer>>();
-        try (var st = c.createStatement(); var rs = st.executeQuery("select instance_id, " + REPORT + " from "
-                + names.instance() + " where relay and expires_at > now()")) {
+        var routed = new HashMap<String, Set<String>>();
+        try (var st = c.createStatement(); var rs = st.executeQuery("select instance_id, " + REPORT + ", " + ROUTES
+                + " from " + names.instance() + " where relay and expires_at > now()")) {
             while (rs.next()) {
-                reports.put(rs.getString(1), report(rs, 2));
+                var id = rs.getString(1);
+                reports.put(id, report(rs, 2));
+                var topics = routes(rs, 5);
+                routed.put(id, topics == null ? null : Set.copyOf(topics));
             }
         }
-        observed(new Snapshot(readAt, reports));
+        observed(new Snapshot(readAt, reports, routed));
     }
 
     /**
@@ -98,8 +122,21 @@ final class ContractGuard {
         return report;
     }
 
+    /** The {@link #ROUTES} column {@code column}: the topics, sorted; null when unknown. */
+    @Nullable
+    static List<String> routes(ResultSet rs, int column) throws SQLException {
+        var routes = rs.getArray(column);
+        return routes == null ? null : List.of((String[]) routes.getArray());
+    }
+
     void observed(Snapshot read) {
         snapshot = read;
+    }
+
+    /** The last read, null before the first. */
+    @Nullable
+    Snapshot snapshot() {
+        return snapshot;
     }
 
     /**
@@ -171,10 +208,13 @@ final class ContractGuard {
         final Map<String, Integer> lowest;
         /** A report is unknown. */
         final boolean unknown;
+        /** By instance id, sorted: the topics its routes claim; null when unknown. */
+        final SortedMap<String, Set<String>> routes;
 
-        Snapshot(long readAt, Map<String, Map<String, Integer>> reports) {
+        Snapshot(long readAt, Map<String, Map<String, Integer>> reports, Map<String, Set<String>> routes) {
             this.readAt = readAt;
             this.reports = Collections.unmodifiableSortedMap(new TreeMap<>(reports));
+            this.routes = Collections.unmodifiableSortedMap(new TreeMap<>(routes));
             this.unknown = this.reports.containsValue(null); // the copy's: Map.of refuses to look for null
             var lowest = new HashMap<String, Integer>();
             for (var report : reports.values()) {

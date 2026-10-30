@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * The outbox assembled from public parts: config, the application's transactions, the handler and, optionally, topic
@@ -53,6 +54,8 @@ public final class OutboxRuntime implements AutoCloseable {
     private final Set<String> claimedTopics;
     /** The version each {@link TypedOutboxTopicHandler} route reads, by topic: what this instance's row reports. */
     private final Map<String, Integer> contracts;
+    /** Every topic a route claims, typed or plain, sorted: what this instance's row reports. */
+    private final Set<String> routes;
     private final OutboxDeadLetterHandler deadLetterHandler;
     private final OutboxTelemetry telemetry;
     /** The transactions with the owner's new connections, or {@link #transactions} without an owner source. */
@@ -61,12 +64,13 @@ public final class OutboxRuntime implements AutoCloseable {
     private volatile Parts parts;
 
     private OutboxRuntime(Builder builder, OutboxHandler handler, @Nullable Set<String> claimedTopics,
-            Map<String, Integer> contracts) {
+            Map<String, Integer> contracts, Set<String> routes) {
         this.config = builder.config;
         this.transactions = builder.transactions;
         this.handler = handler;
         this.claimedTopics = claimedTopics;
         this.contracts = contracts;
+        this.routes = routes;
         this.deadLetterHandler = builder.deadLetterHandler;
         this.telemetry = GuardedTelemetry.of(builder.telemetry);
         this.ddl = OwnerTransactions.of(transactions, builder.owner);
@@ -122,7 +126,7 @@ public final class OutboxRuntime implements AutoCloseable {
         if (parts != null) {
             throw new IllegalStateException("OutboxRuntime.start() has run already");
         }
-        var schema = new OutboxSchema(transactions, ddl, config, contracts);
+        var schema = new OutboxSchema(transactions, ddl, config, contracts, routes);
         try {
             schema.start();
         } catch (SQLException e) {
@@ -234,7 +238,8 @@ public final class OutboxRuntime implements AutoCloseable {
                     contracts.put(topic, typed.contractVersion());
                 }
             });
-            return new OutboxRuntime(this, routed, handler != null ? null : claims.keySet(), contracts);
+            return new OutboxRuntime(this, routed, handler != null ? null : claims.keySet(), contracts,
+                    new TreeSet<>(claims.keySet()));
         }
 
         /** Fills {@code claims} with each claimed topic's route. */

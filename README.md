@@ -1802,8 +1802,10 @@ create table outbox_instance (     -- heartbeat работающих инста�
   hook_active boolean not null default false,  -- relay здесь работает, и хук dead letters активен
   expires_at  timestamptz,           -- last_seen + 3 × maintenanceInterval этого инстанса
   relay       boolean not null default false,  -- relay здесь работает
-  contracts   jsonb                  -- топик → старшая версия контракта, которую читает инстанс; null: неизвестно,
+  contracts   jsonb,                 -- топик → старшая версия контракта, которую читает инстанс; null: неизвестно,
                                      -- {}: не сообщает ничего (нет типизированных обработчиков)
+  routes      text[]                 -- топики, которые забрали маршруты инстанса, типизированные и простые, по
+                                     -- порядку; null: неизвестно, {}: маршрутов нет
 );
 
 -- inbox (InboxModule), создаётся, когда какой-то компонент использует Inbox
