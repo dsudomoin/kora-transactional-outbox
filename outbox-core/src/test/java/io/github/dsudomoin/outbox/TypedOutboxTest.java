@@ -96,6 +96,16 @@ class TypedOutboxTest {
     }
 
     @Test
+    void protobufKeepsAHandSetContractHeader() {
+        var header = new OutboxHeader("h", null);
+        var contract = new OutboxHeader("outbox-contract", "3".getBytes(US_ASCII));
+
+        new ProtobufOutbox(outbox).send("p", "k", StringValue.of("hello"), List.of(contract, header));
+
+        assertThat(sent).singleElement().extracting(OutboxMessage::headers).isEqualTo(List.of(contract, header));
+    }
+
+    @Test
     void serializerFailureWrappedAndNothingSent() {
         var cause = new IOException("boom");
         var typed = new TypedOutbox<Integer>(outbox, (topic, value) -> {
