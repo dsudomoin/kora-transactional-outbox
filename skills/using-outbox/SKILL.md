@@ -71,8 +71,8 @@ data (a record no running release reads waits; it is never lost or dead-lettered
   `OutboxIncompatibleContractException` before writing (topic, type, versions, instance ids), counted in
   `outbox.messages.contract_rejected`; deploy the reading release everywhere first. Limits: reports are one heartbeat
   (30 s) stale, a crashed old instance blocks up to about 90 s, an old instance started after the check still gets v2
-  (it waits), plain handlers and Kafka-bound topics are not checked, no live relay instance (on a fresh read) means
-  nothing is refused.
+  (it waits), plain handlers and Kafka-bound topics are not version-checked, no live relay instance (on a fresh read)
+  means nothing is refused.
 - A writer whose heartbeat has not read the reports for over 3 × `maintenanceInterval` decides both the version and
   the route check by its last read: refused if there was none, if it found no live relay instance, or if a live relay
   instance in it had no report (`contracts` or `routes` null) or an incompatible one; otherwise let through, counted in
@@ -165,16 +165,14 @@ for ops:
    state the numbers. It needs a restart; hot standbys need at least the primary's value.
 6. **Topics** the Kafka handler writes (topics an `OutboxTopicHandler` claims need none, but writing to a new route's
    topic starts only once every live relay instance reports the route, «Routes and their releases» above), and DLQ
-   topics with
-   `outbox.kafka.deadLetterTopic`: created before writers deploy, broker
-   auto-create off, ACLs (WRITE, DESCRIBE) for the service principal, final partition count (added partitions move
-   keys), the producer's `batch.size` ≤ the topic's `max.message.bytes` (the default 16 384 is; else kafka-clients
-   ≤ 4.1 stall a batch holding an oversized record until `delivery.timeout.ms`). One line per topic:
+   topics with `outbox.kafka.deadLetterTopic`: created before writers deploy, broker auto-create off, ACLs (WRITE,
+   DESCRIBE) for the service principal, final partition count (added partitions move keys), the producer's `batch.size`
+   ≤ the topic's `max.message.bytes` (the default 16 384 is; else kafka-clients ≤ 4.1 stall a batch holding an oversized
+   record until `delivery.timeout.ms`). One line per topic:
    `kafka-topics.sh --bootstrap-server "$KAFKA" --create --topic <topic> --partitions <N> --replication-factor 3 --config min.insync.replicas=2 --config unclean.leader.election.enable=false`
 7. **Relay** enabled on at least one instance: maintenance and the dead-letter pass run only there.
 8. **Alerts**: `outbox.shard.lag` growing, `outbox.dead.size > 0`, `outbox.maintenance.since_success > 5 ×
-   maintenanceInterval`, `outbox.maintenance.transaction_pooling = 1`, `outbox.partitions.premade < 2`,
-   `overflow = 1`, `xids_left` not NaN, `orphaned > 0`, `outbox.waiting.oldest > 900` (`relay.waiting.alertAfter`),
+   maintenanceInterval`, `outbox.maintenance.transaction_pooling = 1`, `outbox.partitions.premade < 2`, `overflow = 1`,
+   `xids_left` not NaN, `orphaned > 0`, `outbox.waiting.oldest > 900` (`relay.waiting.alertAfter`),
    `outbox.messages.contract_rejected` or `outbox.messages.route_rejected` growing; with a dead-letter hook,
-   `outbox.dead.pending.oldest`. Dead letters:
-   admin API, never SQL.
+   `outbox.dead.pending.oldest`. Dead letters: admin API, never SQL.
