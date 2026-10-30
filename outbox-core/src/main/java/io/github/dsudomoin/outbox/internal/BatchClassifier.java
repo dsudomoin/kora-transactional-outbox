@@ -9,6 +9,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /** Turns the outcomes of a handler call into retry/dead/parked actions or a shard pause. */
 public final class BatchClassifier {
@@ -39,8 +40,18 @@ public final class BatchClassifier {
         OutboxRecord r();
     }
 
-    /** First retry row of its (topic, key), or an unkeyed retry row; due at {@code nextAttemptAt}. */
-    public record Head(OutboxRecord r, int attempts, Instant nextAttemptAt, String error) implements Action {}
+    /**
+     * First retry row of its (topic, key), or an unkeyed retry row; due at {@code nextAttemptAt}. {@code waiting}: why
+     * a waiting head waits, null for one that failed or was not attempted.
+     */
+    public record Head(OutboxRecord r, int attempts, Instant nextAttemptAt, String error,
+            @Nullable Outcome.Waiting.Kind waiting) implements Action {
+
+        /** A head that failed or was not attempted. */
+        public Head(OutboxRecord r, int attempts, Instant nextAttemptAt, String error) {
+            this(r, attempts, nextAttemptAt, error, null);
+        }
+    }
 
     /** A retry row waiting behind its head ({@code next_attempt_at} null). */
     public record Follower(OutboxRecord r) implements Action {}
@@ -75,14 +86,18 @@ public final class BatchClassifier {
     }
 
     /**
-     * Any delivery → per-key handling: the first Retry/NotAttempted row of a (topic, key) becomes its
+     * Any delivery → per-key handling: the first Retry/NotAttempted/Waiting row of a (topic, key) becomes its
      * head, every later row of that pair and every row of a {@code dbBlocked} pair a follower, Permanent rows
-     * dead. Nothing delivered and Retry/NotAttempted rows on 2+ pairs → pause. Exactly one such pair
+     * dead. Nothing delivered and 2+ {@linkplain #failingKeys failing} pairs → pause. Exactly one such pair
      * → pause until {@code priorFailures + 1 >= headFailuresBeforeDivert}, then per-key handling with this attempt
      * counted {@code priorFailures + 1} times instead of once. No such pair at all → advance. Retry heads and
      * Permanent dead rows add this attempt to the record's {@code attempts}; NotAttempted heads always start at 0
      * attempts (never-attempted rows keep their {@code maxAttempts} budget). A head is due at
      * {@code max(now + backoff(max(attempts - 1, 0)), notBefore)}, with {@code notBefore} capped at {@code now + 24h}.
+     *
+     * <p>Waiting is neither a delivery nor a failure: the row becomes a waiting head with its attempts unchanged, due
+     * at {@code max(now + waitBackoff(0), notBefore)} ({@link #waitBackoff}), {@code notBefore} capped the same way,
+     * and blocks its key, which is not failing, the NotAttempted rows after it included.
      *
      * <p>Requeue is neither a delivery nor a failure: the row is parked ({@code requeues + 1}, due at
      * {@code max(now + requeueDelay, notBefore)}) without blocking its key, or, the requeue past a positive
@@ -91,16 +106,10 @@ public final class BatchClassifier {
      * {@code max(now + requeueDelay, notBefore)}) without blocking its key; any other outcome treats it as any row.
      */
     public static Decision classify(List<Item> items, int priorFailures, int headFailuresBeforeDivert, Instant now,
-            Duration retryInitial, Duration retryMax, Duration requeueDelay, int maxRequeues) {
-        boolean anyDelivered = false;
-        var failing = new HashSet<Object>();
-        for (var item : items) {
-            if (item.outcome() instanceof Outcome.Delivered) {
-                anyDelivered = true;
-            } else if (item.outcome() instanceof Outcome.Retry || item.outcome() instanceof Outcome.NotAttempted) {
-                failing.add(orderingKey(item.record()));
-            }
-        }
+            Duration retryInitial, Duration retryMax, Duration requeueDelay, int maxRequeues, Duration waitDelay,
+            Duration waitMax) {
+        boolean anyDelivered = items.stream().anyMatch(item -> item.outcome() instanceof Outcome.Delivered);
+        var failing = failingKeys(items);
         int attempts = 1; // added by a Retry head or dead row: this attempt plus the paused batches before it
         if (!anyDelivered && !failing.isEmpty()) {
             if (failing.size() > 1 || priorFailures + 1 < headFailuresBeforeDivert) {
@@ -110,6 +119,7 @@ public final class BatchClassifier {
         }
         var notAttemptedDue = now.plus(Backoff.delay(0, retryInitial, retryMax)); // attempts 0
         var requeueDue = now.plus(requeueDelay);
+        var waitDue = now.plus(waitBackoff(Duration.ZERO, waitDelay, waitMax)); // a first wait
         var blocked = new HashSet<Object>();
         var actions = new ArrayList<Action>();
         for (var item : items) {
@@ -139,9 +149,56 @@ public final class BatchClassifier {
             } else if (outcome instanceof Outcome.NotAttempted skipped) {
                 actions.add(new Head(r, 0, dueAt(notAttemptedDue, skipped.notBefore(), now), NOT_ATTEMPTED));
                 blocked.add(key);
+            } else if (outcome instanceof Outcome.Waiting waiting) {
+                actions.add(new Head(r, r.attempts(), dueAt(waitDue, waiting.notBefore(), now), waitingError(waiting),
+                        waiting.kind()));
+                blocked.add(key);
+            } else {
+                throw new IllegalStateException("unknown outcome " + outcome);
             }
         }
         return new Decision(false, actions);
+    }
+
+    /**
+     * The (topic, key) pairs of {@code items} that failed: those whose first Retry, NotAttempted or Waiting row is a
+     * Retry or a NotAttempted. A pair whose first such row waits is not failing: a wait says nothing about the target,
+     * and the rows after it were not attempted because of it.
+     */
+    static Set<Object> failingKeys(List<Item> items) {
+        var seen = new HashSet<Object>();
+        var failing = new HashSet<Object>();
+        for (var item : items) {
+            var outcome = item.outcome();
+            if (item.dbBlocked() || outcome instanceof Outcome.Delivered || outcome instanceof Outcome.Permanent
+                    || outcome instanceof Outcome.Requeue) {
+                continue; // not handed, or its key goes on
+            } else if (outcome instanceof Outcome.Retry || outcome instanceof Outcome.NotAttempted) {
+                var key = orderingKey(item.record());
+                if (seen.add(key)) {
+                    failing.add(key);
+                }
+            } else if (outcome instanceof Outcome.Waiting) {
+                seen.add(orderingKey(item.record()));
+            } else {
+                throw new IllegalStateException("unknown outcome " + outcome);
+            }
+        }
+        return failing;
+    }
+
+    /**
+     * Until a waiting record is handed again: a quarter of the time it has {@code waited}, at least {@code delay} and
+     * at most {@code maxDelay}, so a long wait is asked about less often.
+     */
+    static Duration waitBackoff(Duration waited, Duration delay, Duration maxDelay) {
+        var quarter = waited.dividedBy(4);
+        return quarter.compareTo(maxDelay) > 0 ? maxDelay : quarter.compareTo(delay) < 0 ? delay : quarter;
+    }
+
+    /** The {@code last_error} of a waiting head. */
+    static String waitingError(Outcome.Waiting waiting) {
+        return "waiting (" + waiting.kind().label() + "): " + waiting.reason();
     }
 
     /** A requeue of {@code r} now goes past a positive {@code maxRequeues}: dead instead of parked. */

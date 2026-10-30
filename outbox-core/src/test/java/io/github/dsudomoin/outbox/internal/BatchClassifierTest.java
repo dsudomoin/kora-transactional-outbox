@@ -31,6 +31,8 @@ class BatchClassifierTest {
     private static final Duration MAX = Duration.ofMinutes(5);
     private static final int THRESHOLD = 3;
     private static final Duration DELAY = Duration.ofSeconds(1);
+    private static final Duration WAIT = Duration.ofSeconds(2);
+    private static final Duration WAIT_MAX = Duration.ofMinutes(1);
     private static final RuntimeException DOWN = new RuntimeException("down");
     private static final Decision PAUSE = new Decision(true, List.of());
 
@@ -308,13 +310,104 @@ class BatchClassifierTest {
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
+    @Test
+    void waitingIsNeitherADeliveryNorAFailure() {
+        var k1a = record("t", "k1");
+        var k1b = record("t", "k1");
+        var k2 = record("t", "k2");
+
+        assertThat(classify(0, waiting(k1a), notAttempted(k1b), waiting(k2)))
+                .as("no pause: the rows a wait held back count nowhere")
+                .isEqualTo(advance(waitingHead(k1a), new Follower(k1b), waitingHead(k2)));
+        assertThat(classify(0, waiting(k1a), delivered(k2))).isEqualTo(advance(waitingHead(k1a)));
+    }
+
+    @Test
+    void aWaitingKeyIsNotFailingNextToARetriedOne() {
+        var k1 = record("t", "k1");
+        var k2 = record("t", "k2");
+        var items = new Item[] {waiting(k1), retry(k2)};
+
+        assertThat(BatchClassifier.failingKeys(List.of(items))).containsExactly(BatchClassifier.orderingKey(k2));
+        assertThat(classify(0, items)).as("a single failing key pauses until the threshold").isEqualTo(PAUSE);
+        assertThat(classify(THRESHOLD - 1, items)).isEqualTo(advance(waitingHead(k1), head(k2, THRESHOLD)));
+    }
+
+    @Test
+    void aKeyIsDecidedByItsFirstRetryNotAttemptedOrWaitingRow() {
+        var a1 = record("t", "a");
+        var a2 = record("t", "a");
+        var a3 = record("t", "a");
+        var c1 = record("t", "c");
+
+        assertThat(BatchClassifier.failingKeys(List.of(permanent(a1), waiting(a2), notAttempted(a3),
+                requeue(record("t", "b")), waiting(record("t", "b")), notAttempted(record("t", "b")),
+                retry(c1), waiting(record("t", "c")), waiting(record("t", "d")), retry(record("t", "d")))))
+                .containsExactly(BatchClassifier.orderingKey(c1));
+        assertThat(classify(0, permanent(a1), waiting(a2), notAttempted(a3)))
+                .as("a dead row before the wait does not make its key failing")
+                .isEqualTo(advance(new Dead(a1, 1, new OutboxPermanentException("bad").toString()), waitingHead(a2),
+                        new Follower(a3)));
+    }
+
+    @Test
+    void aParkedRowThatWaitsBecomesAWaitingHead() {
+        var veteran = record("t", "k", 2, 3);
+        var after = record("t", "k");
+
+        assertThat(classify(0, parked(veteran, Outcome.waitFor("not yet")), notAttempted(after)))
+                .isEqualTo(advance(waitingHead(veteran), new Follower(after)));
+    }
+
+    @Test
+    void aWaitSpendsNoAttempt() {
+        var retried = record("t", "k1", 4, 0);
+        var failing = record("t", "k2");
+
+        assertThat(classify(THRESHOLD - 1, waiting(retried), retry(failing))).isEqualTo(advance(
+                new Head(retried, 4, NOW.plus(WAIT), "waiting (handler): not yet", Outcome.Waiting.Kind.HANDLER),
+                head(failing, THRESHOLD)));
+    }
+
+    @Test
+    void firstWaitDueTime() {
+        var plain = record("t", "a");
+        var later = record("t", "b");
+        var early = record("t", "c");
+        var farAway = record("t", "d");
+        var contract = record("t", "e");
+
+        assertThat(classify(0, waiting(plain),
+                new Item(later, false, Outcome.waitFor("not yet", NOW.plusSeconds(30))),
+                new Item(early, false, Outcome.waitFor("not yet", NOW.plusMillis(100))),
+                new Item(farAway, false, Outcome.waitFor("not yet", NOW.plus(Duration.ofHours(30)))),
+                new Item(contract, false, new Outcome.Waiting(Outcome.Waiting.Kind.CONTRACT, "v2", null))))
+                .isEqualTo(advance(
+                        waitingHead(plain),
+                        new Head(later, 0, NOW.plusSeconds(30), "waiting (handler): not yet",
+                                Outcome.Waiting.Kind.HANDLER),
+                        waitingHead(early), // never before the delay
+                        new Head(farAway, 0, NOW.plus(Duration.ofHours(24)), "waiting (handler): not yet",
+                                Outcome.Waiting.Kind.HANDLER), // notBefore capped at 24 h
+                        new Head(contract, 0, NOW.plus(WAIT), "waiting (contract): v2",
+                                Outcome.Waiting.Kind.CONTRACT)));
+    }
+
+    @Test
+    void waitBackoffIsAQuarterOfTheWaitWithinBounds() {
+        assertThat(BatchClassifier.waitBackoff(Duration.ZERO, WAIT, WAIT_MAX)).isEqualTo(WAIT);
+        assertThat(BatchClassifier.waitBackoff(Duration.ofSeconds(20), WAIT, WAIT_MAX))
+                .isEqualTo(Duration.ofSeconds(5));
+        assertThat(BatchClassifier.waitBackoff(Duration.ofHours(1), WAIT, WAIT_MAX)).isEqualTo(WAIT_MAX);
+    }
+
     private static Decision classify(int priorFailures, Item... items) {
         return classify(priorFailures, 0, items);
     }
 
     private static Decision classify(int priorFailures, int maxRequeues, Item... items) {
         return BatchClassifier.classify(List.of(items), priorFailures, THRESHOLD, NOW, INITIAL, MAX, DELAY,
-                maxRequeues);
+                maxRequeues, WAIT, WAIT_MAX);
     }
 
     private static Decision advance(Action... actions) {
@@ -325,6 +418,11 @@ class BatchClassifierTest {
     private static Head head(OutboxRecord r, int attempts) {
         return new Head(r, attempts, NOW.plus(Backoff.delay(Math.max(attempts - 1, 0), INITIAL, MAX)),
                 DOWN.toString());
+    }
+
+    /** Head of a {@link #waiting} item: attempts unchanged, due after the first wait. */
+    private static Head waitingHead(OutboxRecord r) {
+        return new Head(r, r.attempts(), NOW.plus(WAIT), "waiting (handler): not yet", Outcome.Waiting.Kind.HANDLER);
     }
 
     private static Item delivered(OutboxRecord r) {
@@ -353,6 +451,10 @@ class BatchClassifierTest {
 
     private static Item requeue(OutboxRecord r, Instant notBefore) {
         return new Item(r, false, Outcome.requeue(notBefore));
+    }
+
+    private static Item waiting(OutboxRecord r) {
+        return new Item(r, false, Outcome.waitFor("not yet"));
     }
 
     private static Item parked(OutboxRecord r, Outcome outcome) {

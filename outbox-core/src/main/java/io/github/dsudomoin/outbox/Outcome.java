@@ -59,7 +59,7 @@ public sealed interface Outcome {
         return new Waiting(Waiting.Kind.HANDLER, reason, null);
     }
 
-    /** {@link #waitFor(String)}, handed again no earlier than {@code notBefore}. */
+    /** {@link #waitFor(String)}, handed again no earlier than {@code notBefore}, capped at 24 h from now. */
     static Outcome waitFor(String reason, Instant notBefore) {
         return new Waiting(Waiting.Kind.HANDLER, reason, Objects.requireNonNull(notBefore, "notBefore"));
     }
