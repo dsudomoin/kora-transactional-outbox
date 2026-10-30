@@ -9,6 +9,8 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -17,6 +19,7 @@ import org.slf4j.LoggerFactory;
  * Enqueue. A keyed row takes {@code pg_advisory_xact_lock(keyNamespace, keyHash)} in its INSERT statement,
  * before the identity assigns the row id, so per (topic, key) id order is commit order. Unkeyed rows take no lock and
  * land on a random shard. {@code sendAll} inserts through {@link Resender}, every key locked in one statement first.
+ * Without a handler behind the routes, a message of a topic no route claims is refused before anything is written.
  */
 public final class PgOutbox implements Outbox {
 
@@ -32,9 +35,19 @@ public final class PgOutbox implements Outbox {
     private final Resender resender;
     private final TableNames names;
     private final ShardGuard guard;
+    /** The topics the routes claim; null: a handler takes every other topic, so every topic goes in. */
+    @Nullable
+    private final Set<String> claimedTopics;
 
+    /** Takes every topic. */
     public PgOutbox(OutboxTransactions db, OutboxSchema schema, int shards, Runnable wakeUpRelay,
             OutboxTelemetry telemetry) {
+        this(db, schema, shards, wakeUpRelay, telemetry, null);
+    }
+
+    /** {@code claimedTopics}: the only topics it takes, or null for every topic. */
+    public PgOutbox(OutboxTransactions db, OutboxSchema schema, int shards, Runnable wakeUpRelay,
+            OutboxTelemetry telemetry, @Nullable Set<String> claimedTopics) {
         OutboxSchema.validateShards(shards);
         this.db = db;
         this.notInTx = "Outbox.send must be called inside " + db.transactionHint();
@@ -55,6 +68,7 @@ public final class PgOutbox implements Outbox {
         this.names = schema.names();
         this.guard = schema.shardGuard(); // the cursors' count as this instance's heartbeat last read it
         this.resender = new Resender(names, shards, guard);
+        this.claimedTopics = claimedTopics == null ? null : Set.copyOf(claimedTopics);
     }
 
     @Override
@@ -81,6 +95,9 @@ public final class PgOutbox implements Outbox {
         int n = messages.size();
         if (n == 0) {
             return List.of();
+        }
+        for (var m : messages) {
+            requireClaimed(m.topic());
         }
         var enqueue = telemetry.enqueueStarted();
         var ids = new UUID[n];
@@ -112,6 +129,7 @@ public final class PgOutbox implements Outbox {
     /** One message, one enqueue of the telemetry. */
     private UUID insert(Connection c, OutboxMessage m) {
         guard.require(names, shards);
+        requireClaimed(m.topic());
         var enqueue = telemetry.enqueueStarted();
         var id = UuidV7.next();
         boolean keyed = m.key() != null;
@@ -139,6 +157,17 @@ public final class PgOutbox implements Outbox {
         telemetry.enqueued(m.topic());
         enqueue.finished();
         return id;
+    }
+
+    /**
+     * A topic no route claims, without a handler behind the routes, is a typo or a route this release lacks: refused
+     * here, in the business transaction, instead of a record that waits for an instance with the route.
+     */
+    private void requireClaimed(String topic) {
+        if (claimedTopics != null && !claimedTopics.contains(topic)) {
+            throw new IllegalArgumentException("outbox topic " + topic + " is claimed by no OutboxTopicHandler and"
+                    + " there is no OutboxHandler: claimed topics are " + new TreeSet<>(claimedTopics));
+        }
     }
 
     private Connection currentTransaction() {

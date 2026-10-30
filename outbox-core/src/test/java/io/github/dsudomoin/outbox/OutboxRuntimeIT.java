@@ -7,11 +7,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import io.github.dsudomoin.outbox.testing.RecordingHandler;
 import io.github.dsudomoin.outbox.testing.TestDataSources;
 import io.github.dsudomoin.outbox.testing.TestOutboxConfig;
+import io.github.dsudomoin.outbox.testing.TestSql;
 import jakarta.annotation.Nullable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import org.junit.jupiter.api.Test;
 
@@ -56,6 +58,86 @@ class OutboxRuntimeIT {
         }
     }
 
+    @Test
+    void withoutAHandlerATopicNoRouteClaimsIsRefusedBeforeAnythingIsWritten() {
+        var transactions = new JdbcTransactions(TestDataSources.newDataSource());
+        var config = new TestOutboxConfig().relayEnabled(false);
+        try (var runtime = OutboxRuntime.builder(config, transactions, null)
+                .route(new Claiming(Set.of("billing", "audit"))).build()) {
+            runtime.start();
+            var outbox = runtime.outbox();
+            var typed = new TypedOutbox<>(outbox, (topic, value) -> value.getBytes(UTF_8), String.class);
+            var refused = "outbox topic orders is claimed by no OutboxTopicHandler and there is no OutboxHandler:"
+                    + " claimed topics are [audit, billing]";
+
+            transactions.inTx(c -> {
+                assertThatThrownBy(() -> outbox.send(OutboxMessage.of("orders", "k", bytes("p"))))
+                        .isInstanceOf(IllegalArgumentException.class).hasMessage(refused);
+                assertThatThrownBy(() -> outbox.send(c, OutboxMessage.of("orders", "k", bytes("p"))))
+                        .isInstanceOf(IllegalArgumentException.class).hasMessage(refused);
+                assertThatThrownBy(() -> outbox.sendAll(List.of(OutboxMessage.of("audit", "k", bytes("a")),
+                        OutboxMessage.of("orders", "k", bytes("p")))))
+                        .isInstanceOf(IllegalArgumentException.class).hasMessage(refused);
+                assertThatThrownBy(() -> typed.send("orders", "k", "p"))
+                        .isInstanceOf(IllegalArgumentException.class).hasMessage(refused);
+                return null;
+            });
+            assertThat(rows(transactions, config)).as("the transaction committed, and nothing in it was written, not"
+                    + " even sendAll's claimed message").isZero();
+
+            transactions.inTx(c -> outbox.sendAll(List.of(OutboxMessage.of("audit", "k", bytes("a")),
+                    typed.message("billing", "k", "b"))));
+            assertThat(rows(transactions, config)).isEqualTo(2);
+        }
+    }
+
+    @Test
+    void withAHandlerBehindTheRoutesEveryTopicIsSent() {
+        var transactions = new JdbcTransactions(TestDataSources.newDataSource());
+        var config = new TestOutboxConfig().relayEnabled(false);
+        try (var runtime = OutboxRuntime.builder(config, transactions, new RecordingHandler())
+                .route(new Claiming(Set.of("audit"))).build()) {
+            runtime.start();
+            var outbox = runtime.outbox();
+            var typed = new TypedOutbox<>(outbox, (topic, value) -> value.getBytes(UTF_8), String.class);
+
+            transactions.inTx(c -> {
+                outbox.send(OutboxMessage.of("orders", "k", bytes("p")));
+                outbox.sendAll(List.of(OutboxMessage.of("orders", "k", bytes("p"))));
+                return typed.send("orders", "k", "p");
+            });
+
+            assertThat(rows(transactions, config)).isEqualTo(3);
+        }
+    }
+
+    /** Redrive does not go through {@link Outbox}: a letter of a topic no route claims any more goes back in. */
+    @Test
+    void aRedriveToATopicNoRouteClaimsStillGoesIn() {
+        var transactions = new JdbcTransactions(TestDataSources.newDataSource());
+        var config = new TestOutboxConfig().relayEnabled(false);
+        // the release before: a handler took every topic, and it failed an orders record for good
+        try (var before = OutboxRuntime.builder(config, transactions,
+                new RecordingHandler().failAlways(r -> true, () -> new OutboxPermanentException("bad"))).build()) {
+            before.start();
+            transactions.inTx(c -> before.outbox().send(OutboxMessage.of("orders", "k", bytes("p"))));
+            before.relay().drain();
+        }
+
+        try (var routeOnly = OutboxRuntime.builder(config, transactions, null)
+                .route(new Claiming(Set.of("audit"))).build()) {
+            routeOnly.start();
+            assertThatThrownBy(() -> transactions.inTx(c -> routeOnly.outbox().send(
+                    OutboxMessage.of("orders", "k", bytes("p"))))).isInstanceOf(IllegalArgumentException.class);
+            var letters = routeOnly.admin().findDeadLetters(DeadLetterFilter.any(), null, 10).letters();
+            assertThat(letters).extracting(DeadLetter::topic).containsExactly("orders");
+
+            long written = rows(transactions, config); // the dead record's row stays until its partition goes
+            assertThat(routeOnly.admin().redriveDeadLetters(List.of(letters.get(0).id()))).isOne();
+            assertThat(rows(transactions, config)).as("the letter is back in the outbox").isEqualTo(written + 1);
+        }
+    }
+
     /**
      * A start that fails after the relay began beating (here the halt check's database call) leaves no instance
      * behind: once the start deleted the bootstrap's row, no beat writes it back, so an emergency reshard counts none.
@@ -75,6 +157,19 @@ class OutboxRuntimeIT {
             rs.next();
             assertThat(rs.getInt(1)).as("instance rows five beats after the failed start").isZero();
         }
+    }
+
+    private static long rows(JdbcTransactions transactions, TestOutboxConfig config) {
+        return transactions.inTx(c -> TestSql.queryLong(c, "select count(*) from " + config.table()));
+    }
+
+    private static byte[] bytes(String s) {
+        return s.getBytes(UTF_8);
+    }
+
+    private record Claiming(Set<String> topics) implements OutboxTopicHandler {
+        @Override
+        public void handle(OutboxRecord record) {}
     }
 
     /** Refuses the connection {@code Maintenance.checkHalt} asks for, as a database down at that moment would. */

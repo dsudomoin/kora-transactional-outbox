@@ -1,9 +1,11 @@
 package io.github.dsudomoin.outbox.kafka.wiring;
 
 import static io.github.dsudomoin.outbox.kafka.wiring.RoutedIT.await;
+import static io.github.dsudomoin.outbox.testing.TestSql.execute;
 import static io.github.dsudomoin.outbox.testing.TestSql.queryString;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.dsudomoin.outbox.OutboxMessage;
 import io.github.dsudomoin.outbox.kafka.wiring.RoutedAuditHandler.AuditEvent;
@@ -53,21 +55,34 @@ class RoutedNoKafkaIT implements KoraAppTestConfigModifier {
 
     @Test
     void componentsDeliverWithoutAnyOutboxHandler() throws Exception {
-        var unclaimed = db.inTx((SqlFunction0<UUID>) () -> {
-            app.audit().send(RoutedAuditHandler.TOPIC, "k", new AuditEvent("login"));
-            return app.outbox().send(OutboxMessage.of("routed-unclaimed", "k", "u".getBytes(UTF_8)));
-        });
+        db.inTx((SqlFunction0<UUID>) () -> app.audit().send(RoutedAuditHandler.TOPIC, "k", new AuditEvent("login")));
 
         await(() -> !audit.events.isEmpty());
         assertThat(audit.events).containsExactly(new AuditEvent("login"));
-        await(() -> lastError(unclaimed) != null); // no route claims it: it waits for an instance with one
+    }
+
+    @Test
+    void aTopicNoRouteClaimsIsRefusedAtSendAndWaitsWhenAnotherReleaseWroteIt() throws Exception {
+        assertThatThrownBy(() -> db.inTx((SqlFunction0<UUID>) () -> app.outbox().send(
+                OutboxMessage.of("routed-unclaimed", "k", "u".getBytes(UTF_8)))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageStartingWith("outbox topic routed-unclaimed is claimed by no OutboxTopicHandler");
+
+        var unclaimed = UUID.randomUUID(); // written as a release with a route for the topic writes it
+        try (var c = TestDb.connect()) {
+            execute(c, "insert into " + table + " (shard, message_id, topic, payload) values (0, '" + unclaimed
+                    + "', 'routed-unclaimed', 'u'::bytea)");
+        }
+
+        await(() -> lastError(unclaimed) != null); // no route claims it here: it waits for an instance with one
         assertThat(lastError(unclaimed))
                 .isEqualTo("waiting (no_route): no handler for topic routed-unclaimed on this instance");
     }
 
     private String lastError(UUID messageId) {
         try (var c = TestDb.connect()) {
-            return queryString(c, "select last_error from " + table + "_retry where message_id = ?::uuid",
+            // one row, null before the relay took the record
+            return queryString(c, "select max(last_error) from " + table + "_retry where message_id = ?::uuid",
                     messageId.toString());
         } catch (SQLException e) {
             throw new IllegalStateException(e);

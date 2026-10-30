@@ -12,7 +12,9 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * The outbox assembled from public parts: config, the application's transactions, the handler and, optionally, topic
@@ -46,6 +48,9 @@ public final class OutboxRuntime implements AutoCloseable {
     private final OutboxTransactions transactions;
     /** The builder's handler, with its routes in front of it. Package-private for tests. */
     final OutboxHandler handler;
+    /** The topics the routes claim, the only ones {@link #outbox()} takes; null with a handler behind them. */
+    @Nullable
+    private final Set<String> claimedTopics;
     private final OutboxDeadLetterHandler deadLetterHandler;
     private final OutboxTelemetry telemetry;
     /** The transactions with the owner's new connections, or {@link #transactions} without an owner source. */
@@ -53,18 +58,21 @@ public final class OutboxRuntime implements AutoCloseable {
     @Nullable
     private volatile Parts parts;
 
-    private OutboxRuntime(Builder builder, OutboxHandler handler) {
+    private OutboxRuntime(Builder builder, OutboxHandler handler, @Nullable Set<String> claimedTopics) {
         this.config = builder.config;
         this.transactions = builder.transactions;
         this.handler = handler;
+        this.claimedTopics = claimedTopics;
         this.deadLetterHandler = builder.deadLetterHandler;
         this.telemetry = GuardedTelemetry.of(builder.telemetry);
         this.ddl = OwnerTransactions.of(transactions, builder.owner);
     }
 
     /**
-     * {@code handler} delivers every topic no {@link Builder#route} claims. It may be null when there are routes: a
-     * record of a topic none claims then waits ({@link Outcome.Waiting.Kind#NO_ROUTE}) for an instance with one.
+     * {@code handler} delivers every topic no {@link Builder#route} claims. It may be null when there are routes:
+     * {@link #outbox()} then refuses a topic none claims with an {@link IllegalArgumentException}, before anything is
+     * written, and a record of such a topic that another release wrote waits
+     * ({@link Outcome.Waiting.Kind#NO_ROUTE}) for an instance with its route.
      */
     public static Builder builder(OutboxConfig config, OutboxTransactions transactions,
             @Nullable OutboxHandler handler) {
@@ -122,7 +130,7 @@ public final class OutboxRuntime implements AutoCloseable {
             var maintenance = new Maintenance(ddl, names, resolved, telemetry);
             var deadLetters = new DeadLetterPass(transactions, names, resolved, deadLetterHandler, telemetry);
             var relay = new OutboxRelay(transactions, resolved, schema, handler, telemetry, maintenance, deadLetters);
-            var outbox = new PgOutbox(transactions, schema, resolved.shards(), relay::wake, telemetry);
+            var outbox = new PgOutbox(transactions, schema, resolved.shards(), relay::wake, telemetry, claimedTopics);
             var admin = new PgOutboxAdmin(transactions, ddl, names, resolved, maintenance, relay::wake);
             relay.start();
             parts = new Parts(schema, maintenance, deadLetters, relay, outbox, admin);
@@ -211,17 +219,19 @@ public final class OutboxRuntime implements AutoCloseable {
             if (owner != null && config.schema().bootstrap()) {
                 throw new IllegalArgumentException(OWNER_NEEDS_MIGRATIONS);
             }
-            return new OutboxRuntime(this, routed());
+            var claims = new HashMap<String, OutboxTopicHandler>();
+            var routed = routed(claims);
+            return new OutboxRuntime(this, routed, handler != null ? null : claims.keySet());
         }
 
-        private OutboxHandler routed() {
+        /** Fills {@code claims} with each claimed topic's route. */
+        private OutboxHandler routed(Map<String, OutboxTopicHandler> claims) {
             if (routes.isEmpty()) {
                 if (handler == null) {
                     throw new IllegalArgumentException(NO_HANDLER);
                 }
                 return handler;
             }
-            var claims = new HashMap<String, OutboxTopicHandler>();
             var table = new HashMap<String, OutboxHandler>();
             for (var route : routes) {
                 var topics = route.topics();
